@@ -31,6 +31,9 @@ jobs:
         with:
           context: images/base
           platforms: linux/amd64
+          # A single image, not an index with an attestation, keeps the copy into
+          # each account's registry simple.
+          provenance: false
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ghcr.io/lucataco/cloudex-base:edge

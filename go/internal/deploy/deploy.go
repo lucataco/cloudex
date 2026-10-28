@@ -28,9 +28,9 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/cloudflare"
 )
@@ -224,19 +224,33 @@ func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, 
 	if err != nil {
 		return "", fmt.Errorf("registry credentials: %w", err)
 	}
-	opts := []crane.Option{
-		crane.WithContext(ctx),
-		crane.WithAuthFromKeychain(authn.NewMultiKeychain(registryKeychain{user, pass}, authn.DefaultKeychain)),
-		crane.WithPlatform(&v1.Platform{OS: "linux", Architecture: "amd64"}),
+	dstRef, err := name.ParseReference(dst)
+	if err != nil {
+		return "", err
+	}
+	opts := []remote.Option{
+		remote.WithContext(ctx),
+		remote.WithAuthFromKeychain(authn.NewMultiKeychain(registryKeychain{user, pass}, authn.DefaultKeychain)),
+		remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"}),
 	}
 	log("Copying the sandbox image %s into your account (about 700 MB the first time)", src)
 	t0 := time.Now()
-	if err := crane.Copy(src, dst, opts...); err != nil {
+	// Copy only the linux/amd64 image, even when the source is a multi-platform
+	// index or carries attestations.
+	desc, err := remote.Get(srcRef, opts...)
+	if err != nil {
+		return "", fmt.Errorf("reading the sandbox image: %w", err)
+	}
+	img, err := desc.Image()
+	if err != nil {
+		return "", fmt.Errorf("the sandbox image has no linux/amd64 variant: %w", err)
+	}
+	if err := remote.Write(dstRef, img, opts...); err != nil {
 		return "", fmt.Errorf("copying the sandbox image: %w", err)
 	}
-	digest, err := crane.Digest(dst, opts...)
+	digest, err := img.Digest()
 	if err != nil {
-		return "", fmt.Errorf("reading the copied image's digest: %w", err)
+		return "", err
 	}
 	log("Image copied in %s", time.Since(t0).Round(time.Second))
 	return fmt.Sprintf("%s/%s/%s@%s", registryHost, account, imageRepo, digest), nil
