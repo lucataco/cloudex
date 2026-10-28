@@ -10,7 +10,9 @@ import { errorStatus, isSandboxId, newSandboxId, previewToken, sameSecret } from
 export { Sandbox } from "./sandbox";
 export { Egress } from "./egress";
 
-const VERSION = "0.1.0-dev";
+// Set by scripts/bundle-api.sh for releases.
+declare const CLOUDEX_VERSION: string | undefined;
+const VERSION = typeof CLOUDEX_VERSION === "string" ? CLOUDEX_VERSION : "dev";
 
 type Ctx = { Bindings: Env };
 const app = new Hono<Ctx>();
