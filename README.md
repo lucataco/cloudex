@@ -4,8 +4,9 @@ Open-source agent computers that run in your own Cloudflare account. Each sandbo
 is a Linux machine with a shell, Docker, SSH and coding agents, saved and resumed
 on demand. You pay Cloudflare directly; there is no Cloudex service in between.
 
-**Status: pre-alpha.** Nothing here works end to end yet. Phase 1, a personal
-version you deploy with `wrangler`, is under way. Site: [cloudex.build](https://cloudex.build).
+**Status: pre-alpha.** Nothing here works end to end yet. v0.1 is under way:
+install the CLI, run `cloudex deploy` against your own account, then create and
+SSH into sandboxes. Site: [cloudex.build](https://cloudex.build).
 
 ## Layout
 
@@ -35,7 +36,7 @@ pnpm --filter @cloudex/api exec wrangler dev --enable-containers=false
 cd go && go test ./... && go run ./cmd/cloudex status --api-url http://localhost:8787
 ```
 
-## Deploy (Phase 1)
+## Deploy by hand (until `cloudex deploy` exists)
 
 ```sh
 cd apps/api
