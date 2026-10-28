@@ -22,9 +22,9 @@ for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64 wi
   CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "$ldflags" -o "$work/$exe" ./cmd/cloudex
   cp "$root/LICENSE" "$root/README.md" "$work/"
   if [ "$os" = windows ]; then
-    (cd "$work" && zip -q "../$name.zip" ./*)
+    (cd "$work" && zip -q "../$name.zip" "$exe" LICENSE README.md)
   else
-    tar -C "$work" -czf "$dist/$name.tar.gz" .
+    tar -C "$work" -czf "$dist/$name.tar.gz" "$exe" LICENSE README.md
   fi
   rm -rf "$work"
 done
