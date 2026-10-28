@@ -69,7 +69,7 @@ func New(version string) *cobra.Command {
 		newStopCmd(opts), newResumeCmd(opts), newDeleteCmd(opts))
 	add("connect", newSSHCmd(opts), newExecCmd(opts), newHostCmd(opts), newPromptCmd(opts),
 		newAttachCmd(opts), newSSHConfigCmd(opts))
-	add("setup", newStatusCmd(opts), newVersionCmd(version, opts))
+	add("setup", newDeployCmd(opts), newDoctorCmd(opts), newStatusCmd(opts), newVersionCmd(version, opts))
 	root.AddCommand(newProxyCmd(opts))
 	return root
 }
