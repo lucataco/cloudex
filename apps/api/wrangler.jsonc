@@ -1,0 +1,25 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "cloudex-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  // One container per Sandbox Durable Object. A newly pushed image can take
+  // 15-20 minutes before it starts (spike S7), so deploys must wait for a test boot.
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "scheduling_policy": "durable_object",
+      "images": { "base": { "dockerfile": "../../images/base/Dockerfile" } }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "SANDBOX", "class_name": "Sandbox" }]
+  },
+  "exports": {
+    "Sandbox": { "type": "durable-object", "storage": "sqlite" }
+  },
+  // No database_id: wrangler creates the database on first deploy.
+  "d1_databases": [{ "binding": "DB", "database_name": "cloudex" }]
+  // Secrets: ADMIN_KEY (wrangler secret put ADMIN_KEY). Locally, put it in .dev.vars.
+}

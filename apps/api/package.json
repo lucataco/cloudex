@@ -1,0 +1,18 @@
+{
+  "name": "@cloudex/api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Control plane Worker: the /v1 API and one Sandbox Durable Object per sandbox",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@cloudex/schema": "workspace:*",
+    "hono": "^4.13.14"
+  }
+}

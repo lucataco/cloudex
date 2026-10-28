@@ -1,0 +1,17 @@
+{
+  "name": "@cloudex/schema",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Zod models shared by the API, CLI and SDKs. The OpenAPI spec is generated from these.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  }
+}

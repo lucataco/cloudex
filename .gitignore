@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env*
+!.env.example
+*.log
+.DS_Store
+
+# Go build output
+/go/bin/

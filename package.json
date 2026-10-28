@@ -1,0 +1,19 @@
+{
+  "name": "cloudex",
+  "private": true,
+  "description": "Open-source agent computers in your own Cloudflare account",
+  "license": "MIT",
+  "packageManager": "pnpm@12.15.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "dev:api": "pnpm --filter @cloudex/api dev",
+    "deploy:api": "pnpm --filter @cloudex/api run deploy"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "wrangler": "^4.154.0"
+  }
+}

@@ -1,0 +1,23 @@
+# Builds the sandbox image when it changes. Pushing it to Cloudflare happens
+# on `wrangler deploy`, not here.
+name: Image
+
+on:
+  push:
+    branches: [main]
+    paths: ["images/**"]
+  pull_request:
+    paths: ["images/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  base:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build images/base for linux/amd64
+        run: docker build --platform linux/amd64 -t cloudex-base:ci images/base
+      - name: Report size
+        run: docker image inspect cloudex-base:ci --format '{{.Size}}' | numfmt --to=iec
