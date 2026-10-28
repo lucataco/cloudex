@@ -1,0 +1,36 @@
+#!/bin/bash
+# Starts a coding agent in a detached tmux session, so it keeps working when you
+# disconnect and you can reattach from any terminal.
+#   cloudex-agent start <claude|codex> <prompt...>            prints the session name
+#   cloudex-agent attach [session]                            newest session by default
+#   cloudex-agent list
+set -euo pipefail
+
+usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+case "${1:-}" in
+  start)
+    [ $# -ge 3 ] || usage
+    agent=$2; shift 2; prompt="$*"
+    # The sandbox is the isolation boundary, so agents run without their own
+    # permission prompts and sandboxes.
+    case "$agent" in
+      claude) run=(claude --dangerously-skip-permissions "$prompt") ;;
+      codex) run=(codex --dangerously-bypass-approvals-and-sandbox "$prompt") ;;
+      *) echo "unknown agent: $agent (use claude or codex)" >&2; exit 2 ;;
+    esac
+    command -v "${run[0]}" >/dev/null || { echo "$agent isn't installed in this sandbox" >&2; exit 1; }
+    name="agent-$(date +%m%d-%H%M%S)"
+    tmux new-session -d -s "$name" -c "$HOME" -x 200 -y 50 "$(printf '%q ' "${run[@]}"); exec bash -l"
+    echo "$name"
+    ;;
+  attach)
+    name=${2:-$(tmux list-sessions -F '#{session_created} #{session_name}' 2>/dev/null | awk '$2 ~ /^agent-/' | sort -n | tail -1 | cut -d' ' -f2)}
+    [ -n "$name" ] || { echo "no agent sessions; start one with cloudex prompt" >&2; exit 1; }
+    exec tmux attach -t "$name"
+    ;;
+  list)
+    tmux list-sessions -F '#{session_name}  started #{t:session_created}  #{?session_attached,attached,detached}' 2>/dev/null | grep '^agent-' || true
+    ;;
+  *) usage ;;
+esac

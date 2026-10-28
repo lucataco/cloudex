@@ -1,0 +1,4 @@
+#!/bin/bash
+# Run by the entrypoint on SIGTERM: ask the sandbox's controller for a final save
+# while the disk is still here. The host allows 15 minutes before SIGKILL.
+curl -fsS -m 900 -X POST http://cloudex.internal/save-on-term

@@ -25,13 +25,17 @@ RUN install -m 0755 -d /etc/apt/keyrings \
        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
   && rm -rf /var/lib/apt/lists/*
 
-# Agent CLIs. Their API keys are added outside the box by the egress handler.
+# Agent CLIs. Users sign in once inside the sandbox; the login survives stop and resume.
 RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force
 
-RUN useradd -m -s /bin/bash -G sudo,docker cloudex \
+# The sandbox user is uid 1000 (the API execs as 1000:1000), so drop the
+# image's stock ubuntu user, which holds that id.
+RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -s /bin/bash -G sudo,docker cloudex \
   && echo 'cloudex ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/cloudex \
+  && rm -f /home/cloudex/.bash_logout \
   && mkdir -p /run/sshd \
   && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
 
 COPY entrypoint.sh /usr/local/bin/cloudex-entrypoint
+COPY bin/ /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/cloudex-entrypoint"]

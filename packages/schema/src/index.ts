@@ -6,17 +6,68 @@ import { z } from "zod";
 export const SandboxSize = z.enum(["lite", "standard-1", "standard-2", "standard-3", "standard-4"]);
 export type SandboxSize = z.infer<typeof SandboxSize>;
 
-export const SandboxState = z.enum(["creating", "starting", "running", "stopping", "stopped", "error"]);
+export const SandboxState = z.enum(["starting", "running", "stopping", "stopped", "error"]);
 export type SandboxState = z.infer<typeof SandboxState>;
 
-export const SandboxStatus = z.object({
+export const Sandbox = z.object({
   id: z.string(),
+  name: z.string().nullable(),
+  size: SandboxSize,
   state: SandboxState,
+  idleMinutes: z.number().int(),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+  startedAt: z.number().int().nullable(),
+  stoppedAt: z.number().int().nullable(),
+  // When the disk was last saved, and the size of that save. Saves after a
+  // resume hold only what changed since the previous one.
+  savedAt: z.number().int().nullable(),
+  savedBytes: z.number().int().nullable(),
+  error: z.string().nullable(),
 });
-export type SandboxStatus = z.infer<typeof SandboxStatus>;
+export type Sandbox = z.infer<typeof Sandbox>;
+
+const Name = z
+  .string()
+  .regex(/^[a-z][a-z0-9-]{0,30}[a-z0-9]$/, "lowercase letters, digits and dashes; 2-32 characters")
+  .refine((n) => !n.startsWith("cx-"), "names can't start with cx-, which marks sandbox ids");
+
+export const CreateSandbox = z.object({
+  name: Name.optional(),
+  size: SandboxSize.default("standard-2"),
+  // Stop (and save) after this many minutes without SSH, exec, preview or agent
+  // activity. 0 keeps it running until the platform's 6-hour limit.
+  idleMinutes: z.number().int().min(0).max(360).default(30),
+});
+export type CreateSandbox = z.input<typeof CreateSandbox>;
+
+export const ExecRequest = z.object({
+  cmd: z.string().min(1),
+  root: z.boolean().default(false),
+  cwd: z.string().optional(),
+  timeoutSec: z.number().int().min(1).max(3600).default(600),
+});
+export type ExecRequest = z.input<typeof ExecRequest>;
+
+export const ExecResult = z.object({
+  exitCode: z.number().int(),
+  stdout: z.string(),
+  stderr: z.string(),
+  timedOut: z.boolean(),
+  ms: z.number().int(),
+});
+export type ExecResult = z.infer<typeof ExecResult>;
+
+export const HostRequest = z.object({ port: z.number().int().min(1).max(65535) });
+export const HostResult = z.object({ url: z.string() });
+export type HostResult = z.infer<typeof HostResult>;
 
 export const Health = z.object({
   ok: z.literal(true),
   version: z.string(),
+  previewZone: z.string().nullable(),
 });
 export type Health = z.infer<typeof Health>;
+
+export const ApiError = z.object({ error: z.string() });
+export type ApiError = z.infer<typeof ApiError>;

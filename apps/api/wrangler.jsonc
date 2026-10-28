@@ -20,6 +20,9 @@
     "Sandbox": { "type": "durable-object", "storage": "sqlite" }
   },
   // No database_id: wrangler creates the database on first deploy.
-  "d1_databases": [{ "binding": "DB", "database_name": "cloudex" }]
+  "d1_databases": [{ "binding": "DB", "database_name": "cloudex" }],
+  // PREVIEW_ZONE: a zone in this account that serves preview links
+  // (https://<port>-<id>-<token>.<zone>). Empty turns preview links off.
+  "vars": { "PREVIEW_ZONE": "" }
   // Secrets: ADMIN_KEY (wrangler secret put ADMIN_KEY). Locally, put it in .dev.vars.
 }

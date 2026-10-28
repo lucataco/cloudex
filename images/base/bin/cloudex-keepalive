@@ -1,0 +1,10 @@
+#!/bin/bash
+# Tells the controller the sandbox is busy while an agent session is producing
+# output, so idle stop doesn't end a long task. Quiet sessions don't count.
+while :; do
+  sleep 60
+  now=$(date +%s)
+  busy=$(su cloudex -c "tmux list-windows -a -F '#{session_name} #{window_activity}' 2>/dev/null" |
+    awk -v now="$now" '$1 ~ /^agent-/ && now - $2 < 600 { n++ } END { print n + 0 }')
+  [ "$busy" -gt 0 ] && curl -fsS -m 10 -X POST http://cloudex.internal/activity >/dev/null 2>&1
+done

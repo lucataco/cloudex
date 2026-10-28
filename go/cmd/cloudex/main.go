@@ -11,7 +11,5 @@ import (
 var version = "dev"
 
 func main() {
-	if err := cli.New(version).Execute(); err != nil {
-		os.Exit(1)
-	}
+	os.Exit(cli.Run(version, os.Args[1:], os.Stdout, os.Stderr))
 }

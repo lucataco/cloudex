@@ -5,11 +5,11 @@
 set -u
 
 log() { echo "[cloudex] $(date +%s.%N) $*" | tee -a /var/log/cloudex.log; }
-log "entrypoint start box=${CLOUDEX_BOX:-?}"
+log "entrypoint start sandbox=${CLOUDEX_SANDBOX:-?}"
 
 # The platform's hostname is the 64-character instance ID, which is too long for
 # a DNS label and breaks tools such as Python's http.server.
-[ -n "${CLOUDEX_BOX:-}" ] && hostname "cx-${CLOUDEX_BOX}"
+[ -n "${CLOUDEX_SANDBOX:-}" ] && hostname "${CLOUDEX_SANDBOX}"
 
 # Trust the egress CA when HTTPS interception is on.
 if [ -f /etc/cloudflare/certs/cloudflare-containers-ca.crt ]; then
@@ -23,10 +23,9 @@ for name in $(compgen -e | grep -E '^(CLOUDEX_|ANTHROPIC_|OPENAI_|DISABLE_TELEME
   printf 'export %s=%q\n' "$name" "${!name}"
 done > /etc/profile.d/cloudex-env.sh
 
-mkdir -p /home/cloudex/.ssh
-echo "${CLOUDEX_SSH_PUBKEY:-}" > /home/cloudex/.ssh/authorized_keys
-chown -R cloudex:cloudex /home/cloudex/.ssh
-chmod 700 /home/cloudex/.ssh && chmod 600 /home/cloudex/.ssh/authorized_keys
+# The API adds client keys to authorized_keys when they connect; a resumed
+# disk keeps them. Host keys are made on first boot and kept the same way.
+install -d -m 700 -o cloudex -g cloudex /home/cloudex/.ssh
 ssh-keygen -A >/dev/null 2>&1
 # /run is a tmpfs mounted at boot, so the directory baked into the image is hidden.
 mkdir -p /run/sshd
@@ -47,6 +46,8 @@ on_term() {
   exit 0
 }
 trap on_term TERM INT
+
+/usr/local/bin/cloudex-keepalive >>/var/log/cloudex.log 2>&1 &
 
 cat /proc/sys/kernel/random/boot_id > /run/cloudex-ready
 log "ready"
