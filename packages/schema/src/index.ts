@@ -3,7 +3,8 @@
 import { z } from "zod";
 
 // Container instance types on Cloudflare. standard-4 is 4 vCPU, 12 GiB and 20 GB of disk.
-export const SandboxSize = z.enum(["lite", "standard-1", "standard-2", "standard-3", "standard-4"]);
+// lite (256 MiB, 2 GB of disk) is left out: the sandbox image fails to boot on it.
+export const SandboxSize = z.enum(["standard-1", "standard-2", "standard-3", "standard-4"]);
 export type SandboxSize = z.infer<typeof SandboxSize>;
 
 export const SandboxState = z.enum(["starting", "running", "stopping", "stopped", "error"]);

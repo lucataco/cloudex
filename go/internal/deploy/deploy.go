@@ -158,7 +158,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		if made {
 			log("Added a proxied *.%s record for preview links", zone)
 		}
-		log("Preview links on *.%s", zone)
+		log("Preview links on *.%s; its other subdomains pass through to their origins", zone)
 	}
 
 	res := &Result{APIURL: apiURL, APIKey: key, AccountID: account.ID, PreviewZone: zone}

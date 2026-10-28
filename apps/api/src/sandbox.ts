@@ -349,7 +349,11 @@ export class Sandbox extends DurableObject<Env> {
     this.touch();
     if (m[1] === "http") {
       const target = new URL(`http://container${m[3] ?? "/"}${url.search}`);
-      return this.container.getTcpPort(port).fetch(new Request(target, req));
+      try {
+        return await this.container.getTcpPort(port).fetch(new Request(target, req));
+      } catch (e) {
+        return new Response(`nothing is answering on port ${port} in ${r.name ?? r.id}: ${message(e)}\n`, { status: 502 });
+      }
     }
     if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("expected a WebSocket upgrade", { status: 426 });

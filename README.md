@@ -5,19 +5,21 @@ is a Linux machine with a shell, Docker, SSH and coding agents. Stopping saves i
 disk; resuming brings it back. You pay Cloudflare directly; there is no Cloudex
 service in between. Site: [cloudex.build](https://cloudex.build).
 
-**Status: pre-alpha (v0.1 in progress).** Expect rough edges and breaking changes.
+**Status: v0.1, pre-alpha.** Expect rough edges and breaking changes.
 
 ## What you need
 
 - A Cloudflare account on **Workers Paid** ($5/month). Containers need it.
 - An OpenSSH client, and Node.js 20+ for `cloudex deploy` (it runs Cloudflare's wrangler).
-- Optional: a domain in the same Cloudflare account, for preview links.
+- Optional: a domain in the same Cloudflare account, for preview links. Cloudex adds
+  a proxied `*.<domain>` record and routes `*.<domain>/*` to its Worker; requests
+  for your other subdomains, like `www`, pass through to their origins.
 
 ## Get started
 
 ```sh
-curl -fsSL https://cloudex.build/install | sh   # once v0.1 is released
-cloudex deploy                                  # asks for a Cloudflare API token
+curl -fsSL https://cloudex.build/install | sh
+cloudex deploy --preview-domain example.com     # asks for a Cloudflare API token
 cloudex new --name web
 cloudex ssh
 ```
@@ -25,13 +27,13 @@ cloudex ssh
 `cloudex deploy` prints a link that opens the Cloudflare dashboard with the token's
 permissions pre-filled. It then copies the sandbox image into your account, uploads
 the API Worker, and starts a test sandbox. Run it again to update; your sandboxes
-stay.
+stay. Leave out `--preview-domain` if you don't want preview links.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `cloudex new [--name] [--size] [--idle 30m]` | Create and start a sandbox; it becomes the current one |
+| `cloudex new [--name] [--size standard-2] [--idle 30m]` | Create and start a sandbox; it becomes the current one |
 | `cloudex list`, `info`, `use <sandbox>` | See sandboxes and pick the current one |
 | `cloudex ssh [sandbox] [-- ssh args]` | Shell in over SSH, through your API (no public IP) |
 | `cloudex exec [sandbox] -- <command>` | Run a command and print its output and exit code |

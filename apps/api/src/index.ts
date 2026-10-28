@@ -102,9 +102,9 @@ app.all("/v1/*", (c) => c.json({ error: "not found" }, 404));
 
 // Preview links: https://<port>-<id>-<token>.<zone>. One label, so the zone's
 // Universal SSL certificate covers it.
-async function preview(req: Request, env: Env, host: string): Promise<Response> {
-  const m = /^(\d{1,5})-(cx-[a-z0-9]{6})-([a-z0-9]{10})\./.exec(host);
-  if (!m) return new Response("not found", { status: 404 });
+const PREVIEW_HOST = /^(\d{1,5})-(cx-[a-z0-9]{6})-([a-z0-9]{10})\./;
+
+async function preview(req: Request, env: Env, m: RegExpExecArray): Promise<Response> {
   const [, portText, id, token] = m as unknown as [string, string, string, string];
   const port = Number(portText);
   if (!(await sameSecret(token, await previewToken(env.ADMIN_KEY, id, port)))) {
@@ -118,7 +118,13 @@ export default {
   async fetch(req, env, ctx) {
     const host = new URL(req.url).hostname;
     const zone = env.PREVIEW_ZONE;
-    if (zone && host.endsWith(`.${zone}`) && env.ADMIN_KEY) return preview(req, env, host);
+    if (zone && host.endsWith(`.${zone}`)) {
+      const m = PREVIEW_HOST.exec(host);
+      if (m && env.ADMIN_KEY) return preview(req, env, m);
+      // The preview route (*.zone/*) also catches the zone's other subdomains,
+      // like www. Send those on to their origin untouched.
+      return fetch(req);
+    }
     return app.fetch(req, env, ctx);
   },
 } satisfies ExportedHandler<Env>;

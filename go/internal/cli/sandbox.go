@@ -70,7 +70,7 @@ func newNewCmd(opts *options) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "a name to use instead of the id")
-	cmd.Flags().StringVar(&size, "size", "", "lite, standard-1, standard-2 (default), standard-3 or standard-4")
+	cmd.Flags().StringVar(&size, "size", "", "standard-1, standard-2 (default), standard-3 or standard-4")
 	cmd.Flags().DurationVar(&idle, "idle", 30*time.Minute, "stop after this long without activity; 0 waits for the 6-hour platform limit")
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make it the current sandbox")
 	return cmd
