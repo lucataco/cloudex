@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,14 +53,28 @@ const (
 
 // TokenURL opens the dashboard with an account API token pre-filled with what
 // deploy needs. The last three permissions are only used for preview links.
-const TokenURL = `https://dash.cloudflare.com/?to=/:account/api-tokens&name=Cloudex&permissionGroupKeys=` +
-	`%5B%7B%22key%22%3A%22e086da7e2179491d91ee5f35b3ca210a%22%7D%2C` + // Workers Scripts Write
-	`%7B%22key%22%3A%22bdbcd690c763475a985e8641dddc09f7%22%7D%2C` + // Workers Containers Write
-	`%7B%22key%22%3A%2209b2857d1c31407795e75e3fed8617a1%22%7D%2C` + // D1 Write
-	`%7B%22key%22%3A%22c1fde68c7bcc44588cbb6ddbc16d6480%22%7D%2C` + // Account Settings Read
-	`%7B%22key%22%3A%2228f4b596e7d643029c524985477ae49a%22%7D%2C` + // Workers Routes Write
-	`%7B%22key%22%3A%224755a26eedb94da69e1066d98aa820be%22%7D%2C` + // DNS Write
-	`%7B%22key%22%3A%22c8fed203ed3043cba015a93ad1616f1f%22%7D%5D` // Zone Read
+// The dashboard rejects the whole link if an entry has no type, even though it
+// ignores the type when the key is a permission group ID.
+var TokenURL = tokenURL([]tokenPermission{
+	{"e086da7e2179491d91ee5f35b3ca210a", "edit"}, // Workers Scripts Write
+	{"bdbcd690c763475a985e8641dddc09f7", "edit"}, // Workers Containers Write
+	{"09b2857d1c31407795e75e3fed8617a1", "edit"}, // D1 Write
+	{"c1fde68c7bcc44588cbb6ddbc16d6480", "read"}, // Account Settings Read
+	{"28f4b596e7d643029c524985477ae49a", "edit"}, // Workers Routes Write
+	{"4755a26eedb94da69e1066d98aa820be", "edit"}, // DNS Write
+	{"c8fed203ed3043cba015a93ad1616f1f", "read"}, // Zone Read
+})
+
+type tokenPermission struct {
+	Key  string `json:"key"`
+	Type string `json:"type"`
+}
+
+func tokenURL(perms []tokenPermission) string {
+	keys, _ := json.Marshal(perms)
+	// The documented shape: https://developers.cloudflare.com/fundamentals/api/how-to/account-owned-token-template/
+	return "https://dash.cloudflare.com/?to=/:account/api-tokens&permissionGroupKeys=" + url.QueryEscape(string(keys)) + "&name=Cloudex"
+}
 
 type Options struct {
 	Token         string
