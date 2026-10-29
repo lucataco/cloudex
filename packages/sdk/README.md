@@ -4,6 +4,10 @@ Create, fork and drive [Cloudex](https://cloudex.build) sandboxes: agent
 computers in your own Cloudflare account. It runs anywhere `fetch` does (Node
 18+, Bun, Deno, Workers, browsers) and has no dependencies.
 
+```sh
+npm install cloudex
+```
+
 ```ts
 import { Cloudex } from "cloudex";
 

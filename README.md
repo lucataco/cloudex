@@ -101,13 +101,12 @@ limit. An open `cloudex ssh` session counts, since it sends a keepalive every
 
 The [TypeScript SDK](packages/sdk) and the [Python SDK](python) do what the CLI
 does from code: create, fork, exec, host links, desktop, stop and resume. They
-use the deployment the CLI saved, or an API URL and key you pass in. They're
-not on npm or PyPI yet. Until then:
+use the deployment the CLI saved, or an API URL and key you pass in.
 
 ```sh
+npm install cloudex
+# Python isn't on PyPI yet:
 pip install 'git+https://github.com/lucataco/cloudex#subdirectory=python'
-# TypeScript, from a clone of this repository:
-pnpm install && pnpm --filter cloudex build && npm install <clone>/packages/sdk
 ```
 
 The API describes itself at `<your API URL>/v1/openapi.json`.
@@ -126,7 +125,7 @@ await Promise.all(forks.map((f) => f.exec("npm test")));
 | `images/base` | The sandbox image: Ubuntu 24.04, Node, Python, Docker, sshd, tmux, Claude Code and Codex |
 | `go/cmd/cloudex` | The `cloudex` CLI |
 | `packages/schema` | Zod models shared by the API and the SDKs, and the OpenAPI document built from them |
-| `packages/sdk` | The TypeScript SDK (`cloudex` on npm, once published) |
+| `packages/sdk` | The TypeScript SDK, [`cloudex` on npm](https://www.npmjs.com/package/cloudex) |
 | `python` | The Python SDK (`cloudex` on PyPI, once published) |
 | `scripts/` | `bundle-api.sh` embeds the API in the CLI; `build-cli.sh` builds release archives |
 
