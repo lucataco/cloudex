@@ -1,7 +1,6 @@
 {
   "name": "cloudex",
   "version": "0.1.6",
-  "private": true,
   "description": "SDK for Cloudex: agent sandboxes in your own Cloudflare account",
   "license": "MIT",
   "repository": {
@@ -26,7 +25,9 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
   "engines": {
     "node": ">=18"
