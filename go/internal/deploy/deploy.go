@@ -208,6 +208,9 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		return nil, err
 	}
 	log("API deployed at %s", apiURL)
+	if live.running {
+		log("Sandboxes keep running. Busy connections (ssh, desktops) move to the new version within about 5 minutes and may drop then; reconnect if one does")
+	}
 
 	if zone != "" {
 		made, err := cf.EnsureWildcardRecord(ctx, zoneID, zone)

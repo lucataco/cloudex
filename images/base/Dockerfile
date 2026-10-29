@@ -29,12 +29,14 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force
 
 # The sandbox user is uid 1000 (the API execs as 1000:1000), so drop the
-# image's stock ubuntu user, which holds that id.
+# image's stock ubuntu user, which holds that id. sshd ends sessions whose
+# client hasn't answered for 3 minutes.
 RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -s /bin/bash -G sudo,docker cloudex \
   && echo 'cloudex ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/cloudex \
   && rm -f /home/cloudex/.bash_logout \
   && mkdir -p /run/sshd \
-  && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+  && printf 'ClientAliveInterval 30\nClientAliveCountMax 6\n' > /etc/ssh/sshd_config.d/cloudex.conf
 
 COPY entrypoint.sh /usr/local/bin/cloudex-entrypoint
 COPY bin/ /usr/local/bin/

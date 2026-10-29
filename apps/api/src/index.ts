@@ -84,14 +84,15 @@ app.post("/v1/sandboxes/:ref/exec", async (c) => {
   return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.exec(input));
 });
 
-// A sandbox that keeps running across a deploy keeps the Durable Object code it
-// started with, so it may not have methods added since.
+// A sandbox that's busy (a connection open, a command running) during a deploy
+// keeps its old Durable Object code for 3-5 minutes, so it may not have
+// methods added since.
 async function newMethod<T>(ref: string, call: Promise<T>): Promise<T> {
   try {
     return await call;
   } catch (e) {
     if (e instanceof Error && /does not implement/.test(e.message)) {
-      fail(409, `${ref} has run since before this deployment was updated, so it can't do this yet. Stop it, give it a couple of minutes, then resume it`);
+      fail(409, `${ref} is still running code from before this deployment was updated, so it can't do this yet. A busy sandbox moves to the new code within about 5 minutes; try again then`);
     }
     throw e;
   }

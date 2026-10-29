@@ -406,3 +406,19 @@ func TestUpdateRefusesASourceBuild(t *testing.T) {
 		t.Fatalf("code %d, stderr %q, executable %q", code, errOut, got)
 	}
 }
+
+func TestDesktopQualitySetsTheViewerOption(t *testing.T) {
+	newFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/web":                sandboxJSON,
+		"POST /v1/sandboxes/cx-abc123/desktop": `{"port":6080,"path":"vnc.html?autoconnect=1&quality=3","size":"1280x720","installed":false,"started":false}`,
+		"POST /v1/sandboxes/cx-abc123/hosts":   `{"url":"https://6080-cx-abc123-0123456789.example.com"}`,
+	})
+	code, out, errOut := run(t, "desktop", "web", "--link", "--no-open", "--quality", "0")
+	want := "https://6080-cx-abc123-0123456789.example.com/vnc.html?autoconnect=1&quality=0"
+	if code != 0 || strings.TrimSpace(out) != want {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if code, _, errOut := run(t, "desktop", "web", "--quality", "12"); code != 1 || !strings.Contains(errOut, "0 (least bandwidth) to 9") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}

@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"regexp"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,7 +32,7 @@ var screenSize = regexp.MustCompile(`^\d{3,4}x\d{3,4}$`)
 
 func newDesktopCmd(opts *options) *cobra.Command {
 	var size string
-	var port int
+	var port, quality int
 	var link, noOpen, stop bool
 	cmd := &cobra.Command{
 		Use:   "desktop [sandbox]",
@@ -47,6 +50,9 @@ func newDesktopCmd(opts *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !screenSize.MatchString(size) {
 				return fmt.Errorf("bad size %q: use WIDTHxHEIGHT, such as 1280x720", size)
+			}
+			if quality < 0 || quality > 9 {
+				return fmt.Errorf("bad quality %d: use 0 (least bandwidth) to 9", quality)
 			}
 			cfg, client, err := opts.load()
 			if err != nil {
@@ -84,6 +90,9 @@ func newDesktopCmd(opts *options) *cobra.Command {
 			cancelStart()
 			if err != nil {
 				return desktopError(err)
+			}
+			if cmd.Flags().Changed("quality") {
+				d.Path = withQuery(d.Path, "quality", strconv.Itoa(quality))
 			}
 
 			if link {
@@ -126,9 +135,21 @@ func newDesktopCmd(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&size, "size", "1280x720", "screen size; a running desktop is resized")
 	cmd.Flags().BoolVar(&link, "link", false, "print an HTTPS link on your preview domain instead of using a local port")
 	cmd.Flags().IntVar(&port, "port", 0, fmt.Sprintf("local port to use (default %d, or a free one)", desktopLocalPort))
+	cmd.Flags().IntVar(&quality, "quality", 3, "picture quality, 0 to 9: lower uses less bandwidth on moving images (text stays sharp)")
 	cmd.Flags().BoolVar(&noOpen, "no-open", false, "don't open a browser")
 	cmd.Flags().BoolVar(&stop, "stop", false, "stop the desktop and the programs on it")
 	return cmd
+}
+
+// withQuery sets one option in the viewer's path, keeping the others.
+func withQuery(path, key, value string) string {
+	page, query, _ := strings.Cut(path, "?")
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return path
+	}
+	values.Set(key, value)
+	return page + "?" + values.Encode()
 }
 
 // desktopError explains a 404 from a deployment that predates the desktop.

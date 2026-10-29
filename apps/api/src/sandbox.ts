@@ -58,7 +58,6 @@ function clip(buf: ArrayBuffer) {
 export class Sandbox extends DurableObject<Env> {
   private record: SandboxRecord | undefined;
   private queue: Promise<unknown> = Promise.resolve();
-  private connections = 0;
   private lastActivity = Date.now();
   private lastActivitySaved = 0;
   private exitedAt = 0;
@@ -446,13 +445,16 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   // Idle stop. The platform's own inactivity timer only sees incoming
-  // connections, so this is what actually ends a quiet box.
+  // connections, so this is what actually ends a quiet box. An open bridge
+  // counts only while its client sends something (ssh keepalives every 30 s,
+  // a desktop viewer's update requests): at the edge a dropped connection can
+  // look open for half an hour, and an open one alone would hold the box up.
   async alarm() {
     const r = this.record;
     if (!r || r.state !== "running") return;
     if (!this.ctx.container?.running) return this.onExit();
     const idleMs = r.idleMinutes * 60_000;
-    if (idleMs > 0 && this.connections === 0 && Date.now() - this.lastActivity > idleMs) {
+    if (idleMs > 0 && Date.now() - this.lastActivity > idleMs) {
       try {
         await this.exclusive(async () => {
           if (this.record?.state === "running") await this.saveAndDestroy();
@@ -526,17 +528,16 @@ export class Sandbox extends DurableObject<Env> {
     server.accept();
     // Newer compatibility dates deliver binary messages as Blob unless told otherwise.
     server.binaryType = "arraybuffer";
-    this.connections++;
     const writer = sock.writable.getWriter();
     let closed = false;
     const done = () => {
       if (closed) return;
       closed = true;
-      this.connections--;
       this.touch();
       writer.close().catch(() => {});
     };
     server.addEventListener("message", (e) => {
+      this.touch(); // data from the client is what shows the connection is alive
       const chunk = typeof e.data === "string" ? new TextEncoder().encode(e.data) : new Uint8Array(e.data as ArrayBuffer);
       writer.write(chunk).catch(() => server.close(1011, "guest connection failed"));
     });

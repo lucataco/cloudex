@@ -48,7 +48,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex new [--name] [--size standard-2] [--idle 30m]` | Create and start a sandbox; it becomes the current one |
 | `cloudex list`, `info`, `use <sandbox>` | See sandboxes and pick the current one |
 | `cloudex ssh [sandbox] [-- ssh args]` | Shell in over SSH, through your API (no public IP) |
-| `cloudex desktop [sandbox] [--size 1280x720] [--link]` | Open the sandbox's desktop, with Chrome and a terminal, in your browser |
+| `cloudex desktop [sandbox] [--size 1280x720] [--link] [--quality 0-9]` | Open the sandbox's desktop, with Chrome and a terminal, in your browser |
 | `cloudex exec [sandbox] -- <command>` | Run a command and print its output and exit code |
 | `cloudex ssh-config >> ~/.ssh/config` | Lets `scp`, `rsync` and editors reach `<sandbox>.cloudex` |
 | `cloudex prompt [sandbox] "task"` | Start Claude Code or Codex on a task in tmux and watch it |
@@ -77,11 +77,14 @@ link on your preview domain instead, for any browser and anyone you give it to.
 Windows opened from the sandbox's shells, such as an agent's browser, show up
 on it; the desktop's Chrome also listens for automation on `localhost:9222`
 inside the sandbox. A connected viewer counts as activity for idle stop.
-`--stop` ends the desktop and its programs.
+On a slow connection, `--quality 0` (of 0 to 9; 3 by default) cuts the
+bandwidth of moving pictures by more than half; text stays sharp. `--stop`
+ends the desktop and its programs.
 
 Sandboxes stop and save after `--idle` without SSH, exec, preview or agent
 activity (30 minutes by default), and in any case within Cloudflare's 6-hour
-limit. Agents need signing in once inside the sandbox (`cloudex ssh`, then run
+limit. An open `cloudex ssh` session counts, since it sends a keepalive every
+30 seconds; a connection that has gone silent doesn't. Agents need signing in once inside the sandbox (`cloudex ssh`, then run
 `claude` or `codex`); the login is saved with the disk.
 
 ## Layout

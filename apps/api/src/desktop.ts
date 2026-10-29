@@ -121,8 +121,11 @@ EOF
 cat >/usr/local/bin/cloudex-desktop-keepalive <<'EOF'
 #!/bin/bash
 # Counts a viewer connected to the desktop as activity, so idle stop waits.
+# Only connections that sent something in the last 5 minutes count: a viewer
+# asks for updates all the time, and a dropped one can look open for a long time.
 while sleep 60; do
-  if [ -n "$(ss -Htn state established '( sport = :6080 )')" ]; then
+  if ss -Htin state established '( sport = :6080 )' | grep -oE 'lastrcv:[0-9]+' |
+    awk -F: '$2 < 300000 { live = 1 } END { exit !live }'; then
     curl -fsS -m 10 -X POST http://cloudex.internal/activity >/dev/null 2>&1
   fi
 done
