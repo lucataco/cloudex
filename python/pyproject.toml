@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cloudex"
+dynamic = ["version"]
+description = "SDK for Cloudex: agent sandboxes in your own Cloudflare account"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+keywords = ["sandbox", "agents", "cloudflare", "containers", "claude-code", "codex"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://cloudex.build"
+Source = "https://github.com/lucataco/cloudex"
+
+[tool.hatch.version]
+path = "src/cloudex/__init__.py"

@@ -6,10 +6,12 @@
   "license": "MIT",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./openapi": "./src/openapi.ts"
   },
   "scripts": {
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p .",
+    "test": "node --test test/*.test.ts"
   },
   "dependencies": {
     "zod": "^4.6.7"

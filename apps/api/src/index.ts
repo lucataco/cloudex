@@ -13,6 +13,7 @@ import {
   ResumeRequest,
   type Health,
 } from "@cloudex/schema";
+import { openapi } from "@cloudex/schema/openapi";
 import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
 import { errorStatus, fail, isSandboxId, newSandboxId, previewToken, sameSecret } from "./util";
@@ -40,6 +41,9 @@ app.onError((e, c) => {
 app.get("/v1/health", (c) =>
   c.json({ ok: true, version: VERSION, previewZone: c.env.PREVIEW_ZONE || null, backups: Boolean(backupBucket(c.env)) } satisfies Health),
 );
+
+let spec: object | undefined;
+app.get("/v1/openapi.json", (c) => c.json((spec ??= openapi(VERSION))));
 
 app.use("/v1/*", async (c, next) => {
   const key = c.env.ADMIN_KEY;

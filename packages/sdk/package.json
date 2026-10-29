@@ -1,0 +1,43 @@
+{
+  "name": "cloudex",
+  "version": "0.1.6",
+  "private": true,
+  "description": "SDK for Cloudex: agent sandboxes in your own Cloudflare account",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lucataco/cloudex.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://cloudex.build",
+  "keywords": [
+    "sandbox",
+    "agents",
+    "cloudflare",
+    "containers",
+    "claude-code",
+    "codex"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "node --test test/*.test.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json"
+  },
+  "devDependencies": {
+    "@cloudex/schema": "workspace:*"
+  }
+}

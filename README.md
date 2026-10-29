@@ -97,6 +97,27 @@ limit. An open `cloudex ssh` session counts, since it sends a keepalive every
 30 seconds; a connection that has gone silent doesn't. Agents need signing in once inside the sandbox (`cloudex ssh`, then run
 `claude` or `codex`); the login is saved with the disk.
 
+## SDKs
+
+The [TypeScript SDK](packages/sdk) and the [Python SDK](python) do what the CLI
+does from code: create, fork, exec, host links, desktop, stop and resume. They
+use the deployment the CLI saved, or an API URL and key you pass in. They're
+not on npm or PyPI yet. Until then:
+
+```sh
+pip install 'git+https://github.com/lucataco/cloudex#subdirectory=python'
+# TypeScript, from a clone of this repository:
+pnpm install && pnpm --filter cloudex build && npm install <clone>/packages/sdk
+```
+
+The API describes itself at `<your API URL>/v1/openapi.json`.
+
+```ts
+const box = await new Cloudex().create({ name: "web" });
+const forks = await box.fork({ count: 10 });
+await Promise.all(forks.map((f) => f.exec("npm test")));
+```
+
 ## Layout
 
 | Path | What |
@@ -104,14 +125,17 @@ limit. An open `cloudex ssh` session counts, since it sends a keepalive every
 | `apps/api` | Control plane Worker: the `/v1` API and one `Sandbox` Durable Object per sandbox, each owning one container |
 | `images/base` | The sandbox image: Ubuntu 24.04, Node, Python, Docker, sshd, tmux, Claude Code and Codex |
 | `go/cmd/cloudex` | The `cloudex` CLI |
-| `packages/schema` | Zod models shared by the API and, later, generated SDKs |
+| `packages/schema` | Zod models shared by the API and the SDKs, and the OpenAPI document built from them |
+| `packages/sdk` | The TypeScript SDK (`cloudex` on npm, once published) |
+| `python` | The Python SDK (`cloudex` on PyPI, once published) |
 | `scripts/` | `bundle-api.sh` embeds the API in the CLI; `build-cli.sh` builds release archives |
 
 ## Develop
 
 ```sh
-pnpm install && pnpm typecheck
+pnpm install && pnpm typecheck && pnpm test
 cd go && go test ./...
+cd python && PYTHONPATH=src python3 -m unittest discover -s tests
 
 # API on localhost:8787 without the container image
 echo 'ADMIN_KEY=dev-admin-key' > apps/api/.dev.vars
