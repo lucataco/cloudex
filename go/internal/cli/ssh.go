@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/coder/websocket"
 	"github.com/lucataco/cloudex/go/internal/config"
@@ -165,12 +166,16 @@ func newProxyCmd(opts *options) *cobra.Command {
 				return err
 			}
 			nc := websocket.NetConn(ctx, conn, websocket.MessageBinary)
+			// ssh closes our stdin when it's done; closing the connection then
+			// makes the read below fail, which isn't an error worth printing.
+			var closed atomic.Bool
 			go func() {
 				io.Copy(nc, os.Stdin)
+				closed.Store(true)
 				nc.Close()
 			}()
 			_, err = io.Copy(os.Stdout, nc)
-			if err != nil && ctx.Err() == nil && !errors.Is(err, io.EOF) && websocket.CloseStatus(err) == -1 {
+			if err != nil && !closed.Load() && ctx.Err() == nil && !errors.Is(err, io.EOF) && websocket.CloseStatus(err) == -1 {
 				return err
 			}
 			return nil
