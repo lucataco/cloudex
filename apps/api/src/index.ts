@@ -3,10 +3,10 @@
 // as a Worker secret.
 import { Hono } from "hono";
 import { ZodError } from "zod";
-import { CreateSandbox, ExecRequest, HostRequest, ResumeRequest, type Health } from "@cloudex/schema";
+import { CreateSandbox, DesktopRequest, ExecRequest, HostRequest, ResumeRequest, type Health } from "@cloudex/schema";
 import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
-import { errorStatus, isSandboxId, newSandboxId, previewToken, sameSecret } from "./util";
+import { errorStatus, fail, isSandboxId, newSandboxId, previewToken, sameSecret } from "./util";
 
 export { Sandbox } from "./sandbox";
 export { Egress } from "./egress";
@@ -82,6 +82,32 @@ app.delete("/v1/sandboxes/:ref", async (c) =>
 app.post("/v1/sandboxes/:ref/exec", async (c) => {
   const input = ExecRequest.parse(await c.req.json());
   return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.exec(input));
+});
+
+// A sandbox that keeps running across a deploy keeps the Durable Object code it
+// started with, so it may not have methods added since.
+async function newMethod<T>(ref: string, call: Promise<T>): Promise<T> {
+  try {
+    return await call;
+  } catch (e) {
+    if (e instanceof Error && /does not implement/.test(e.message)) {
+      fail(409, `${ref} has run since before this deployment was updated, so it can't do this yet. Stop it, give it a couple of minutes, then resume it`);
+    }
+    throw e;
+  }
+}
+
+// The desktop: POST starts it (installing it the first time) or resizes it; DELETE stops it.
+app.post("/v1/sandboxes/:ref/desktop", async (c) => {
+  const body = await c.req.text();
+  const { size } = DesktopRequest.parse(body ? JSON.parse(body) : {});
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.desktop(size)));
+});
+
+app.delete("/v1/sandboxes/:ref/desktop", async (c) => {
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.stopDesktop()));
 });
 
 // WebSocket to a guest TCP port: `cloudex ssh` and `cloudex proxy` use port 22.

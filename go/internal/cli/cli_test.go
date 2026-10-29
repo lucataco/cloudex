@@ -1,14 +1,21 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/coder/websocket"
+	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/config"
 )
 
@@ -46,6 +53,12 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// "!404 {...}" answers with that status.
+	if strings.HasPrefix(resp, "!") {
+		code, _ := strconv.Atoi(resp[1:4])
+		w.WriteHeader(code)
+		resp = resp[5:]
+	}
 	w.Write([]byte(resp))
 }
 
@@ -207,5 +220,114 @@ func TestResumeFromBackupAsksForIt(t *testing.T) {
 	}
 	if code, _, _ := run(t, "resume", "web"); code != 0 || f.bodies[1] != "" {
 		t.Fatalf("a plain resume sent %q", f.bodies[1])
+	}
+}
+
+const desktopJSON = `{"port":6080,"path":"vnc.html?autoconnect=1","size":"1280x720","installed":false,"started":true}`
+
+func TestDesktopLinkPrintsTheViewer(t *testing.T) {
+	f := &fakeAPI{t: t, routes: map[string]string{
+		"GET /v1/sandboxes/web":                sandboxJSON,
+		"POST /v1/sandboxes/cx-abc123/desktop": desktopJSON,
+		"POST /v1/sandboxes/cx-abc123/hosts":   `{"url":"https://6080-cx-abc123-0123456789.example.com"}`,
+	}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", srv.URL)
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	opened := ""
+	defer func(old func(string)) { openBrowser = old }(openBrowser)
+	openBrowser = func(url string) { opened = url }
+
+	code, out, errOut := run(t, "desktop", "web", "--link", "--size", "1920x1080")
+	want := "https://6080-cx-abc123-0123456789.example.com/vnc.html?autoconnect=1"
+	if code != 0 || strings.TrimSpace(out) != want || opened != want {
+		t.Fatalf("code %d, stdout %q, opened %q, stderr %q", code, out, opened, errOut)
+	}
+	if f.bodies[1] != `{"size":"1920x1080"}` || f.bodies[2] != `{"port":6080}` {
+		t.Fatalf("bodies %q", f.bodies)
+	}
+}
+
+func TestDesktopStop(t *testing.T) {
+	f := &fakeAPI{t: t, routes: map[string]string{
+		"GET /v1/sandboxes/web":                  sandboxJSON,
+		"DELETE /v1/sandboxes/cx-abc123/desktop": `{"stopped":true}`,
+	}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", srv.URL)
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	code, out, errOut := run(t, "desktop", "web", "--stop")
+	if code != 0 || !strings.Contains(out, "Stopped the desktop on web") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
+func TestDesktopOnAnOlderDeploymentSaysToUpdate(t *testing.T) {
+	newFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/web":                sandboxJSON,
+		"POST /v1/sandboxes/cx-abc123/desktop": `!404 {"error":"not found"}`,
+	})
+	code, _, errOut := run(t, "desktop", "web", "--no-open")
+	if code != 1 || !strings.Contains(errOut, "cloudex deploy") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestDesktopRejectsABadSize(t *testing.T) {
+	newFakeAPI(t, nil)
+	if code, _, errOut := run(t, "desktop", "web", "--size", "big"); code != 1 || !strings.Contains(errOut, "1280x720") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+// forward should carry each local connection over its own bridge WebSocket.
+func TestForwardBridgesEachConnection(t *testing.T) {
+	var dials atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/sandboxes/cx-abc123/tcp/6080" || r.Header.Get("Authorization") != "Bearer test-key" {
+			http.Error(w, "wrong request", http.StatusBadRequest)
+			return
+		}
+		dials.Add(1)
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		guest := websocket.NetConn(r.Context(), ws, websocket.MessageBinary)
+		defer guest.Close()
+		// Answer like websockify's web server: one HTTP/1.0 response, then close.
+		bufio.NewReader(guest).ReadString('\n')
+		io.WriteString(guest, "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+	}))
+	defer srv.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- forward(ctx, ln, api.New(srv.URL, "test-key"), "cx-abc123", 6080, io.Discard) }()
+	for i := 0; i < 2; i++ {
+		res, err := http.Get("http://" + ln.Addr().String() + "/vnc.html")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if string(body) != "hello" {
+			t.Fatalf("got %q", body)
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("%d bridge connections, want 2", n)
 	}
 }

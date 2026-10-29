@@ -75,6 +75,29 @@ export const HostRequest = z.object({ port: z.number().int().min(1).max(65535) }
 export const HostResult = z.object({ url: z.string() });
 export type HostResult = z.infer<typeof HostResult>;
 
+// The desktop's screen, from 640x480 up to 3840x2160. A running desktop is resized.
+const ScreenSize = z
+  .string()
+  .regex(/^\d{3,4}x\d{3,4}$/, "a size such as 1280x720")
+  .refine((s) => {
+    const [w, h] = s.split("x").map(Number) as [number, number];
+    return w >= 640 && w <= 3840 && h >= 480 && h <= 2160;
+  }, "between 640x480 and 3840x2160");
+
+export const DesktopRequest = z.object({ size: ScreenSize.default("1280x720") });
+export type DesktopRequest = z.input<typeof DesktopRequest>;
+
+// Where the desktop is served: the viewer page is <path> on guest <port>, which
+// the TCP bridge or a preview link for that port reaches.
+export const Desktop = z.object({
+  port: z.number().int(),
+  path: z.string(),
+  size: z.string(),
+  installed: z.boolean(), // installed by this call (the first one takes a minute or two)
+  started: z.boolean(), // started by this call rather than already running
+});
+export type Desktop = z.infer<typeof Desktop>;
+
 export const Health = z.object({
   ok: z.literal(true),
   version: z.string(),

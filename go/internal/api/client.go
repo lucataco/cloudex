@@ -188,6 +188,31 @@ func (c *Client) Host(ctx context.Context, ref string, port int) (string, error)
 	return out.URL, err
 }
 
+// Desktop is where a sandbox's desktop is served: the viewer page is Path on
+// guest Port, which DialTCP or a preview link for that port reaches.
+type Desktop struct {
+	Port      int    `json:"port"`
+	Path      string `json:"path"`
+	Size      string `json:"size"`
+	Installed bool   `json:"installed"` // installed by this call
+	Started   bool   `json:"started"`   // started by this call rather than already running
+}
+
+// Desktop starts the sandbox's desktop, installing it the first time, or
+// resizes a running one. An empty size means the API's default.
+func (c *Client) Desktop(ctx context.Context, ref, size string) (*Desktop, error) {
+	var d Desktop
+	body := struct {
+		Size string `json:"size,omitempty"`
+	}{size}
+	return &d, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/desktop", body, &d)
+}
+
+// StopDesktop stops the desktop and the programs on it.
+func (c *Client) StopDesktop(ctx context.Context, ref string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/sandboxes/"+url.PathEscape(ref)+"/desktop", nil, nil)
+}
+
 // DialTCP opens a WebSocket bridged to a TCP port in the sandbox. For port 22,
 // sshKey (an authorized_keys line) is added to the sandbox user's keys first.
 func (c *Client) DialTCP(ctx context.Context, ref string, port int, sshKey string) (*websocket.Conn, error) {

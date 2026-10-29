@@ -11,8 +11,10 @@
 //   handler (see egress.ts); the host allows 15 minutes.
 // - After each save, /home is also backed up to R2 when the deployment has a
 //   bucket (backup.ts). Saves expire; backups don't, and restore onto any image.
+// - The desktop (desktop.ts) is installed and started on demand by a script, so
+//   it works on any image.
 import { DurableObject } from "cloudflare:workers";
-import type { ExecResult, Sandbox as SandboxRecord, SandboxSize } from "@cloudex/schema";
+import type { Desktop, ExecResult, Sandbox as SandboxRecord, SandboxSize } from "@cloudex/schema";
 import {
   BACKUP_SCRIPT,
   type BackupManifest,
@@ -25,12 +27,14 @@ import {
   writeManifest,
 } from "./backup";
 import { deleteSandbox, upsertSandbox } from "./db";
+import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } from "./desktop";
 import { fail, sleep, withTimeout } from "./util";
 
 const READY_CHECK = '[ "$(cat /run/cloudex-ready 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id)" ]';
 const READY_TIMEOUT_MS = 10 * 60_000; // a host without the image pulls it first
 const SAVE_TIMEOUT_MS = 15 * 60_000; // 15 GiB took 179 s in the spikes
 const BACKUP_TIMEOUT_MS = 20 * 60_000; // about 110 MiB/s each way in the spikes
+const DESKTOP_TIMEOUT_MS = 10 * 60_000; // the first start installs about 950 MB
 // A save expires 30 days after it was made or last restored; past this, resume
 // restores the backup instead of trying the save.
 const SAVE_LIFETIME_MS = 29 * 24 * 3600_000;
@@ -185,7 +189,7 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.mustRecord();
     await this.boot(undefined, async () => {
       const t0 = Date.now();
-      await this.runScript(RESTORE_SCRIPT, [String(b.gen), String(b.parts)], "restoring the backup");
+      await this.runScript(RESTORE_SCRIPT, [HELPER, String(b.gen), String(b.parts)], "restoring the backup");
       console.log(`[${r.id}] restored backup ${b.gen} (${b.bytes} bytes) in ${Date.now() - t0} ms`);
     });
     await this.ctx.storage.delete(["snapshot", "saveTouchedAt"]);
@@ -338,7 +342,7 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.mustRecord();
     const gen = Date.now();
     try {
-      const out = await this.runScript(BACKUP_SCRIPT, [String(gen)], "backing up /home");
+      const out = await this.runScript(BACKUP_SCRIPT, [HELPER, String(gen)], "backing up /home");
       const last = out.trim().split("\n").pop() ?? "";
       const { parts, bytes } = JSON.parse(last) as { parts?: number; bytes?: number };
       if (!Number.isInteger(parts) || !parts || !Number.isInteger(bytes)) throw new Error(`unexpected helper output: ${last.slice(0, 200)}`);
@@ -353,12 +357,12 @@ export class Sandbox extends DurableObject<Env> {
     }
   }
 
-  // Runs a backup or restore script as root, with HELPER as $1. Returns stdout.
-  private async runScript(script: string, args: string[], what: string): Promise<string> {
+  // Runs one of the guest scripts as root, with args as $1, $2 and so on. Returns stdout.
+  private async runScript(script: string, args: string[], what: string, timeoutMs = BACKUP_TIMEOUT_MS): Promise<string> {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), BACKUP_TIMEOUT_MS);
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
-      const p = await this.container.exec(["bash", "-c", script, "cloudex-backup", HELPER, ...args], {
+      const p = await this.container.exec(["bash", "-c", script, "cloudex", ...args], {
         cwd: "/",
         env: { HOME: "/root", LANG: "C.UTF-8" },
         signal: ctl.signal,
@@ -370,7 +374,7 @@ export class Sandbox extends DurableObject<Env> {
       }
       return new TextDecoder().decode(out.stdout);
     } catch (e) {
-      if (ctl.signal.aborted) throw new Error(`${what} took longer than ${BACKUP_TIMEOUT_MS / 60_000} minutes`);
+      if (ctl.signal.aborted) throw new Error(`${what} took longer than ${timeoutMs / 60_000} minutes`);
       throw e;
     } finally {
       clearTimeout(timer);
@@ -414,6 +418,31 @@ export class Sandbox extends DurableObject<Env> {
       clearTimeout(timer);
       this.touch();
     }
+  }
+
+  // Starts the desktop, installing it the first time, or resizes a running one.
+  async desktop(size: string): Promise<Desktop> {
+    const r = this.mustRecord();
+    if (r.state !== "running") fail(409, `${r.id} is ${r.state}; resume it first`);
+    this.touch();
+    const t0 = Date.now();
+    try {
+      const out = await this.runScript(DESKTOP_SCRIPT, [size, r.name ?? r.id], "starting the desktop", DESKTOP_TIMEOUT_MS);
+      const last = out.trim().split("\n").pop() ?? "";
+      const { installed, started } = JSON.parse(last) as { installed: boolean; started: boolean };
+      console.log(`[${r.id}] desktop ${started ? "started" : "running"} at ${size}${installed ? ", installed" : ""} in ${Date.now() - t0} ms`);
+      return { port: DESKTOP_PORT, path: DESKTOP_VIEWER, size, installed, started };
+    } finally {
+      this.touch();
+    }
+  }
+
+  async stopDesktop(): Promise<{ stopped: boolean }> {
+    const r = this.mustRecord();
+    if (r.state !== "running") return { stopped: false };
+    this.touch();
+    await this.runScript(DESKTOP_STOP_SCRIPT, [], "stopping the desktop", 60_000);
+    return { stopped: true };
   }
 
   // Idle stop. The platform's own inactivity timer only sees incoming

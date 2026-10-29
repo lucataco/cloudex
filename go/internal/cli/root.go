@@ -67,7 +67,7 @@ func New(version string) *cobra.Command {
 	}
 	add("sandbox", newNewCmd(opts), newListCmd(opts), newInfoCmd(opts), newUseCmd(opts),
 		newStopCmd(opts), newResumeCmd(opts), newDeleteCmd(opts))
-	add("connect", newSSHCmd(opts), newExecCmd(opts), newHostCmd(opts), newPromptCmd(opts),
+	add("connect", newSSHCmd(opts), newDesktopCmd(opts), newExecCmd(opts), newHostCmd(opts), newPromptCmd(opts),
 		newAttachCmd(opts), newSSHConfigCmd(opts))
 	add("setup", newDeployCmd(opts), newLoginCmd(opts), newDoctorCmd(opts), newStatusCmd(opts), newVersionCmd(version, opts))
 	root.AddCommand(newProxyCmd(opts))
@@ -116,6 +116,7 @@ func isTerminal(f *os.File) bool {
 func writeJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false) // keep & in URLs readable
 	return enc.Encode(v)
 }
 
