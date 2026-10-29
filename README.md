@@ -35,6 +35,12 @@ API key and lock out the first computer. Instead run `cloudex status --show-key`
 on the first one, then `cloudex login --url <API URL>` on the new one and paste
 the key. `cloudex deploy` asks before replacing a key it doesn't have.
 
+**Updating.** `cloudex update` replaces the CLI with the latest release, after
+checking it against the release's checksums, then offers to run `cloudex deploy`
+if your deployment is older. Sandboxes that are running keep the old version
+until they stop. Once a day the CLI checks for a new release and mentions one
+after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
+
 ## Commands
 
 | Command | What it does |
@@ -51,6 +57,7 @@ the key. `cloudex deploy` asks before replacing a key it doesn't have.
 | `cloudex stop`, `resume [--from-backup]`, `delete` | Save, back up and stop; resume from the save or the backup; or delete |
 | `cloudex login --url <api url>` | Use an existing deployment from another computer |
 | `cloudex doctor`, `status [--show-key]` | Check this computer and the deployment |
+| `cloudex update [--check]` | Update the CLI to the latest release, then offer to update the deployment |
 
 **Backups.** Each stop also backs up `/home` (without `~/.cache`) and the SSH
 host keys to an R2 bucket in your account, `cloudex-backups`, keeping the newest

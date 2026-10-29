@@ -77,12 +77,17 @@ func newDeployCmd(opts *options) *cobra.Command {
 	return cmd
 }
 
-// confirm asks a yes/no question on the terminal; without one, the answer is no.
+// confirm asks whether to replace the key on the terminal; without one, the answer is no.
 func confirm(cmd *cobra.Command, question string) bool {
+	return ask(cmd, fmt.Sprintf("\n%s\n\nReplace the key? [y/N] ", question))
+}
+
+// ask puts a yes/no prompt on the terminal; without one, the answer is no.
+func ask(cmd *cobra.Command, prompt string) bool {
 	if !isTerminal(os.Stdin) {
 		return false
 	}
-	fmt.Fprintf(cmd.ErrOrStderr(), "\n%s\n\nReplace the key? [y/N] ", question)
+	fmt.Fprint(cmd.ErrOrStderr(), prompt)
 	var answer string
 	fmt.Fscanln(os.Stdin, &answer)
 	return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")

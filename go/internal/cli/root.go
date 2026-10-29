@@ -12,6 +12,7 @@ import (
 	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/config"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 type options struct {
@@ -30,7 +31,9 @@ func Run(version string, args []string, stdout, stderr io.Writer) int {
 	cmd.SetArgs(args)
 	cmd.SetOut(stdout)
 	cmd.SetErr(stderr)
+	notice := startUpdateCheck(version, args, stderr)
 	err := cmd.Execute()
+	notice()
 	var exit exitError
 	switch {
 	case err == nil:
@@ -69,7 +72,8 @@ func New(version string) *cobra.Command {
 		newStopCmd(opts), newResumeCmd(opts), newDeleteCmd(opts))
 	add("connect", newSSHCmd(opts), newDesktopCmd(opts), newExecCmd(opts), newHostCmd(opts), newPromptCmd(opts),
 		newAttachCmd(opts), newSSHConfigCmd(opts))
-	add("setup", newDeployCmd(opts), newLoginCmd(opts), newDoctorCmd(opts), newStatusCmd(opts), newVersionCmd(version, opts))
+	add("setup", newDeployCmd(opts), newLoginCmd(opts), newDoctorCmd(opts), newStatusCmd(opts),
+		newUpdateCmd(version, opts), newVersionCmd(version, opts))
 	root.AddCommand(newProxyCmd(opts))
 	return root
 }
@@ -108,9 +112,10 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// isTerminal is true for a terminal, but not for other character devices
+// such as /dev/null.
 func isTerminal(f *os.File) bool {
-	info, err := f.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(f.Fd()))
 }
 
 func writeJSON(w io.Writer, v any) error {

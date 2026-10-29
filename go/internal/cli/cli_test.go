@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/config"
+	"github.com/lucataco/cloudex/go/internal/update/updatetest"
 )
 
 // fakeAPI records requests and answers with canned JSON per "METHOD /path".
@@ -329,5 +332,77 @@ func TestForwardBridgesEachConnection(t *testing.T) {
 	}
 	if n := dials.Load(); n != 2 {
 		t.Fatalf("%d bridge connections, want 2", n)
+	}
+}
+
+// fakeExecutable points update at a temporary "cloudex" holding old.
+func fakeExecutable(t *testing.T, old string) string {
+	t.Helper()
+	target := filepath.Join(t.TempDir(), "cloudex")
+	if err := os.WriteFile(target, []byte(old), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := executable
+	t.Cleanup(func() { executable = prev })
+	executable = func() (string, error) { return target, nil }
+	return target
+}
+
+func runVersion(t *testing.T, version string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	code = Run(version, append([]string{"--json=false"}, args...), &out, &errOut)
+	return code, out.String(), errOut.String()
+}
+
+func TestUpdateReplacesTheCLIAndPointsAtDeploy(t *testing.T) {
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"v0.1.0","previewZone":null}`})
+	updatetest.Server(t, "v9.9.9", []byte("new build"), "")
+	target := fakeExecutable(t, "old build")
+
+	code, out, errOut := runVersion(t, "v0.1.0", "update")
+	if code != 0 || !strings.Contains(out, "Updated cloudex from v0.1.0 to v9.9.9") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "new build" {
+		t.Fatalf("executable holds %q", got)
+	}
+	// Without a terminal it doesn't run deploy, but says to.
+	if !strings.Contains(out, "Your deployment runs v0.1.0. Update it with: cloudex deploy") {
+		t.Fatalf("stdout %q", out)
+	}
+}
+
+func TestUpdateCheckChangesNothing(t *testing.T) {
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"v9.9.9","previewZone":null}`})
+	updatetest.Server(t, "v9.9.9", []byte("new build"), "")
+	target := fakeExecutable(t, "old build")
+
+	code, out, errOut := runVersion(t, "v0.1.0", "update", "--check")
+	if code != 0 || !strings.Contains(out, "cloudex v9.9.9 is out; this is v0.1.0") || !strings.Contains(out, "Your deployment runs v9.9.9.") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "old build" {
+		t.Fatalf("--check replaced the executable: %q", got)
+	}
+}
+
+func TestUpdateWhenCurrent(t *testing.T) {
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"v9.9.9","previewZone":null}`})
+	updatetest.Server(t, "v9.9.9", []byte("new build"), "")
+	fakeExecutable(t, "same build")
+	code, out, _ := runVersion(t, "v9.9.9", "update")
+	if code != 0 || !strings.Contains(out, "cloudex v9.9.9 is the latest version.") {
+		t.Fatalf("code %d, stdout %q", code, out)
+	}
+}
+
+func TestUpdateRefusesASourceBuild(t *testing.T) {
+	newFakeAPI(t, nil)
+	updatetest.Server(t, "v9.9.9", []byte("new build"), "")
+	target := fakeExecutable(t, "dev build")
+	code, _, errOut := runVersion(t, "dev", "update")
+	if got, _ := os.ReadFile(target); code != 1 || !strings.Contains(errOut, "built from source") || string(got) != "dev build" {
+		t.Fatalf("code %d, stderr %q, executable %q", code, errOut, got)
 	}
 }
