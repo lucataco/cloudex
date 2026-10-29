@@ -10,12 +10,15 @@ import {
   ForkRequest,
   HostRequest,
   Name,
+  Provider,
   ResumeRequest,
+  SetProviderKey,
   type Health,
 } from "@cloudex/schema";
 import { openapi } from "@cloudex/schema/openapi";
 import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
+import { deleteKey, listKeys, setKey } from "./keys";
 import { errorStatus, fail, isSandboxId, newSandboxId, previewToken, sameSecret } from "./util";
 
 export { Sandbox } from "./sandbox";
@@ -175,6 +178,27 @@ app.post("/v1/sandboxes/:ref/hosts", async (c) => {
   await stub.get();
   const token = await previewToken(c.env.ADMIN_KEY, id, port);
   return c.json({ url: `https://${port}-${id}-${token}.${zone}` });
+});
+
+// AI provider keys (keys.ts). Keys are write-only: listing shows a hint.
+app.get("/v1/keys", async (c) => c.json(await listKeys(c.env.DB)));
+
+function provider(name: string) {
+  const p = Provider.safeParse(name);
+  if (!p.success) fail(404, `unknown provider ${name}: use ${Provider.options.join(" or ")}`);
+  return p.data;
+}
+
+app.put("/v1/keys/:provider", async (c) => {
+  const p = provider(c.req.param("provider"));
+  const { key } = SetProviderKey.parse(await c.req.json());
+  return c.json(await setKey(c.env, p, key));
+});
+
+app.delete("/v1/keys/:provider", async (c) => {
+  const p = provider(c.req.param("provider"));
+  if (!(await deleteKey(c.env.DB, p))) return c.json({ error: `no ${p} key is set` }, 404);
+  return c.json({ deleted: p });
 });
 
 app.all("/v1/*", (c) => c.json({ error: "not found" }, 404));

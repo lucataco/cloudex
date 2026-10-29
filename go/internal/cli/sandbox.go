@@ -202,6 +202,9 @@ func printSandbox(w io.Writer, s *api.Sandbox) {
 	if s.ForkedFrom != nil {
 		fmt.Fprintf(tw, "Forked from\t%s\n", *s.ForkedFrom)
 	}
+	if len(s.ProviderKeys) > 0 && s.State == "running" {
+		fmt.Fprintf(tw, "Provider keys\t%s, added on the way out\n", strings.Join(s.ProviderKeys, ", "))
+	}
 	if s.Notice != nil {
 		fmt.Fprintf(tw, "Note\t%s\n", *s.Notice)
 	}

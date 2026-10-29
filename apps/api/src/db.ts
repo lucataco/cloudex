@@ -17,6 +17,13 @@ const SCHEMA = [
     saved_bytes INTEGER,
     error TEXT
   )`,
+  // AI provider keys (keys.ts), encrypted.
+  `CREATE TABLE IF NOT EXISTS provider_keys (
+    provider TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    hint TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
 ];
 
 // Created on first use so a fresh deployment needs no migration step.

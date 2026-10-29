@@ -44,6 +44,7 @@ gives full control of your sandboxes; keep it on a server.
 | `box.desktop({ size? })`, `box.stopDesktop()` | Start the desktop (Chrome, a terminal) and get a link to it |
 | `box.stop()`, `box.resume({ fromBackup? })`, `box.delete()` | Save and stop, start again, delete |
 | `box.refresh()` | Fetch the latest state; `box.id`, `box.name`, `box.state` and `box.info` hold it |
+| `cx.setKey(provider, key)`, `cx.listKeys()`, `cx.deleteKey(provider)` | AI provider keys sandboxes use without holding them (`"anthropic"`, `"openai"`) |
 
 Errors from the API throw `CloudexError`, with `status` and the API's message.
 The full API is described at `<your API URL>/v1/openapi.json`.

@@ -13,6 +13,9 @@
 //   bucket (backup.ts). Saves expire; backups don't, and restore onto any image.
 // - The desktop (desktop.ts) is installed and started on demand by a script, so
 //   it works on any image.
+// - AI provider keys (keys.ts) are set up at each start for the providers that
+//   have one then: the sandbox gets placeholders, and the real keys are added
+//   to its HTTPS calls to those providers on the way out.
 import { DurableObject } from "cloudflare:workers";
 import type { Desktop, ExecResult, Sandbox as SandboxRecord, SandboxSize } from "@cloudex/schema";
 import {
@@ -28,6 +31,7 @@ import {
 } from "./backup";
 import { deleteSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } from "./desktop";
+import { KEYS_SCRIPT, PROVIDERS, listKeys } from "./keys";
 import { fail, sleep, withTimeout } from "./util";
 
 const READY_CHECK = '[ "$(cat /run/cloudex-ready 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id)" ]';
@@ -272,6 +276,13 @@ export class Sandbox extends DurableObject<Env> {
     const c = this.container;
     const t0 = Date.now();
     await this.update({ state: "starting", error: null, notice: null });
+    let providers: (keyof typeof PROVIDERS)[] = [];
+    try {
+      providers = (await listKeys(this.env.DB)).map((k) => k.provider);
+    } catch (e) {
+      console.error(`[${r.id}] reading provider keys failed: ${message(e)}`);
+    }
+    let keysProblem = "";
     try {
       const images = c.images as Record<string, string>;
       c.start({
@@ -284,8 +295,24 @@ export class Sandbox extends DurableObject<Env> {
       this.watch();
       const egress = this.ctx.exports.Egress({ props: { id: r.id } });
       await withTimeout(c.interceptOutboundHttp("cloudex.internal", egress), 30_000, "routing cloudex.internal");
+      for (const p of providers) {
+        await withTimeout(c.interceptOutboundHttps(PROVIDERS[p].host, egress), 30_000, `routing ${PROVIDERS[p].host}`);
+      }
       await this.waitReady(t0);
       if (afterReady) await afterReady();
+      // After any restore of /home, which holds Claude Code's settings. Also run
+      // with no providers, to clear placeholders a save may still hold.
+      try {
+        await this.runScript(
+          KEYS_SCRIPT,
+          [providers.join(" "), PROVIDERS.anthropic.placeholder, PROVIDERS.openai.placeholder],
+          "setting up provider keys",
+          60_000,
+        );
+      } catch (e) {
+        keysProblem = message(e);
+        console.error(`[${r.id}] ${keysProblem}`);
+      }
     } catch (e) {
       try {
         if (c.running) await withTimeout(c.destroy(), 60_000, "destroy");
@@ -301,7 +328,13 @@ export class Sandbox extends DurableObject<Env> {
     }
     console.log(`[${r.id}] ready in ${Date.now() - t0} ms (${snapshot ? "from save" : "fresh"})`);
     this.touch();
-    await this.update({ state: "running", startedAt: Date.now(), stoppedAt: null });
+    await this.update({
+      state: "running",
+      startedAt: Date.now(),
+      stoppedAt: null,
+      providerKeys: keysProblem ? [] : providers,
+      ...(keysProblem ? { notice: `Provider keys aren't set up in this run: ${keysProblem}` } : {}),
+    });
     await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
   }
 

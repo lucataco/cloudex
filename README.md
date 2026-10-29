@@ -57,6 +57,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex host [sandbox] <port>` | HTTPS link to a port, on your preview domain |
 | `cloudex stop`, `resume [--from-backup]`, `delete` | Save, back up and stop; resume from the save or the backup; or delete |
 | `cloudex login --url <api url>` | Use an existing deployment from another computer |
+| `cloudex keys set <anthropic\|openai>`, `keys`, `keys rm` | Let sandboxes use an AI provider key that never enters them |
 | `cloudex doctor`, `status [--show-key]` | Check this computer and the deployment |
 | `cloudex update [--check]` | Update the CLI to the latest release, then offer to update the deployment |
 
@@ -68,6 +69,17 @@ installed outside `/home` needs installing again. `cloudex resume --from-backup`
 does that on request, and `delete` removes the backups. Backups need R2 turned
 on for the account (the free tier is enough); `cloudex deploy` says when it
 isn't, and `cloudex status` shows whether they're on.
+
+**Provider keys.** `cloudex keys set anthropic` (or `openai`) stores an API key
+in your deployment, encrypted. Sandboxes started after that get a placeholder
+key, and the real one is added to their HTTPS calls to the provider as they
+leave, so it never enters a sandbox, its saves, backups or forks. Claude Code,
+Codex, the providers' SDKs and curl work as if the key were there, with no
+sign-in; the first `cloudex prompt` asks you once to accept Claude Code's
+Bypass Permissions warning. A key a sandbox brings itself, or a subscription
+login, is used as is. A new provider reaches a running sandbox when it next
+starts; a changed or removed key reaches it within a minute. `cloudex info`
+shows which providers a sandbox uses this way.
 
 **Forks.** `cloudex fork` makes new sandboxes that start from a copy of a
 sandbox's whole disk, including installed packages and agent logins. A running
@@ -94,8 +106,10 @@ ends the desktop and its programs.
 Sandboxes stop and save after `--idle` without SSH, exec, preview or agent
 activity (30 minutes by default), and in any case within Cloudflare's 6-hour
 limit. An open `cloudex ssh` session counts, since it sends a keepalive every
-30 seconds; a connection that has gone silent doesn't. Agents need signing in once inside the sandbox (`cloudex ssh`, then run
-`claude` or `codex`); the login is saved with the disk.
+30 seconds; a connection that has gone silent doesn't. With provider keys, an
+agent's calls to its provider count too. Without them, agents need signing in
+once inside the sandbox (`cloudex ssh`, then run `claude` or `codex`); the login
+is saved with the disk, and copied into forks.
 
 ## SDKs
 

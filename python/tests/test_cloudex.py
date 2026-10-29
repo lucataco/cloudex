@@ -6,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from cloudex import Cloudex, CloudexError, ExecResult
+from cloudex import Cloudex, CloudexError, ExecResult, ProviderKey
 
 
 def info(id, **extra):
@@ -38,7 +38,7 @@ class FakeAPI(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    do_GET = do_POST = do_DELETE = _handle
+    do_GET = do_POST = do_PUT = do_DELETE = _handle
 
     def log_message(self, *args):
         pass
@@ -147,6 +147,18 @@ class CloudexTest(unittest.TestCase):
                 Cloudex()
         self.assertEqual(caught.exception.status, 0)
         self.assertIn("cloudex login", str(caught.exception))
+
+    def test_provider_keys(self):
+        FakeAPI.routes["PUT /v1/keys/anthropic"] = (200, {"provider": "anthropic", "hint": "…wxyz", "updatedAt": 5})
+        FakeAPI.routes["GET /v1/keys"] = (200, [{"provider": "anthropic", "hint": "…wxyz", "updatedAt": 5}])
+        FakeAPI.routes["DELETE /v1/keys/anthropic"] = (200, {"deleted": "anthropic"})
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111", providerKeys=["anthropic"]))
+        self.assertEqual(self.cx.set_key("anthropic", "sk-ant-x-wxyz"), ProviderKey("anthropic", "…wxyz", 5))
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"key": "sk-ant-x-wxyz"})
+        self.assertEqual([k.provider for k in self.cx.list_keys()], ["anthropic"])
+        self.assertEqual(self.cx.get("web").provider_keys, ["anthropic"])
+        self.cx.delete_key("anthropic")
+        self.assertEqual(FakeAPI.seen[-1]["route"], "DELETE /v1/keys/anthropic")
 
     def test_unreachable_api(self):
         with self.assertRaises(CloudexError) as caught:

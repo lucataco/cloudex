@@ -13,14 +13,17 @@ import {
   Health,
   HostRequest,
   HostResult,
+  Provider,
+  ProviderKey,
   ResumeRequest,
   Sandbox,
+  SetProviderKey,
 } from "./index.ts";
 
 // Request bodies are described as sent (defaults make fields optional);
 // responses as returned.
-const requests = { CreateSandbox, ForkRequest, ResumeRequest, ExecRequest, HostRequest, DesktopRequest };
-const responses = { Sandbox, ExecResult, HostResult, Desktop, Health, Error: ApiError };
+const requests = { CreateSandbox, ForkRequest, ResumeRequest, ExecRequest, HostRequest, DesktopRequest, SetProviderKey };
+const responses = { Sandbox, ExecResult, HostResult, Desktop, Health, ProviderKey, Error: ApiError };
 
 function jsonSchema(model: z.ZodType, io: "input" | "output") {
   const { $schema: _, ...schema } = z.toJSONSchema(model, { io });
@@ -144,6 +147,28 @@ export function openapi(version: string) {
         delete: op("stopDesktop", "Stop the desktop and the programs on it", {
           responses: {
             200: ok("Stopped", { type: "object", properties: { stopped: { type: "boolean" } }, required: ["stopped"] }),
+          },
+        }),
+      },
+      "/v1/keys": {
+        get: op("listKeys", "List the AI provider keys sandboxes use; the keys themselves are never returned", {
+          responses: { 200: ok("The keys", { type: "array", items: ref("ProviderKey") }) },
+        }),
+      },
+      "/v1/keys/{provider}": {
+        parameters: [
+          { name: "provider", in: "path", required: true, schema: { type: "string", enum: Provider.options } },
+        ],
+        put: op("setKey", "Set a provider's key", {
+          description:
+            "Sandboxes started from then on get a placeholder key, and the real one is added to their " +
+            "HTTPS calls to the provider on the way out. A changed key reaches running sandboxes within a minute.",
+          requestBody: body("SetProviderKey"),
+          responses: { 200: ok("The stored key", ref("ProviderKey")) },
+        }),
+        delete: op("deleteKey", "Remove a provider's key", {
+          responses: {
+            200: ok("Removed", { type: "object", properties: { deleted: { type: "string" } }, required: ["deleted"] }),
           },
         }),
       },

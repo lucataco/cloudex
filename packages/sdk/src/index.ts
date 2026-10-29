@@ -32,7 +32,19 @@ export interface SandboxInfo {
   notice?: string | null;
   /** The id of the sandbox this one is a fork of. */
   forkedFrom?: string | null;
+  /** Providers whose keys this run uses without holding them (see Cloudex.setKey). */
+  providerKeys?: string[];
   error: string | null;
+}
+
+/** An AI provider whose key the deployment can hold for sandboxes. */
+export type Provider = "anthropic" | "openai";
+
+/** A stored provider key. The key itself is never returned; hint is its last 4 characters. */
+export interface ProviderKey {
+  provider: Provider;
+  hint: string;
+  updatedAt: number;
 }
 
 export interface CreateOptions {
@@ -143,6 +155,25 @@ export class Cloudex {
   /** Creates a sandbox and answers once it's running, usually in about 10 seconds. */
   async create(options: CreateOptions = {}): Promise<Sandbox> {
     return this.#wrap(await this.#call<SandboxInfo>("POST", "/v1/sandboxes", options));
+  }
+
+  /** The AI provider keys sandboxes use; the keys themselves are never returned. */
+  listKeys(): Promise<ProviderKey[]> {
+    return this.#call("GET", "/v1/keys");
+  }
+
+  /**
+   * Sets a provider's key. Sandboxes started from then on get a placeholder,
+   * and the real key is added to their HTTPS calls to the provider on the way
+   * out, so it never enters a sandbox, its saves, backups or forks. A changed
+   * key reaches running sandboxes within a minute.
+   */
+  setKey(provider: Provider, key: string): Promise<ProviderKey> {
+    return this.#call("PUT", `/v1/keys/${provider}`, { key });
+  }
+
+  async deleteKey(provider: Provider): Promise<void> {
+    await this.#call("DELETE", `/v1/keys/${provider}`);
   }
 
   #wrap(info: SandboxInfo) {

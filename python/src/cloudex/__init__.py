@@ -23,8 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-__all__ = ["Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "Sandbox"]
-__version__ = "0.1.6"
+__all__ = ["Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "ProviderKey", "Sandbox"]
+__version__ = "0.1.7"
 
 
 class CloudexError(Exception):
@@ -53,6 +53,13 @@ class Desktop:
     size: str
     installed: bool  # this call installed it (the first start takes a minute or two)
     started: bool  # this call started it, rather than finding it running
+
+
+@dataclass(frozen=True)
+class ProviderKey:
+    provider: str  # anthropic or openai
+    hint: str  # the key's last 4 characters; the key itself is never returned
+    updated_at: int  # milliseconds since the epoch
 
 
 @dataclass(frozen=True)
@@ -128,6 +135,23 @@ class Cloudex:
         body = _drop_none(name=name, size=size, idleMinutes=idle_minutes)
         return Sandbox(self, self._call("POST", "/v1/sandboxes", body))
 
+    def list_keys(self) -> List[ProviderKey]:
+        """The AI provider keys sandboxes use; the keys themselves are never returned."""
+        return [_provider_key(k) for k in self._call("GET", "/v1/keys")]
+
+    def set_key(self, provider: str, key: str) -> ProviderKey:
+        """Sets a provider's key ("anthropic" or "openai").
+
+        Sandboxes started from then on get a placeholder, and the real key is
+        added to their HTTPS calls to the provider on the way out, so it never
+        enters a sandbox, its saves, backups or forks. A changed key reaches
+        running sandboxes within a minute.
+        """
+        return _provider_key(self._call("PUT", "/v1/keys/" + urllib.parse.quote(provider, safe=""), {"key": key}))
+
+    def delete_key(self, provider: str) -> None:
+        self._call("DELETE", "/v1/keys/" + urllib.parse.quote(provider, safe=""))
+
     def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.api_url + path, data=data, method=method)
@@ -148,6 +172,10 @@ class Cloudex:
         except urllib.error.URLError as e:
             raise CloudexError(0, f"can't reach {self.api_url}: {e.reason}") from None
         return json.loads(text) if text else None
+
+
+def _provider_key(k: Dict[str, Any]) -> ProviderKey:
+    return ProviderKey(provider=k["provider"], hint=k["hint"], updated_at=k["updatedAt"])
 
 
 def _sandbox_path(ref: str) -> str:
@@ -180,6 +208,11 @@ class Sandbox:
     @property
     def forked_from(self) -> Optional[str]:
         return self.info.get("forkedFrom")
+
+    @property
+    def provider_keys(self) -> List[str]:
+        """Providers whose keys this run uses without holding them (see Cloudex.set_key)."""
+        return self.info.get("providerKeys") or []
 
     def __repr__(self) -> str:
         label = f" {self.name!r}" if self.name else ""

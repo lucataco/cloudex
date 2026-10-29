@@ -163,3 +163,15 @@ test("shellQuote", () => {
   assert.equal(shellQuote(""), "''");
   assert.equal(shellQuote("$HOME"), "'$HOME'");
 });
+
+test("provider keys: set, list, delete", async () => {
+  routes["PUT /v1/keys/openai"] = [200, { provider: "openai", hint: "…abcd", updatedAt: 5 }];
+  routes["GET /v1/keys"] = [200, [{ provider: "openai", hint: "…abcd", updatedAt: 5 }]];
+  routes["DELETE /v1/keys/openai"] = [200, { deleted: "openai" }];
+  const cx = new Cloudex({ apiUrl: url, apiKey: "k" });
+  assert.deepEqual(await cx.setKey("openai", "sk-x-abcd"), { provider: "openai", hint: "…abcd", updatedAt: 5 });
+  assert.deepEqual(seen.at(-1)?.body, { key: "sk-x-abcd" });
+  assert.equal((await cx.listKeys())[0]?.hint, "…abcd");
+  await cx.deleteKey("openai");
+  assert.equal(seen.at(-1)?.route, "DELETE /v1/keys/openai");
+});

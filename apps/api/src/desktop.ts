@@ -66,6 +66,7 @@ XTerm*cursorColor: #f8964a
 XTerm*selectToClipboard: true
 XTerm*saveLines: 10000
 XTerm*scrollBar: false
+XTerm*loginShell: true
 EOF
 cat >/etc/cloudex/tint2rc <<'EOF'
 panel_items = LTSC

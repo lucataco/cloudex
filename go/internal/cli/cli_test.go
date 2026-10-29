@@ -515,3 +515,54 @@ func TestForkChecksCount(t *testing.T) {
 		t.Fatalf("code %d, stderr %q", code, errOut)
 	}
 }
+
+func TestKeysSetFromEnvSendsTheKey(t *testing.T) {
+	f := withFakeAPI(t, map[string]string{
+		"PUT /v1/keys/anthropic": `{"provider":"anthropic","hint":"…wxyz","updatedAt":5}`,
+	})
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test-wxyz")
+	code, out, errOut := run(t, "keys", "set", "anthropic", "--from-env")
+	if code != 0 || !strings.Contains(out, "Stored the anthropic key (…wxyz)") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if f.bodies[0] != `{"key":"sk-ant-test-wxyz"}` {
+		t.Fatalf("body %s", f.bodies[0])
+	}
+}
+
+func TestKeysSetFromEnvNeedsTheVariable(t *testing.T) {
+	withFakeAPI(t, nil)
+	t.Setenv("OPENAI_API_KEY", "")
+	if code, _, errOut := run(t, "keys", "set", "openai", "--from-env"); code != 1 || !strings.Contains(errOut, "$OPENAI_API_KEY isn't set") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestKeysListAndRemove(t *testing.T) {
+	f := withFakeAPI(t, map[string]string{
+		"GET /v1/keys":           `[{"provider":"openai","hint":"…abcd","updatedAt":1}]`,
+		"DELETE /v1/keys/openai": `{"deleted":"openai"}`,
+		"DELETE /v1/keys/gemini": `!404 {"error":"unknown provider gemini: use anthropic or openai"}`,
+	})
+	if code, out, errOut := run(t, "keys"); code != 0 || !strings.Contains(out, "openai    …abcd") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if code, out, _ := run(t, "keys", "rm", "openai"); code != 0 || !strings.Contains(out, "Removed the openai key") {
+		t.Fatalf("code %d, stdout %q", code, out)
+	}
+	if code, _, errOut := run(t, "keys", "rm", "gemini"); code != 1 || !strings.Contains(errOut, "unknown provider gemini") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	if f.requests[1] != "DELETE /v1/keys/openai" {
+		t.Fatalf("requests %v", f.requests)
+	}
+}
+
+func TestInfoShowsProviderKeys(t *testing.T) {
+	withFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/web": strings.Replace(sandboxJSON, `"error":null`, `"providerKeys":["anthropic","openai"],"error":null`, 1),
+	})
+	if code, out, _ := run(t, "info", "web"); code != 0 || !strings.Contains(out, "Provider keys  anthropic, openai, added on the way out") {
+		t.Fatalf("code %d, stdout %q", code, out)
+	}
+}

@@ -17,23 +17,24 @@ import (
 
 // Sandbox mirrors the API's sandbox record (packages/schema).
 type Sandbox struct {
-	ID          string  `json:"id"`
-	Name        *string `json:"name"`
-	Size        string  `json:"size"`
-	State       string  `json:"state"`
-	IdleMinutes int     `json:"idleMinutes"`
-	CreatedAt   int64   `json:"createdAt"`
-	UpdatedAt   int64   `json:"updatedAt"`
-	StartedAt   *int64  `json:"startedAt"`
-	StoppedAt   *int64  `json:"stoppedAt"`
-	SavedAt     *int64  `json:"savedAt"`
-	SavedBytes  *int64  `json:"savedBytes"`
-	BackupAt    *int64  `json:"backupAt"`
-	BackupBytes *int64  `json:"backupBytes"`
-	BackupError *string `json:"backupError"`
-	Notice      *string `json:"notice"`
-	ForkedFrom  *string `json:"forkedFrom"`
-	Error       *string `json:"error"`
+	ID           string   `json:"id"`
+	Name         *string  `json:"name"`
+	Size         string   `json:"size"`
+	State        string   `json:"state"`
+	IdleMinutes  int      `json:"idleMinutes"`
+	CreatedAt    int64    `json:"createdAt"`
+	UpdatedAt    int64    `json:"updatedAt"`
+	StartedAt    *int64   `json:"startedAt"`
+	StoppedAt    *int64   `json:"stoppedAt"`
+	SavedAt      *int64   `json:"savedAt"`
+	SavedBytes   *int64   `json:"savedBytes"`
+	BackupAt     *int64   `json:"backupAt"`
+	BackupBytes  *int64   `json:"backupBytes"`
+	BackupError  *string  `json:"backupError"`
+	Notice       *string  `json:"notice"`
+	ForkedFrom   *string  `json:"forkedFrom"`
+	ProviderKeys []string `json:"providerKeys"`
+	Error        *string  `json:"error"`
 }
 
 // Label is the name if there is one, otherwise the id.
@@ -185,6 +186,27 @@ type ForkRequest struct {
 func (c *Client) Fork(ctx context.Context, ref string, r ForkRequest) ([]Sandbox, error) {
 	var forks []Sandbox
 	return forks, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/fork", r, &forks)
+}
+
+// ProviderKey is a stored AI provider key; Hint is its last 4 characters.
+type ProviderKey struct {
+	Provider  string `json:"provider"`
+	Hint      string `json:"hint"`
+	UpdatedAt int64  `json:"updatedAt"`
+}
+
+func (c *Client) ListKeys(ctx context.Context) ([]ProviderKey, error) {
+	var keys []ProviderKey
+	return keys, c.do(ctx, http.MethodGet, "/v1/keys", nil, &keys)
+}
+
+func (c *Client) SetKey(ctx context.Context, provider, key string) (*ProviderKey, error) {
+	var k ProviderKey
+	return &k, c.do(ctx, http.MethodPut, "/v1/keys/"+url.PathEscape(provider), map[string]string{"key": key}, &k)
+}
+
+func (c *Client) DeleteKey(ctx context.Context, provider string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/keys/"+url.PathEscape(provider), nil, nil)
 }
 
 func (c *Client) Delete(ctx context.Context, ref string) error {

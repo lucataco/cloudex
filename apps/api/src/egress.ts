@@ -5,14 +5,23 @@
 //   PUT  /backup/<gen>/<n>      one part of a backup, written to R2 (backup.ts)
 //   GET  /backup/<gen>/<n>      one part read back, for a restore
 // The id comes from the props, so a guest can only reach its own backups.
+//
+// So do HTTPS requests to AI providers whose keys the deployment holds
+// (keys.ts): the real key goes in here, on the way out.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { backupBucket, partKey } from "./backup";
+import { PROVIDERS, providerForHost, providerKey } from "./keys";
+
+// When each sandbox last counted a provider call as activity, per isolate.
+const lastPing = new Map<string, number>();
 
 const BACKUP_PART = /^\/backup\/(\d{1,15})\/(\d{1,6})$/;
 
 export class Egress extends WorkerEntrypoint<Env, { id: string }> {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
+    const provider = providerForHost(url.hostname);
+    if (provider) return this.provider(req, url, provider);
     if (url.hostname !== "cloudex.internal") return new Response("not found", { status: 404 });
     const id = this.ctx.props.id;
 
@@ -29,6 +38,28 @@ export class Egress extends WorkerEntrypoint<Env, { id: string }> {
         return new Response("ok\n");
     }
     return new Response("not found", { status: 404 });
+  }
+
+  private async provider(req: Request, url: URL, name: keyof typeof PROVIDERS): Promise<Response> {
+    // Codex tries a WebSocket first and falls back to HTTPS on a refusal.
+    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      return new Response("Cloudex passes provider calls over HTTPS only\n", { status: 426 });
+    }
+    const spec = PROVIDERS[name];
+    const headers = new Headers(req.headers);
+    const sent = spec.sent(headers);
+    if (!sent || sent === spec.placeholder) {
+      const key = await providerKey(this.env, name);
+      if (key) spec.set(headers, key);
+    }
+    // An agent working counts as activity, at most twice a minute.
+    const id = this.ctx.props.id;
+    if (Date.now() - (lastPing.get(id) ?? 0) > 30_000) {
+      lastPing.set(id, Date.now());
+      this.ctx.waitUntil(this.env.SANDBOX.getByName(id).ping().catch(() => {}));
+    }
+    headers.delete("host");
+    return fetch(url.toString(), { method: req.method, headers, body: req.body, redirect: "manual" });
   }
 
   private async backupPart(req: Request, key: string): Promise<Response> {

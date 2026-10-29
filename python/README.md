@@ -41,6 +41,7 @@ The key gives full control of your sandboxes.
 | `box.desktop(size=)`, `box.stop_desktop()` | Start the desktop (Chrome, a terminal) and get a link to it |
 | `box.stop()`, `box.resume(from_backup=)`, `box.delete()` | Save and stop, start again, delete |
 | `box.refresh()` | Fetch the latest state; `box.id`, `box.name`, `box.state` and `box.info` hold it |
+| `cx.set_key(provider, key)`, `cx.list_keys()`, `cx.delete_key(provider)` | AI provider keys sandboxes use without holding them (`"anthropic"`, `"openai"`) |
 
 Errors from the API raise `CloudexError`, with `status` and the API's message.
 The full API is described at `<your API URL>/v1/openapi.json`.

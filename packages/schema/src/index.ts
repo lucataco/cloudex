@@ -33,6 +33,8 @@ export const Sandbox = z.object({
   notice: z.string().nullable().optional(),
   // The sandbox this one is a fork of.
   forkedFrom: z.string().nullable().optional(),
+  // Providers whose keys this run uses without holding them (see ProviderKey).
+  providerKeys: z.array(z.string()).optional(),
   error: z.string().nullable(),
 });
 export type Sandbox = z.infer<typeof Sandbox>;
@@ -84,6 +86,26 @@ export const ExecResult = z.object({
   ms: z.number().int(),
 });
 export type ExecResult = z.infer<typeof ExecResult>;
+
+// AI providers whose keys the deployment can hold for sandboxes. A sandbox
+// started while a provider has a key gets a placeholder, and the real key is
+// added to its requests to that provider on the way out, so it never enters the
+// sandbox, its saves, backups or forks.
+export const Provider = z.enum(["anthropic", "openai"]);
+export type Provider = z.infer<typeof Provider>;
+
+export const SetProviderKey = z.object({
+  key: z.string().min(8).max(1000).regex(/^\S+$/, "a key, without spaces"),
+});
+export type SetProviderKey = z.input<typeof SetProviderKey>;
+
+// A stored key, which the API never returns: hint is its last 4 characters.
+export const ProviderKey = z.object({
+  provider: Provider,
+  hint: z.string(),
+  updatedAt: z.number().int(),
+});
+export type ProviderKey = z.infer<typeof ProviderKey>;
 
 export const HostRequest = z.object({ port: z.number().int().min(1).max(65535) });
 export const HostResult = z.object({ url: z.string() });
