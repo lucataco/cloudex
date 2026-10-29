@@ -46,6 +46,7 @@ const OUTPUT_LIMIT = 1 << 20;
 const SSH_KEY = /^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^\n]*)?$/;
 
 type CreateInput = { name: string | null; size: SandboxSize; idleMinutes: number };
+export type ForkSource = { sandbox: string; snapshot: { id: string } };
 type ExecInput = { cmd: string; root: boolean; cwd?: string; timeoutSec: number };
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
@@ -132,7 +133,8 @@ export class Sandbox extends DurableObject<Env> {
     });
   }
 
-  async create(id: string, input: CreateInput): Promise<SandboxRecord> {
+  // With from, the sandbox is a fork and starts from that save (see forkPoint).
+  async create(id: string, input: CreateInput, from?: ForkSource): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       if (this.record) fail(409, `${id} already exists`);
       const now = Date.now();
@@ -149,10 +151,44 @@ export class Sandbox extends DurableObject<Env> {
         savedAt: null,
         savedBytes: null,
         error: null,
+        ...(from ? { forkedFrom: from.sandbox } : {}),
       };
       await this.update({});
-      await this.boot();
+      if (from) {
+        // The fork's save until it makes its own, so that a resume after a
+        // failed start, or after the platform stops it first, starts here too.
+        await this.ctx.storage.put("snapshot", from.snapshot);
+        await this.ctx.storage.put("saveTouchedAt", Date.now());
+      }
+      await this.boot(from?.snapshot);
       return this.mustRecord();
+    });
+  }
+
+  // The disk a fork starts from: a fresh save of a running sandbox, which keeps
+  // running (the filesystem freezes for a moment), or a stopped one's last save.
+  async forkPoint(): Promise<ForkSource> {
+    return this.exclusive(async () => {
+      const r = this.mustRecord();
+      if (r.state === "running") {
+        this.touch();
+        const t0 = Date.now();
+        const snap = await withTimeout(
+          this.container.snapshotContainer({ name: `${r.id}-fork-${t0}` }),
+          SAVE_TIMEOUT_MS,
+          "saving the disk",
+        );
+        console.log(`[${r.id}] saved ${snap.size} bytes for a fork in ${Date.now() - t0} ms`);
+        return { sandbox: r.id, snapshot: { id: snap.id } };
+      }
+      if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}; try again when it has finished`);
+      const snapshot = await this.ctx.storage.get<{ id: string }>("snapshot");
+      if (!snapshot) fail(409, `${r.id} has no saved disk to fork; resume it, then fork it`);
+      const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
+      if (Date.now() - touched > SAVE_LIFETIME_MS) {
+        fail(409, `${r.id}'s save has expired; resume it (which restores its backup), then fork it`);
+      }
+      return { sandbox: r.id, snapshot: { id: snapshot.id } };
     });
   }
 

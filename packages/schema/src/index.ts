@@ -31,11 +31,13 @@ export const Sandbox = z.object({
   backupError: z.string().nullable().optional(),
   // Something the user should know about the last start, such as a restore from backup.
   notice: z.string().nullable().optional(),
+  // The sandbox this one is a fork of.
+  forkedFrom: z.string().nullable().optional(),
   error: z.string().nullable(),
 });
 export type Sandbox = z.infer<typeof Sandbox>;
 
-const Name = z
+export const Name = z
   .string()
   .regex(/^[a-z][a-z0-9-]{0,30}[a-z0-9]$/, "lowercase letters, digits and dashes; 2-32 characters")
   .refine((n) => !n.startsWith("cx-"), "names can't start with cx-, which marks sandbox ids");
@@ -48,6 +50,18 @@ export const CreateSandbox = z.object({
   idleMinutes: z.number().int().min(0).max(360).default(30),
 });
 export type CreateSandbox = z.input<typeof CreateSandbox>;
+
+// A fork is a new sandbox starting from a copy of another's disk: a fresh save
+// of a running sandbox, which keeps running, or the last save of a stopped one.
+// With count above 1 and a name, the forks are named <name>-1, <name>-2 and so
+// on. Size and idle minutes default to the original's.
+export const ForkRequest = z.object({
+  name: Name.optional(),
+  count: z.number().int().min(1).max(10).default(1),
+  size: SandboxSize.optional(),
+  idleMinutes: z.number().int().min(0).max(360).optional(),
+});
+export type ForkRequest = z.input<typeof ForkRequest>;
 
 // fromBackup starts the image fresh and restores the newest backup, instead of
 // resuming from the save. Resume does this by itself when the save has expired.

@@ -157,6 +157,10 @@ pgrep -u cloudex -x tint2 >/dev/null || daemon tint2 -c /etc/cloudex/tint2rc
 if $started; then
   as_user xsetroot -solid '#1d1915'
   as_user xrdb -merge /etc/cloudex/Xresources
+  # A fork's profile is locked to the original's hostname, and Chrome won't
+  # open a profile "in use on another computer".
+  pgrep -u cloudex -f '^/opt/google/chrome/chrome' >/dev/null ||
+    rm -f /home/cloudex/.config/cloudex-chrome/Singleton{Lock,Socket,Cookie}
   daemon google-chrome --no-first-run --no-default-browser-check --password-store=basic --start-maximized \
     --hide-crash-restore-bubble --user-data-dir=/home/cloudex/.config/cloudex-chrome --remote-debugging-port=9222
 fi

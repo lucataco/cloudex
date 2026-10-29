@@ -422,3 +422,96 @@ func TestDesktopQualitySetsTheViewerOption(t *testing.T) {
 		t.Fatalf("code %d, stderr %q", code, errOut)
 	}
 }
+
+func forkJSON(id, name, state, errMsg string) string {
+	e := "null"
+	if errMsg != "" {
+		e = strconv.Quote(errMsg)
+	}
+	return `{"id":"` + id + `","name":"` + name + `","size":"standard-2","state":"` + state + `","idleMinutes":30,
+"createdAt":2,"updatedAt":2,"startedAt":2,"stoppedAt":null,"savedAt":null,"savedBytes":null,"forkedFrom":"cx-abc123","error":` + e + `}`
+}
+
+func withFakeAPI(t *testing.T, routes map[string]string) *fakeAPI {
+	f := &fakeAPI{t: t, routes: routes}
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", srv.URL)
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	return f
+}
+
+func TestForkMakesTheForkCurrent(t *testing.T) {
+	f := withFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes/web/fork": "!201 [" + forkJSON("cx-fff111", "try-2", "running", "") + "]",
+	})
+	code, out, errOut := run(t, "fork", "web", "--name", "try-2")
+	if code != 0 || !strings.Contains(out, "try-2 is running (standard-2), a fork of web") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	var body map[string]any
+	json.Unmarshal([]byte(f.bodies[0]), &body)
+	if body["name"] != "try-2" || body["count"] != float64(1) || body["idleMinutes"] != nil || body["size"] != nil {
+		t.Fatalf("request body %v", body)
+	}
+	cfg, _ := config.Load()
+	if cfg.Current != "cx-fff111" {
+		t.Fatalf("current is %q", cfg.Current)
+	}
+}
+
+func TestNewFromMakesSeveralForks(t *testing.T) {
+	f := withFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes/web/fork": "!201 [" + forkJSON("cx-fff111", "agent-1", "running", "") + "," +
+			forkJSON("cx-fff222", "agent-2", "running", "") + "]",
+	})
+	code, out, errOut := run(t, "new", "--from", "web", "--count", "2", "--name", "agent", "--idle", "1h")
+	if code != 0 || !strings.Contains(out, "cx-fff111  agent-1  running") || !strings.Contains(out, "cx-fff222  agent-2  running") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	var body map[string]any
+	json.Unmarshal([]byte(f.bodies[0]), &body)
+	if body["count"] != float64(2) || body["idleMinutes"] != float64(60) {
+		t.Fatalf("request body %v", body)
+	}
+	// Several forks leave the current sandbox alone.
+	if cfg, _ := config.Load(); cfg.Current != "" {
+		t.Fatalf("current is %q", cfg.Current)
+	}
+}
+
+func TestForkReportsForksThatDidntStart(t *testing.T) {
+	withFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes/web/fork": "!201 [" + forkJSON("cx-fff111", "a-1", "running", "") + "," +
+			forkJSON("cx-fff222", "a-2", "error", "start failed: no capacity") + "]",
+	})
+	code, out, errOut := run(t, "fork", "web", "--count", "2", "--name", "a")
+	if code != 1 || !strings.Contains(out, "error: start failed: no capacity") || !strings.Contains(errOut, "1 of 2 forks didn't start") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
+func TestForkJSONIsAList(t *testing.T) {
+	withFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes/web/fork": "!201 [" + forkJSON("cx-fff111", "x", "running", "") + "]",
+	})
+	var out, errOut bytes.Buffer
+	if code := Run("test", []string{"--json", "fork", "web", "--no-use"}, &out, &errOut); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut.String())
+	}
+	var forks []api.Sandbox
+	if err := json.Unmarshal(out.Bytes(), &forks); err != nil || len(forks) != 1 || *forks[0].ForkedFrom != "cx-abc123" {
+		t.Fatalf("%v: %s", err, out.String())
+	}
+}
+
+func TestForkChecksCount(t *testing.T) {
+	withFakeAPI(t, nil)
+	if code, _, errOut := run(t, "fork", "web", "--count", "11"); code != 1 || !strings.Contains(errOut, "--count must be 1 to 10") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	if code, _, errOut := run(t, "new", "--count", "2"); code != 1 || !strings.Contains(errOut, "--count needs --from") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}

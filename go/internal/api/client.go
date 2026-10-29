@@ -32,6 +32,7 @@ type Sandbox struct {
 	BackupBytes *int64  `json:"backupBytes"`
 	BackupError *string `json:"backupError"`
 	Notice      *string `json:"notice"`
+	ForkedFrom  *string `json:"forkedFrom"`
 	Error       *string `json:"error"`
 }
 
@@ -169,6 +170,21 @@ func (c *Client) Resume(ctx context.Context, ref string, fromBackup bool) (*Sand
 		body = map[string]bool{"fromBackup": true}
 	}
 	return &s, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/resume", body, &s)
+}
+
+// ForkRequest asks for Count new sandboxes starting from a copy of another's
+// disk. Size and IdleMinutes default to the original's.
+type ForkRequest struct {
+	Name        string `json:"name,omitempty"`
+	Count       int    `json:"count,omitempty"`
+	Size        string `json:"size,omitempty"`
+	IdleMinutes *int   `json:"idleMinutes,omitempty"`
+}
+
+// Fork returns the forks, including any that failed to start (state "error").
+func (c *Client) Fork(ctx context.Context, ref string, r ForkRequest) ([]Sandbox, error) {
+	var forks []Sandbox
+	return forks, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/fork", r, &forks)
 }
 
 func (c *Client) Delete(ctx context.Context, ref string) error {

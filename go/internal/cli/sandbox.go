@@ -27,16 +27,29 @@ func optionalRef(args []string) string {
 }
 
 func newNewCmd(opts *options) *cobra.Command {
-	var name, size string
+	var name, size, from string
+	var count int
 	var idle time.Duration
 	var noUse bool
 	cmd := &cobra.Command{
 		Use:   "new",
 		Short: "Create and start a sandbox",
 		Long: "Create a sandbox and make it the current one. It stops (and saves its disk) after\n" +
-			"--idle without SSH, exec, preview or agent activity.",
-		Args: cobra.NoArgs,
+			"--idle without SSH, exec, preview or agent activity.\n\n" +
+			"With --from, the new sandboxes start from a copy of another's disk; see cloudex fork.",
+		Example: "  cloudex new --name my-box\n  cloudex new --from my-box --count 3 --name agent",
+		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if from != "" {
+				req, err := forkRequest(cmd, name, size, count, idle)
+				if err != nil {
+					return err
+				}
+				return runFork(cmd, opts, from, req, noUse)
+			}
+			if cmd.Flags().Changed("count") {
+				return errors.New("--count needs --from: it makes several forks of one sandbox")
+			}
 			cfg, client, err := opts.load()
 			if err != nil {
 				return err
@@ -73,6 +86,8 @@ func newNewCmd(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&size, "size", "", "standard-1, standard-2 (default), standard-3 or standard-4")
 	cmd.Flags().DurationVar(&idle, "idle", 30*time.Minute, "stop after this long without activity; 0 waits for the 6-hour platform limit")
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make it the current sandbox")
+	cmd.Flags().StringVar(&from, "from", "", "start from a copy of this sandbox's disk (a fork)")
+	cmd.Flags().IntVar(&count, "count", 1, fmt.Sprintf("with --from, how many forks to make, up to %d", maxForks))
 	return cmd
 }
 
@@ -183,6 +198,9 @@ func printSandbox(w io.Writer, s *api.Sandbox) {
 	}
 	if s.BackupError != nil {
 		fmt.Fprintf(tw, "Backup\tthe last one failed: %s\n", *s.BackupError)
+	}
+	if s.ForkedFrom != nil {
+		fmt.Fprintf(tw, "Forked from\t%s\n", *s.ForkedFrom)
 	}
 	if s.Notice != nil {
 		fmt.Fprintf(tw, "Note\t%s\n", *s.Notice)

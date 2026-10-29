@@ -46,6 +46,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | Command | What it does |
 |---|---|
 | `cloudex new [--name] [--size standard-2] [--idle 30m]` | Create and start a sandbox; it becomes the current one |
+| `cloudex fork [sandbox] [--name] [--count 1-10]` | New sandboxes that start from a copy of one's disk (also `cloudex new --from <sandbox>`) |
 | `cloudex list`, `info`, `use <sandbox>` | See sandboxes and pick the current one |
 | `cloudex ssh [sandbox] [-- ssh args]` | Shell in over SSH, through your API (no public IP) |
 | `cloudex desktop [sandbox] [--size 1280x720] [--link] [--quality 0-9]` | Open the sandbox's desktop, with Chrome and a terminal, in your browser |
@@ -67,6 +68,15 @@ installed outside `/home` needs installing again. `cloudex resume --from-backup`
 does that on request, and `delete` removes the backups. Backups need R2 turned
 on for the account (the free tier is enough); `cloudex deploy` says when it
 isn't, and `cloudex status` shows whether they're on.
+
+**Forks.** `cloudex fork` makes new sandboxes that start from a copy of a
+sandbox's whole disk, including installed packages and agent logins. A running
+sandbox is saved first, which takes seconds and leaves it running; a stopped one
+is copied from its last save. `--count 10 --name agent` makes `agent-1` to
+`agent-10` at once (ten forks took about 20 seconds in testing). Each fork is a
+separate sandbox with its own id, saves and backups, and `cloudex info` shows
+what it was forked from. A sandbox whose save has expired needs a `resume`
+before it can be forked.
 
 **Desktop.** `cloudex desktop` starts a desktop in the sandbox (TigerVNC,
 openbox, Chrome and a terminal) and opens it in your browser through noVNC. The

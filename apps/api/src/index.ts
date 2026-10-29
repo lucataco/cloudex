@@ -3,7 +3,16 @@
 // as a Worker secret.
 import { Hono } from "hono";
 import { ZodError } from "zod";
-import { CreateSandbox, DesktopRequest, ExecRequest, HostRequest, ResumeRequest, type Health } from "@cloudex/schema";
+import {
+  CreateSandbox,
+  DesktopRequest,
+  ExecRequest,
+  ForkRequest,
+  HostRequest,
+  Name,
+  ResumeRequest,
+  type Health,
+} from "@cloudex/schema";
 import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
 import { errorStatus, fail, isSandboxId, newSandboxId, previewToken, sameSecret } from "./util";
@@ -97,6 +106,42 @@ async function newMethod<T>(ref: string, call: Promise<T>): Promise<T> {
     throw e;
   }
 }
+
+// Forks (see ForkRequest). All of them start from the same save, at the same
+// time. One that fails to start is kept in state error with the reason, like a
+// failed new, and resuming it tries again.
+app.post("/v1/sandboxes/:ref/fork", async (c) => {
+  const body = await c.req.text();
+  const input = ForkRequest.parse(body ? JSON.parse(body) : {});
+  const ref = c.req.param("ref");
+  const names = Array.from({ length: input.count }, (_, i) =>
+    !input.name ? null : input.count === 1 ? input.name : `${input.name}-${i + 1}`,
+  );
+  for (const name of names) {
+    if (!name) continue;
+    const ok = Name.safeParse(name);
+    if (!ok.success) return c.json({ error: `can't name a fork ${name}: ${ok.error.issues[0]?.message}` }, 400);
+    if (await nameTaken(c.env.DB, name)) return c.json({ error: `the name ${name} is taken` }, 409);
+  }
+  const { stub } = await sandbox(c.env, ref);
+  const original = await stub.get();
+  const from = await newMethod(ref, stub.forkPoint());
+  const size = input.size ?? original.size;
+  const idleMinutes = input.idleMinutes ?? original.idleMinutes;
+  const forks = await Promise.all(
+    names.map(async (name) => {
+      const id = newSandboxId();
+      const fork = c.env.SANDBOX.getByName(id);
+      try {
+        return await fork.create(id, { name, size, idleMinutes }, from);
+      } catch (e) {
+        console.error(`[${id}] fork of ${original.id} didn't start: ${errorStatus(e).message}`);
+        return await fork.get();
+      }
+    }),
+  );
+  return c.json(forks, 201);
+});
 
 // The desktop: POST starts it (installing it the first time) or resizes it; DELETE stops it.
 app.post("/v1/sandboxes/:ref/desktop", async (c) => {
