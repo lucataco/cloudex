@@ -21,6 +21,9 @@
   },
   // No database_id: wrangler creates the database on first deploy.
   "d1_databases": [{ "binding": "DB", "database_name": "cloudex" }],
+  // Backups of /home. Optional at runtime: cloudex deploy leaves the binding out
+  // when the account hasn't turned R2 on, and backups are then skipped.
+  "r2_buckets": [{ "binding": "BACKUPS", "bucket_name": "cloudex-backups" }],
   // PREVIEW_ZONE: a zone in this account that serves preview links
   // (https://<port>-<id>-<token>.<zone>). Empty turns preview links off.
   "vars": { "PREVIEW_ZONE": "" }

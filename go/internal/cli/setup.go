@@ -41,7 +41,7 @@ func newStatusCmd(opts *options) *cobra.Command {
 				zone = *h.PreviewZone
 			}
 			if opts.json {
-				out := map[string]any{"apiUrl": client.BaseURL, "apiVersion": h.Version, "previewZone": zone, "current": cfg.Current}
+				out := map[string]any{"apiUrl": client.BaseURL, "apiVersion": h.Version, "previewZone": zone, "backups": h.Backups, "current": cfg.Current}
 				if showKey {
 					out["apiKey"] = client.Key
 				}
@@ -58,6 +58,13 @@ func newStatusCmd(opts *options) *cobra.Command {
 				zone = "off (cloudex deploy --preview-domain <domain> turns them on)"
 			}
 			fmt.Fprintf(w, "Previews %s\n", zone)
+			switch {
+			case h.Backups == nil:
+			case *h.Backups:
+				fmt.Fprintln(w, "Backups  on: /home goes to the R2 bucket cloudex-backups on each stop")
+			default:
+				fmt.Fprintln(w, "Backups  off (cloudex deploy turns them on once R2 is enabled for the account)")
+			}
 			current := cfg.Current
 			if current == "" {
 				current = "none"

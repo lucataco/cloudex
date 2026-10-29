@@ -24,6 +24,13 @@ export const Sandbox = z.object({
   // resume hold only what changed since the previous one.
   savedAt: z.number().int().nullable(),
   savedBytes: z.number().int().nullable(),
+  // The newest backup of /home (and the SSH host keys) in the account's R2
+  // bucket. Unlike a save, it doesn't expire, and it restores onto a newer image.
+  backupAt: z.number().int().nullable().optional(),
+  backupBytes: z.number().int().nullable().optional(),
+  backupError: z.string().nullable().optional(),
+  // Something the user should know about the last start, such as a restore from backup.
+  notice: z.string().nullable().optional(),
   error: z.string().nullable(),
 });
 export type Sandbox = z.infer<typeof Sandbox>;
@@ -41,6 +48,11 @@ export const CreateSandbox = z.object({
   idleMinutes: z.number().int().min(0).max(360).default(30),
 });
 export type CreateSandbox = z.input<typeof CreateSandbox>;
+
+// fromBackup starts the image fresh and restores the newest backup, instead of
+// resuming from the save. Resume does this by itself when the save has expired.
+export const ResumeRequest = z.object({ fromBackup: z.boolean().default(false) });
+export type ResumeRequest = z.input<typeof ResumeRequest>;
 
 export const ExecRequest = z.object({
   cmd: z.string().min(1),
@@ -67,6 +79,7 @@ export const Health = z.object({
   ok: z.literal(true),
   version: z.string(),
   previewZone: z.string().nullable(),
+  backups: z.boolean().optional(),
 });
 export type Health = z.infer<typeof Health>;
 

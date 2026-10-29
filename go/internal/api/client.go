@@ -28,6 +28,10 @@ type Sandbox struct {
 	StoppedAt   *int64  `json:"stoppedAt"`
 	SavedAt     *int64  `json:"savedAt"`
 	SavedBytes  *int64  `json:"savedBytes"`
+	BackupAt    *int64  `json:"backupAt"`
+	BackupBytes *int64  `json:"backupBytes"`
+	BackupError *string `json:"backupError"`
+	Notice      *string `json:"notice"`
 	Error       *string `json:"error"`
 }
 
@@ -64,6 +68,7 @@ type Health struct {
 	OK          bool    `json:"ok"`
 	Version     string  `json:"version"`
 	PreviewZone *string `json:"previewZone"`
+	Backups     *bool   `json:"backups"` // nil from APIs older than backups
 }
 
 // Error is a non-2xx answer from the API.
@@ -155,9 +160,15 @@ func (c *Client) Stop(ctx context.Context, ref string) (*Sandbox, error) {
 	return &s, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/stop", nil, &s)
 }
 
-func (c *Client) Resume(ctx context.Context, ref string) (*Sandbox, error) {
+// Resume starts a stopped sandbox from its save, or with fromBackup, from a
+// fresh image with /home restored from the newest backup.
+func (c *Client) Resume(ctx context.Context, ref string, fromBackup bool) (*Sandbox, error) {
 	var s Sandbox
-	return &s, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/resume", nil, &s)
+	var body any
+	if fromBackup {
+		body = map[string]bool{"fromBackup": true}
+	}
+	return &s, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/resume", body, &s)
 }
 
 func (c *Client) Delete(ctx context.Context, ref string) error {

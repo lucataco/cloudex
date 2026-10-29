@@ -9,14 +9,31 @@
 // - Save (snapshotContainer) before destroy(); snapshots need a running box.
 // - On SIGTERM from the platform the guest asks for a save through the outbound
 //   handler (see egress.ts); the host allows 15 minutes.
+// - After each save, /home is also backed up to R2 when the deployment has a
+//   bucket (backup.ts). Saves expire; backups don't, and restore onto any image.
 import { DurableObject } from "cloudflare:workers";
 import type { ExecResult, Sandbox as SandboxRecord, SandboxSize } from "@cloudex/schema";
+import {
+  BACKUP_SCRIPT,
+  type BackupManifest,
+  HELPER,
+  RESTORE_SCRIPT,
+  backupBucket,
+  deleteBackups,
+  deleteGeneration,
+  latestBackup,
+  writeManifest,
+} from "./backup";
 import { deleteSandbox, upsertSandbox } from "./db";
 import { fail, sleep, withTimeout } from "./util";
 
 const READY_CHECK = '[ "$(cat /run/cloudex-ready 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id)" ]';
 const READY_TIMEOUT_MS = 10 * 60_000; // a host without the image pulls it first
 const SAVE_TIMEOUT_MS = 15 * 60_000; // 15 GiB took 179 s in the spikes
+const BACKUP_TIMEOUT_MS = 20 * 60_000; // about 110 MiB/s each way in the spikes
+// A save expires 30 days after it was made or last restored; past this, resume
+// restores the backup instead of trying the save.
+const SAVE_LIFETIME_MS = 29 * 24 * 3600_000;
 const PLATFORM_MAX_INACTIVITY_MS = 6 * 3600_000;
 const ALARM_EVERY_MS = 60_000;
 const GUEST_USER = "1000:1000"; // the image's cloudex user
@@ -140,13 +157,41 @@ export class Sandbox extends DurableObject<Env> {
     return this.mustRecord();
   }
 
-  async resume(): Promise<SandboxRecord> {
+  async resume(fromBackup = false): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
       if (r.state === "running") return r;
       if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}`);
-      await this.boot(await this.ctx.storage.get("snapshot"));
+      const snapshot = await this.ctx.storage.get("snapshot");
+      const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
+      const expired = Boolean(snapshot) && Date.now() - touched > SAVE_LIFETIME_MS;
+      if (fromBackup || expired) {
+        const bucket = backupBucket(this.env);
+        const backup = bucket ? await latestBackup(bucket, r.id) : null;
+        if (backup) {
+          await this.bootFromBackup(backup, fromBackup ? "as asked" : "its save had expired");
+          return this.mustRecord();
+        }
+        if (fromBackup) fail(404, bucket ? `${r.id} has no backup yet` : "backups are off: this deployment has no R2 bucket");
+      }
+      await this.boot(snapshot);
+      // Restoring a save restarts its 30 days.
+      if (snapshot) await this.ctx.storage.put("saveTouchedAt", Date.now());
       return this.mustRecord();
+    });
+  }
+
+  private async bootFromBackup(b: BackupManifest, why: string) {
+    const r = this.mustRecord();
+    await this.boot(undefined, async () => {
+      const t0 = Date.now();
+      await this.runScript(RESTORE_SCRIPT, [String(b.gen), String(b.parts)], "restoring the backup");
+      console.log(`[${r.id}] restored backup ${b.gen} (${b.bytes} bytes) in ${Date.now() - t0} ms`);
+    });
+    await this.ctx.storage.delete(["snapshot", "saveTouchedAt"]);
+    const when = new Date(b.createdAt).toISOString().slice(0, 16).replace("T", " ");
+    await this.update({
+      notice: `Restored /home from the backup of ${when} UTC (${why}). Anything installed outside /home needs installing again.`,
     });
   }
 
@@ -165,20 +210,29 @@ export class Sandbox extends DurableObject<Env> {
       const r = this.mustRecord();
       this.record = { ...r, state: "stopping" }; // so the exit watcher stays out of it
       if (this.ctx.container?.running) await withTimeout(this.container.destroy(), 60_000, "destroy");
+      const bucket = backupBucket(this.env);
+      if (bucket) {
+        try {
+          await deleteBackups(bucket, r.id);
+        } catch (e) {
+          console.error(`[${r.id}] deleting backups failed: ${message(e)}`);
+        }
+      }
       await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.deleteAll();
       await deleteSandbox(this.env.DB, r.id);
       this.record = undefined;
-      // The last save expires on its own 30 days after it was made or last restored.
+      // Its backups are gone. The last save can't be deleted from a Worker; it
+      // expires on its own 30 days after it was made or last restored.
       return { deleted: r.id };
     });
   }
 
-  private async boot(snapshot?: unknown) {
+  private async boot(snapshot?: unknown, afterReady?: () => Promise<void>) {
     const r = this.mustRecord();
     const c = this.container;
     const t0 = Date.now();
-    await this.update({ state: "starting", error: null });
+    await this.update({ state: "starting", error: null, notice: null });
     try {
       const images = c.images as Record<string, string>;
       c.start({
@@ -192,6 +246,7 @@ export class Sandbox extends DurableObject<Env> {
       const egress = this.ctx.exports.Egress({ props: { id: r.id } });
       await withTimeout(c.interceptOutboundHttp("cloudex.internal", egress), 30_000, "routing cloudex.internal");
       await this.waitReady(t0);
+      if (afterReady) await afterReady();
     } catch (e) {
       try {
         if (c.running) await withTimeout(c.destroy(), 60_000, "destroy");
@@ -240,6 +295,7 @@ export class Sandbox extends DurableObject<Env> {
       "saving the disk",
     );
     await this.ctx.storage.put("snapshot", snap);
+    await this.ctx.storage.put("saveTouchedAt", Date.now());
     await this.update({ savedAt: Date.now(), savedBytes: snap.size ?? null });
     console.log(`[${r.id}] saved ${snap.size} bytes in ${Date.now() - t0} ms`);
   }
@@ -253,6 +309,7 @@ export class Sandbox extends DurableObject<Env> {
       await this.update({ state: "running", error: `save failed: ${message(e)}` });
       fail(500, `couldn't save ${r.id}, so it is still running: ${message(e)}`);
     }
+    await this.backup();
     await withTimeout(this.container.destroy(), 60_000, "destroy");
     await this.ctx.storage.deleteAlarm();
     await this.update({ state: "stopped", stoppedAt: Date.now(), error: null });
@@ -265,12 +322,59 @@ export class Sandbox extends DurableObject<Env> {
       if (!r || r.state !== "running") return { saved: false }; // our own stop is already saving
       try {
         await this.save();
+        await this.backup();
         return { saved: true };
       } catch (e) {
         console.error(`[${r.id}] save on SIGTERM failed: ${message(e)}`);
         return { saved: false };
       }
     });
+  }
+
+  // Backs up /home to R2 after a save. A failure is recorded, not fatal: the save stands.
+  private async backup() {
+    const bucket = backupBucket(this.env);
+    if (!bucket) return;
+    const r = this.mustRecord();
+    const gen = Date.now();
+    try {
+      const out = await this.runScript(BACKUP_SCRIPT, [String(gen)], "backing up /home");
+      const last = out.trim().split("\n").pop() ?? "";
+      const { parts, bytes } = JSON.parse(last) as { parts?: number; bytes?: number };
+      if (!Number.isInteger(parts) || !parts || !Number.isInteger(bytes)) throw new Error(`unexpected helper output: ${last.slice(0, 200)}`);
+      await writeManifest(bucket, r.id, { gen, parts, bytes: bytes!, createdAt: gen, ms: Date.now() - gen });
+      await deleteBackups(bucket, r.id, gen);
+      await this.update({ backupAt: gen, backupBytes: bytes!, backupError: null });
+      console.log(`[${r.id}] backed up ${bytes} bytes in ${parts} parts in ${Date.now() - gen} ms`);
+    } catch (e) {
+      console.error(`[${r.id}] backup failed: ${message(e)}`);
+      await this.update({ backupError: message(e) });
+      await deleteGeneration(bucket, r.id, gen).catch(() => {});
+    }
+  }
+
+  // Runs a backup or restore script as root, with HELPER as $1. Returns stdout.
+  private async runScript(script: string, args: string[], what: string): Promise<string> {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), BACKUP_TIMEOUT_MS);
+    try {
+      const p = await this.container.exec(["bash", "-c", script, "cloudex-backup", HELPER, ...args], {
+        cwd: "/",
+        env: { HOME: "/root", LANG: "C.UTF-8" },
+        signal: ctl.signal,
+      });
+      const out = await p.output();
+      if (out.exitCode !== 0) {
+        const tail = clip(out.stderr).trim().split("\n").slice(-3).join(" | ");
+        throw new Error(`${what} failed (exit ${out.exitCode}): ${tail}`);
+      }
+      return new TextDecoder().decode(out.stdout);
+    } catch (e) {
+      if (ctl.signal.aborted) throw new Error(`${what} took longer than ${BACKUP_TIMEOUT_MS / 60_000} minutes`);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // Activity from inside the guest, for example a running agent.

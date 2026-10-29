@@ -22,11 +22,11 @@ func TestTokenURL(t *testing.T) {
 	if err := json.Unmarshal([]byte(q.Get("permissionGroupKeys")), &perms); err != nil {
 		t.Fatal(err)
 	}
-	if len(perms) != 7 {
-		t.Fatalf("got %d permissions, want 7", len(perms))
+	if len(perms) != 8 {
+		t.Fatalf("got %d permissions, want 8", len(perms))
 	}
 	for _, p := range perms {
-		if len(p["key"]) != 32 || (p["type"] != "edit" && p["type"] != "read") {
+		if p["key"] == "" || (p["type"] != "edit" && p["type"] != "read") {
 			t.Errorf("bad permission %v", p)
 		}
 	}
@@ -64,5 +64,15 @@ func TestInspect(t *testing.T) {
 	live, err = inspect(ctx, gone.URL, gone.URL, "good")
 	if err != nil || live.running {
 		t.Fatalf("nothing deployed: %+v, %v", live, err)
+	}
+}
+
+func TestWranglerConfigBindsBackupsOnlyWhenAvailable(t *testing.T) {
+	if _, ok := wranglerConfig("2026-10-01", nil, "img", "db", "", false)["r2_buckets"]; ok {
+		t.Fatal("bound R2 without a bucket")
+	}
+	b, ok := wranglerConfig("2026-10-01", nil, "img", "db", "", true)["r2_buckets"].([]any)
+	if !ok || b[0].(map[string]any)["binding"] != "BACKUPS" {
+		t.Fatalf("r2_buckets = %v", b)
 	}
 }

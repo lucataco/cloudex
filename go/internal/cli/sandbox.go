@@ -174,6 +174,19 @@ func printSandbox(w io.Writer, s *api.Sandbox) {
 		}
 		fmt.Fprintf(tw, "Saved\t%s%s\n", ago(*s.SavedAt), size)
 	}
+	if s.BackupAt != nil {
+		size := ""
+		if s.BackupBytes != nil {
+			size = fmt.Sprintf(" (%s)", humanBytes(*s.BackupBytes))
+		}
+		fmt.Fprintf(tw, "Backup\t%s%s, of /home\n", ago(*s.BackupAt), size)
+	}
+	if s.BackupError != nil {
+		fmt.Fprintf(tw, "Backup\tthe last one failed: %s\n", *s.BackupError)
+	}
+	if s.Notice != nil {
+		fmt.Fprintf(tw, "Note\t%s\n", *s.Notice)
+	}
 	if s.Error != nil {
 		fmt.Fprintf(tw, "Note\t%s\n", *s.Error)
 	}
@@ -229,8 +242,14 @@ func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client
 			if opts.json {
 				return writeJSON(cmd.OutOrStdout(), s)
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s %s.\n", s.Label(), done)
-			return err
+			fmt.Fprintf(cmd.OutOrStdout(), "%s %s.\n", s.Label(), done)
+			if s.Notice != nil {
+				fmt.Fprintln(cmd.OutOrStdout(), *s.Notice)
+			}
+			if use == "stop" && s.BackupError != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Backing up /home failed, so only the save has it: %s\n", *s.BackupError)
+			}
+			return nil
 		},
 	}
 }
@@ -241,8 +260,16 @@ func newStopCmd(opts *options) *cobra.Command {
 }
 
 func newResumeCmd(opts *options) *cobra.Command {
-	return lifecycleCmd(opts, "resume", "Start a stopped sandbox from its saved disk", "Resuming",
-		(*api.Client).Resume, "is running")
+	var fromBackup bool
+	cmd := lifecycleCmd(opts, "resume", "Start a stopped sandbox from its saved disk", "Resuming",
+		func(c *api.Client, ctx context.Context, ref string) (*api.Sandbox, error) {
+			return c.Resume(ctx, ref, fromBackup)
+		}, "is running")
+	cmd.Long = "Start a stopped sandbox from its saved disk. A save expires after 30 days without\n" +
+		"a resume; after that, resume restores /home from the newest backup onto a fresh\n" +
+		"image instead, and anything installed outside /home needs installing again."
+	cmd.Flags().BoolVar(&fromBackup, "from-backup", false, "restore /home from the newest backup onto a fresh image instead of using the save")
+	return cmd
 }
 
 func newDeleteCmd(opts *options) *cobra.Command {

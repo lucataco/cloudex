@@ -45,6 +45,7 @@ var DefaultImage = "ghcr.io/lucataco/cloudex-base:edge"
 
 const (
 	WorkerName      = "cloudex-api"
+	BucketName      = "cloudex-backups"
 	DatabaseName    = "cloudex"
 	imageRepo       = "cloudex-base"
 	registryHost    = "registry.cloudflare.com"
@@ -52,7 +53,8 @@ const (
 )
 
 // TokenURL opens the dashboard with an account API token pre-filled with what
-// deploy needs. The last three permissions are only used for preview links.
+// deploy needs. Routes, DNS and Zone are only used for preview links, and R2
+// only for backups; deploy carries on without them.
 // The dashboard rejects the whole link if an entry has no type, even though it
 // ignores the type when the key is a permission group ID.
 var TokenURL = tokenURL([]tokenPermission{
@@ -63,6 +65,7 @@ var TokenURL = tokenURL([]tokenPermission{
 	{"28f4b596e7d643029c524985477ae49a", "edit"}, // Workers Routes Write
 	{"4755a26eedb94da69e1066d98aa820be", "edit"}, // DNS Write
 	{"c8fed203ed3043cba015a93ad1616f1f", "read"}, // Zone Read
+	{"workers_r2", "edit"},                       // Workers R2 Storage Write (the documented short key)
 })
 
 type tokenPermission struct {
@@ -187,13 +190,21 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	}
 	log("D1 database %s (%s)", DatabaseName, map[bool]string{true: "created", false: "existing"}[created])
 
+	backups := true
+	if made, err := cf.EnsureR2Bucket(ctx, account.ID, BucketName); err != nil {
+		backups = false
+		log("Backups of /home are off: %s", r2Problem(err))
+	} else {
+		log("R2 bucket %s (%s) for backups of /home", BucketName, map[bool]string{true: "created", false: "existing"}[made])
+	}
+
 	if key == "" {
 		if key, err = newKey(); err != nil {
 			return nil, err
 		}
 	}
 
-	if err := runWrangler(ctx, npx, o.Token, account.ID, wranglerConfig(meta.CompatibilityDate, meta.CompatibilityFlags, image, dbID, zone), worker, key, log); err != nil {
+	if err := runWrangler(ctx, npx, o.Token, account.ID, wranglerConfig(meta.CompatibilityDate, meta.CompatibilityFlags, image, dbID, zone, backups), worker, key, log); err != nil {
 		return nil, err
 	}
 	log("API deployed at %s", apiURL)
@@ -304,7 +315,20 @@ func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, 
 	return fmt.Sprintf("%s/%s/%s@%s", registryHost, account, imageRepo, digest), nil
 }
 
-func wranglerConfig(compatDate string, flags []string, image, dbID, zone string) map[string]any {
+// r2Problem explains why backups can't be turned on.
+func r2Problem(err error) string {
+	var cfErr *cloudflare.Error
+	switch {
+	case errors.As(err, &cfErr) && cfErr.Code == 10042:
+		return "R2 isn't turned on for this account. Turn it on in the Cloudflare dashboard (R2 Object Storage; the free tier is enough), then run cloudex deploy again"
+	case errors.As(err, &cfErr) && (cfErr.Status == 403 || cfErr.Code == 10000):
+		return "this API token can't use R2. Make a new one with the link in cloudex deploy --help, which now includes R2, then run cloudex deploy again"
+	default:
+		return err.Error()
+	}
+}
+
+func wranglerConfig(compatDate string, flags []string, image, dbID, zone string, backups bool) map[string]any {
 	cfg := map[string]any{
 		"name":                WorkerName,
 		"main":                "worker.js",
@@ -325,6 +349,9 @@ func wranglerConfig(compatDate string, flags []string, image, dbID, zone string)
 	}
 	if zone != "" {
 		cfg["routes"] = []any{map[string]any{"pattern": "*." + zone + "/*", "zone_name": zone}}
+	}
+	if backups {
+		cfg["r2_buckets"] = []any{map[string]any{"binding": "BACKUPS", "bucket_name": BucketName}}
 	}
 	return cfg
 }

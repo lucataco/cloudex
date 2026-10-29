@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -154,6 +155,17 @@ func (c *Client) EnsureD1(ctx context.Context, account, name string) (id string,
 		return "", false, err
 	}
 	return db.UUID, true, nil
+}
+
+// EnsureR2Bucket finds or creates an R2 bucket. An account that hasn't turned
+// R2 on in the dashboard gets code 10042; a token without R2 access gets a 403.
+func (c *Client) EnsureR2Bucket(ctx context.Context, account, name string) (created bool, err error) {
+	err = c.do(ctx, http.MethodGet, "/accounts/"+account+"/r2/buckets/"+url.PathEscape(name), nil, nil)
+	var cfErr *Error
+	if err == nil || !errors.As(err, &cfErr) || cfErr.Status != http.StatusNotFound {
+		return false, err
+	}
+	return true, c.do(ctx, http.MethodPost, "/accounts/"+account+"/r2/buckets", map[string]string{"name": name}, nil)
 }
 
 // RegistryCredentials returns short-lived push and pull credentials for the

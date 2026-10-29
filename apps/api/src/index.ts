@@ -3,7 +3,8 @@
 // as a Worker secret.
 import { Hono } from "hono";
 import { ZodError } from "zod";
-import { CreateSandbox, ExecRequest, HostRequest, type Health } from "@cloudex/schema";
+import { CreateSandbox, ExecRequest, HostRequest, ResumeRequest, type Health } from "@cloudex/schema";
+import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
 import { errorStatus, isSandboxId, newSandboxId, previewToken, sameSecret } from "./util";
 
@@ -28,7 +29,7 @@ app.onError((e, c) => {
 });
 
 app.get("/v1/health", (c) =>
-  c.json({ ok: true, version: VERSION, previewZone: c.env.PREVIEW_ZONE || null } satisfies Health),
+  c.json({ ok: true, version: VERSION, previewZone: c.env.PREVIEW_ZONE || null, backups: Boolean(backupBucket(c.env)) } satisfies Health),
 );
 
 app.use("/v1/*", async (c, next) => {
@@ -68,9 +69,11 @@ app.get("/v1/sandboxes/:ref", async (c) => c.json(await (await sandbox(c.env, c.
 
 app.post("/v1/sandboxes/:ref/stop", async (c) => c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.stop()));
 
-app.post("/v1/sandboxes/:ref/resume", async (c) =>
-  c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.resume()),
-);
+app.post("/v1/sandboxes/:ref/resume", async (c) => {
+  const body = await c.req.text();
+  const { fromBackup } = ResumeRequest.parse(body ? JSON.parse(body) : {});
+  return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.resume(fromBackup));
+});
 
 app.delete("/v1/sandboxes/:ref", async (c) =>
   c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.remove()),

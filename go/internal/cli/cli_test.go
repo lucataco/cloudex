@@ -189,3 +189,23 @@ func TestStatusHidesTheKeyUnlessAsked(t *testing.T) {
 		t.Fatalf("status --show-key didn't print the key: %q", out)
 	}
 }
+
+func TestResumeFromBackupAsksForIt(t *testing.T) {
+	restored := strings.Replace(sandboxJSON, `"error":null`, `"notice":"Restored /home from the backup of 2026-10-29 03:12 UTC (as asked).","error":null`, 1)
+	f := &fakeAPI{t: t, routes: map[string]string{"POST /v1/sandboxes/web/resume": restored}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", srv.URL)
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	code, out, errOut := run(t, "resume", "web", "--from-backup")
+	if code != 0 || !strings.Contains(out, "Restored /home") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if f.bodies[0] != `{"fromBackup":true}` {
+		t.Fatalf("body %q", f.bodies[0])
+	}
+	if code, _, _ := run(t, "resume", "web"); code != 0 || f.bodies[1] != "" {
+		t.Fatalf("a plain resume sent %q", f.bodies[1])
+	}
+}
