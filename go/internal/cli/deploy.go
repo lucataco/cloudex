@@ -18,7 +18,7 @@ import (
 
 func newDeployCmd(opts *options) *cobra.Command {
 	var accountID, previewDomain, image string
-	var skipCheck bool
+	var skipCheck, yes bool
 	cmd := &cobra.Command{
 		Use:   "deploy",
 		Short: "Install or update Cloudex in your Cloudflare account",
@@ -26,7 +26,8 @@ func newDeployCmd(opts *options) *cobra.Command {
 			"($5/month) and an API token, read from $CLOUDFLARE_API_TOKEN or asked for.\n" +
 			"Create the token with this link, which pre-fills the permissions:\n\n  " + deploy.TokenURL + "\n\n" +
 			"Preview links need a domain in the same account: --preview-domain example.dev.\n" +
-			"Running deploy again updates the API and image and keeps your sandboxes.",
+			"Running deploy again updates the API and image and keeps your sandboxes, your API\n" +
+			"key and your preview domain. On another computer, run cloudex login instead.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := config.Load()
@@ -37,16 +38,15 @@ func newDeployCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if previewDomain == "" && !cmd.Flags().Changed("preview-domain") && cfg.AccountID != "" {
-				previewDomain = cfg.PreviewZone // keep the domain from the last deploy
-			}
 			fmt.Fprintln(cmd.ErrOrStderr(), "Deploying Cloudex:")
 			ctx, cancel := context.WithTimeout(cmd.Context(), 45*time.Minute)
 			defer cancel()
 			res, err := deploy.Run(ctx, deploy.Options{
 				Token: token, AccountID: firstNonEmpty(accountID, os.Getenv("CLOUDFLARE_ACCOUNT_ID")),
-				PreviewDomain: previewDomain, Image: image,
+				PreviewDomain: previewDomain, PreviewDomainSet: cmd.Flags().Changed("preview-domain"),
+				RememberedPreviewDomain: cfg.PreviewZone, Image: image,
 				ExistingURL: cfg.APIURL, ExistingKey: cfg.APIKey,
+				Confirm:   func(q string) bool { return yes || confirm(cmd, q) },
 				SkipCheck: skipCheck, Log: cmd.ErrOrStderr(),
 			})
 			if res != nil {
@@ -70,10 +70,22 @@ func newDeployCmd(opts *options) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&accountID, "account-id", "", "Cloudflare account id (needed when the token reaches several)")
-	cmd.Flags().StringVar(&previewDomain, "preview-domain", "", "a domain in the account to serve preview links on")
+	cmd.Flags().StringVar(&previewDomain, "preview-domain", "", "a domain in the account to serve preview links on ('' turns them off)")
 	cmd.Flags().StringVar(&image, "image", deploy.DefaultImage, "sandbox image to install")
 	cmd.Flags().BoolVar(&skipCheck, "skip-check", false, "don't start a test sandbox after deploying")
+	cmd.Flags().BoolVar(&yes, "yes", false, "replace the API key of an existing deployment without asking")
 	return cmd
+}
+
+// confirm asks a yes/no question on the terminal; without one, the answer is no.
+func confirm(cmd *cobra.Command, question string) bool {
+	if !isTerminal(os.Stdin) {
+		return false
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "\n%s\n\nReplace the key? [y/N] ", question)
+	var answer string
+	fmt.Fscanln(os.Stdin, &answer)
+	return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")
 }
 
 func cloudflareToken(cmd *cobra.Command) (string, error) {

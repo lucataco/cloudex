@@ -144,3 +144,48 @@ func TestShellQuote(t *testing.T) {
 		t.Fatalf("got %s", got)
 	}
 }
+
+func TestLoginSavesTheDeployment(t *testing.T) {
+	srv := newFakeAPI(t, map[string]string{
+		"GET /v1/health":    `{"ok":true,"version":"0.1.2","previewZone":"example.dev"}`,
+		"GET /v1/sandboxes": `[]`,
+	})
+	t.Setenv("CLOUDEX_API_URL", "")
+	code, out, errOut := run(t, "login", "--url", srv.URL+"/")
+	if code != 0 || !strings.Contains(out, "Logged in to "+srv.URL) {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIURL != srv.URL || cfg.APIKey != "test-key" || cfg.PreviewZone != "example.dev" {
+		t.Fatalf("saved %+v", cfg)
+	}
+}
+
+func TestLoginRejectsAWrongKey(t *testing.T) {
+	srv := newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"0.1.2","previewZone":null}`})
+	t.Setenv("CLOUDEX_API_KEY", "wrong")
+	// The fake API wants a key even for health, so the health call fails first.
+	code, _, errOut := run(t, "login", "--url", srv.URL)
+	if code != 1 || errOut == "" {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	cfg, _ := config.Load()
+	if cfg.APIKey != "" {
+		t.Fatalf("saved a key that doesn't work: %+v", cfg)
+	}
+}
+
+func TestStatusHidesTheKeyUnlessAsked(t *testing.T) {
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`})
+	_, out, _ := run(t, "status")
+	if strings.Contains(out, "test-key") {
+		t.Fatalf("status printed the key: %q", out)
+	}
+	_, out, _ = run(t, "status", "--show-key")
+	if !strings.Contains(out, "test-key") {
+		t.Fatalf("status --show-key didn't print the key: %q", out)
+	}
+}

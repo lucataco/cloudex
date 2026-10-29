@@ -22,7 +22,8 @@ func newVersionCmd(version string, opts *options) *cobra.Command {
 }
 
 func newStatusCmd(opts *options) *cobra.Command {
-	return &cobra.Command{
+	var showKey bool
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Check the connection to your Cloudex deployment",
 		Args:  cobra.NoArgs,
@@ -40,12 +41,19 @@ func newStatusCmd(opts *options) *cobra.Command {
 				zone = *h.PreviewZone
 			}
 			if opts.json {
-				return writeJSON(cmd.OutOrStdout(), map[string]any{
-					"apiUrl": client.BaseURL, "apiVersion": h.Version, "previewZone": zone, "current": cfg.Current,
-				})
+				out := map[string]any{"apiUrl": client.BaseURL, "apiVersion": h.Version, "previewZone": zone, "current": cfg.Current}
+				if showKey {
+					out["apiKey"] = client.Key
+				}
+				return writeJSON(cmd.OutOrStdout(), out)
 			}
 			w := cmd.OutOrStdout()
 			fmt.Fprintf(w, "API      %s (version %s)\n", client.BaseURL, h.Version)
+			if showKey {
+				fmt.Fprintf(w, "Key      %s\n", client.Key)
+			} else {
+				fmt.Fprintln(w, "Key      hidden (--show-key prints it, for cloudex login on another computer)")
+			}
 			if zone == "" {
 				zone = "off (cloudex deploy --preview-domain <domain> turns them on)"
 			}
@@ -58,4 +66,6 @@ func newStatusCmd(opts *options) *cobra.Command {
 			return err
 		},
 	}
+	cmd.Flags().BoolVar(&showKey, "show-key", false, "print the API key too")
+	return cmd
 }

@@ -26,8 +26,14 @@ cloudex ssh
 
 `cloudex deploy` prints a link that opens the Cloudflare dashboard with the token's
 permissions pre-filled. It then copies the sandbox image into your account, uploads
-the API Worker, and starts a test sandbox. Run it again to update; your sandboxes
-stay. Leave out `--preview-domain` if you don't want preview links.
+the API Worker, and starts a test sandbox. Run it again to update; your sandboxes,
+API key and preview domain stay. Leave out `--preview-domain` if you don't want
+preview links.
+
+**On another computer**, don't deploy again: that would give the deployment a new
+API key and lock out the first computer. Instead run `cloudex status --show-key`
+on the first one, then `cloudex login --url <API URL>` on the new one and paste
+the key. `cloudex deploy` asks before replacing a key it doesn't have.
 
 ## Commands
 
@@ -42,7 +48,8 @@ stay. Leave out `--preview-domain` if you don't want preview links.
 | `cloudex attach [sandbox]` | Reattach to the newest agent session |
 | `cloudex host [sandbox] <port>` | HTTPS link to a port, on your preview domain |
 | `cloudex stop`, `resume`, `delete` | Save and stop, resume from the save, or delete |
-| `cloudex doctor`, `status` | Check this computer and the deployment |
+| `cloudex login --url <api url>` | Use an existing deployment from another computer |
+| `cloudex doctor`, `status [--show-key]` | Check this computer and the deployment |
 
 Sandboxes stop and save after `--idle` without SSH, exec, preview or agent
 activity (30 minutes by default), and in any case within Cloudflare's 6-hour

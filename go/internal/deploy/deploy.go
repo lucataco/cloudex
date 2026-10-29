@@ -77,16 +77,24 @@ func tokenURL(perms []tokenPermission) string {
 }
 
 type Options struct {
-	Token         string
-	AccountID     string
-	PreviewDomain string
-	Image         string
-	// ExistingKey is reused when redeploying to the same API, so other
+	Token     string
+	AccountID string
+	// PreviewDomain is used when PreviewDomainSet (an empty one turns previews
+	// off). Otherwise deploy keeps the live deployment's domain, or failing
+	// that RememberedPreviewDomain from this computer's last deploy.
+	PreviewDomain           string
+	PreviewDomainSet        bool
+	RememberedPreviewDomain string
+	Image                   string
+	// ExistingKey is reused when it still works for the live API, so other
 	// computers configured for this deployment keep working.
 	ExistingURL string
 	ExistingKey string
-	SkipCheck   bool
-	Log         io.Writer
+	// Confirm is asked before replacing the API key of a live deployment
+	// whose key this computer doesn't have. Nil means no.
+	Confirm   func(question string) bool
+	SkipCheck bool
+	Log       io.Writer
 }
 
 type Result struct {
@@ -134,7 +142,33 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	}
 	apiURL := fmt.Sprintf("https://%s.%s.workers.dev", WorkerName, sub)
 
+	live, err := inspect(ctx, apiURL, o.ExistingURL, o.ExistingKey)
+	if err != nil {
+		return nil, err
+	}
+	key := ""
+	switch {
+	case live.keyWorks:
+		key = o.ExistingKey
+	case live.running:
+		question := fmt.Sprintf("Cloudex is already deployed at %s, and this computer doesn't have its API key.\n"+
+			"Deploying gives it a new key, so other computers using it stop working until they run\n"+
+			"cloudex login with the new key. To use it from here instead, run: cloudex login --url %s", apiURL, apiURL)
+		if o.Confirm == nil || !o.Confirm(question) {
+			return nil, fmt.Errorf("stopped before replacing the API key of %s; run cloudex login --url %s to use it, or cloudex deploy --yes to replace the key", apiURL, apiURL)
+		}
+		log("Replacing the API key of the existing deployment")
+	case o.ExistingKey != "" && o.ExistingURL == apiURL:
+		key = o.ExistingKey // the API isn't answering; keep what this computer has
+	}
+
 	zone := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(o.PreviewDomain)), ".")
+	if !o.PreviewDomainSet {
+		zone = firstNonEmpty(live.previewZone, o.RememberedPreviewDomain)
+		if live.previewZone != "" {
+			log("Keeping preview links on *.%s (--preview-domain '' turns them off)", zone)
+		}
+	}
 	zoneID := ""
 	if zone != "" {
 		if zoneID, err = cf.ZoneID(ctx, account.ID, zone); err != nil {
@@ -153,8 +187,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	}
 	log("D1 database %s (%s)", DatabaseName, map[bool]string{true: "created", false: "existing"}[created])
 
-	key := o.ExistingKey
-	if key == "" || o.ExistingURL != apiURL {
+	if key == "" {
 		if key, err = newKey(); err != nil {
 			return nil, err
 		}
@@ -334,6 +367,51 @@ func runWrangler(ctx context.Context, npx, token, account string, cfg map[string
 		return fmt.Errorf("wrangler deploy failed: %w\n%s", err, strings.Join(lines, "\n"))
 	}
 	return nil
+}
+
+// liveDeployment is what an existing API at the deploy URL tells us.
+type liveDeployment struct {
+	running     bool
+	keyWorks    bool
+	previewZone string
+}
+
+// inspect asks the API at apiURL, if there is one, for its preview domain and
+// whether this computer's key still works there.
+func inspect(ctx context.Context, apiURL, existingURL, existingKey string) (liveDeployment, error) {
+	var live liveDeployment
+	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	h, err := api.New(apiURL, "").Health(hctx)
+	if err != nil || !h.OK {
+		return live, nil // nothing deployed yet, or not answering
+	}
+	live.running = true
+	if h.PreviewZone != nil {
+		live.previewZone = *h.PreviewZone
+	}
+	if existingKey == "" || existingURL != apiURL {
+		return live, nil
+	}
+	_, err = api.New(apiURL, existingKey).List(hctx)
+	var apiErr *api.Error
+	switch {
+	case err == nil:
+		live.keyWorks = true
+	case errors.As(err, &apiErr) && apiErr.Status == 401:
+	default:
+		return live, fmt.Errorf("checking the existing deployment: %w", err)
+	}
+	return live, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func waitHealthy(ctx context.Context, client *api.Client) error {
