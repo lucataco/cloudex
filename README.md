@@ -1,4 +1,4 @@
-# Cloudex
+<h1 align="center"><img src="docs/banner.svg" alt="Cloudex" width="638"></h1>
 
 Open-source agent computers that run in your own Cloudflare account. Each sandbox
 is a Linux machine with a shell, Docker, SSH and coding agents. Stopping saves its
