@@ -15,12 +15,14 @@ package deploy
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -307,7 +309,7 @@ func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, 
 	if err != nil {
 		return "", fmt.Errorf("the sandbox image has no linux/amd64 variant: %w", err)
 	}
-	if err := remote.Write(dstRef, img, opts...); err != nil {
+	if err := writeImage(ctx, dstRef, img, opts, log); err != nil {
 		return "", fmt.Errorf("copying the sandbox image: %w", err)
 	}
 	digest, err := img.Digest()
@@ -316,6 +318,40 @@ func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, 
 	}
 	log("Image copied in %s", time.Since(t0).Round(time.Second))
 	return fmt.Sprintf("%s/%s/%s@%s", registryHost, account, imageRepo, digest), nil
+}
+
+// How many times writeImage tries, and its pause after the first failure;
+// later pauses grow.
+var copyAttempts, copyPause = 3, 5 * time.Second
+
+// writeImage pushes img, trying again when an upload fails partway; layers
+// already uploaded are skipped. Twice in a row, an upload to the registry over
+// HTTP/2 failed with "tls: bad record MAC" while HTTP/1.1 then worked, so the
+// retries use HTTP/1.1.
+func writeImage(ctx context.Context, dst name.Reference, img v1.Image, opts []remote.Option, log func(string, ...any)) error {
+	for attempt := 1; ; attempt++ {
+		err := remote.Write(dst, img, opts...)
+		if err == nil || attempt == copyAttempts || ctx.Err() != nil {
+			return err
+		}
+		log("Copying stopped (%v); trying again", err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt) * copyPause):
+		}
+		if attempt == 1 {
+			opts = append(opts, remote.WithTransport(http1Transport()))
+		}
+	}
+}
+
+func http1Transport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ForceAttemptHTTP2 = false
+	t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	t.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+	return t
 }
 
 // r2Problem explains why backups can't be turned on.
