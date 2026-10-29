@@ -47,9 +47,18 @@ the key. `cloudex deploy` asks before replacing a key it doesn't have.
 | `cloudex prompt [sandbox] "task"` | Start Claude Code or Codex on a task in tmux and watch it |
 | `cloudex attach [sandbox]` | Reattach to the newest agent session |
 | `cloudex host [sandbox] <port>` | HTTPS link to a port, on your preview domain |
-| `cloudex stop`, `resume`, `delete` | Save and stop, resume from the save, or delete |
+| `cloudex stop`, `resume [--from-backup]`, `delete` | Save, back up and stop; resume from the save or the backup; or delete |
 | `cloudex login --url <api url>` | Use an existing deployment from another computer |
 | `cloudex doctor`, `status [--show-key]` | Check this computer and the deployment |
+
+**Backups.** Each stop also backs up `/home` (without `~/.cache`) and the SSH
+host keys to an R2 bucket in your account, `cloudex-backups`, keeping the newest
+one per sandbox. A save expires 30 days after it was made or last resumed; after
+that, `resume` restores the backup onto a fresh image instead, and anything
+installed outside `/home` needs installing again. `cloudex resume --from-backup`
+does that on request, and `delete` removes the backups. Backups need R2 turned
+on for the account (the free tier is enough); `cloudex deploy` says when it
+isn't, and `cloudex status` shows whether they're on.
 
 Sandboxes stop and save after `--idle` without SSH, exec, preview or agent
 activity (30 minutes by default), and in any case within Cloudflare's 6-hour
