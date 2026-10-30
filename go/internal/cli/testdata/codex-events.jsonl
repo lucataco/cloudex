@@ -1,0 +1,9 @@
+{"seq":1,"turn":1,"at":1793397564257,"type":"prompt","text":"please run: echo hello from codex && false"}
+{"seq":2,"turn":1,"at":1793397566960,"type":"event","event":{"type":"thread.started","thread_id":"01a18ed3-2ced-73c2-a6a4-d44ef512dff0"}}
+{"seq":3,"turn":1,"at":1793397566994,"type":"event","event":{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `gpt-5` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}}
+{"seq":4,"turn":1,"at":1793397567062,"type":"event","event":{"type":"turn.started"}}
+{"seq":5,"turn":1,"at":1793397567237,"type":"event","event":{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'echo hello from codex && false'","aggregated_output":"","exit_code":null,"status":"in_progress"}}}
+{"seq":6,"turn":1,"at":1793397567238,"type":"event","event":{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'echo hello from codex && false'","aggregated_output":"hello from codex\n","exit_code":1,"status":"failed"}}}
+{"seq":7,"turn":1,"at":1793397567274,"type":"event","event":{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"The command ran."}}}
+{"seq":8,"turn":1,"at":1793397567293,"type":"event","event":{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}}
+{"seq":9,"turn":1,"at":1793397567432,"type":"end","exitCode":0}

@@ -55,6 +55,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex ssh-config >> ~/.ssh/config` | Lets `scp`, `rsync` and editors reach `<sandbox>.cloudex` |
 | `cloudex prompt [sandbox] "task"` | Start Claude Code or Codex on a task in tmux and watch it |
 | `cloudex attach [sandbox]` | Reattach to the newest agent session |
+| `cloudex agents start [sandbox] "task"`, `agents`, `logs -f`, `send`, `interrupt` | Run an agent with no terminal and follow it; send follow-ups or steer it |
 | `cloudex host [sandbox] <port>` | HTTPS link to a port, on your preview domain |
 | `cloudex stop`, `resume [--from-backup]`, `delete` | Save, back up and stop; resume from the save or the backup; or delete |
 | `cloudex login --url <api url>` | Use an existing deployment from another computer |
@@ -125,10 +126,10 @@ is saved with the disk, and copied into forks.
 
 The [TypeScript SDK](packages/sdk) and the [Python SDK](python) do what the CLI
 does from code: create, fork, exec, host links, desktop, stop and resume. They
-also drive agents: start Claude Code or Codex on a task with no terminal, follow
-its events, send it follow-ups, and interrupt or steer it. The agent and its
-conversation live on the sandbox's disk, so a fork can take the same
-conversation somewhere else. The SDKs use the deployment the CLI saved, or an
+also drive agents, like `cloudex agents`: start Claude Code or Codex on a task
+with no terminal, follow its events, send it follow-ups, and interrupt or steer
+it. The agent and its conversation live on the sandbox's disk, so a fork can
+take the same conversation somewhere else. The SDKs use the deployment the CLI saved, or an
 API URL and key you pass in.
 
 ```sh

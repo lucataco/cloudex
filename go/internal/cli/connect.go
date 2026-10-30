@@ -112,7 +112,7 @@ func newHostCmd(opts *options) *cobra.Command {
 	}
 }
 
-var agents = map[string]bool{"claude": true, "codex": true}
+var agentKinds = map[string]bool{"claude": true, "codex": true}
 
 func newPromptCmd(opts *options) *cobra.Command {
 	var agent string
@@ -130,7 +130,7 @@ func newPromptCmd(opts *options) *cobra.Command {
 		Example: "  cloudex prompt \"make the tests pass\"\n  cloudex prompt my-box --agent codex \"add a dark mode\"",
 		Args:    cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !agents[agent] {
+			if !agentKinds[agent] {
 				return fmt.Errorf("unknown agent %q: use claude or codex", agent)
 			}
 			named := ""

@@ -91,6 +91,55 @@ function clip(buf: ArrayBuffer) {
   return buf.byteLength > OUTPUT_LIMIT ? `${text}\n[cloudex: output cut at 1 MiB of ${buf.byteLength} bytes]` : text;
 }
 
+// How long exec keeps reading output after the command exits. Something it
+// started in the background, such as `npm run dev &`, holds the output open
+// for as long as it runs, and exec doesn't wait for that.
+const EXIT_GRACE_MS = 500;
+
+// Reads a process's stdout and stderr until it exits, then for EXIT_GRACE_MS
+// more, keeping the first OUTPUT_LIMIT bytes of each.
+async function readOutput(p: ExecProcess) {
+  let stop!: () => void;
+  const stopped = new Promise<void>((resolve) => (stop = resolve));
+  const read = async (stream: ReadableStream | null) => {
+    const kept: Uint8Array[] = [];
+    let size = 0;
+    let total = 0;
+    if (stream) {
+      const reader = stream.getReader();
+      void stopped.then(() => reader.cancel().catch(() => {}));
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = value instanceof Uint8Array ? value : new Uint8Array(value as ArrayBuffer);
+          total += chunk.byteLength;
+          if (size < OUTPUT_LIMIT) {
+            const part = chunk.subarray(0, OUTPUT_LIMIT - size);
+            kept.push(part);
+            size += part.byteLength;
+          }
+        }
+      } catch {
+        // cancelled after the grace period
+      }
+    }
+    const text = new TextDecoder().decode(await new Blob(kept).arrayBuffer());
+    return total > OUTPUT_LIMIT ? `${text}\n[cloudex: output cut at 1 MiB of ${total} bytes]` : text;
+  };
+  const output = Promise.all([read(p.stdout), read(p.stderr)]);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const exitCode = await p.exitCode;
+    timer = setTimeout(stop, EXIT_GRACE_MS);
+    const [stdout, stderr] = await output;
+    return { exitCode, stdout, stderr };
+  } finally {
+    if (timer) clearTimeout(timer);
+    stop();
+  }
+}
+
 export class Sandbox extends DurableObject<Env> {
   private record: SandboxRecord | undefined;
   private queue: Promise<unknown> = Promise.resolve();
@@ -117,6 +166,14 @@ export class Sandbox extends DurableObject<Env> {
   private mustRecord(): SandboxRecord {
     if (!this.record) fail(404, "no such sandbox");
     return this.record;
+  }
+
+  // The record of a running sandbox, for work inside it, which counts as activity.
+  private mustRun(): SandboxRecord {
+    const r = this.mustRecord();
+    if (r.state !== "running") fail(409, `${r.name ?? r.id} is ${r.state}; resume it first`);
+    this.touch();
+    return r;
   }
 
   // Lifecycle changes run one at a time.
@@ -562,9 +619,7 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   async exec(input: ExecInput): Promise<ExecResult> {
-    const r = this.mustRecord();
-    if (r.state !== "running") fail(409, `${r.id} is ${r.state}; resume it first`);
-    this.touch();
+    this.mustRun();
     const ctl = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -581,14 +636,8 @@ export class Sandbox extends DurableObject<Env> {
         ...(input.root ? {} : { user: GUEST_USER }),
         signal: ctl.signal,
       });
-      const out = await p.output();
-      return {
-        exitCode: out.exitCode,
-        stdout: clip(out.stdout),
-        stderr: clip(out.stderr),
-        timedOut,
-        ms: Date.now() - t0,
-      };
+      const out = await readOutput(p);
+      return { ...out, timedOut, ms: Date.now() - t0 };
     } finally {
       clearTimeout(timer);
       this.touch();
@@ -599,9 +648,7 @@ export class Sandbox extends DurableObject<Env> {
   // login shell, so agents get the provider key placeholders. A prompt goes in
   // on standard input. Returns the script's JSON.
   async agentOp(op: string, args: string[], prompt?: string, waitSec = 0): Promise<unknown> {
-    const r = this.mustRecord();
-    if (r.state !== "running") fail(409, `${r.id} is ${r.state}; resume it first`);
-    this.touch();
+    const r = this.mustRun();
     try {
       const out = await this.asGuest([AGENT_BOOT, AGENT_SCRIPT, op, ...args], `agent ${op}`, (waitSec + 60) * 1000, prompt);
       const why = new TextDecoder().decode(out.stderr).trim().split("\n").pop() ?? "";
@@ -639,9 +686,7 @@ export class Sandbox extends DurableObject<Env> {
 
   // Starts the desktop, installing it the first time, or resizes a running one.
   async desktop(size: string): Promise<Desktop> {
-    const r = this.mustRecord();
-    if (r.state !== "running") fail(409, `${r.id} is ${r.state}; resume it first`);
-    this.touch();
+    const r = this.mustRun();
     const t0 = Date.now();
     try {
       const out = await this.runScript(DESKTOP_SCRIPT, [size, r.name ?? r.id], "starting the desktop", DESKTOP_TIMEOUT_MS);

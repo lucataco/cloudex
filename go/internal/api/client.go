@@ -319,3 +319,92 @@ func (c *Client) DialTCP(ctx context.Context, ref string, port int, sshKey strin
 	conn.SetReadLimit(-1)
 	return conn, nil
 }
+
+// Agent mirrors the API's agent record: Claude Code or Codex working through
+// messages in a sandbox, one headless turn per message.
+type Agent struct {
+	ID           string  `json:"id"`
+	Agent        string  `json:"agent"`
+	State        string  `json:"state"` // running or idle
+	Cwd          string  `json:"cwd"`
+	Model        *string `json:"model"`
+	Turns        int     `json:"turns"`
+	Queued       int     `json:"queued"`
+	Events       int     `json:"events"`
+	SessionID    *string `json:"sessionId"`
+	LastMessage  *string `json:"lastMessage"`
+	LastExitCode *int    `json:"lastExitCode"`
+	Error        *string `json:"error"`
+	CreatedAt    int64   `json:"createdAt"`
+	UpdatedAt    int64   `json:"updatedAt"`
+}
+
+type StartAgentRequest struct {
+	Prompt string `json:"prompt"`
+	Agent  string `json:"agent,omitempty"`
+	Cwd    string `json:"cwd,omitempty"`
+	Model  string `json:"model,omitempty"`
+}
+
+// AgentEvent is one line of an agent's log. Event is the agent's own JSON
+// event (Claude Code's stream-json or Codex's exec --json), as it printed it.
+type AgentEvent struct {
+	Seq         int             `json:"seq"`
+	Turn        int             `json:"turn"`
+	At          int64           `json:"at"`
+	Type        string          `json:"type"` // prompt, event, output or end
+	Text        string          `json:"text,omitempty"`
+	Event       json.RawMessage `json:"event,omitempty"`
+	Truncated   bool            `json:"truncated,omitempty"`
+	ExitCode    *int            `json:"exitCode,omitempty"`
+	Interrupted bool            `json:"interrupted,omitempty"`
+	Error       *string         `json:"error,omitempty"`
+}
+
+type AgentEvents struct {
+	Events []AgentEvent `json:"events"`
+	Next   int          `json:"next"` // pass as after for the events that follow
+	Agent  Agent        `json:"agent"`
+}
+
+func agentPath(ref, id string) string {
+	return "/v1/sandboxes/" + url.PathEscape(ref) + "/agents/" + url.PathEscape(id)
+}
+
+func (c *Client) StartAgent(ctx context.Context, ref string, r StartAgentRequest) (*Agent, error) {
+	var a Agent
+	return &a, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/agents", r, &a)
+}
+
+func (c *Client) ListAgents(ctx context.Context, ref string) ([]Agent, error) {
+	var list []Agent
+	return list, c.do(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/agents", nil, &list)
+}
+
+func (c *Client) GetAgent(ctx context.Context, ref, id string) (*Agent, error) {
+	var a Agent
+	return &a, c.do(ctx, http.MethodGet, agentPath(ref, id), nil, &a)
+}
+
+// AgentEvents returns the events after seq after. With wait (at most 60
+// seconds), the API answers as soon as there are some, the agent goes idle,
+// or the seconds pass.
+func (c *Client) AgentEvents(ctx context.Context, ref, id string, after, wait int) (*AgentEvents, error) {
+	var ev AgentEvents
+	q := url.Values{"after": {fmt.Sprint(after)}, "wait": {fmt.Sprint(wait)}}
+	return &ev, c.do(ctx, http.MethodGet, agentPath(ref, id)+"/events?"+q.Encode(), nil, &ev)
+}
+
+// SendAgent queues a message for the agent's next turn; with interrupt, it
+// stops the running turn and drops queued messages first.
+func (c *Client) SendAgent(ctx context.Context, ref, id, prompt string, interrupt bool) (*Agent, error) {
+	var a Agent
+	body := map[string]any{"prompt": prompt, "interrupt": interrupt}
+	return &a, c.do(ctx, http.MethodPost, agentPath(ref, id)+"/messages", body, &a)
+}
+
+// InterruptAgent stops the running turn and drops queued messages.
+func (c *Client) InterruptAgent(ctx context.Context, ref, id string) (*Agent, error) {
+	var a Agent
+	return &a, c.do(ctx, http.MethodPost, agentPath(ref, id)+"/interrupt", nil, &a)
+}
