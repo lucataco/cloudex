@@ -107,6 +107,81 @@ export const ProviderKey = z.object({
 });
 export type ProviderKey = z.infer<typeof ProviderKey>;
 
+// Agents: Claude Code or Codex working on a task in a sandbox, without a
+// terminal. Each message is one turn of the agent's own conversation; a message
+// sent while a turn runs waits for it, or with interrupt, cuts it short. The
+// conversation lives on the sandbox's disk, so saves, resumes and forks keep it.
+export const AgentKind = z.enum(["claude", "codex"]);
+export type AgentKind = z.infer<typeof AgentKind>;
+
+// Up to 1 MB: prompts reach the sandbox on standard input, not the command line.
+const Prompt = z.string().min(1).max(1_000_000);
+
+export const StartAgent = z.object({
+  prompt: Prompt,
+  agent: AgentKind.default("claude"),
+  // The directory to work in, default the home directory.
+  cwd: z.string().min(1).max(4096).optional(),
+  // The agent's model, such as opus or gpt-5; default the agent's own default.
+  model: z.string().regex(/^[\w.:/@[\]-]{1,100}$/, "a model name").optional(),
+});
+export type StartAgent = z.input<typeof StartAgent>;
+
+export const AgentMessage = z.object({
+  prompt: Prompt,
+  // Stop the running turn, and drop any queued messages, before this one.
+  interrupt: z.boolean().default(false),
+});
+export type AgentMessage = z.input<typeof AgentMessage>;
+
+export const AgentState = z.enum(["running", "idle"]);
+export type AgentState = z.infer<typeof AgentState>;
+
+export const Agent = z.object({
+  id: z.string(),
+  agent: AgentKind,
+  // running while a turn is in progress or messages are queued, idle otherwise.
+  state: AgentState,
+  cwd: z.string(),
+  model: z.string().nullable(),
+  turns: z.number().int(), // turns started so far
+  queued: z.number().int(), // messages waiting for the running turn
+  events: z.number().int(), // events so far; the next one's seq is this plus 1
+  // The agent's own conversation id: Claude Code's session or Codex's thread.
+  sessionId: z.string().nullable(),
+  // The agent's final message in the last finished turn, and how that turn ended.
+  lastMessage: z.string().nullable(),
+  lastExitCode: z.number().int().nullable(),
+  error: z.string().nullable(),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+});
+export type Agent = z.infer<typeof Agent>;
+
+// One line of an agent's log. A turn is a prompt, then the agent's own JSON
+// events (Claude Code's stream-json or Codex's exec --json) and any other
+// output lines, then an end.
+export const AgentEvent = z.object({
+  seq: z.number().int(), // from 1
+  turn: z.number().int(),
+  at: z.number().int(),
+  type: z.enum(["prompt", "event", "output", "end"]),
+  text: z.string().optional(), // the prompt, or an output line that isn't JSON
+  event: z.record(z.string(), z.unknown()).optional(), // the agent's event, as it printed it
+  truncated: z.boolean().optional(), // a line over 256 KiB, cut to its first 4 KiB of text
+  exitCode: z.number().int().optional(), // end: the agent's exit code
+  interrupted: z.boolean().optional(), // end: the turn was interrupted, or the sandbox stopped
+  error: z.string().nullable().optional(), // end: why the turn failed
+});
+export type AgentEvent = z.infer<typeof AgentEvent>;
+
+export const AgentEvents = z.object({
+  events: z.array(AgentEvent),
+  next: z.number().int(), // pass as after to get the events that follow
+  agent: Agent,
+});
+export type AgentEvents = z.infer<typeof AgentEvents>;
+
 export const HostRequest = z.object({ port: z.number().int().min(1).max(65535) });
 export const HostResult = z.object({ url: z.string() });
 export type HostResult = z.infer<typeof HostResult>;

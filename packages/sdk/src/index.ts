@@ -97,6 +97,75 @@ export interface Desktop {
   started: boolean;
 }
 
+export type AgentKind = "claude" | "codex";
+export type AgentState = "running" | "idle";
+
+export interface PromptOptions {
+  /** Default claude. */
+  agent?: AgentKind;
+  /** The directory to work in; default the home directory. */
+  cwd?: string;
+  /** The agent's model, such as opus or gpt-5; default the agent's own. */
+  model?: string;
+}
+
+/** An agent as the API reports it. Times are milliseconds since the epoch. */
+export interface AgentInfo {
+  id: string;
+  agent: AgentKind;
+  /** running while a turn is in progress or messages are queued. */
+  state: AgentState;
+  cwd: string;
+  model: string | null;
+  /** Turns started so far. */
+  turns: number;
+  /** Messages waiting for the running turn. */
+  queued: number;
+  /** Events so far. */
+  events: number;
+  /** The agent's own conversation id: Claude Code's session or Codex's thread. */
+  sessionId: string | null;
+  /** The agent's final message in the last finished turn. */
+  lastMessage: string | null;
+  lastExitCode: number | null;
+  /** Why the last turn failed. */
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/**
+ * One line of an agent's log. A turn is a prompt, then the agent's own JSON
+ * events (Claude Code's stream-json or Codex's exec --json) and any other
+ * output lines, then an end.
+ */
+export interface AgentEvent {
+  /** From 1. */
+  seq: number;
+  turn: number;
+  at: number;
+  type: "prompt" | "event" | "output" | "end";
+  /** The prompt, or an output line that isn't JSON. */
+  text?: string;
+  /** The agent's event, as it printed it. */
+  event?: Record<string, unknown>;
+  /** A line over 256 KiB, cut to its first 4 KiB of text. */
+  truncated?: boolean;
+  /** end: the agent's exit code. */
+  exitCode?: number;
+  /** end: the turn was interrupted, or the sandbox stopped. */
+  interrupted?: boolean;
+  /** end: why the turn failed. */
+  error?: string | null;
+}
+
+export interface AgentEvents {
+  events: AgentEvent[];
+  /** Pass as after to get the events that follow. */
+  next: number;
+  agent: AgentInfo;
+}
+
 export interface Health {
   ok: true;
   version: string;
@@ -313,12 +382,118 @@ export class Sandbox {
     await this.#call("DELETE", this.#path("/desktop"));
   }
 
+  /**
+   * Starts Claude Code (or Codex) on a task, with no terminal, and answers at
+   * once. Follow it with agent.events() or agent.wait(), and continue the
+   * conversation with agent.send(). With provider keys set, it needs no sign-in.
+   */
+  async prompt(prompt: string, options: PromptOptions = {}): Promise<Agent> {
+    const info = await this.#call<AgentInfo>("POST", this.#path("/agents"), { prompt, ...options });
+    return new Agent(info, this.#path(`/agents/${info.id}`), this.#call);
+  }
+
+  /** The agents started in this sandbox, newest first. */
+  async agents(): Promise<Agent[]> {
+    const list = await this.#call<AgentInfo[]>("GET", this.#path("/agents"));
+    return list.map((info) => new Agent(info, this.#path(`/agents/${info.id}`), this.#call));
+  }
+
+  /** An agent by id (ag-xxxxxxxx). */
+  async agent(id: string): Promise<Agent> {
+    const path = this.#path(`/agents/${encodeURIComponent(id)}`);
+    return new Agent(await this.#call<AgentInfo>("GET", path), path, this.#call);
+  }
+
   #path(suffix: string) {
     return sandboxPath(this.#info.id) + suffix;
   }
 
   async #update(method: string, suffix: string, body?: unknown): Promise<this> {
     this.#info = await this.#call<SandboxInfo>(method, this.#path(suffix), body);
+    return this;
+  }
+}
+
+/**
+ * Claude Code or Codex working on a task in a sandbox. Its fields are as of the
+ * last call that returned it; refresh(), events() and wait() update them.
+ */
+export class Agent {
+  #info: AgentInfo;
+  #path: string;
+  #call: Call;
+
+  /** @internal Get agents from Sandbox.prompt, agents or agent. */
+  constructor(info: AgentInfo, path: string, call: Call) {
+    this.#info = info;
+    this.#path = path;
+    this.#call = call;
+  }
+
+  get id(): string {
+    return this.#info.id;
+  }
+  get state(): AgentState {
+    return this.#info.state;
+  }
+  /** The agent's final message in the last finished turn. */
+  get lastMessage(): string | null {
+    return this.#info.lastMessage;
+  }
+  /** Why the last turn failed. */
+  get error(): string | null {
+    return this.#info.error;
+  }
+  get info(): AgentInfo {
+    return this.#info;
+  }
+
+  toJSON(): AgentInfo {
+    return this.#info;
+  }
+
+  async refresh(): Promise<this> {
+    this.#info = await this.#call<AgentInfo>("GET", this.#path);
+    return this;
+  }
+
+  /**
+   * Continues the conversation. While a turn runs the message waits for it;
+   * with interrupt, the running turn stops and queued messages are dropped first.
+   */
+  async send(prompt: string, options: { interrupt?: boolean } = {}): Promise<this> {
+    this.#info = await this.#call<AgentInfo>("POST", `${this.#path}/messages`, { prompt, ...options });
+    return this;
+  }
+
+  /** Stops the running turn and drops queued messages. */
+  async interrupt(): Promise<this> {
+    this.#info = await this.#call<AgentInfo>("POST", `${this.#path}/interrupt`);
+    return this;
+  }
+
+  /**
+   * The agent's events from after (default 0, the start). With follow (the
+   * default), it waits for new ones until the agent is idle; without, it stops
+   * at the newest.
+   */
+  async *events(options: { after?: number; follow?: boolean } = {}): AsyncGenerator<AgentEvent> {
+    const follow = options.follow ?? true;
+    let after = options.after ?? 0;
+    for (;;) {
+      const page = await this.#call<AgentEvents>("GET", `${this.#path}/events?after=${after}&wait=${follow ? 30 : 0}`);
+      this.#info = page.agent;
+      yield* page.events;
+      after = page.next;
+      if (after >= page.agent.events && (!follow || page.agent.state === "idle")) return;
+    }
+  }
+
+  /** Waits until the agent is idle; then lastMessage and error tell how its last turn went. */
+  async wait(): Promise<this> {
+    for await (const _ of this.events({ after: this.#info.events })) {
+      // Only the end matters.
+    }
     return this;
   }
 }

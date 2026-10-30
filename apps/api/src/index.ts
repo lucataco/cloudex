@@ -4,6 +4,7 @@
 import { Hono } from "hono";
 import { ZodError } from "zod";
 import {
+  AgentMessage,
   CreateSandbox,
   DesktopRequest,
   ExecRequest,
@@ -13,13 +14,16 @@ import {
   Provider,
   ResumeRequest,
   SetProviderKey,
+  StartAgent,
   type Health,
 } from "@cloudex/schema";
+import { z } from "zod";
 import { openapi } from "@cloudex/schema/openapi";
+import { isAgentId } from "./agents";
 import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
 import { deleteKey, listKeys, setKey } from "./keys";
-import { errorStatus, fail, isSandboxId, newSandboxId, previewToken, sameSecret } from "./util";
+import { errorStatus, fail, isSandboxId, newAgentId, newSandboxId, previewToken, sameSecret } from "./util";
 
 export { Sandbox } from "./sandbox";
 export { Egress } from "./egress";
@@ -162,6 +166,53 @@ app.delete("/v1/sandboxes/:ref/desktop", async (c) => {
   const ref = c.req.param("ref");
   return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.stopDesktop()));
 });
+
+// Agents: Claude Code or Codex on a task with no terminal (agents.ts). Each
+// call runs a script in the sandbox, which keeps the agent's state.
+async function agentOp(env: Env, ref: string, op: string, args: string[], prompt?: string, waitSec?: number) {
+  const { stub } = await sandbox(env, ref);
+  return newMethod(ref, stub.agentOp(op, args, prompt, waitSec));
+}
+
+function agentId(id: string) {
+  if (!isAgentId(id)) fail(404, `no agent ${id}`);
+  return id;
+}
+
+const EventsQuery = z.object({
+  after: z.coerce.number().int().min(0).default(0),
+  wait: z.coerce.number().int().min(0).max(60).default(0),
+});
+
+app.post("/v1/sandboxes/:ref/agents", async (c) => {
+  const input = StartAgent.parse(await c.req.json());
+  const args = [newAgentId(), input.agent, input.cwd ?? "", input.model ?? ""];
+  return c.json(await agentOp(c.env, c.req.param("ref"), "start", args, input.prompt), 201);
+});
+
+app.get("/v1/sandboxes/:ref/agents", async (c) => c.json(await agentOp(c.env, c.req.param("ref"), "list", [])));
+
+app.get("/v1/sandboxes/:ref/agents/:agent", async (c) =>
+  c.json(await agentOp(c.env, c.req.param("ref"), "get", [agentId(c.req.param("agent"))])),
+);
+
+// Long polling: with wait, answers as soon as there are events after `after`,
+// the agent goes idle, or the seconds pass.
+app.get("/v1/sandboxes/:ref/agents/:agent/events", async (c) => {
+  const { after, wait } = EventsQuery.parse(c.req.query());
+  const args = [agentId(c.req.param("agent")), String(after), String(wait)];
+  return c.json(await agentOp(c.env, c.req.param("ref"), "events", args, undefined, wait));
+});
+
+app.post("/v1/sandboxes/:ref/agents/:agent/messages", async (c) => {
+  const id = agentId(c.req.param("agent"));
+  const { prompt, interrupt } = AgentMessage.parse(await c.req.json());
+  return c.json(await agentOp(c.env, c.req.param("ref"), "send", [id, interrupt ? "1" : "0"], prompt));
+});
+
+app.post("/v1/sandboxes/:ref/agents/:agent/interrupt", async (c) =>
+  c.json(await agentOp(c.env, c.req.param("ref"), "interrupt", [agentId(c.req.param("agent"))])),
+);
 
 // WebSocket to a guest TCP port: `cloudex ssh` and `cloudex proxy` use port 22.
 app.get("/v1/sandboxes/:ref/tcp/:port{[0-9]+}", async (c) => {

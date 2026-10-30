@@ -2,6 +2,9 @@
 // part of the published package.
 import type * as schema from "@cloudex/schema";
 import type {
+  AgentEvent,
+  AgentEvents,
+  AgentInfo,
   CreateOptions,
   Desktop,
   ExecOptions,
@@ -9,6 +12,7 @@ import type {
   ForkOptions,
   Health,
   Provider,
+  PromptOptions,
   ProviderKey,
   SandboxInfo,
 } from "./index.ts";
@@ -37,4 +41,9 @@ export const checks: [
   Same<Provider, schema.Provider>,
   Same<ProviderKey, schema.ProviderKey>,
   Same<{ key: string }, schema.SetProviderKey>,
-] = [true, true, true, true, true, true, true, true, true, true, true];
+  Same<PromptOptions & { prompt: string }, schema.StartAgent>,
+  Same<{ prompt: string; interrupt?: boolean }, schema.AgentMessage>,
+  Same<AgentInfo, schema.Agent>,
+  Same<AgentEvent, schema.AgentEvent>,
+  Same<AgentEvents, schema.AgentEvents>,
+] = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];

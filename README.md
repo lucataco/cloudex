@@ -115,7 +115,11 @@ is saved with the disk, and copied into forks.
 
 The [TypeScript SDK](packages/sdk) and the [Python SDK](python) do what the CLI
 does from code: create, fork, exec, host links, desktop, stop and resume. They
-use the deployment the CLI saved, or an API URL and key you pass in.
+also drive agents: start Claude Code or Codex on a task with no terminal, follow
+its events, send it follow-ups, and interrupt or steer it. The agent and its
+conversation live on the sandbox's disk, so a fork can take the same
+conversation somewhere else. The SDKs use the deployment the CLI saved, or an
+API URL and key you pass in.
 
 ```sh
 npm install cloudex
@@ -129,6 +133,11 @@ The API describes itself at `<your API URL>/v1/openapi.json`.
 const box = await new Cloudex().create({ name: "web" });
 const forks = await box.fork({ count: 10 });
 await Promise.all(forks.map((f) => f.exec("npm test")));
+
+const agent = await box.prompt("make the tests pass"); // Claude Code; { agent: "codex" } for Codex
+for await (const event of agent.events()) console.log(event.type, event.event ?? event.text ?? "");
+console.log(agent.lastMessage);
+await (await agent.send("now update the docs")).wait();
 ```
 
 ## Layout

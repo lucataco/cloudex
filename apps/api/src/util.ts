@@ -18,6 +18,7 @@ function randomString(n: number) {
 }
 
 export const newSandboxId = () => `cx-${randomString(6)}`;
+export const newAgentId = () => `ag-${randomString(8)}`;
 
 export const isSandboxId = (s: string) => /^cx-[a-z0-9]{6}$/.test(s);
 

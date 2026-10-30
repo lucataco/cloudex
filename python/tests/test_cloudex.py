@@ -160,6 +160,37 @@ class CloudexTest(unittest.TestCase):
         self.cx.delete_key("anthropic")
         self.assertEqual(FakeAPI.seen[-1]["route"], "DELETE /v1/keys/anthropic")
 
+    def test_agents(self):
+        def agent(**extra):
+            base = {"id": "ag-aaaa1111", "agent": "claude", "state": "running", "cwd": "/home/cloudex", "model": None,
+                    "turns": 1, "queued": 0, "events": 1, "sessionId": None, "lastMessage": None,
+                    "lastExitCode": None, "error": None, "createdAt": 1, "updatedAt": 1}
+            base.update(extra)
+            return base
+
+        path = "/v1/sandboxes/cx-aaa111/agents/ag-aaaa1111"
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/agents"] = (201, agent(turns=0, events=0))
+        FakeAPI.routes[f"GET {path}/events?after=0&wait=25"] = (200, {
+            "events": [{"seq": 1, "turn": 1, "at": 1, "type": "prompt", "text": "fix it"}],
+            "next": 1, "agent": agent(events=2)})
+        FakeAPI.routes[f"GET {path}/events?after=1&wait=25"] = (200, {
+            "events": [{"seq": 2, "turn": 1, "at": 2, "type": "end", "exitCode": 0}],
+            "next": 2, "agent": agent(state="idle", events=2, lastMessage="fixed")})
+        FakeAPI.routes[f"GET {path}/events?after=2&wait=25"] = (200, {"events": [], "next": 2, "agent": agent(state="idle", events=2, lastMessage="fixed")})
+        FakeAPI.routes[f"POST {path}/messages"] = (200, agent(queued=1))
+        FakeAPI.routes[f"POST {path}/interrupt"] = (200, agent(state="idle", error="interrupted"))
+
+        a = self.cx.get("web").prompt("fix it", agent="codex")
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"prompt": "fix it", "agent": "codex"})
+        self.assertEqual([e["type"] for e in a.events()], ["prompt", "end"])
+        self.assertEqual((a.state, a.last_message), ("idle", "fixed"))
+        self.assertIs(a.wait(), a)
+        self.assertEqual(FakeAPI.seen[-1]["route"], f"GET {path}/events?after=2&wait=25")
+        a.send("and the docs", interrupt=True)
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"prompt": "and the docs", "interrupt": True})
+        self.assertEqual(a.interrupt().error, "interrupted")
+
     def test_unreachable_api(self):
         with self.assertRaises(CloudexError) as caught:
             Cloudex("http://127.0.0.1:9", "k").list()

@@ -16,6 +16,8 @@
 // - AI provider keys (keys.ts) are set up at each start for the providers that
 //   have one then: the sandbox gets placeholders, and the real keys are added
 //   to its HTTPS calls to those providers on the way out.
+// - Agents started through the API (agents.ts) run and keep their state in the
+//   guest; this object only passes each call to a script there.
 import { DurableObject } from "cloudflare:workers";
 import type { Desktop, ExecResult, Sandbox as SandboxRecord, SandboxSize } from "@cloudex/schema";
 import {
@@ -29,6 +31,7 @@ import {
   latestBackup,
   writeManifest,
 } from "./backup";
+import { AGENT_BAD_REQUEST, AGENT_BOOT, AGENT_NOT_FOUND, AGENT_SCRIPT } from "./agents";
 import { deleteSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } from "./desktop";
 import { KEYS_SCRIPT, PROVIDERS, listKeys } from "./keys";
@@ -482,6 +485,38 @@ export class Sandbox extends DurableObject<Env> {
         timedOut,
         ms: Date.now() - t0,
       };
+    } finally {
+      clearTimeout(timer);
+      this.touch();
+    }
+  }
+
+  // One operation of the agent script (agents.ts), as the guest user from a
+  // login shell, so agents get the provider key placeholders. A prompt goes in
+  // on standard input. Returns the script's JSON.
+  async agentOp(op: string, args: string[], prompt?: string, waitSec = 0): Promise<unknown> {
+    const r = this.mustRecord();
+    if (r.state !== "running") fail(409, `${r.id} is ${r.state}; resume it first`);
+    this.touch();
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), (waitSec + 60) * 1000);
+    try {
+      const p = await this.container.exec(["bash", "-lc", AGENT_BOOT, "cloudex", AGENT_SCRIPT, op, ...args], {
+        cwd: GUEST_HOME,
+        env: { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8" },
+        user: GUEST_USER,
+        ...(prompt === undefined ? {} : { stdin: new Response(prompt).body! }),
+        signal: ctl.signal,
+      });
+      const out = await p.output();
+      const why = new TextDecoder().decode(out.stderr).trim().split("\n").pop() ?? "";
+      if (out.exitCode === AGENT_NOT_FOUND) fail(404, `${why} in ${r.name ?? r.id}`);
+      if (out.exitCode === AGENT_BAD_REQUEST) fail(400, why);
+      if (out.exitCode !== 0) throw new Error(`agent ${op} failed (exit ${out.exitCode}): ${why}`);
+      return JSON.parse(new TextDecoder().decode(out.stdout));
+    } catch (e) {
+      if (ctl.signal.aborted) throw new Error(`agent ${op} took too long`);
+      throw e;
     } finally {
       clearTimeout(timer);
       this.touch();

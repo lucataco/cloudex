@@ -175,3 +175,68 @@ test("provider keys: set, list, delete", async () => {
   await cx.deleteKey("openai");
   assert.equal(seen.at(-1)?.route, "DELETE /v1/keys/openai");
 });
+
+const agentInfo = (extra: object = {}) => ({
+  id: "ag-aaaa1111",
+  agent: "claude",
+  state: "running",
+  cwd: "/home/cloudex",
+  model: null,
+  turns: 1,
+  queued: 0,
+  events: 1,
+  sessionId: null,
+  lastMessage: null,
+  lastExitCode: null,
+  error: null,
+  createdAt: 1,
+  updatedAt: 1,
+  ...extra,
+});
+
+test("agents: prompt, follow the events to idle, send, interrupt", async () => {
+  const path = "/v1/sandboxes/cx-aaa111/agents/ag-aaaa1111";
+  const ev = (seq: number, type: string, extra: object = {}) => ({ seq, turn: 1, at: seq, type, ...extra });
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["POST /v1/sandboxes/cx-aaa111/agents"] = [201, agentInfo({ turns: 0, events: 0 })];
+  routes[`GET ${path}/events?after=0&wait=30`] = [
+    200,
+    { events: [ev(1, "prompt", { text: "fix it" }), ev(2, "event", { event: { type: "system" } })], next: 2, agent: agentInfo({ events: 3 }) },
+  ];
+  routes[`GET ${path}/events?after=2&wait=30`] = [
+    200,
+    { events: [ev(3, "end", { exitCode: 0 })], next: 3, agent: agentInfo({ state: "idle", events: 3, lastMessage: "fixed" }) },
+  ];
+  routes[`POST ${path}/messages`] = [200, agentInfo({ queued: 1 })];
+  routes[`POST ${path}/interrupt`] = [200, agentInfo({ state: "idle", error: "interrupted" })];
+
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  const agent = await box.prompt("fix it", { agent: "codex", cwd: "app" });
+  assert.deepEqual(seen.at(-1)?.body, { prompt: "fix it", agent: "codex", cwd: "app" });
+  const types: string[] = [];
+  for await (const e of agent.events()) types.push(e.type);
+  assert.deepEqual(types, ["prompt", "event", "end"]);
+  assert.equal(agent.state, "idle");
+  assert.equal(agent.lastMessage, "fixed");
+
+  await agent.send("and the docs", { interrupt: true });
+  assert.deepEqual(seen.at(-1)?.body, { prompt: "and the docs", interrupt: true });
+  assert.equal(agent.info.queued, 1);
+  await agent.interrupt();
+  assert.equal(agent.error, "interrupted");
+});
+
+test("agents: wait reads only new events, and events without follow stop at the newest", async () => {
+  const path = "/v1/sandboxes/cx-aaa111/agents/ag-aaaa1111";
+  routes[`GET /v1/sandboxes/cx-aaa111/agents`] = [200, [agentInfo({ events: 7 })]];
+  routes[`GET ${path}/events?after=7&wait=30`] = [200, { events: [], next: 7, agent: agentInfo({ state: "idle", events: 7, lastMessage: "done" }) }];
+  routes[`GET ${path}/events?after=5&wait=0`] = [200, { events: [], next: 7, agent: agentInfo({ events: 7 }) }];
+  routes["GET /v1/sandboxes/cx-aaa111"] = [200, info("cx-aaa111")];
+  const [agent] = await (await new Cloudex({ apiUrl: url, apiKey: "k" }).get("cx-aaa111")).agents();
+  await agent!.wait();
+  assert.equal(agent!.lastMessage, "done");
+  const quick = [];
+  for await (const e of agent!.events({ after: 5, follow: false })) quick.push(e);
+  assert.deepEqual(quick, []);
+  assert.equal(seen.at(-1)?.route, `GET ${path}/events?after=5&wait=0`);
+});

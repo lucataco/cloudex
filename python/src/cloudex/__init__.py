@@ -9,6 +9,11 @@ account, using only the standard library.
     box = cx.create(name="web")
     print(box.exec("uname -a").stdout)
     forks = box.fork(count=3, name="try")
+
+    agent = box.prompt("make the tests pass")  # Claude Code, with no terminal
+    for event in agent.events():
+        print(event["type"])
+    print(agent.last_message)
 """
 
 from __future__ import annotations
@@ -21,10 +26,10 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
-__all__ = ["Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "ProviderKey", "Sandbox"]
-__version__ = "0.1.7"
+__all__ = ["Agent", "Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "ProviderKey", "Sandbox"]
+__version__ = "0.1.10"
 
 
 class CloudexError(Exception):
@@ -295,3 +300,104 @@ class Sandbox:
 
     def stop_desktop(self) -> None:
         self._client._call("DELETE", self._path("/desktop"))
+
+    def prompt(
+        self,
+        prompt: str,
+        agent: Optional[str] = None,
+        cwd: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> "Agent":
+        """Starts Claude Code (or agent="codex") on a task, with no terminal, and returns at once.
+
+        Follow it with events() or wait(), and continue the conversation with
+        send(). cwd defaults to the home directory, model to the agent's own.
+        With provider keys set, it needs no sign-in.
+        """
+        info = self._client._call("POST", self._path("/agents"), _drop_none(prompt=prompt, agent=agent, cwd=cwd, model=model))
+        return Agent(self._client, self._path("/agents/" + info["id"]), info)
+
+    def agents(self) -> List["Agent"]:
+        """The agents started in this sandbox, newest first."""
+        return [Agent(self._client, self._path("/agents/" + i["id"]), i) for i in self._client._call("GET", self._path("/agents"))]
+
+    def agent(self, id: str) -> "Agent":
+        """An agent by id (ag-xxxxxxxx)."""
+        path = self._path("/agents/" + urllib.parse.quote(id, safe=""))
+        return Agent(self._client, path, self._client._call("GET", path))
+
+
+class Agent:
+    """Claude Code or Codex working on a task in a sandbox.
+
+    Its fields are as of the last call that returned it; refresh(), events()
+    and wait() update them. info holds everything the API reports.
+    """
+
+    def __init__(self, client: Cloudex, path: str, info: Dict[str, Any]):
+        self._client = client
+        self._path = path
+        self.info = info
+
+    @property
+    def id(self) -> str:
+        return self.info["id"]
+
+    @property
+    def state(self) -> str:
+        """running while a turn is in progress or messages are queued, idle otherwise."""
+        return self.info["state"]
+
+    @property
+    def last_message(self) -> Optional[str]:
+        """The agent's final message in the last finished turn."""
+        return self.info.get("lastMessage")
+
+    @property
+    def error(self) -> Optional[str]:
+        """Why the last turn failed."""
+        return self.info.get("error")
+
+    def __repr__(self) -> str:
+        return f"<Agent {self.id} {self.info.get('agent')} {self.state}>"
+
+    def refresh(self) -> "Agent":
+        self.info = self._client._call("GET", self._path)
+        return self
+
+    def send(self, prompt: str, interrupt: bool = False) -> "Agent":
+        """Continues the conversation.
+
+        While a turn runs the message waits for it; with interrupt, the running
+        turn stops and queued messages are dropped first.
+        """
+        body = {"prompt": prompt, "interrupt": True} if interrupt else {"prompt": prompt}
+        self.info = self._client._call("POST", self._path + "/messages", body)
+        return self
+
+    def interrupt(self) -> "Agent":
+        """Stops the running turn and drops queued messages."""
+        self.info = self._client._call("POST", self._path + "/interrupt")
+        return self
+
+    def events(self, after: int = 0, follow: bool = True) -> Iterator[Dict[str, Any]]:
+        """The agent's events (dicts) from after (default 0, the start).
+
+        With follow (the default), waits for new ones until the agent is idle;
+        without, stops at the newest. Each request waits up to 25 seconds, so a
+        client timeout must be longer than that.
+        """
+        wait = 25 if follow else 0
+        while True:
+            page = self._client._call("GET", f"{self._path}/events?after={after}&wait={wait}")
+            self.info = page["agent"]
+            yield from page["events"]
+            after = page["next"]
+            if after >= self.info["events"] and (not follow or self.info["state"] == "idle"):
+                return
+
+    def wait(self) -> "Agent":
+        """Waits until the agent is idle; then last_message and error tell how its last turn went."""
+        for _ in self.events(after=self.info["events"]):
+            pass
+        return self

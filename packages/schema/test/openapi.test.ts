@@ -30,7 +30,7 @@ test("every operation has an id and a success response", () => {
       assert.ok(Object.keys(o.responses).some((c) => /^[12]\d\d$/.test(c)), `${method} ${path}: no success response`);
     }
   }
-  assert.equal(ids.size, 17);
+  assert.equal(ids.size, 23);
 });
 
 test("request bodies leave defaulted fields optional", () => {
@@ -38,4 +38,6 @@ test("request bodies leave defaulted fields optional", () => {
   assert.deepEqual(create.required ?? [], []);
   const exec = openapi("test").components.schemas.ExecRequest as { required?: string[] };
   assert.deepEqual(exec.required, ["cmd"]);
+  const start = openapi("test").components.schemas.StartAgent as { required?: string[] };
+  assert.deepEqual(start.required, ["prompt"]);
 });

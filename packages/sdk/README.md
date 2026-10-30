@@ -24,6 +24,25 @@ await Promise.all(forks.map((f) => f.delete()));
 await box.stop(); // saves the disk; box.resume() picks up where it left off
 ```
 
+## Agents
+
+`box.prompt()` starts Claude Code, or Codex, on a task with no terminal. Each
+message is one turn of the agent's own conversation, which lives on the
+sandbox's disk.
+
+```ts
+const agent = await box.prompt("make the tests pass", { cwd: "app" });
+for await (const e of agent.events()) {
+  // e.type is prompt, event (the agent's own JSON in e.event), output or end
+  if (e.type === "event") console.log(e.event);
+}
+console.log(agent.lastMessage, agent.error);
+
+await agent.send("now update the docs"); // waits for a running turn
+await agent.send("stop, fix the build first", { interrupt: true });
+await agent.wait();
+```
+
 ## Connecting
 
 `new Cloudex({ apiUrl, apiKey })` takes the API URL and key that `cloudex
@@ -45,6 +64,10 @@ gives full control of your sandboxes; keep it on a server.
 | `box.stop()`, `box.resume({ fromBackup? })`, `box.delete()` | Save and stop, start again, delete |
 | `box.refresh()` | Fetch the latest state; `box.id`, `box.name`, `box.state` and `box.info` hold it |
 | `cx.setKey(provider, key)`, `cx.listKeys()`, `cx.deleteKey(provider)` | AI provider keys sandboxes use without holding them (`"anthropic"`, `"openai"`) |
+| `box.prompt(prompt, { agent?, cwd?, model? })` | Start Claude Code (default) or Codex on a task; returns an `Agent` at once |
+| `box.agents()`, `box.agent(id)` | The sandbox's agents, newest first; one by id |
+| `agent.events({ after?, follow? })` | Async iterator over its events; follows until the agent is idle |
+| `agent.send(prompt, { interrupt? })`, `agent.interrupt()`, `agent.wait()` | Continue, stop the running turn, wait until idle |
 
 Errors from the API throw `CloudexError`, with `status` and the API's message.
 The full API is described at `<your API URL>/v1/openapi.json`.

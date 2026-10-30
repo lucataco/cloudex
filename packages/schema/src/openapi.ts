@@ -3,6 +3,9 @@
 // generated from a running deployment.
 import { z } from "zod";
 import {
+  Agent,
+  AgentEvents,
+  AgentMessage,
   ApiError,
   CreateSandbox,
   Desktop,
@@ -18,12 +21,23 @@ import {
   ResumeRequest,
   Sandbox,
   SetProviderKey,
+  StartAgent,
 } from "./index.ts";
 
 // Request bodies are described as sent (defaults make fields optional);
 // responses as returned.
-const requests = { CreateSandbox, ForkRequest, ResumeRequest, ExecRequest, HostRequest, DesktopRequest, SetProviderKey };
-const responses = { Sandbox, ExecResult, HostResult, Desktop, Health, ProviderKey, Error: ApiError };
+const requests = {
+  CreateSandbox,
+  ForkRequest,
+  ResumeRequest,
+  ExecRequest,
+  HostRequest,
+  DesktopRequest,
+  SetProviderKey,
+  StartAgent,
+  AgentMessage,
+};
+const responses = { Sandbox, ExecResult, HostResult, Desktop, Health, ProviderKey, Agent, AgentEvents, Error: ApiError };
 
 function jsonSchema(model: z.ZodType, io: "input" | "output") {
   const { $schema: _, ...schema } = z.toJSONSchema(model, { io });
@@ -44,6 +58,14 @@ const sandboxRef = {
   schema: { type: "string" },
 };
 
+const agentRef = {
+  name: "agent",
+  in: "path",
+  required: true,
+  description: "The agent's id (ag-xxxxxxxx)",
+  schema: { type: "string" },
+};
+
 function op(operationId: string, summary: string, rest: object) {
   return { operationId, summary, ...rest, responses: { ...(rest as { responses?: object }).responses, ...errors } };
 }
@@ -53,6 +75,7 @@ export function openapi(version: string) {
   for (const [name, model] of Object.entries(requests)) schemas[name] = jsonSchema(model, "input");
   for (const [name, model] of Object.entries(responses)) schemas[name] = jsonSchema(model, "output");
   const sandbox = ok("The sandbox", ref("Sandbox"));
+  const agent = ok("The agent", ref("Agent"));
 
   return {
     openapi: "3.1.0",
@@ -148,6 +171,61 @@ export function openapi(version: string) {
           responses: {
             200: ok("Stopped", { type: "object", properties: { stopped: { type: "boolean" } }, required: ["stopped"] }),
           },
+        }),
+      },
+      "/v1/sandboxes/{ref}/agents": {
+        parameters: [sandboxRef],
+        get: op("listAgents", "List the sandbox's agents, newest first", {
+          responses: { 200: ok("The agents", { type: "array", items: ref("Agent") }) },
+        }),
+        post: op("startAgent", "Start Claude Code or Codex on a task", {
+          description:
+            "Runs the agent with no terminal, as the cloudex user in a login shell, so it uses provider keys. " +
+            "Answers at once; follow it with the events. The agent and its conversation live on the sandbox's disk.",
+          requestBody: body("StartAgent"),
+          responses: { 201: agent },
+        }),
+      },
+      "/v1/sandboxes/{ref}/agents/{agent}": {
+        parameters: [sandboxRef, agentRef],
+        get: op("getAgent", "Get an agent", { responses: { 200: agent } }),
+      },
+      "/v1/sandboxes/{ref}/agents/{agent}/events": {
+        parameters: [
+          sandboxRef,
+          agentRef,
+          {
+            name: "after",
+            in: "query",
+            description: "Return the events after this seq; next in the answer is the one to pass next time",
+            schema: { type: "integer", minimum: 0, default: 0 },
+          },
+          {
+            name: "wait",
+            in: "query",
+            description: "Seconds to wait for an event while there's none after `after` and the agent is running",
+            schema: { type: "integer", minimum: 0, maximum: 60, default: 0 },
+          },
+        ],
+        get: op("agentEvents", "Read an agent's events, waiting for new ones if asked", {
+          description: "Returns up to about 512 KiB of events at a time; ask again from next for the rest.",
+          responses: { 200: ok("Events, and the agent as of now", ref("AgentEvents")) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/agents/{agent}/messages": {
+        parameters: [sandboxRef, agentRef],
+        post: op("sendAgentMessage", "Send an agent a message, which starts its next turn", {
+          description:
+            "The message continues the agent's conversation. While a turn runs it waits its turn, unless " +
+            "interrupt is set, which stops the running turn and drops queued messages first.",
+          requestBody: body("AgentMessage"),
+          responses: { 200: agent },
+        }),
+      },
+      "/v1/sandboxes/{ref}/agents/{agent}/interrupt": {
+        parameters: [sandboxRef, agentRef],
+        post: op("interruptAgent", "Stop an agent's running turn and drop its queued messages", {
+          responses: { 200: agent },
         }),
       },
       "/v1/keys": {
