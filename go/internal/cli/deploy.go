@@ -131,8 +131,6 @@ func newDoctorCmd(opts *options) *cobra.Command {
 			}
 			_, err := exec.LookPath("ssh")
 			check(err == nil, "ssh is installed", "install an OpenSSH client; cloudex ssh, scp and prompt use it")
-			_, err = exec.LookPath("npx")
-			check(err == nil, "Node.js is installed (cloudex deploy runs wrangler with it)", "install Node.js 20 or newer before running cloudex deploy")
 
 			cfg, client, err := opts.load()
 			check(err == nil, "a deployment is configured", "run cloudex deploy")

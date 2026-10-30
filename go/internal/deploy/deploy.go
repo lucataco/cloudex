@@ -6,8 +6,10 @@
 //     durable_object scheduling policy only runs digest-pinned images from
 //     that registry, and this needs no Docker on the user's machine.
 //  3. Find or create the D1 database, and the preview zone's wildcard record.
-//  4. Upload the embedded API Worker with wrangler, which also creates the
-//     container application, and set the admin key as a secret.
+//  4. Upload the embedded API Worker through the Cloudflare API, the way
+//     wrangler deploy does, with the admin key as a secret; give its Durable
+//     Objects their container application; turn on its workers.dev URL and
+//     the preview route.
 //  5. Wait for the API, then start, use and delete a throwaway sandbox,
 //     because a newly pushed image can take a while to reach every host.
 package deploy
@@ -24,9 +26,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -46,12 +45,14 @@ var assets embed.FS
 var DefaultImage = "ghcr.io/lucataco/cloudex-base:edge"
 
 const (
-	WorkerName      = "cloudex-api"
-	BucketName      = "cloudex-backups"
-	DatabaseName    = "cloudex"
-	imageRepo       = "cloudex-base"
-	registryHost    = "registry.cloudflare.com"
-	wranglerVersion = "4.154.0"
+	WorkerName   = "cloudex-api"
+	BucketName   = "cloudex-backups"
+	DatabaseName = "cloudex"
+	imageRepo    = "cloudex-base"
+	registryHost = "registry.cloudflare.com"
+	// The container application of the Sandbox Durable Objects, under the name
+	// wrangler gave it, so deployments made with wrangler keep theirs.
+	containerName = WorkerName + "-sandbox"
 )
 
 // TokenURL opens the dashboard with an account API token pre-filled with what
@@ -113,10 +114,6 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	log := func(format string, args ...any) { fmt.Fprintf(o.Log, "  "+format+"\n", args...) }
 	cf := cloudflare.New(o.Token)
 
-	npx, err := exec.LookPath("npx")
-	if err != nil {
-		return nil, errors.New("cloudex deploy runs Cloudflare's wrangler, which needs Node.js 20 or newer (https://nodejs.org)")
-	}
 	worker, err := assets.ReadFile("assets/worker.js")
 	if err != nil {
 		return nil, errors.New("this cloudex build has no API bundle; build it with scripts/bundle-api.sh first")
@@ -185,6 +182,9 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := prepareImage(ctx, cf, account.ID, image, log); err != nil {
+		return nil, err
+	}
 
 	dbID, created, err := cf.EnsureD1(ctx, account.ID, DatabaseName)
 	if err != nil {
@@ -206,7 +206,8 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
-	if err := runWrangler(ctx, npx, o.Token, account.ID, wranglerConfig(meta.CompatibilityDate, meta.CompatibilityFlags, image, dbID, zone, backups), worker, key, log); err != nil {
+	md := workerMetadata(meta.CompatibilityDate, meta.CompatibilityFlags, image, dbID, zone, key, backups)
+	if err := installWorker(ctx, cf, account.ID, md, worker, zoneID, zone, log); err != nil {
 		return nil, err
 	}
 	log("API deployed at %s", apiURL)
@@ -367,72 +368,97 @@ func r2Problem(err error) string {
 	}
 }
 
-func wranglerConfig(compatDate string, flags []string, image, dbID, zone string, backups bool) map[string]any {
-	cfg := map[string]any{
-		"name":                WorkerName,
-		"main":                "worker.js",
-		"no_bundle":           true,
-		"compatibility_date":  compatDate,
-		"compatibility_flags": flags,
-		"workers_dev":         true,
-		"observability":       map[string]any{"enabled": true},
-		"containers": []any{map[string]any{
-			"class_name":        "Sandbox",
-			"scheduling_policy": "durable_object",
-			"images":            map[string]any{"base": map[string]any{"image": image}},
-		}},
-		"durable_objects": map[string]any{"bindings": []any{map[string]any{"name": "SANDBOX", "class_name": "Sandbox"}}},
-		"exports":         map[string]any{"Sandbox": map[string]any{"type": "durable-object", "storage": "sqlite"}},
-		"d1_databases":    []any{map[string]any{"binding": "DB", "database_name": DatabaseName, "database_id": dbID}},
-		"vars":            map[string]any{"PREVIEW_ZONE": zone},
+// Image preparation can take minutes for a new image; wrangler allows 15.
+var prepareTimeout, preparePause = 15 * time.Minute, 2 * time.Second
+
+// prepareImage waits until Cloudflare has the image ready to run; a Worker
+// version can only name a prepared image.
+func prepareImage(ctx context.Context, cf *cloudflare.Client, account, image string, log func(string, ...any)) error {
+	deadline := time.Now().Add(prepareTimeout)
+	for logged := false; ; {
+		status, reason, err := cf.PrepareImage(ctx, account, image)
+		switch {
+		case err != nil:
+			return fmt.Errorf("preparing the sandbox image: %w", err)
+		case status == "ready":
+			return nil
+		case status == "error":
+			return fmt.Errorf("Cloudflare couldn't prepare the sandbox image: %s", firstNonEmpty(reason, "no reason given"))
+		case status != "pending":
+			return fmt.Errorf("preparing the sandbox image: unexpected status %q", status)
+		case time.Now().After(deadline):
+			return fmt.Errorf("Cloudflare was still preparing the sandbox image after %s; run cloudex deploy again", prepareTimeout)
+		}
+		if !logged {
+			log("Waiting for Cloudflare to prepare the image")
+			logged = true
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(preparePause):
+		}
 	}
-	if zone != "" {
-		cfg["routes"] = []any{map[string]any{"pattern": "*." + zone + "/*", "zone_name": zone}}
-	}
-	if backups {
-		cfg["r2_buckets"] = []any{map[string]any{"binding": "BACKUPS", "bucket_name": BucketName}}
-	}
-	return cfg
 }
 
-func runWrangler(ctx context.Context, npx, token, account string, cfg map[string]any, worker []byte, key string, log func(string, ...any)) error {
-	dir, err := os.MkdirTemp("", "cloudex-deploy-")
+// installWorker uploads the API Worker, then does what wrangler deploy does
+// after an upload: gives the Durable Objects their container application, and
+// turns on the workers.dev URL and the preview route.
+func installWorker(ctx context.Context, cf *cloudflare.Client, account string, md map[string]any, code []byte, zoneID, zone string, log func(string, ...any)) error {
+	log("Uploading the API Worker")
+	if err := cf.UploadWorker(ctx, account, WorkerName, md, "worker.js", code); err != nil {
+		return fmt.Errorf("uploading the API Worker: %w", err)
+	}
+	ns, err := cf.DurableObjectNamespace(ctx, account, WorkerName, "Sandbox")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
-	cfgJSON, err := json.MarshalIndent(cfg, "", "  ")
+	made, err := cf.EnsureContainerApplication(ctx, account, containerName, ns)
 	if err != nil {
-		return err
+		return fmt.Errorf("container application: %w", err)
 	}
-	secrets, err := json.Marshal(map[string]string{"ADMIN_KEY": key})
-	if err != nil {
-		return err
+	if made {
+		log("Created the container application %s", containerName)
 	}
-	files := map[string][]byte{"wrangler.json": cfgJSON, "worker.js": worker, "secrets.json": secrets}
-	for name, data := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
-			return err
+	if err := cf.EnableWorkersDev(ctx, account, WorkerName); err != nil {
+		return fmt.Errorf("turning on the workers.dev URL: %w", err)
+	}
+	if zone != "" {
+		if err := cf.RouteWorker(ctx, account, WorkerName, zoneID, zone, "*."+zone+"/*"); err != nil {
+			return fmt.Errorf("preview route: %w", err)
 		}
-	}
-	log("Uploading the API Worker with wrangler %s", wranglerVersion)
-	cmd := exec.CommandContext(ctx, npx, "--yes", "wrangler@"+wranglerVersion, "deploy",
-		"--config", "wrangler.json", "--secrets-file", "secrets.json", "--containers-rollout", "immediate")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"CLOUDFLARE_API_TOKEN="+token,
-		"CLOUDFLARE_ACCOUNT_ID="+account,
-		"WRANGLER_SEND_METRICS=false",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		if len(lines) > 25 {
-			lines = lines[len(lines)-25:]
-		}
-		return fmt.Errorf("wrangler deploy failed: %w\n%s", err, strings.Join(lines, "\n"))
 	}
 	return nil
+}
+
+// workerMetadata describes the API Worker for the Workers upload API: what
+// wrangler sends for the configuration in apps/api/wrangler.jsonc.
+func workerMetadata(compatDate string, flags []string, image, dbID, zone, key string, backups bool) map[string]any {
+	if flags == nil {
+		flags = []string{}
+	}
+	bindings := []map[string]any{
+		{"type": "durable_object_namespace", "name": "SANDBOX", "class_name": "Sandbox"},
+		{"type": "d1", "name": "DB", "id": dbID},
+		{"type": "plain_text", "name": "PREVIEW_ZONE", "text": zone},
+		{"type": "secret_text", "name": "ADMIN_KEY", "text": key},
+	}
+	if backups {
+		bindings = append(bindings, map[string]any{"type": "r2_bucket", "name": "BACKUPS", "bucket_name": BucketName})
+	}
+	return map[string]any{
+		"main_module":         "worker.js",
+		"bindings":            bindings,
+		"compatibility_date":  compatDate,
+		"compatibility_flags": flags,
+		"exports":             map[string]any{"Sandbox": map[string]any{"type": "durable-object", "storage": "sqlite"}},
+		"containers": []any{map[string]any{
+			"name":       containerName,
+			"class_name": "Sandbox",
+			"images":     map[string]string{"base": image},
+		}},
+		"observability": map[string]any{"enabled": true},
+	}
 }
 
 // liveDeployment is what an existing API at the deploy URL tells us.

@@ -1,6 +1,14 @@
 # Push a tag like v0.1.0 to release: the sandbox image goes to
 # ghcr.io/lucataco/cloudex-base:<tag>, and CLI archives built against it go to
-# a GitHub release, where https://cloudex.build/install downloads them.
+# a GitHub release, where https://cloudex.build/install downloads them. Then
+# the SDKs are published when their version is new: Python to PyPI, and the
+# TypeScript SDK staged on npm for a maintainer to approve with
+# `npm stage approve <id>`, which asks for 2FA.
+#
+# Both use trusted publishing, so no token is stored here. One-time setup:
+#   npm:  npm trust github cloudex --file release.yml --repo lucataco/cloudex --env npm --allow-stage-publish
+#   PyPI: a trusted publisher for the project cloudex on pypi.org: owner
+#         lucataco, repository cloudex, workflow release.yml, environment pypi
 name: Release
 
 on:
@@ -55,3 +63,50 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release create "${{ github.ref_name }}" dist/* --title "${{ github.ref_name }}" --generate-notes
+
+  npm:
+    needs: cli
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # npm stage needs a newer npm than Node 24 may come with.
+      - run: npm install -g npm@11
+      - name: Stage the SDK on npm
+        working-directory: packages/sdk
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          if [ "$(npm view "cloudex@$version" version 2>/dev/null)" = "$version" ]; then
+            echo "cloudex@$version is already on npm"
+            exit 0
+          fi
+          npm stage publish --access public
+          echo "::notice::cloudex@$version is staged on npm; approve it with npm stage approve <id> (the id is in the log above)"
+
+  pypi:
+    needs: cli
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pipx run build --outdir dist python
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # A release that doesn't change the Python SDK keeps its version.
+          skip-existing: true

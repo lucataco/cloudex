@@ -1,5 +1,6 @@
-// Package cloudflare covers the few Cloudflare API calls `cloudex deploy` makes
-// itself. Uploading the Worker and its container application is left to wrangler.
+// Package cloudflare covers the Cloudflare API calls `cloudex deploy` makes:
+// the account's resources, its container registry, and uploading the API Worker
+// with its container application, the same calls wrangler deploy makes.
 package cloudflare
 
 import (
@@ -9,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"strings"
 )
@@ -23,7 +26,12 @@ type Client struct {
 }
 
 func New(token string) *Client {
-	return &Client{token: token, base: apiBase, http: &http.Client{}}
+	return NewAt(token, apiBase)
+}
+
+// NewAt talks to another API base URL, such as a test server.
+func NewAt(token, base string) *Client {
+	return &Client{token: token, base: base, http: &http.Client{}}
 }
 
 // Error carries Cloudflare's own message, which usually explains the fix.
@@ -50,21 +58,33 @@ type envelope struct {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	return c.doHeader(ctx, method, path, nil, body, out)
+}
+
+func (c *Client) doHeader(ctx context.Context, method, path string, header http.Header, body, out any) error {
 	var rd io.Reader
+	contentType := ""
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		rd = bytes.NewReader(data)
+		rd, contentType = bytes.NewReader(data), "application/json"
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rd)
+	return c.send(ctx, method, path, header, contentType, rd, out)
+}
+
+func (c *Client) send(ctx context.Context, method, path string, header http.Header, contentType string, body io.Reader, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return err
 	}
+	for k, v := range header {
+		req.Header[k] = v
+	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	res, err := c.http.Do(req)
 	if err != nil {
@@ -214,6 +234,131 @@ func (c *Client) EnsureWildcardRecord(ctx context.Context, zoneID, zone string) 
 	}
 	body := map[string]any{"type": "AAAA", "name": "*." + zone, "content": "100::", "proxied": true, "comment": "Cloudex preview links"}
 	return true, c.do(ctx, http.MethodPost, "/zones/"+zoneID+"/dns_records", body, nil)
+}
+
+// PrepareImage asks Cloudflare to get a digest-pinned image in the account's
+// registry ready to run. The status is "ready", "pending" (ask again) or
+// "error", with a reason.
+func (c *Client) PrepareImage(ctx context.Context, account, image string) (status, reason string, err error) {
+	var out struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	err = c.do(ctx, http.MethodPost, "/accounts/"+account+"/containers/image-preparations", map[string]string{"image": image}, &out)
+	return out.Status, out.Reason, err
+}
+
+// UploadWorker uploads a module Worker and deploys it to all its traffic. The
+// metadata is what the Workers script upload API takes: main_module, bindings,
+// compatibility date and flags, exports and containers.
+func (c *Client) UploadWorker(ctx context.Context, account, name string, metadata any, module string, code []byte) error {
+	meta, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	if err := form.WriteField("metadata", string(meta)); err != nil {
+		return err
+	}
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, module, module))
+	h.Set("Content-Type", "application/javascript+module")
+	part, err := form.CreatePart(h)
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write(code); err != nil {
+		return err
+	}
+	if err := form.Close(); err != nil {
+		return err
+	}
+	path := "/accounts/" + account + "/workers/scripts/" + url.PathEscape(name) + "?bindings_inherit=strict"
+	return c.send(ctx, http.MethodPut, path, nil, form.FormDataContentType(), &body, nil)
+}
+
+// DurableObjectNamespace finds the namespace of a Worker's Durable Object
+// class among its bindings.
+func (c *Client) DurableObjectNamespace(ctx context.Context, account, script, class string) (string, error) {
+	var out struct {
+		Bindings []struct {
+			Type        string `json:"type"`
+			ClassName   string `json:"class_name"`
+			ScriptName  string `json:"script_name"`
+			NamespaceID string `json:"namespace_id"`
+		} `json:"bindings"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/accounts/"+account+"/workers/scripts/"+url.PathEscape(script)+"/settings", nil, &out); err != nil {
+		return "", err
+	}
+	for _, b := range out.Bindings {
+		if b.Type == "durable_object_namespace" && b.ClassName == class && (b.ScriptName == "" || b.ScriptName == script) && b.NamespaceID != "" {
+			return b.NamespaceID, nil
+		}
+	}
+	return "", fmt.Errorf("the Worker %s has no Durable Object namespace for %s", script, class)
+}
+
+// EnsureContainerApplication gives a Durable Object namespace its container
+// application, which lets its objects start containers from the images in the
+// Worker's metadata. The application's id is the namespace's.
+func (c *Client) EnsureContainerApplication(ctx context.Context, account, name, namespaceID string) (created bool, err error) {
+	var app struct {
+		Name             string `json:"name"`
+		SchedulingPolicy string `json:"scheduling_policy"`
+	}
+	err = c.do(ctx, http.MethodGet, "/accounts/"+account+"/containers/applications/"+url.PathEscape(namespaceID), nil, &app)
+	var cfErr *Error
+	switch {
+	case err == nil && (app.Name != name || app.SchedulingPolicy != "durable_object"):
+		return false, fmt.Errorf("the container application for the Durable Objects is %s (%s), not %s; delete it in the Cloudflare dashboard and deploy again", app.Name, app.SchedulingPolicy, name)
+	case err == nil:
+		return false, nil
+	case !errors.As(err, &cfErr) || cfErr.Status != http.StatusNotFound:
+		return false, err
+	}
+	body := map[string]any{
+		"name":              name,
+		"scheduling_policy": "durable_object",
+		"durable_objects":   map[string]string{"namespace_id": namespaceID},
+	}
+	return true, c.do(ctx, http.MethodPost, "/accounts/"+account+"/containers/applications", body, nil)
+}
+
+// EnableWorkersDev serves the Worker at <script>.<subdomain>.workers.dev.
+func (c *Client) EnableWorkersDev(ctx context.Context, account, script string) error {
+	header := http.Header{"Cloudflare-Workers-Script-Api-Date": {"2025-08-01"}}
+	return c.doHeader(ctx, http.MethodPost, "/accounts/"+account+"/workers/scripts/"+url.PathEscape(script)+"/subdomain", header, map[string]bool{"enabled": true}, nil)
+}
+
+// RouteWorker sends a route pattern in a zone to the Worker, replacing its
+// other routes. A token limited to some zones can't use that account-wide
+// call; then the route is added through the zone, as wrangler does.
+func (c *Client) RouteWorker(ctx context.Context, account, script, zoneID, zone, pattern string) error {
+	routes := []map[string]string{{"pattern": pattern, "zone_name": zone}}
+	err := c.do(ctx, http.MethodPut, "/accounts/"+account+"/workers/scripts/"+url.PathEscape(script)+"/routes", routes, nil)
+	var cfErr *Error
+	if err == nil || !errors.As(err, &cfErr) || (cfErr.Status != http.StatusForbidden && cfErr.Code != 10000) {
+		return err
+	}
+	var existing []struct {
+		Pattern string `json:"pattern"`
+		Script  string `json:"script"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/zones/"+zoneID+"/workers/routes", nil, &existing); err != nil {
+		return err
+	}
+	for _, r := range existing {
+		if r.Pattern != pattern {
+			continue
+		}
+		if r.Script == script {
+			return nil
+		}
+		return fmt.Errorf("the route %s already goes to the Worker %s; remove it in the Cloudflare dashboard and deploy again", pattern, r.Script)
+	}
+	return c.do(ctx, http.MethodPost, "/zones/"+zoneID+"/workers/routes", map[string]string{"pattern": pattern, "script": script}, nil)
 }
 
 func asError(err error, target **Error) bool {

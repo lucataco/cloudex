@@ -10,7 +10,7 @@ service in between. Site: [cloudex.build](https://cloudex.build).
 ## What you need
 
 - A Cloudflare account on **Workers Paid** ($5/month). Containers need it.
-- An OpenSSH client, and Node.js 20+ for `cloudex deploy` (it runs Cloudflare's wrangler).
+- An OpenSSH client.
 - Optional: a domain in the same Cloudflare account, for preview links. Cloudex adds
   a proxied `*.<domain>` record and routes `*.<domain>/*` to its Worker; requests
   for your other subdomains, like `www`, pass through to their origins.
