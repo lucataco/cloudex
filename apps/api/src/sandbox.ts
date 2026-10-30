@@ -16,10 +16,20 @@
 // - AI provider keys (keys.ts) are set up at each start for the providers that
 //   have one then: the sandbox gets placeholders, and the real keys are added
 //   to its HTTPS calls to those providers on the way out.
+// - Settings (settings.ts) are kept sealed here and applied at every start,
+//   after the keys; a repo in them is cloned once, when the sandbox is created.
 // - Agents started through the API (agents.ts) run and keep their state in the
 //   guest; this object only passes each call to a script there.
 import { DurableObject } from "cloudflare:workers";
-import type { Desktop, ExecResult, Sandbox as SandboxRecord, SandboxSize } from "@cloudex/schema";
+import type {
+  Desktop,
+  ExecResult,
+  Repo,
+  Sandbox as SandboxRecord,
+  SandboxSettings,
+  SandboxSize,
+  UpdateSettings,
+} from "@cloudex/schema";
 import {
   BACKUP_SCRIPT,
   type BackupManifest,
@@ -35,6 +45,17 @@ import { AGENT_BAD_REQUEST, AGENT_BOOT, AGENT_NOT_FOUND, AGENT_SCRIPT } from "./
 import { deleteSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } from "./desktop";
 import { KEYS_SCRIPT, PROVIDERS, listKeys } from "./keys";
+import {
+  CLONE_SCRIPT,
+  SETTINGS_SCRIPT,
+  type StoredSettings,
+  UnreadableSettings,
+  merge,
+  readSecret,
+  repoSpec,
+  store,
+  view,
+} from "./settings";
 import { fail, sleep, withTimeout } from "./util";
 
 const READY_CHECK = '[ "$(cat /run/cloudex-ready 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id)" ]';
@@ -52,8 +73,15 @@ const GUEST_HOME = "/home/cloudex";
 const OUTPUT_LIMIT = 1 << 20;
 const SSH_KEY = /^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^\n]*)?$/;
 
-type CreateInput = { name: string | null; size: SandboxSize; idleMinutes: number };
-export type ForkSource = { sandbox: string; snapshot: { id: string } };
+type CreateInput = {
+  name: string | null;
+  size: SandboxSize;
+  idleMinutes: number;
+  env?: Record<string, string>;
+  files?: Record<string, string>;
+  repo?: string | Repo;
+};
+export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?: StoredSettings };
 type ExecInput = { cmd: string; root: boolean; cwd?: string; timeoutSec: number };
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
@@ -144,6 +172,16 @@ export class Sandbox extends DurableObject<Env> {
   async create(id: string, input: CreateInput, from?: ForkSource): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       if (this.record) fail(409, `${id} already exists`);
+      // A fork gets the original's settings; checked before anything is kept.
+      const settings =
+        from?.settings ??
+        (input.env || input.files || input.repo
+          ? await store(
+              this.env.ADMIN_KEY,
+              merge({ env: {}, files: {} }, { env: input.env, files: input.files }),
+              input.repo ? repoSpec(input.repo) : null,
+            )
+          : undefined);
       const now = Date.now();
       this.record = {
         id,
@@ -161,6 +199,7 @@ export class Sandbox extends DurableObject<Env> {
         ...(from ? { forkedFrom: from.sandbox } : {}),
       };
       await this.update({});
+      if (settings) await this.ctx.storage.put("settings", settings);
       if (from) {
         // The fork's save until it makes its own, so that a resume after a
         // failed start, or after the platform stops it first, starts here too.
@@ -168,8 +207,54 @@ export class Sandbox extends DurableObject<Env> {
         await this.ctx.storage.put("saveTouchedAt", Date.now());
       }
       await this.boot(from?.snapshot);
+      if (settings?.repo && !from) await this.clone(settings.repo);
       return this.mustRecord();
     });
+  }
+
+  private async clone(repo: NonNullable<StoredSettings["repo"]>) {
+    const t0 = Date.now();
+    const out = await this.asGuest([CLONE_SCRIPT, repo.url, repo.dir, repo.branch ?? ""], "cloning", 10 * 60_000);
+    const why = new TextDecoder().decode(out.stderr).trim().split("\n").slice(-2).join(" ");
+    if (out.exitCode === 0) {
+      console.log(`[${this.mustRecord().id}] cloned ${repo.url} in ${Date.now() - t0} ms${why ? `: ${why}` : ""}`);
+      return;
+    }
+    // GitHub asks for a login for a private repo, and for one that isn't there.
+    const hint = /could not read Username/.test(why) ? " If it's private, set GH_TOKEN in the sandbox's env." : "";
+    const notice = `Couldn't clone ${repo.url} into ~/${repo.dir}: ${why || `git exited with code ${out.exitCode}`}.${hint}`;
+    await this.update({ notice: [this.mustRecord().notice, notice].filter(Boolean).join(" ") });
+  }
+
+  // Names and paths only; values and contents stay sealed.
+  async settings(): Promise<SandboxSettings> {
+    this.mustRecord();
+    return view(await this.ctx.storage.get<StoredSettings>("settings"));
+  }
+
+  // Applied at once to a running sandbox; a stopped one gets them at its next start.
+  async updateSettings(change: UpdateSettings): Promise<SandboxSettings> {
+    return this.exclusive(async () => {
+      const r = this.mustRecord();
+      const stored = await this.ctx.storage.get<StoredSettings>("settings");
+      // Settings sealed under an earlier admin key are lost; start over.
+      const secret = await readSecret(this.env.ADMIN_KEY, stored).catch((e) => {
+        if (e instanceof UnreadableSettings) return { env: {}, files: {} };
+        throw e;
+      });
+      const next = await store(this.env.ADMIN_KEY, merge(secret, change), stored?.repo ?? null);
+      await this.ctx.storage.put("settings", next);
+      if (r.state === "running") {
+        this.touch();
+        await this.applySettings();
+      }
+      return view(next);
+    });
+  }
+
+  private async applySettings() {
+    const secret = await readSecret(this.env.ADMIN_KEY, await this.ctx.storage.get<StoredSettings>("settings"));
+    await this.runScript(SETTINGS_SCRIPT, [], "applying the settings", 120_000, JSON.stringify(secret));
   }
 
   // The disk a fork starts from: a fresh save of a running sandbox, which keeps
@@ -186,7 +271,7 @@ export class Sandbox extends DurableObject<Env> {
           "saving the disk",
         );
         console.log(`[${r.id}] saved ${snap.size} bytes for a fork in ${Date.now() - t0} ms`);
-        return { sandbox: r.id, snapshot: { id: snap.id } };
+        return { sandbox: r.id, snapshot: { id: snap.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
       }
       if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}; try again when it has finished`);
       const snapshot = await this.ctx.storage.get<{ id: string }>("snapshot");
@@ -195,7 +280,7 @@ export class Sandbox extends DurableObject<Env> {
       if (Date.now() - touched > SAVE_LIFETIME_MS) {
         fail(409, `${r.id}'s save has expired; resume it (which restores its backup), then fork it`);
       }
-      return { sandbox: r.id, snapshot: { id: snapshot.id } };
+      return { sandbox: r.id, snapshot: { id: snapshot.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
     });
   }
 
@@ -286,6 +371,7 @@ export class Sandbox extends DurableObject<Env> {
       console.error(`[${r.id}] reading provider keys failed: ${message(e)}`);
     }
     let keysProblem = "";
+    let settingsProblem = "";
     try {
       const images = c.images as Record<string, string>;
       c.start({
@@ -316,6 +402,13 @@ export class Sandbox extends DurableObject<Env> {
         keysProblem = message(e);
         console.error(`[${r.id}] ${keysProblem}`);
       }
+      // After the keys, so that a variable in the settings wins over a placeholder.
+      try {
+        await this.applySettings();
+      } catch (e) {
+        settingsProblem = message(e);
+        console.error(`[${r.id}] ${settingsProblem}`);
+      }
     } catch (e) {
       try {
         if (c.running) await withTimeout(c.destroy(), 60_000, "destroy");
@@ -336,7 +429,16 @@ export class Sandbox extends DurableObject<Env> {
       startedAt: Date.now(),
       stoppedAt: null,
       providerKeys: keysProblem ? [] : providers,
-      ...(keysProblem ? { notice: `Provider keys aren't set up in this run: ${keysProblem}` } : {}),
+      ...(keysProblem || settingsProblem
+        ? {
+            notice: [
+              keysProblem && `Provider keys aren't set up in this run: ${keysProblem}.`,
+              settingsProblem && `The sandbox's settings aren't applied in this run: ${settingsProblem}.`,
+            ]
+              .filter(Boolean)
+              .join(" "),
+          }
+        : {}),
     });
     await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
   }
@@ -428,14 +530,16 @@ export class Sandbox extends DurableObject<Env> {
     }
   }
 
-  // Runs one of the guest scripts as root, with args as $1, $2 and so on. Returns stdout.
-  private async runScript(script: string, args: string[], what: string, timeoutMs = BACKUP_TIMEOUT_MS): Promise<string> {
+  // Runs one of the guest scripts as root, with args as $1, $2 and so on, and
+  // stdin if given. Returns stdout.
+  private async runScript(script: string, args: string[], what: string, timeoutMs = BACKUP_TIMEOUT_MS, stdin?: string): Promise<string> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
       const p = await this.container.exec(["bash", "-c", script, "cloudex", ...args], {
         cwd: "/",
         env: { HOME: "/root", LANG: "C.UTF-8" },
+        ...(stdin === undefined ? {} : { stdin: new Response(stdin).body! }),
         signal: ctl.signal,
       });
       const out = await p.output();
@@ -498,28 +602,38 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.mustRecord();
     if (r.state !== "running") fail(409, `${r.id} is ${r.state}; resume it first`);
     this.touch();
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), (waitSec + 60) * 1000);
     try {
-      const p = await this.container.exec(["bash", "-lc", AGENT_BOOT, "cloudex", AGENT_SCRIPT, op, ...args], {
-        cwd: GUEST_HOME,
-        env: { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8" },
-        user: GUEST_USER,
-        ...(prompt === undefined ? {} : { stdin: new Response(prompt).body! }),
-        signal: ctl.signal,
-      });
-      const out = await p.output();
+      const out = await this.asGuest([AGENT_BOOT, AGENT_SCRIPT, op, ...args], `agent ${op}`, (waitSec + 60) * 1000, prompt);
       const why = new TextDecoder().decode(out.stderr).trim().split("\n").pop() ?? "";
       if (out.exitCode === AGENT_NOT_FOUND) fail(404, `${why} in ${r.name ?? r.id}`);
       if (out.exitCode === AGENT_BAD_REQUEST) fail(400, why);
       if (out.exitCode !== 0) throw new Error(`agent ${op} failed (exit ${out.exitCode}): ${why}`);
       return JSON.parse(new TextDecoder().decode(out.stdout));
+    } finally {
+      this.touch();
+    }
+  }
+
+  // Runs a script as the guest user from a login shell (so it gets the
+  // settings' variables and the provider key placeholders): argv[0] is the
+  // script, the rest its $1, $2 and so on.
+  private async asGuest(argv: string[], what: string, timeoutMs: number, stdin?: string) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const p = await this.container.exec(["bash", "-lc", argv[0]!, "cloudex", ...argv.slice(1)], {
+        cwd: GUEST_HOME,
+        env: { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8" },
+        user: GUEST_USER,
+        ...(stdin === undefined ? {} : { stdin: new Response(stdin).body! }),
+        signal: ctl.signal,
+      });
+      return await p.output();
     } catch (e) {
-      if (ctl.signal.aborted) throw new Error(`agent ${op} took too long`);
+      if (ctl.signal.aborted) throw new Error(`${what} took longer than ${Math.round(timeoutMs / 1000)} s`);
       throw e;
     } finally {
       clearTimeout(timer);
-      this.touch();
     }
   }
 

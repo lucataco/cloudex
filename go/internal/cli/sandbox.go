@@ -27,19 +27,29 @@ func optionalRef(args []string) string {
 }
 
 func newNewCmd(opts *options) *cobra.Command {
-	var name, size, from string
+	var name, size, from, repo string
 	var count int
 	var idle time.Duration
 	var noUse bool
+	var envPairs, envFiles, files []string
 	cmd := &cobra.Command{
 		Use:   "new",
 		Short: "Create and start a sandbox",
 		Long: "Create a sandbox and make it the current one. It stops (and saves its disk) after\n" +
 			"--idle without SSH, exec, preview or agent activity.\n\n" +
-			"With --from, the new sandboxes start from a copy of another's disk; see cloudex fork.",
-		Example: "  cloudex new --name my-box\n  cloudex new --from my-box --count 3 --name agent",
-		Args:    cobra.NoArgs,
+			"--env, --env-file and --file give it environment variables and files at every\n" +
+			"start (see cloudex env), and --repo clones a repo into its home directory.\n\n" +
+			"With --from, the new sandboxes start from a copy of another's disk, and its\n" +
+			"settings; see cloudex fork.",
+		Example: "  cloudex new --name my-box\n" +
+			"  cloudex new --repo https://github.com/you/app --env GH_TOKEN=$(gh auth token) --env-file .env\n" +
+			"  cloudex new --from my-box --count 3 --name agent",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			settingsFlags := len(envPairs)+len(envFiles)+len(files) > 0 || repo != ""
+			if from != "" && settingsFlags {
+				return errors.New("--env, --env-file, --file and --repo don't go with --from: forks get the original's settings; change them after with cloudex env set")
+			}
 			if from != "" {
 				req, err := forkRequest(cmd, name, size, count, idle)
 				if err != nil {
@@ -54,7 +64,21 @@ func newNewCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			req := api.CreateRequest{Name: name, Size: size}
+			env, err := envSettings(envPairs, envFiles)
+			if err != nil {
+				return err
+			}
+			fileMap, err := fileSettings(files)
+			if err != nil {
+				return err
+			}
+			req := api.CreateRequest{Name: name, Size: size, Repo: repo}
+			if len(env) > 0 {
+				req.Env = env
+			}
+			if len(fileMap) > 0 {
+				req.Files = fileMap
+			}
 			if cmd.Flags().Changed("idle") {
 				minutes := int(idle.Minutes())
 				req.IdleMinutes = &minutes
@@ -76,6 +100,9 @@ func newNewCmd(opts *options) *cobra.Command {
 				return writeJSON(cmd.OutOrStdout(), s)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s is running (%s).\n", s.Label(), s.Size)
+			if s.Notice != nil && *s.Notice != "" {
+				fmt.Fprintln(cmd.OutOrStdout(), *s.Notice)
+			}
 			if !noUse {
 				fmt.Fprintln(cmd.OutOrStdout(), "It is now the current sandbox. Connect with: cloudex ssh")
 			}
@@ -88,6 +115,10 @@ func newNewCmd(opts *options) *cobra.Command {
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make it the current sandbox")
 	cmd.Flags().StringVar(&from, "from", "", "start from a copy of this sandbox's disk (a fork)")
 	cmd.Flags().IntVar(&count, "count", 1, fmt.Sprintf("with --from, how many forks to make, up to %d", maxForks))
+	cmd.Flags().StringArrayVar(&envPairs, "env", nil, "NAME=VALUE: an environment variable (repeatable)")
+	cmd.Flags().StringArrayVar(&envFiles, "env-file", nil, "read NAME=VALUE lines from this file (repeatable)")
+	cmd.Flags().StringArrayVar(&files, "file", nil, "DEST=SRC: put the local file SRC at DEST in the sandbox's home (repeatable)")
+	cmd.Flags().StringVar(&repo, "repo", "", "an https:// repo to clone into the home directory, with #branch to pick one")
 	return cmd
 }
 

@@ -55,7 +55,7 @@ The key gives full control of your sandboxes.
 
 | Call | Does |
 |---|---|
-| `cx.create(name=, size=, idle_minutes=)` | Create a sandbox; returns once it's running |
+| `cx.create(name=, size=, idle_minutes=, env=, files=, repo=)` | Create a sandbox; returns once it's running (and the repo is cloned) |
 | `cx.get(ref)`, `cx.list()`, `cx.health()` | Look up by id or name, list, check the deployment |
 | `box.exec(cmd, root=, cwd=, timeout_sec=)` | Run shell code, or an argument list, and wait; check `exit_code` |
 | `box.fork(count=, name=, size=, idle_minutes=)` | Up to 10 sandboxes starting from a copy of the disk |
@@ -63,6 +63,7 @@ The key gives full control of your sandboxes.
 | `box.desktop(size=)`, `box.stop_desktop()` | Start the desktop (Chrome, a terminal) and get a link to it |
 | `box.stop()`, `box.resume(from_backup=)`, `box.delete()` | Save and stop, start again, delete |
 | `box.refresh()` | Fetch the latest state; `box.id`, `box.name`, `box.state` and `box.info` hold it |
+| `box.settings()`, `box.update_settings(env=, files=)` | Environment variables and files the sandbox gets at every start; `None` removes one |
 | `cx.set_key(provider, key)`, `cx.list_keys()`, `cx.delete_key(provider)` | AI provider keys sandboxes use without holding them (`"anthropic"`, `"openai"`) |
 | `box.prompt(prompt, agent=, cwd=, model=)` | Start Claude Code (default) or Codex on a task; returns an `Agent` at once |
 | `box.agents()`, `box.agent(id)` | The sandbox's agents, newest first; one by id |

@@ -20,8 +20,10 @@ import {
   ProviderKey,
   ResumeRequest,
   Sandbox,
+  SandboxSettings,
   SetProviderKey,
   StartAgent,
+  UpdateSettings,
 } from "./index.ts";
 
 // Request bodies are described as sent (defaults make fields optional);
@@ -36,8 +38,20 @@ const requests = {
   SetProviderKey,
   StartAgent,
   AgentMessage,
+  UpdateSettings,
 };
-const responses = { Sandbox, ExecResult, HostResult, Desktop, Health, ProviderKey, Agent, AgentEvents, Error: ApiError };
+const responses = {
+  Sandbox,
+  SandboxSettings,
+  ExecResult,
+  HostResult,
+  Desktop,
+  Health,
+  ProviderKey,
+  Agent,
+  AgentEvents,
+  Error: ApiError,
+};
 
 function jsonSchema(model: z.ZodType, io: "input" | "output") {
   const { $schema: _, ...schema } = z.toJSONSchema(model, { io });
@@ -171,6 +185,20 @@ export function openapi(version: string) {
           responses: {
             200: ok("Stopped", { type: "object", properties: { stopped: { type: "boolean" } }, required: ["stopped"] }),
           },
+        }),
+      },
+      "/v1/sandboxes/{ref}/settings": {
+        parameters: [sandboxRef],
+        get: op("getSettings", "The sandbox's settings: variable names, file paths and the repo", {
+          description: "Values and file contents are never returned.",
+          responses: { 200: ok("The settings", ref("SandboxSettings")) },
+        }),
+        patch: op("updateSettings", "Set or remove environment variables and files", {
+          description:
+            "null removes a variable or file. A running sandbox gets the change at once, in new shells; " +
+            "a stopped one at its next start.",
+          requestBody: body("UpdateSettings"),
+          responses: { 200: ok("The settings", ref("SandboxSettings")) },
         }),
       },
       "/v1/sandboxes/{ref}/agents": {

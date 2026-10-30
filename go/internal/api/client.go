@@ -46,9 +46,32 @@ func (s *Sandbox) Label() string {
 }
 
 type CreateRequest struct {
-	Name        string `json:"name,omitempty"`
-	Size        string `json:"size,omitempty"`
-	IdleMinutes *int   `json:"idleMinutes,omitempty"`
+	Name        string            `json:"name,omitempty"`
+	Size        string            `json:"size,omitempty"`
+	IdleMinutes *int              `json:"idleMinutes,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+	Files       map[string]string `json:"files,omitempty"`
+	Repo        string            `json:"repo,omitempty"` // https URL, with #branch if wanted
+}
+
+// Settings lists a sandbox's environment variables, files and repo. Values
+// and contents never come back.
+type Settings struct {
+	Env   []string      `json:"env"`
+	Files []string      `json:"files"`
+	Repo  *SettingsRepo `json:"repo"`
+}
+
+type SettingsRepo struct {
+	URL    string  `json:"url"`
+	Dir    string  `json:"dir"`
+	Branch *string `json:"branch"`
+}
+
+// SettingsChange sets variables and files; a nil value removes one.
+type SettingsChange struct {
+	Env   map[string]*string `json:"env,omitempty"`
+	Files map[string]*string `json:"files,omitempty"`
 }
 
 type ExecRequest struct {
@@ -186,6 +209,16 @@ type ForkRequest struct {
 func (c *Client) Fork(ctx context.Context, ref string, r ForkRequest) ([]Sandbox, error) {
 	var forks []Sandbox
 	return forks, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/fork", r, &forks)
+}
+
+func (c *Client) Settings(ctx context.Context, ref string) (*Settings, error) {
+	var st Settings
+	return &st, c.do(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/settings", nil, &st)
+}
+
+func (c *Client) UpdateSettings(ctx context.Context, ref string, ch SettingsChange) (*Settings, error) {
+	var st Settings
+	return &st, c.do(ctx, http.MethodPatch, "/v1/sandboxes/"+url.PathEscape(ref)+"/settings", ch, &st)
 }
 
 // ProviderKey is a stored AI provider key; Hint is its last 4 characters.

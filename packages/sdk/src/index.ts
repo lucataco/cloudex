@@ -54,6 +54,34 @@ export interface CreateOptions {
   size?: SandboxSize;
   /** Default 30. */
   idleMinutes?: number;
+  /** Environment variables every shell, ssh session, exec and agent gets, at every start. */
+  env?: Record<string, string>;
+  /** Files in the home directory (~/.npmrc or .npmrc), written at every start, mode 600. */
+  files?: Record<string, string>;
+  /** An https:// repo to clone into the home directory, with #branch to pick one. */
+  repo?: string | RepoOptions;
+}
+
+export interface RepoOptions {
+  /** HTTPS only. For a private GitHub repo, set GH_TOKEN or GITHUB_TOKEN in env. */
+  url: string;
+  /** Where in the home directory; default the repo's name. */
+  dir?: string;
+  branch?: string;
+}
+
+/** A sandbox's settings. Values and file contents never come back. */
+export interface SandboxSettings {
+  env: string[];
+  /** As ~/path. */
+  files: string[];
+  repo: { url: string; dir: string; branch: string | null } | null;
+}
+
+/** A change to a sandbox's settings: null removes a variable or file. */
+export interface SettingsChange {
+  env?: Record<string, string | null>;
+  files?: Record<string, string | null>;
 }
 
 export interface ForkOptions {
@@ -380,6 +408,19 @@ export class Sandbox {
 
   async stopDesktop(): Promise<void> {
     await this.#call("DELETE", this.#path("/desktop"));
+  }
+
+  /** The sandbox's environment variable names, files and repo. */
+  settings(): Promise<SandboxSettings> {
+    return this.#call("GET", this.#path("/settings"));
+  }
+
+  /**
+   * Sets or removes (null) environment variables and files. A running sandbox
+   * gets the change at once, in new shells; a stopped one when it next starts.
+   */
+  updateSettings(change: SettingsChange): Promise<SandboxSettings> {
+    return this.#call("PATCH", this.#path("/settings"), change);
   }
 
   /**

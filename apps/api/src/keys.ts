@@ -7,6 +7,7 @@
 // subscription logins, pass through untouched.
 import type { Provider } from "@cloudex/schema";
 import { ensureSchema } from "./db";
+import { open, seal } from "./seal";
 
 interface ProviderSpec {
   host: string;
@@ -40,34 +41,9 @@ export const PROVIDERS: Record<Provider, ProviderSpec> = {
 export const providerForHost = (host: string) =>
   (Object.keys(PROVIDERS) as Provider[]).find((p) => PROVIDERS[p].host === host);
 
-// AES-GCM with a key derived from the admin key, so a copy of the D1 database
-// alone doesn't reveal the provider keys.
-async function cipherKey(adminKey: string) {
-  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(adminKey), "HKDF", false, ["deriveKey"]);
-  return crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("cloudex"), info: new TextEncoder().encode("provider keys v1") },
-    base,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"],
-  );
-}
-
-const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
-const unb64 = (text: string) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
-
-async function seal(adminKey: string, plain: string) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const sealed = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await cipherKey(adminKey), new TextEncoder().encode(plain));
-  return `v1:${b64(iv)}:${b64(new Uint8Array(sealed))}`;
-}
-
-async function open(adminKey: string, value: string) {
-  const [version, iv, data] = value.split(":");
-  if (version !== "v1" || !iv || !data) throw new Error("unknown key format");
-  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(iv) }, await cipherKey(adminKey), unb64(data));
-  return new TextDecoder().decode(plain);
-}
+// Sealed with the admin key (seal.ts), so a copy of the D1 database alone
+// doesn't reveal the provider keys.
+const LABEL = "provider keys v1";
 
 type Row = { provider: Provider; value: string; hint: string; updated_at: number };
 
@@ -84,7 +60,7 @@ export async function setKey(env: Env, provider: Provider, key: string) {
     `INSERT INTO provider_keys (provider, value, hint, updated_at) VALUES (?, ?, ?, ?)
      ON CONFLICT(provider) DO UPDATE SET value = excluded.value, hint = excluded.hint, updated_at = excluded.updated_at`,
   )
-    .bind(provider, await seal(env.ADMIN_KEY, key), row.hint, row.updatedAt)
+    .bind(provider, await seal(env.ADMIN_KEY, LABEL, key), row.hint, row.updatedAt)
     .run();
   cache.clear();
   return row;
@@ -110,7 +86,7 @@ export async function providerKey(env: Env, provider: Provider): Promise<string 
   await ensureSchema(env.DB);
   const value = await env.DB.prepare("SELECT value FROM provider_keys WHERE provider = ?").bind(provider).first<string>("value");
   let key: string | null = null;
-  if (value) key = await open(env.ADMIN_KEY, value).catch(() => Promise.reject(new UnreadableKey(provider)));
+  if (value) key = await open(env.ADMIN_KEY, LABEL, value).catch(() => Promise.reject(new UnreadableKey(provider)));
   cache.set(provider, { key, at: Date.now() });
   return key;
 }

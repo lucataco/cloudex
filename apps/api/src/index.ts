@@ -15,6 +15,7 @@ import {
   ResumeRequest,
   SetProviderKey,
   StartAgent,
+  UpdateSettings,
   type Health,
 } from "@cloudex/schema";
 import { z } from "zod";
@@ -37,7 +38,9 @@ const app = new Hono<Ctx>();
 
 app.onError((e, c) => {
   if (e instanceof ZodError) {
-    return c.json({ error: e.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ") }, 400);
+    // A bad record key (an environment variable's name, a file's path) carries its reason inside.
+    const why = (i: ZodError["issues"][number]) => (i.code === "invalid_key" && i.issues[0]?.message) || i.message;
+    return c.json({ error: e.issues.map((i) => `${i.path.join(".") || "body"}: ${why(i)}`).join("; ") }, 400);
   }
   if (e instanceof SyntaxError) return c.json({ error: "the request body isn't valid JSON" }, 400);
   const { status, message } = errorStatus(e);
@@ -229,6 +232,19 @@ app.post("/v1/sandboxes/:ref/hosts", async (c) => {
   await stub.get();
   const token = await previewToken(c.env.ADMIN_KEY, id, port);
   return c.json({ url: `https://${port}-${id}-${token}.${zone}` });
+});
+
+// Settings (settings.ts): environment variables and files, applied at every
+// start and at once to a running sandbox. Names and paths only come back.
+app.get("/v1/sandboxes/:ref/settings", async (c) => {
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.settings()));
+});
+
+app.patch("/v1/sandboxes/:ref/settings", async (c) => {
+  const change = UpdateSettings.parse(await c.req.json());
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.updateSettings(change)));
 });
 
 // AI provider keys (keys.ts). Keys are write-only: listing shows a hint.

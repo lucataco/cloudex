@@ -240,3 +240,16 @@ test("agents: wait reads only new events, and events without follow stop at the 
   assert.deepEqual(quick, []);
   assert.equal(seen.at(-1)?.route, `GET ${path}/events?after=5&wait=0`);
 });
+
+test("settings: create sends them, settings() and updateSettings() read and change them", async () => {
+  const view = { env: ["A"], files: ["~/.npmrc"], repo: { url: "https://github.com/you/app", dir: "~/app", branch: null } };
+  routes["POST /v1/sandboxes"] = [201, info("cx-aaa111")];
+  routes["GET /v1/sandboxes/cx-aaa111/settings"] = [200, view];
+  routes["PATCH /v1/sandboxes/cx-aaa111/settings"] = [200, { ...view, env: [] }];
+  const cx = new Cloudex({ apiUrl: url, apiKey: "k" });
+  const box = await cx.create({ env: { A: "1" }, files: { "~/.npmrc": "x" }, repo: { url: "https://github.com/you/app" } });
+  assert.deepEqual(seen.at(-1)?.body, { env: { A: "1" }, files: { "~/.npmrc": "x" }, repo: { url: "https://github.com/you/app" } });
+  assert.deepEqual(await box.settings(), view);
+  assert.deepEqual((await box.updateSettings({ env: { A: null } })).env, []);
+  assert.deepEqual(seen.at(-1), { route: "PATCH /v1/sandboxes/cx-aaa111/settings", auth: "Bearer k", body: { env: { A: null } } });
+});

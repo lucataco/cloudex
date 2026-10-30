@@ -47,6 +47,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 |---|---|
 | `cloudex new [--name] [--size standard-2] [--idle 30m]` | Create and start a sandbox; it becomes the current one |
 | `cloudex fork [sandbox] [--name] [--count 1-10]` | New sandboxes that start from a copy of one's disk (also `cloudex new --from <sandbox>`) |
+| `cloudex env [sandbox]`, `env set NAME=VALUE`, `env unset NAME` | A sandbox's environment variables and files (`--file`, `--env-file`); `cloudex new` takes them too, and `--repo` |
 | `cloudex list`, `info`, `use <sandbox>` | See sandboxes and pick the current one |
 | `cloudex ssh [sandbox] [-- ssh args]` | Shell in over SSH, through your API (no public IP) |
 | `cloudex desktop [sandbox] [--size 1280x720] [--link] [--quality 0-9]` | Open the sandbox's desktop, with Chrome and a terminal, in your browser |
@@ -80,6 +81,15 @@ login, is used as is. A new provider reaches a running sandbox when it next
 starts; a changed or removed key reaches it within a minute. `cloudex info`
 shows which providers a sandbox uses this way. The keys are encrypted with the
 admin key, so after `cloudex deploy --yes` replaces it, set them again.
+
+**Settings.** `cloudex new --env NAME=VALUE --env-file .env --file .npmrc=./npmrc
+--repo https://github.com/you/app` gives a sandbox environment variables that
+every shell, ssh session, exec and agent gets, files in its home directory, and
+a repo cloned when it's created. Variables and files apply at every start, and
+`cloudex env set` changes them on a running sandbox at once; forks get a copy.
+The deployment keeps them encrypted and only shows names and paths. With
+`GH_TOKEN` or `GITHUB_TOKEN` set, git clones and pushes private GitHub repos and
+`gh` works.
 
 **Forks.** `cloudex fork` makes new sandboxes that start from a copy of a
 sandbox's whole disk, including installed packages and agent logins. A running

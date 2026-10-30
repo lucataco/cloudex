@@ -14,7 +14,10 @@ import type {
   Provider,
   PromptOptions,
   ProviderKey,
+  RepoOptions,
   SandboxInfo,
+  SandboxSettings,
+  SettingsChange,
 } from "./index.ts";
 
 // Each assignable to the other, with the same field names (assignability alone
@@ -46,4 +49,7 @@ export const checks: [
   Same<AgentInfo, schema.Agent>,
   Same<AgentEvent, schema.AgentEvent>,
   Same<AgentEvents, schema.AgentEvents>,
-] = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
+  Same<RepoOptions, schema.Repo>,
+  Same<SandboxSettings, schema.SandboxSettings>,
+  Same<SettingsChange, schema.UpdateSettings>,
+] = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];

@@ -6,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from cloudex import Cloudex, CloudexError, ExecResult, ProviderKey
+from cloudex import Cloudex, CloudexError, ExecResult, ProviderKey, Settings
 
 
 def info(id, **extra):
@@ -38,7 +38,7 @@ class FakeAPI(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    do_GET = do_POST = do_PUT = do_DELETE = _handle
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
 
     def log_message(self, *args):
         pass
@@ -190,6 +190,17 @@ class CloudexTest(unittest.TestCase):
         a.send("and the docs", interrupt=True)
         self.assertEqual(FakeAPI.seen[-1]["body"], {"prompt": "and the docs", "interrupt": True})
         self.assertEqual(a.interrupt().error, "interrupted")
+
+    def test_settings(self):
+        view = {"env": ["A"], "files": ["~/.npmrc"], "repo": None}
+        FakeAPI.routes["POST /v1/sandboxes"] = (201, info("cx-aaa111"))
+        FakeAPI.routes["GET /v1/sandboxes/cx-aaa111/settings"] = (200, view)
+        FakeAPI.routes["PATCH /v1/sandboxes/cx-aaa111/settings"] = (200, dict(view, env=[]))
+        box = self.cx.create(env={"A": "1"}, files={"~/.npmrc": "x"}, repo="https://github.com/you/app#dev")
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"env": {"A": "1"}, "files": {"~/.npmrc": "x"}, "repo": "https://github.com/you/app#dev"})
+        self.assertEqual(box.settings(), Settings(env=["A"], files=["~/.npmrc"], repo=None))
+        self.assertEqual(box.update_settings(env={"A": None}).env, [])
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"env": {"A": None}})
 
     def test_unreachable_api(self):
         with self.assertRaises(CloudexError) as caught:

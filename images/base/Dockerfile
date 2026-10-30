@@ -25,6 +25,15 @@ RUN install -m 0755 -d /etc/apt/keyrings \
        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
   && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI, so agents can open pull requests. It and git (through Cloudex's
+# credential helper) use GH_TOKEN or GITHUB_TOKEN from the sandbox's env.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update && apt-get install -y --no-install-recommends gh \
+  && rm -rf /var/lib/apt/lists/*
+
 # Agent CLIs. Users sign in once inside the sandbox; the login survives stop and resume.
 RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force
 

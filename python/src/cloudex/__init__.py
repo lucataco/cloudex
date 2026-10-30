@@ -28,8 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
-__all__ = ["Agent", "Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "ProviderKey", "Sandbox"]
-__version__ = "0.1.10"
+__all__ = ["Agent", "Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "ProviderKey", "Sandbox", "Settings"]
+__version__ = "0.1.11"
 
 
 class CloudexError(Exception):
@@ -65,6 +65,15 @@ class ProviderKey:
     provider: str  # anthropic or openai
     hint: str  # the key's last 4 characters; the key itself is never returned
     updated_at: int  # milliseconds since the epoch
+
+
+@dataclass(frozen=True)
+class Settings:
+    """A sandbox's settings. Values and file contents never come back."""
+
+    env: List[str]
+    files: List[str]  # as ~/path
+    repo: Optional[Dict[str, Any]]  # url, dir, branch
 
 
 @dataclass(frozen=True)
@@ -130,14 +139,25 @@ class Cloudex:
         """A sandbox by id (cx-xxxxxx) or name."""
         return Sandbox(self, self._call("GET", _sandbox_path(ref)))
 
-    def create(self, name: Optional[str] = None, size: Optional[str] = None, idle_minutes: Optional[int] = None) -> "Sandbox":
+    def create(
+        self,
+        name: Optional[str] = None,
+        size: Optional[str] = None,
+        idle_minutes: Optional[int] = None,
+        env: Optional[Dict[str, str]] = None,
+        files: Optional[Dict[str, str]] = None,
+        repo: Union[str, Dict[str, str], None] = None,
+    ) -> "Sandbox":
         """Creates a sandbox and returns once it's running, usually in about 10 seconds.
 
         size is standard-1 to standard-4 (default standard-2). idle_minutes
         (default 30) is how long without activity before it saves and stops;
-        0 waits for the 6-hour platform limit.
+        0 waits for the 6-hour platform limit. env and files (paths in the home
+        directory, such as ~/.npmrc) are applied at every start; repo, an
+        https:// URL with #branch if wanted, or {"url", "dir", "branch"}, is
+        cloned into the home directory. A failed clone leaves a notice.
         """
-        body = _drop_none(name=name, size=size, idleMinutes=idle_minutes)
+        body = _drop_none(name=name, size=size, idleMinutes=idle_minutes, env=env, files=files, repo=repo)
         return Sandbox(self, self._call("POST", "/v1/sandboxes", body))
 
     def list_keys(self) -> List[ProviderKey]:
@@ -181,6 +201,10 @@ class Cloudex:
 
 def _provider_key(k: Dict[str, Any]) -> ProviderKey:
     return ProviderKey(provider=k["provider"], hint=k["hint"], updated_at=k["updatedAt"])
+
+
+def _settings(s: Dict[str, Any]) -> Settings:
+    return Settings(env=s["env"], files=s["files"], repo=s.get("repo"))
 
 
 def _sandbox_path(ref: str) -> str:
@@ -300,6 +324,20 @@ class Sandbox:
 
     def stop_desktop(self) -> None:
         self._client._call("DELETE", self._path("/desktop"))
+
+    def settings(self) -> Settings:
+        """The sandbox's environment variable names, files and repo."""
+        return _settings(self._client._call("GET", self._path("/settings")))
+
+    def update_settings(
+        self, env: Optional[Dict[str, Optional[str]]] = None, files: Optional[Dict[str, Optional[str]]] = None
+    ) -> Settings:
+        """Sets, or with None removes, environment variables and files.
+
+        A running sandbox gets the change at once, in new shells; a stopped one
+        when it next starts.
+        """
+        return _settings(self._client._call("PATCH", self._path("/settings"), _drop_none(env=env, files=files)))
 
     def prompt(
         self,

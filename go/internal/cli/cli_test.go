@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -564,5 +565,78 @@ func TestInfoShowsProviderKeys(t *testing.T) {
 	})
 	if code, out, _ := run(t, "info", "web"); code != 0 || !strings.Contains(out, "Provider keys  anthropic, openai, added on the way out") {
 		t.Fatalf("code %d, stdout %q", code, out)
+	}
+}
+
+const settingsJSON = `{"env":["GH_TOKEN","GREETING"],"files":["~/.npmrc"],"repo":{"url":"https://github.com/you/app","dir":"~/app","branch":"dev"}}`
+
+func TestNewSendsSettings(t *testing.T) {
+	f := withFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes": "!201 " + forkJSON("cx-new111", "web", "running", ""),
+	})
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, ".env")
+	os.WriteFile(envFile, []byte("# comment\nexport A=from-file\nB=\"quoted # value\"\nGREETING=overridden\n"), 0o600)
+	npmrc := filepath.Join(dir, "npmrc")
+	os.WriteFile(npmrc, []byte("token=abc\n"), 0o600)
+	home, _ := os.UserHomeDir()
+	code, out, errOut := run(t, "new", "--name", "web", "--env", "GREETING=hi=there", "--env-file", envFile,
+		"--file", home+"/.npmrc="+npmrc, "--file", "config/x.json="+npmrc, "--repo", "https://github.com/you/app#dev")
+	if code != 0 || !strings.Contains(out, "web is running") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	var body struct {
+		Env   map[string]string
+		Files map[string]string
+		Repo  string
+	}
+	json.Unmarshal([]byte(f.bodies[0]), &body)
+	wantEnv := map[string]string{"A": "from-file", "B": "quoted # value", "GREETING": "hi=there"}
+	wantFiles := map[string]string{"~/.npmrc": "token=abc\n", "config/x.json": "token=abc\n"}
+	if !reflect.DeepEqual(body.Env, wantEnv) || !reflect.DeepEqual(body.Files, wantFiles) || body.Repo != "https://github.com/you/app#dev" {
+		t.Fatalf("request body %s", f.bodies[0])
+	}
+}
+
+func TestNewSettingsDontGoWithFrom(t *testing.T) {
+	withFakeAPI(t, map[string]string{})
+	if code, _, errOut := run(t, "new", "--from", "web", "--env", "A=1"); code != 1 || !strings.Contains(errOut, "don't go with --from") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestEnvSetAndUnset(t *testing.T) {
+	f := withFakeAPI(t, map[string]string{
+		"PATCH /v1/sandboxes/web/settings":       settingsJSON,
+		"PATCH /v1/sandboxes/cx-cur111/settings": settingsJSON,
+		"GET /v1/sandboxes/web/settings":         settingsJSON,
+	})
+	cfg, _ := config.Load()
+	cfg.Current = "cx-cur111"
+	cfg.Save()
+
+	code, out, errOut := run(t, "env", "set", "web", "GREETING=hello world", "EMPTY=")
+	if code != 0 || !strings.Contains(out, "Variables  GH_TOKEN GREETING") || !strings.Contains(out, "Repo       https://github.com/you/app (dev) in ~/app") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if f.bodies[0] != `{"env":{"EMPTY":"","GREETING":"hello world"}}` {
+		t.Fatalf("set body %s", f.bodies[0])
+	}
+	// Without a sandbox, the current one; "web" then "A" is a sandbox and a name.
+	run(t, "env", "set", "A=1")
+	run(t, "env", "unset", "web", "A", "--file", "~/.npmrc")
+	run(t, "env", "unset", "ONLY")
+	want := []string{"PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings", "PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings"}
+	if !reflect.DeepEqual(f.requests, want) {
+		t.Fatalf("requests %v", f.requests)
+	}
+	if f.bodies[2] != `{"env":{"A":null},"files":{"~/.npmrc":null}}` || f.bodies[3] != `{"env":{"ONLY":null}}` {
+		t.Fatalf("unset bodies %s / %s", f.bodies[2], f.bodies[3])
+	}
+	if code, out, _ := run(t, "env", "web"); code != 0 || !strings.Contains(out, "Files      ~/.npmrc") {
+		t.Fatalf("list: code %d, %q", code, out)
+	}
+	if code, _, errOut := run(t, "env", "set", "web", "not a pair"); code != 1 || !strings.Contains(errOut, "isn't NAME=VALUE") {
+		t.Fatalf("bad pair: code %d, %q", code, errOut)
 	}
 }

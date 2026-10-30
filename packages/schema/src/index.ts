@@ -44,14 +44,68 @@ export const Name = z
   .regex(/^[a-z][a-z0-9-]{0,30}[a-z0-9]$/, "lowercase letters, digits and dashes; 2-32 characters")
   .refine((n) => !n.startsWith("cx-"), "names can't start with cx-, which marks sandbox ids");
 
+// Settings: environment variables and files the sandbox gets at every start,
+// and a repo cloned when it's created. Variables reach every shell, ssh
+// session, exec and agent; files go in the home directory, readable only by the
+// cloudex user. The deployment keeps them encrypted, and never returns values
+// or contents.
+const RESERVED_ENV = new Set(["HOME", "USER", "LOGNAME", "SHELL", "PATH", "PWD"]);
+export const EnvName = z
+  .string()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/, "letters, digits and underscores, not starting with a digit")
+  .refine((n) => !RESERVED_ENV.has(n) && !n.startsWith("CLOUDEX_"), "reserved: set it in ~/.profile instead");
+const EnvValue = z.string().max(32_768).refine((v) => !v.includes("\0"), "no NUL characters");
+
+// In the home directory: ~/.npmrc, .npmrc and /home/cloudex/.npmrc are the same file.
+export const FilePath = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine((p) => !p.includes("\0") && !/(^|\/)\.\.(\/|$)/.test(p), "no .. or NUL")
+  .refine((p) => !p.startsWith("/") || p.startsWith("/home/cloudex/"), "a path in the home directory, such as ~/.npmrc");
+const FileContent = z.string().max(262_144);
+
+const Branch = z.string().regex(/^[\w./-]{1,200}$/, "a branch or tag name");
+export const Repo = z.object({
+  // HTTPS only. For a private GitHub repo, set GH_TOKEN or GITHUB_TOKEN in env.
+  url: z.string().regex(/^https:\/\/[^\s#]+$/, "an https:// URL"),
+  // Where to clone it, in the home directory; default the repo's name.
+  dir: FilePath.optional(),
+  branch: Branch.optional(),
+});
+export type Repo = z.input<typeof Repo>;
+
+const maxEntries = (n: number) => (r: Record<string, unknown>) => Object.keys(r).length <= n;
+
 export const CreateSandbox = z.object({
   name: Name.optional(),
   size: SandboxSize.default("standard-2"),
   // Stop (and save) after this many minutes without SSH, exec, preview or agent
   // activity. 0 keeps it running until the platform's 6-hour limit.
   idleMinutes: z.number().int().min(0).max(360).default(30),
+  env: z.record(EnvName, EnvValue).refine(maxEntries(100), "at most 100 variables").optional(),
+  files: z.record(FilePath, FileContent).refine(maxEntries(20), "at most 20 files").optional(),
+  // An https:// URL, with #branch to pick one, or { url, dir, branch }. Cloned
+  // once, when the sandbox is created.
+  repo: z.union([z.string().regex(/^https:\/\/[^\s#]+(#[\w./-]{1,200})?$/, "an https:// URL, with #branch if you like"), Repo]).optional(),
 });
 export type CreateSandbox = z.input<typeof CreateSandbox>;
+
+// A change to a sandbox's settings: null removes a variable or file. Applied at
+// once to a running sandbox, and at every start.
+export const UpdateSettings = z.object({
+  env: z.record(EnvName, EnvValue.nullable()).optional(),
+  files: z.record(FilePath, FileContent.nullable()).optional(),
+});
+export type UpdateSettings = z.input<typeof UpdateSettings>;
+
+// What a sandbox has set: names and paths only.
+export const SandboxSettings = z.object({
+  env: z.array(z.string()),
+  files: z.array(z.string()), // as ~/path
+  repo: z.object({ url: z.string(), dir: z.string(), branch: z.string().nullable() }).nullable(),
+});
+export type SandboxSettings = z.infer<typeof SandboxSettings>;
 
 // A fork is a new sandbox starting from a copy of another's disk: a fresh save
 // of a running sandbox, which keeps running, or the last save of a stopped one.
