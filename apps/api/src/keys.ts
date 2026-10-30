@@ -124,6 +124,16 @@ export const KEYS_SCRIPT = String.raw`
 set -euo pipefail
 providers=" $1 "
 profile=/etc/profile.d/cloudex-keys.sh
+# Not about keys, but it needs the same after-restore timing: cloudex prompt
+# runs Claude Code with --dangerously-skip-permissions, the sandbox being the
+# boundary, so its warning about that is accepted ahead of time. A setting
+# already there, true or false, stays.
+runuser -u cloudex -- env HOME=/home/cloudex bash -c '
+  f=$HOME/.claude/settings.json
+  mkdir -p "$HOME/.claude"
+  [ -s "$f" ] || echo "{}" >"$f"
+  jq "if has(\"skipDangerousModePermissionPrompt\") then . else .skipDangerousModePermissionPrompt = true end" "$f" >"$f.new" &&
+    mv "$f.new" "$f" || rm -f "$f.new"' || true
 # Codex opens on a sign-in screen, even with CODEX_API_KEY set, unless it has
 # a login. With an OpenAI key and no login of its own (ChatGPT or a key given
 # to it in the sandbox), it gets an API-key login with the placeholder, which
@@ -137,6 +147,11 @@ case $providers in
     ;;
   *) [ "$(jq -r '.OPENAI_API_KEY // empty' "$codex_auth" 2>/dev/null)" != "$3" ] || rm -f "$codex_auth" ;;
 esac
+# Shells read the placeholders from the profile. An ssh session that runs a
+# command without one, as cloudex prompt does, or an editor's remote server,
+# gets them from /etc/environment, which sshd reads for every session.
+begin="# Cloudex: placeholder provider keys, rewritten at each start" end="# Cloudex: end"
+sed -i "/^$begin\$/,/^$end\$/d" /etc/environment
 if [ -z "$1" ]; then rm -f "$profile"; exit 0; fi
 ca=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 for _ in $(seq 150); do [ -s "$ca" ] && break; sleep 0.1; done
@@ -144,20 +159,22 @@ for _ in $(seq 150); do [ -s "$ca" ] && break; sleep 0.1; done
 cp "$ca" /usr/local/share/ca-certificates/cloudflare-containers-ca.crt
 update-ca-certificates >/dev/null 2>&1
 bundle=/etc/ssl/certs/ca-certificates.crt
+# NAME=value pairs; none has a space.
+vars="NODE_EXTRA_CA_CERTS=$bundle SSL_CERT_FILE=$bundle REQUESTS_CA_BUNDLE=$bundle"
+case $providers in *" anthropic "*) vars="$vars ANTHROPIC_API_KEY=$2" ;; esac
+case $providers in *" openai "*) vars="$vars OPENAI_API_KEY=$3 CODEX_API_KEY=$3" ;; esac
 {
   echo "# Written by Cloudex at each start. These keys are placeholders: the real"
   echo "# ones stay outside the sandbox and are added to requests on the way out."
-  echo "export NODE_EXTRA_CA_CERTS=$bundle SSL_CERT_FILE=$bundle REQUESTS_CA_BUNDLE=$bundle"
-  case $providers in *" anthropic "*) echo "export ANTHROPIC_API_KEY=$2" ;; esac
-  case $providers in *" openai "*) echo "export OPENAI_API_KEY=$3 CODEX_API_KEY=$3" ;; esac
+  echo "export $vars"
 } >"$profile"
+{ echo "$begin"; printf '%s\n' $vars; echo "$end"; } >>/etc/environment
 case $providers in
   *" anthropic "*)
     # Claude Code asks once before using a key from the environment, and
     # remembers the answer by the key's last 20 characters. With a key there's
     # no login to choose, so first-run setup is skipped too, keeping any
-    # answers already given. Its Bypass Permissions warning, which cloudex
-    # prompt runs into, is left for a person to accept.
+    # answers already given.
     runuser -u cloudex -- env HOME=/home/cloudex TAIL="$(printf %s "$2" | tail -c 20)" bash -c '
       f=$HOME/.claude.json
       [ -s "$f" ] || echo "{}" >"$f"

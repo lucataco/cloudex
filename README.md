@@ -75,8 +75,7 @@ in your deployment, encrypted. Sandboxes started after that get a placeholder
 key, and the real one is added to their HTTPS calls to the provider as they
 leave, so it never enters a sandbox, its saves, backups or forks. Claude Code,
 Codex, the providers' SDKs and curl work as if the key were there, with no
-sign-in; the first `cloudex prompt` asks you once to accept Claude Code's
-Bypass Permissions warning. A key a sandbox brings itself, or a subscription
+sign-in. A key a sandbox brings itself, or a subscription
 login, is used as is. A new provider reaches a running sandbox when it next
 starts; a changed or removed key reaches it within a minute. `cloudex info`
 shows which providers a sandbox uses this way. The keys are encrypted with the

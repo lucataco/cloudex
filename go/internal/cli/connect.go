@@ -123,8 +123,10 @@ func newPromptCmd(opts *options) *cobra.Command {
 		Long: "Start Claude Code or Codex on a task in a tmux session inside the\n" +
 			"sandbox, then attach to it. Detach with Ctrl-b d; the agent keeps working and\n" +
 			"the sandbox stays up while it does. Reattach with cloudex attach.\n\n" +
-			"Sign in to the agent once first (cloudex ssh, then run claude or codex); the\n" +
-			"login is saved with the sandbox's disk.",
+			"The agent needs a key or a login: store an API key with cloudex keys set, or\n" +
+			"sign in once (cloudex ssh, then run claude or codex), which is saved with the\n" +
+			"sandbox's disk. Agents run without their own permission prompts; the sandbox\n" +
+			"is the boundary.",
 		Example: "  cloudex prompt \"make the tests pass\"\n  cloudex prompt my-box --agent codex \"add a dark mode\"",
 		Args:    cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
