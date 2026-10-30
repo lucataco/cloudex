@@ -20,7 +20,9 @@ case "${1:-}" in
       *) echo "unknown agent: $agent (use claude or codex)" >&2; exit 2 ;;
     esac
     command -v "${run[0]}" >/dev/null || { echo "$agent isn't installed in this sandbox" >&2; exit 1; }
-    name="agent-$(date +%m%d-%H%M%S)"
+    # Agents started in the same second get -2, -3 and so on.
+    base="agent-$(date +%m%d-%H%M%S)" name=$base n=1
+    while tmux has-session -t "=$name" 2>/dev/null; do n=$((n + 1)) name="$base-$n"; done
     tmux new-session -d -s "$name" -c "$HOME" -x 200 -y 50 "$(printf '%q ' "${run[@]}"); exec bash -l"
     echo "$name"
     ;;

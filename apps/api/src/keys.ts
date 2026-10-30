@@ -97,6 +97,9 @@ export async function deleteKey(db: D1Database, provider: Provider) {
   return meta.changes > 0;
 }
 
+// A key stored under an earlier admin key, which cloudex deploy --yes replaces.
+export class UnreadableKey extends Error {}
+
 // The real keys, cached for a minute per isolate: provider calls come often,
 // and a changed key needs to reach running sandboxes only soon, not at once.
 const cache = new Map<Provider, { key: string | null; at: number }>();
@@ -106,10 +109,12 @@ export async function providerKey(env: Env, provider: Provider): Promise<string 
   if (hit && Date.now() - hit.at < 60_000) return hit.key;
   await ensureSchema(env.DB);
   const value = await env.DB.prepare("SELECT value FROM provider_keys WHERE provider = ?").bind(provider).first<string>("value");
-  const key = value ? await open(env.ADMIN_KEY, value) : null;
+  let key: string | null = null;
+  if (value) key = await open(env.ADMIN_KEY, value).catch(() => Promise.reject(new UnreadableKey(provider)));
   cache.set(provider, { key, at: Date.now() });
   return key;
 }
+
 
 // Run as root after each start. $1 is the providers with keys, space-separated
 // (possibly none); $2 and $3 the Anthropic and OpenAI placeholders. Trusts the
@@ -119,6 +124,19 @@ export const KEYS_SCRIPT = String.raw`
 set -euo pipefail
 providers=" $1 "
 profile=/etc/profile.d/cloudex-keys.sh
+# Codex opens on a sign-in screen, even with CODEX_API_KEY set, unless it has
+# a login. With an OpenAI key and no login of its own (ChatGPT or a key given
+# to it in the sandbox), it gets an API-key login with the placeholder, which
+# goes when the OpenAI key does.
+codex_auth=/home/cloudex/.codex/auth.json
+case $providers in
+  *" openai "*)
+    if [ ! -s "$codex_auth" ] && command -v codex >/dev/null; then
+      printf %s "$3" | runuser -u cloudex -- env HOME=/home/cloudex codex login --with-api-key >/dev/null 2>&1 || true
+    fi
+    ;;
+  *) [ "$(jq -r '.OPENAI_API_KEY // empty' "$codex_auth" 2>/dev/null)" != "$3" ] || rm -f "$codex_auth" ;;
+esac
 if [ -z "$1" ]; then rm -f "$profile"; exit 0; fi
 ca=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 for _ in $(seq 150); do [ -s "$ca" ] && break; sleep 0.1; done

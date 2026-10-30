@@ -79,7 +79,8 @@ sign-in; the first `cloudex prompt` asks you once to accept Claude Code's
 Bypass Permissions warning. A key a sandbox brings itself, or a subscription
 login, is used as is. A new provider reaches a running sandbox when it next
 starts; a changed or removed key reaches it within a minute. `cloudex info`
-shows which providers a sandbox uses this way.
+shows which providers a sandbox uses this way. The keys are encrypted with the
+admin key, so after `cloudex deploy --yes` replaces it, set them again.
 
 **Forks.** `cloudex fork` makes new sandboxes that start from a copy of a
 sandbox's whole disk, including installed packages and agent logins. A running

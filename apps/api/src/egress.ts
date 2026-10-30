@@ -10,7 +10,7 @@
 // (keys.ts): the real key goes in here, on the way out.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { backupBucket, partKey } from "./backup";
-import { PROVIDERS, providerForHost, providerKey } from "./keys";
+import { PROVIDERS, providerForHost, providerKey, UnreadableKey } from "./keys";
 
 // When each sandbox last counted a provider call as activity, per isolate.
 const lastPing = new Map<string, number>();
@@ -49,7 +49,16 @@ export class Egress extends WorkerEntrypoint<Env, { id: string }> {
     const headers = new Headers(req.headers);
     const sent = spec.sent(headers);
     if (!sent || sent === spec.placeholder) {
-      const key = await providerKey(this.env, name);
+      let key: string | null;
+      try {
+        key = await providerKey(this.env, name);
+      } catch (e) {
+        if (!(e instanceof UnreadableKey)) throw e;
+        // Anthropic's error shape, whose error.message OpenAI's clients read too.
+        // Not a 401: Claude Code retries one whose message it doesn't know.
+        const message = `Cloudex can't read its stored ${name} key: the deployment's admin key changed after it was set. Set it again with: cloudex keys set ${name}`;
+        return Response.json({ type: "error", error: { type: "permission_error", message } }, { status: 403 });
+      }
       if (key) spec.set(headers, key);
     }
     // An agent working counts as activity, at most twice a minute.
