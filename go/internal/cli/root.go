@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"strings"
 
 	"github.com/lucataco/cloudex/go/internal/api"
@@ -25,14 +26,22 @@ type exitError struct{ code int }
 
 func (e exitError) Error() string { return fmt.Sprintf("exit status %d", e.code) }
 
-// Run executes the CLI and returns the process exit code.
-func Run(version string, args []string, stdout, stderr io.Writer) int {
+// Run executes the CLI and returns the process exit code. A command that
+// fails, or crashes, leaves its error for cloudex feedback --last-error.
+func Run(version string, args []string, stdout, stderr io.Writer) (code int) {
 	cmd := New(version)
 	cmd.SetArgs(args)
 	cmd.SetOut(stdout)
 	cmd.SetErr(stderr)
+	defer func() {
+		if p := recover(); p != nil {
+			saveLastError(version, nil, args, nil, fmt.Sprint(p), string(debug.Stack()))
+			fmt.Fprintf(stderr, "cloudex crashed: %v\nThat's a bug in Cloudex. Report it with: cloudex feedback --last-error\n", p)
+			code = 2
+		}
+	}()
 	notice := startUpdateCheck(version, args, stderr)
-	err := cmd.Execute()
+	ran, err := cmd.ExecuteC()
 	notice()
 	var exit exitError
 	switch {
@@ -42,6 +51,12 @@ func Run(version string, args []string, stdout, stderr io.Writer) int {
 		return exit.code
 	default:
 		fmt.Fprintln(stderr, "error:", err)
+		if ran == nil || ran.Name() != "feedback" {
+			saveLastError(version, ran, args, err, err.Error(), "")
+			if looksLikeABug(err) {
+				fmt.Fprintln(stderr, "If this looks like a bug in Cloudex, report it with: cloudex feedback --last-error")
+			}
+		}
 		return 1
 	}
 }
@@ -73,7 +88,7 @@ func New(version string) *cobra.Command {
 	add("connect", newSSHCmd(opts), newDesktopCmd(opts), newExecCmd(opts), newHostCmd(opts), newPromptCmd(opts),
 		newAttachCmd(opts), newAgentsCmd(opts), newSSHConfigCmd(opts))
 	add("setup", newDeployCmd(opts), newLoginCmd(opts), newKeysCmd(opts), newDoctorCmd(opts), newStatusCmd(opts),
-		newUpdateCmd(version, opts), newVersionCmd(version, opts))
+		newUpdateCmd(version, opts), newVersionCmd(version, opts), newFeedbackCmd(version, opts))
 	root.AddCommand(newProxyCmd(opts))
 	return root
 }

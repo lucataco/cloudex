@@ -29,3 +29,7 @@ description: Run code, servers and coding agents in Cloudex sandboxes, Ubuntu ma
 - `cloudex agents start <sandbox> "<task>"` starts Claude Code there (`--agent codex` for Codex) with no terminal and prints what it does until the turn ends; `-d` returns at once.
 - `cloudex agents logs <sandbox> -f` follows the newest agent, `cloudex agents send <sandbox> "<message>"` continues its conversation, and `cloudex agents interrupt <sandbox>` stops its turn.
 - Inside a sandbox, `cloudex` manages only that sandbox: `cloudex host <port>`, `cloudex info`, `cloudex set --idle <time>` and `cloudex stop`.
+
+## When something breaks
+
+If `cloudex` fails in a way that looks like a bug in Cloudex (it suggests `cloudex feedback`, the API answers with a 5xx error, or the CLI crashes), tell the user what happened. With their OK, run `cloudex feedback --last-error "what you were doing"`: without a terminal it sends nothing, and prints the report and a `cloudex feedback --send <id>` command. Show the user that report, and run the `--send` command only if they agree; it sends exactly that report. Reports are public GitHub issues, filed under the user's GitHub account when `gh` is signed in, so never put keys or private details in the message. Security problems go to https://github.com/lucataco/cloudex/security/advisories/new instead.

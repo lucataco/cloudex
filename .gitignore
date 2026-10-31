@@ -17,3 +17,6 @@ dist/
 # Python
 __pycache__/
 *.egg-info/
+
+# Triage runs (.agents/skills/triage-feedback)
+/.triage/

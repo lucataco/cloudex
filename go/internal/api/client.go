@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -148,10 +149,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(data, &e) != nil || e.Error == "" {
-			e.Error = strings.TrimSpace(string(data))
-			if e.Error == "" {
-				e.Error = res.Status
-			}
+			e.Error = plainError(res.Status, string(data))
 		}
 		return &Error{Status: res.StatusCode, Message: e.Error}
 	}
@@ -159,6 +157,28 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return nil
 	}
 	return json.Unmarshal(data, out)
+}
+
+var htmlTitle = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+
+// plainError makes an answer that isn't the API's JSON readable: an HTML error
+// page (from Cloudflare, say) becomes its title.
+func plainError(status, body string) string {
+	body = strings.TrimSpace(body)
+	if strings.HasPrefix(body, "<") {
+		title := ""
+		if m := htmlTitle.FindStringSubmatch(body); m != nil {
+			title = strings.Join(strings.Fields(m[1]), " ")
+		}
+		return strings.TrimSpace(status + " " + title)
+	}
+	if body == "" {
+		return status
+	}
+	if r := []rune(body); len(r) > 500 {
+		body = string(r[:500]) + "…"
+	}
+	return body
 }
 
 func (c *Client) Health(ctx context.Context) (*Health, error) {

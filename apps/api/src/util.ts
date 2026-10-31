@@ -1,3 +1,7 @@
+// Set by scripts/bundle-api.sh for releases.
+declare const CLOUDEX_VERSION: string | undefined;
+export const VERSION = typeof CLOUDEX_VERSION === "string" ? CLOUDEX_VERSION : "dev";
+
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // Container calls can hang (start() does while a new image propagates), so every

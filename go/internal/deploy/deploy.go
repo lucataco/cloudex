@@ -265,11 +265,24 @@ func pickAccount(ctx context.Context, cf *cloudflare.Client, want string) (cloud
 	}
 	var b strings.Builder
 	b.WriteString("the token reaches several accounts; pick one with --account-id:")
+	e := &accountsError{}
 	for _, a := range accounts {
 		fmt.Fprintf(&b, "\n  %s  %s", a.ID, a.Name)
+		e.names = append(e.names, a.ID, a.Name)
 	}
-	return cloudflare.Account{}, errors.New(b.String())
+	e.msg = b.String()
+	return cloudflare.Account{}, e
 }
+
+// accountsError lists the accounts a token reaches, whose names and ids
+// cloudex feedback leaves out of a report.
+type accountsError struct {
+	msg   string
+	names []string
+}
+
+func (e *accountsError) Error() string           { return e.msg }
+func (e *accountsError) PrivateValues() []string { return e.names }
 
 type registryKeychain struct{ username, password string }
 

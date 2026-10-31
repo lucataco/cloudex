@@ -63,6 +63,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex keys set <anthropic\|openai>`, `keys`, `keys rm` | Let sandboxes use an AI provider key that never enters them |
 | `cloudex doctor`, `status [--show-key]` | Check this computer and the deployment |
 | `cloudex update [--check]` | Update the CLI to the latest release, then offer to update the deployment |
+| `cloudex feedback "message"`, `--last-error` | Report a bug or an idea as a GitHub issue; keys and addresses are removed, and you see it first |
 
 **Backups.** Each stop also backs up `/home` (without `~/.cache`) and the SSH
 host keys to an R2 bucket in your account, `cloudex-backups`, keeping the newest
@@ -158,6 +159,15 @@ for await (const event of agent.events()) console.log(event.type, event.event ??
 console.log(agent.lastMessage);
 await (await agent.send("now update the docs")).wait();
 ```
+
+## Feedback
+
+`cloudex feedback "what happened"` (or `--last-error` after a command fails)
+files a report here, as a public issue, after removing keys, addresses and the
+sandbox names it knows of, and showing it to you. Agents get the report and a
+`--send <id>` command to run once you agree. Report security problems privately: see
+[SECURITY.md](SECURITY.md). Maintainers triage reports with the
+[triage-feedback](.agents/skills/triage-feedback/SKILL.md) skill.
 
 ## Layout
 

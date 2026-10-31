@@ -1,0 +1,26 @@
+# Labels the issues that cloudex feedback files: "feedback", plus "cli-error"
+# when the report carries a failed command. The triage skill
+# (.agents/skills/triage-feedback) works from these labels. The issue's text is
+# only matched by the expression below, never passed to a shell.
+name: Feedback
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    if: contains(github.event.issue.body, '<!-- cloudex feedback v1 -->')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          FAILED: ${{ contains(github.event.issue.body, '**What failed**') }}
+        with:
+          script: |
+            const labels = ["feedback"];
+            if (process.env.FAILED === "true") labels.push("cli-error");
+            await github.rest.issues.addLabels({ ...context.repo, issue_number: context.issue.number, labels });

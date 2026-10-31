@@ -25,14 +25,11 @@ import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, listKeys, setKey } from "./keys";
-import { LINK_HEADER, errorStatus, fail, isSandboxId, newAgentId, newSandboxId, previewToken, sameSecret } from "./util";
+import { LINK_HEADER, VERSION, errorStatus, fail, isSandboxId, newAgentId, newSandboxId, previewToken, sameSecret } from "./util";
 
 export { Sandbox } from "./sandbox";
 export { Egress } from "./egress";
 
-// Set by scripts/bundle-api.sh for releases.
-declare const CLOUDEX_VERSION: string | undefined;
-const VERSION = typeof CLOUDEX_VERSION === "string" ? CLOUDEX_VERSION : "dev";
 
 type Ctx = { Bindings: Env };
 const app = new Hono<Ctx>();

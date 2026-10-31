@@ -8,6 +8,7 @@
 // - a note that tells Claude Code and Codex about both;
 // - Vite's allowed hosts, so its dev server answers on the preview domain;
 // - ~/.cloudex/start, the user's own commands for every start (START_SCRIPT).
+import { VERSION } from "./util";
 
 // Python, run as root. Preview links reach the sandbox at its own address
 // (10.0.0.1), so a server listening only on 127.0.0.1 or ::1, as Vite,
@@ -205,15 +206,22 @@ const IN_SANDBOX_CLI = String.raw`#!/usr/bin/python3 -I
 # cloudex-in-sandbox: manage this sandbox from inside it. Cloudex rewrites this
 # file at each start; it replaces only a file carrying this mark.
 import argparse
+import hashlib
 import json
+import os
 import re
+import stat
+import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = "http://cloudex.internal/v1/sandboxes/self"
-COMMANDS = ("info", "host", "set", "stop")
+COMMANDS = ("info", "host", "set", "stop", "feedback")
+REPO = "lucataco/cloudex"
+MARK = "<!-- cloudex feedback v1 -->"
 HELP = """Manage this sandbox from inside it. To create, fork or delete sandboxes, use
 cloudex on your own computer.
 
@@ -227,6 +235,9 @@ Commands:
                           (0 leaves only the platform's 6-hour limit)
   set --name <name>       rename the sandbox
   stop                    save the disk and stop; everything running ends
+  feedback "<message>"    report a bug or an idea to the Cloudex maintainers, as a public
+                          GitHub issue. Without a terminal it only prints the report and
+                          saves it; feedback --send <id> then sends exactly that
 
 Add --json for JSON, the default when output isn't a terminal."""
 
@@ -238,7 +249,8 @@ def die(msg, code=1):
     sys.exit(code)
 
 
-def call(method, path="", body=None):
+def call(method, path="", body=None, quiet=False, timeout=120):
+    """The API's answer; on a failure, exits with its message, or with quiet, None."""
     data = None if body is None else json.dumps(body).encode()
     headers = {"content-type": "application/json"} if data else {}
     try:
@@ -248,15 +260,19 @@ def call(method, path="", body=None):
         pass
     req = urllib.request.Request(API + path, data=data, method=method, headers=headers)
     try:
-        with opener.open(req, timeout=120) as r:
+        with opener.open(req, timeout=timeout) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
+        if quiet:
+            return None
         try:
             msg = json.load(e).get("error")
         except Exception:
             msg = None
         die(msg or "the API answered %d" % e.code)
-    except (urllib.error.URLError, OSError) as e:
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        if quiet:
+            return None
         die("can't reach the Cloudex API from this sandbox: %s" % getattr(e, "reason", e))
 
 
@@ -284,6 +300,267 @@ def idle_text(n):
     return "after %d minutes" % n if n else "off (6-hour platform limit)"
 
 
+SECRETS = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"), "[private key]"),
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@"), r"\1[credentials]@"),
+    (re.compile(r"(?i)(\d{1,5})-(cx-[a-z0-9]{6})-[a-z0-9]{10}\b"), r"\1-\2-[token]"),
+    (re.compile(r"(?i)\b(?:[a-z0-9-]+\.)?[a-z0-9-]+\.workers\.dev\b"), "[subdomain].workers.dev"),
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"), "[email]"),
+    (re.compile(r"\b(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|cxk_[0-9a-f]{8,})"), "[secret]"),
+    (re.compile(r"""(?i)(^|[^A-Za-z0-9])([A-Za-z0-9_-]*?(?:api[_-]?key|key|token|secret|passw(?:or)?d|pwd|credentials?|auth)(?:[_-]?(?:key|token|secret|id))?["']?\s*[=:]\s*["']?)[^\s"',;}]{4,}"""), r"\1\2[secret]"),
+    (re.compile(r"(?i)(--?(?:password|passwd|token|secret|api-key|key)[ =]+)\S{4,}"), r"\1[secret]"),
+    (re.compile(r"(^|\s)(-p)([A-Za-z]\S{3,})"), r"\1\2[secret]"),
+    (re.compile(r"(?i)\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1\2[secret]"),
+    (re.compile(r"\b[A-Za-z0-9_-]{32,}\b"), "[secret]"),
+]
+BASE64 = re.compile(r"[A-Za-z0-9+/]{32,}={0,2}")
+IPV4 = re.compile(r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b")
+IPV6 = re.compile(r"(?i)\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b")
+DRAFT = os.path.expanduser("~/.cloudex/feedback-draft.json")
+
+
+def platform():
+    try:
+        with open("/etc/cloudex/platform.json") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def private_ip(ip):
+    ip = ip.lower()
+    if ip.startswith(("127.", "10.", "192.168.", "169.254.", "0.0.0.0", "fd", "fe80:")) or ip in ("::1", "::"):
+        return True
+    m = re.match(r"172\.(\d+)\.", ip)
+    return bool(m and 16 <= int(m.group(1)) <= 31)
+
+
+def keep_ip(m):
+    ip = m.group(0)
+    # Times (12:34:56) and file positions (main.py:12:3): all digits, at most three groups.
+    if ":" in ip and "::" not in ip and re.fullmatch(r"[\d:]+", ip) and ip.count(":") <= 2:
+        return ip
+    return ip if private_ip(ip) else "[ip]"
+
+
+def keep_base64(m):
+    t = m.group(0)
+    # A secret mixes cases and digits; a path is mostly lowercase.
+    if re.search(r"\d", t) and re.search(r"[A-Z]", t) and re.search(r"[a-z]", t):
+        return "[secret]"
+    return t
+
+
+def setting_values():
+    """The sandbox's own variables and their values, from its settings."""
+    try:
+        with open("/etc/cloudex/env.sh") as f:
+            names = re.findall(r"^export ([A-Za-z_][A-Za-z0-9_]*)=", f.read(), re.M)
+        r = subprocess.run(["bash", "-c", "set -a; . /etc/cloudex/env.sh; env -0"], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    env = dict(e.split("=", 1) for e in r.stdout.decode("utf-8", "replace").split("\0") if "=" in e)
+    return [(n, env[n]) for n in names if n in env]
+
+
+def whole(value):
+    """A pattern for value in any case, not inside a longer word."""
+    p = re.escape(value)
+    if re.match(r"\w", value):
+        p = r"\b" + p
+    if re.search(r"\w$", value):
+        p += r"\b"
+    return re.compile(p, re.I)
+
+
+def scrub(text, name=None):
+    """What a public report mustn't hold: the sandbox's variables, its id and
+    name, the preview domain, link tokens, IP addresses and anything that looks
+    like a secret. Shapes first, while a link or a key is still whole."""
+    for pattern, replacement in SECRETS:
+        text = pattern.sub(replacement, text)
+    text = BASE64.sub(keep_base64, text)
+    values = []
+    for var, value in setting_values():
+        for v in {value, *value.splitlines()}:
+            if len(v.strip()) >= 6:
+                values.append((v.strip(), "[" + var + "]"))
+    if platform().get("zone"):
+        values.append((platform()["zone"], "[preview domain]"))
+    own = os.environ.get("CLOUDEX_SANDBOX", "")
+    if own:
+        values.append((own, "[sandbox id]"))
+    for value, label in sorted(values, key=lambda v: len(v[0]), reverse=True):
+        text = whole(value).sub(lambda m: label, text)
+    text = IPV6.sub(keep_ip, IPV4.sub(keep_ip, text))
+    # A name that can't be an ordinary word: a dash, a digit, or 8 letters or more.
+    if name and (len(name) >= 8 or re.search(r"[-0-9]", name)):
+        text = whole(name).sub("[sandbox]", text)
+    return text
+
+
+def gh(stdin, *args):
+    try:
+        r = subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def gh_login():
+    return (gh("", "api", "--hostname", "github.com", "user", "--jq", ".login") or "").strip()
+
+
+def closed(body):
+    """body with its code fence and details closed, and a note that it was cut."""
+    fence = chr(96)  # a backtick, which this file can't hold
+    opened = 0
+    for line in body.split("\n"):
+        t = line.strip()
+        n = len(t) - len(t.lstrip(fence))
+        if n < 3:
+            continue
+        if not opened:
+            opened = n
+        elif n >= opened and not t.strip(fence):
+            opened = 0
+    if opened:
+        body += "\n" + fence * opened
+    if body.count("<details>") > body.count("</details>"):
+        body += "\n\n</details>"
+    return body + "\n\n_(Cut to fit in a link; the rest is in the sandbox that sent it.)_"
+
+
+def issue_link(title, body):
+    """GitHub's new-issue page with the report filled in, cut to fit."""
+    def build(b):
+        return "https://github.com/%s/issues/new?%s" % (REPO, urllib.parse.urlencode({"title": title, "body": b}))
+    link = build(body)
+    if len(link) <= 7000:
+        return link
+    lines = body.split("\n")
+    while len(lines) > 2:
+        lines = lines[: len(lines) * 4 // 5]
+        link = build(closed("\n".join(lines)))
+        if len(link) <= 7000:
+            return link
+    text = "\n".join(lines)
+    while text:
+        text = text[: len(text) * 4 // 5]
+        link = build(closed(text))
+        if len(link) <= 7000:
+            break
+    return link
+
+
+def how(report):
+    return "gh, as @" + report["login"] if report.get("login") else "GitHub's new-issue page, for you to submit"
+
+
+def send(report, as_json):
+    """Sends a report the way it said it would go."""
+    if report.get("login"):
+        now = gh_login()
+        if now != report["login"]:
+            die("this report was to go with gh as @%s, but gh is %s now; run cloudex feedback again"
+                % (report["login"], "signed in as @" + now if now else "not signed in"))
+        out = gh(report["body"], "issue", "create", "--repo", "github.com/" + REPO, "--title", report["title"], "--body-file", "-")
+        if not out:
+            die("gh couldn't file it; file it from this link instead:\n" + issue_link(report["title"], report["body"]))
+        issue = out.strip().splitlines()[-1]
+        try:
+            os.remove(DRAFT)
+        except OSError:
+            pass
+        print(json.dumps({"sent": True, "url": issue}, indent=2) if as_json else "Filed %s\nThank you." % issue)
+        return
+    link = issue_link(report["title"], report["body"])
+    print(json.dumps({"sent": False, "url": link}, indent=2) if as_json else "Submit the report on GitHub, where it's filled in:\n\n  " + link)
+
+
+def feedback(argv, as_json):
+    # Flags go before the message, so a -y inside it is just text.
+    yes, send_id, rest = False, None, list(argv)
+    while rest and rest[0].startswith("-") and rest[0] != "-":
+        flag = rest.pop(0)
+        if flag in ("-y", "--yes"):
+            yes = True
+        elif flag == "--send" and rest:
+            send_id = rest.pop(0)
+        elif flag.startswith("--send="):
+            send_id = flag.split("=", 1)[1]
+        elif flag in ("-h", "--help"):
+            print('usage: cloudex feedback [-y] "message" | cloudex feedback --send ID')
+            return
+        else:
+            die("unknown flag %s" % flag, 2)
+    if len(rest) > 1:
+        die('put the message in quotes: cloudex feedback "what happened"', 2)
+    message = rest[0] if rest else None
+    if send_id:
+        if message:
+            die("--send sends a saved report as it is: give no message with it", 2)
+        try:
+            with open(DRAFT) as f:
+                report = json.load(f)
+        except (OSError, ValueError):
+            report = {}
+        if report.get("id") != send_id:
+            die("no saved report %s: run cloudex feedback again to make one" % send_id)
+        if time.time() - report.get("at", 0) > 86400:
+            die("report %s is more than a day old: run cloudex feedback again" % send_id)
+        return send(report, as_json)
+    piped = message == "-"
+    if piped:
+        message = sys.stdin.read(65536)
+    me = call("GET", quiet=True, timeout=5) or {}
+    message = scrub((message or "").strip(), me.get("name"))
+    if not message:
+        die('say what happened, for example: cloudex feedback "the preview link answers 502"', 2)
+    title = message.splitlines()[0].strip()
+    if len(title) > 72:
+        title = title[:71] + "…"
+    os_name = "Linux"
+    try:
+        with open("/etc/os-release") as f:
+            os_name = dict(l.rstrip().split("=", 1) for l in f if "=" in l).get("PRETTY_NAME", os_name).strip('"')
+    except OSError:
+        pass
+    person = sys.stdin.isatty() and sys.stderr.isatty() and not piped
+    body = "\n".join([
+        MARK, message, "", "**Setup**",
+        "- Inside a sandbox (%s), API %s" % (me.get("size", "size unknown"), platform().get("version", "unknown")),
+        "- " + os_name,
+        "- Sent from " + ("a terminal" if person and sys.stdout.isatty() else "a script or an agent"),
+        "", "_Sent with cloudex feedback from inside a sandbox, which removed keys, variables and addresses first._", "",
+    ])
+    report = {"id": hashlib.sha256((title + "\0" + body).encode()).hexdigest()[:8], "title": title, "body": body,
+              "at": time.time(), "login": gh_login()}
+    if yes:
+        print("Sending this report, with %s:\n\n%s\n\n%s" % (how(report), title, body), file=sys.stderr)
+        return send(report, as_json)
+    if not person:
+        os.makedirs(os.path.dirname(DRAFT), exist_ok=True)
+        with open(DRAFT, "w") as f:
+            json.dump(report, f)
+        command = "cloudex feedback --send " + report["id"]
+        if as_json:
+            print(json.dumps({"sent": False, "id": report["id"], "title": title, "body": body,
+                              "url": issue_link(title, body), "via": how(report), "send": command}, indent=2))
+        else:
+            print(title + "\n\n" + body)
+        print("Not sent. Show this report to the person you work for. With their OK, send it as a public\n"
+              "issue on github.com/%s, with %s, by running: %s" % (REPO, how(report), command), file=sys.stderr)
+        return
+    print("Title: " + title + "\n\n" + body, file=sys.stderr)
+    print("This becomes a public issue on github.com/%s, filed with %s. Send it? [y/N] " % (REPO, how(report)),
+          end="", file=sys.stderr, flush=True)
+    if input().strip().lower() not in ("y", "yes"):
+        print("Not sent.", file=sys.stderr)
+        return
+    send(report, as_json)
+
+
 def print_sandbox(s):
     rows = [("ID", s["id"])]
     if s.get("name"):
@@ -303,10 +580,13 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(HELP)
         return 0
+    if argv[0] == "feedback":
+        feedback(argv[1:], as_json or not sys.stdout.isatty())
+        return 0
     if argv[0] not in COMMANDS:
         die("%s isn't available inside a sandbox: here cloudex only manages this sandbox (%s). "
             "Use cloudex on your own computer for the rest." % (argv[0], ", ".join(COMMANDS)), 2)
-    p = argparse.ArgumentParser(prog="cloudex " + argv[0], add_help=True)
+    p = argparse.ArgumentParser(prog="cloudex " + argv[0], add_help=True, allow_abbrev=False)
     if argv[0] == "host":
         p.add_argument("port", nargs="?", type=int)
         p.add_argument("--revoke", action="store_true")
@@ -387,6 +667,7 @@ const agentNote = (previews: boolean) =>
     "- `cloudex info` shows the sandbox. `cloudex set --idle 2h` keeps it running longer without activity, and `cloudex stop` saves its disk and stops it, ending everything running in it.",
     "- Docker works, with `--network host` only.",
     "- When the sandbox stops, its whole disk is saved, but programs don't start again by themselves on resume. Commands in `~/.cloudex/start` run at every start.",
+    "- If `cloudex` or the sandbox fails in a way that looks like a bug in Cloudex, tell your user. With their OK, run `cloudex feedback \"what happened\"`: it sends nothing, and prints a report and a `cloudex feedback --send <id>` command. Show them the report, and run that command only if they agree; it files the report as a public GitHub issue.",
     "",
   ].join("\n");
 
@@ -409,7 +690,8 @@ fi
 put() { # put PATH KEY MODE: write a file from the input, replacing it whole
   jq -j --arg k "$2" '.[$k]' <<<"$in" >"$1.new" && chmod "$3" "$1.new" && mv "$1.new" "$1"
 }
-install -d -m 755 /usr/local/lib/cloudex /etc/claude-code
+install -d -m 755 /usr/local/lib/cloudex /etc/claude-code /etc/cloudex
+jq -n --arg v "$(jq -r .version <<<"$in")" --arg z "$zone" '{version: $v, zone: $z}' >/etc/cloudex/platform.json
 put /usr/local/lib/cloudex/relay.py relay 755
 # A cloudex installed in the sandbox by its user stays; ours carries the mark
 # at the top. (The real CLI holds the mark too, deep inside, in its copy of the API.)
@@ -460,7 +742,13 @@ else
 fi
 `;
 
-export const PLATFORM_FILES = JSON.stringify({ relay: RELAY, cli: IN_SANDBOX_CLI, note: agentNote(true), noteNoPreviews: agentNote(false) });
+export const PLATFORM_FILES = JSON.stringify({
+  relay: RELAY,
+  cli: IN_SANDBOX_CLI,
+  note: agentNote(true),
+  noteNoPreviews: agentNote(false),
+  version: VERSION,
+});
 
 // $1 the port, $2 the address previews reach. Prints the port that answers for
 // it there: the port itself, or its relay's. Exit 3: nothing listens on it at all.

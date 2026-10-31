@@ -356,10 +356,23 @@ func (c *Client) RouteWorker(ctx context.Context, account, script, zoneID, zone,
 		if r.Script == script {
 			return nil
 		}
-		return fmt.Errorf("the route %s already goes to the Worker %s; remove it in the Cloudflare dashboard and deploy again", pattern, r.Script)
+		return &privateError{
+			msg:    fmt.Sprintf("the route %s already goes to the Worker %s; remove it in the Cloudflare dashboard and deploy again", pattern, r.Script),
+			values: []string{pattern, r.Script},
+		}
 	}
 	return c.do(ctx, http.MethodPost, "/zones/"+zoneID+"/workers/routes", map[string]string{"pattern": pattern, "script": script}, nil)
 }
+
+// privateError names things in the account, such as another Worker, that
+// cloudex feedback leaves out of a report.
+type privateError struct {
+	msg    string
+	values []string
+}
+
+func (e *privateError) Error() string           { return e.msg }
+func (e *privateError) PrivateValues() []string { return e.values }
 
 func asError(err error, target **Error) bool {
 	e, ok := err.(*Error)
