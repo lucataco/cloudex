@@ -70,6 +70,33 @@ export interface RepoOptions {
   branch?: string;
 }
 
+/** A change to the sandbox itself; fields left out stay as they are. */
+export interface UpdateOptions {
+  name?: string;
+  /** Minutes without activity before it saves and stops, counting from now; 0 waits for the 6-hour limit. */
+  idleMinutes?: number;
+}
+
+export interface ResumeOptions {
+  /** Start a fresh image with /home restored from the newest backup, instead of the save. */
+  fromBackup?: boolean;
+  /** Run on this size from now on. The disk must fit the new size's. */
+  size?: SandboxSize;
+}
+
+/** A preview link handed out that still works. */
+export interface HostLink {
+  port: number;
+  url: string;
+  createdAt: number;
+}
+
+/** What a revoke did: the ports whose links were listed, and whether every link to the sandbox went. */
+export interface RevokedLinks {
+  revoked: number[];
+  all: boolean;
+}
+
 /** A sandbox's settings. Values and file contents never come back. */
 export interface SandboxSettings {
   env: string[];
@@ -360,9 +387,14 @@ export class Sandbox {
     return this.#update("POST", "/stop");
   }
 
-  /** Starts from the save, or with fromBackup, from a fresh image with /home restored. */
-  async resume(options: { fromBackup?: boolean } = {}): Promise<this> {
+  /** Starts from the save, or with fromBackup, from a fresh image with /home restored; with size, on another size. */
+  async resume(options: ResumeOptions = {}): Promise<this> {
     return this.#update("POST", "/resume", options);
+  }
+
+  /** Renames the sandbox, or changes how long it may sit idle; a new idle time applies at once. */
+  async update(options: UpdateOptions): Promise<this> {
+    return this.#update("PATCH", "", options);
   }
 
   /** Deletes the sandbox and its backups. */
@@ -390,10 +422,27 @@ export class Sandbox {
     return forks.map((info) => new Sandbox(info, this.#call));
   }
 
-  /** An HTTPS link to a port, on the deployment's preview domain. Anyone with it can use it. */
+  /**
+   * An HTTPS link to a port, on the deployment's preview domain. Anyone with it
+   * can use it. The same port gives the same link until it's revoked. Servers
+   * that listen only on localhost work too.
+   */
   async host(port: number): Promise<string> {
     const { url } = await this.#call<{ url: string }>("POST", this.#path("/hosts"), { port });
     return url;
+  }
+
+  /** The preview links handed out since v0.1.14 that still work; older ones aren't listed, and revokeLinks() ends them too. */
+  links(): Promise<HostLink[]> {
+    return this.#call("GET", this.#path("/hosts"));
+  }
+
+  /**
+   * Makes a port's link stop working at once, or without a port, every link to
+   * the sandbox, the desktop's too. host() then gives a new link.
+   */
+  revokeLinks(port?: number): Promise<RevokedLinks> {
+    return this.#call("DELETE", this.#path(port === undefined ? "/hosts" : `/hosts/${port}`));
   }
 
   /**

@@ -14,15 +14,18 @@ import {
   ExecResult,
   ForkRequest,
   Health,
+  HostLink,
   HostRequest,
   HostResult,
   Provider,
   ProviderKey,
   ResumeRequest,
+  RevokedLinks,
   Sandbox,
   SandboxSettings,
   SetProviderKey,
   StartAgent,
+  UpdateSandbox,
   UpdateSettings,
 } from "./index.ts";
 
@@ -38,6 +41,7 @@ const requests = {
   SetProviderKey,
   StartAgent,
   AgentMessage,
+  UpdateSandbox,
   UpdateSettings,
 };
 const responses = {
@@ -45,6 +49,8 @@ const responses = {
   SandboxSettings,
   ExecResult,
   HostResult,
+  HostLink,
+  RevokedLinks,
   Desktop,
   Health,
   ProviderKey,
@@ -132,6 +138,11 @@ export function openapi(version: string) {
       "/v1/sandboxes/{ref}": {
         parameters: [sandboxRef],
         get: op("getSandbox", "Get a sandbox", { responses: { 200: sandbox } }),
+        patch: op("updateSandbox", "Rename a sandbox, or change how long it may sit idle", {
+          description: "A new idle time applies at once, counting from now.",
+          requestBody: body("UpdateSandbox"),
+          responses: { 200: sandbox },
+        }),
         delete: op("deleteSandbox", "Delete a sandbox and its backups", {
           responses: {
             200: ok("Deleted", { type: "object", properties: { deleted: { type: "string" } }, required: ["deleted"] }),
@@ -145,6 +156,7 @@ export function openapi(version: string) {
       "/v1/sandboxes/{ref}/resume": {
         parameters: [sandboxRef],
         post: op("resumeSandbox", "Start a stopped sandbox from its save, or from its backup", {
+          description: "With size, it runs on that size from then on.",
           requestBody: body("ResumeRequest", false),
           responses: { 200: sandbox },
         }),
@@ -170,8 +182,27 @@ export function openapi(version: string) {
       "/v1/sandboxes/{ref}/hosts": {
         parameters: [sandboxRef],
         post: op("host", "Get an HTTPS link to a port, on the deployment's preview domain", {
+          description: "The same port gives the same link until it's revoked.",
           requestBody: body("HostRequest"),
           responses: { 200: ok("The link", ref("HostResult")) },
+        }),
+        get: op("listHosts", "List the preview links handed out since v0.1.14 that still work", {
+          description: "Links made before v0.1.14 still work until revoked but aren't listed; revoking every link ends them too.",
+          responses: { 200: ok("The links", { type: "array", items: ref("HostLink") }) },
+        }),
+        delete: op("revokeHosts", "Revoke every preview link to the sandbox, the desktop's too", {
+          description: "Including links handed out before they were listed. Asking for a port's link again gives a new one.",
+          responses: { 200: ok("What was revoked", ref("RevokedLinks")) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/hosts/{port}": {
+        parameters: [
+          sandboxRef,
+          { name: "port", in: "path", required: true, schema: { type: "integer", minimum: 1, maximum: 65535 } },
+        ],
+        delete: op("revokeHost", "Revoke a port's preview link", {
+          description: "It stops working at once; asking for the port's link again gives a new one.",
+          responses: { 200: ok("What was revoked", ref("RevokedLinks")) },
         }),
       },
       "/v1/sandboxes/{ref}/desktop": {

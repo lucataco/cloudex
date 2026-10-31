@@ -121,8 +121,19 @@ export type ForkRequest = z.input<typeof ForkRequest>;
 
 // fromBackup starts the image fresh and restores the newest backup, instead of
 // resuming from the save. Resume does this by itself when the save has expired.
-export const ResumeRequest = z.object({ fromBackup: z.boolean().default(false) });
+// size starts it on another size from now on; a smaller disk must still hold it.
+export const ResumeRequest = z.object({ fromBackup: z.boolean().default(false), size: SandboxSize.optional() });
 export type ResumeRequest = z.input<typeof ResumeRequest>;
+
+// A change to the sandbox itself: its name, or how long it may sit idle before
+// it stops. A new idle time applies at once, counting from now.
+export const UpdateSandbox = z
+  .object({
+    name: Name.optional(),
+    idleMinutes: z.number().int().min(0).max(360).optional(),
+  })
+  .refine((u) => u.name !== undefined || u.idleMinutes !== undefined, "give a name or idleMinutes");
+export type UpdateSandbox = z.input<typeof UpdateSandbox>;
 
 export const ExecRequest = z.object({
   cmd: z.string().min(1),
@@ -239,6 +250,17 @@ export type AgentEvents = z.infer<typeof AgentEvents>;
 export const HostRequest = z.object({ port: z.number().int().min(1).max(65535) });
 export const HostResult = z.object({ url: z.string() });
 export type HostResult = z.infer<typeof HostResult>;
+
+// The links handed out for a sandbox's ports since v0.1.14 that still work;
+// older ones aren't listed, though they work until revoked. A revoked link
+// stops working at once; asking for the port's link again gives a new one.
+export const HostLink = z.object({ port: z.number().int(), url: z.string(), createdAt: z.number().int() });
+export type HostLink = z.infer<typeof HostLink>;
+export const RevokedLinks = z.object({
+  revoked: z.array(z.number().int()), // ports whose links were listed
+  all: z.boolean(), // every link to the sandbox, including ones made before links were listed
+});
+export type RevokedLinks = z.infer<typeof RevokedLinks>;
 
 // The desktop's screen, from 640x480 up to 3840x2160. A running desktop is resized.
 const ScreenSize = z

@@ -253,3 +253,32 @@ test("settings: create sends them, settings() and updateSettings() read and chan
   assert.deepEqual((await box.updateSettings({ env: { A: null } })).env, []);
   assert.deepEqual(seen.at(-1), { route: "PATCH /v1/sandboxes/cx-aaa111/settings", auth: "Bearer k", body: { env: { A: null } } });
 });
+
+test("update, resume on another size, and links: list and revoke", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111", { name: "web" })];
+  routes["PATCH /v1/sandboxes/cx-aaa111"] = [200, info("cx-aaa111", { name: "site", idleMinutes: 120 })];
+  routes["POST /v1/sandboxes/cx-aaa111/resume"] = [200, info("cx-aaa111", { size: "standard-4" })];
+  routes["GET /v1/sandboxes/cx-aaa111/hosts"] = [200, [{ port: 3000, url: "https://3000-cx-aaa111-t.example.com", createdAt: 1 }]];
+  routes["DELETE /v1/sandboxes/cx-aaa111/hosts/3000"] = [200, { revoked: [3000], all: false }];
+  routes["DELETE /v1/sandboxes/cx-aaa111/hosts"] = [200, { revoked: [3000], all: true }];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  await box.update({ name: "site", idleMinutes: 120 });
+  assert.equal(box.name, "site");
+  assert.equal(box.info.idleMinutes, 120);
+  await box.resume({ size: "standard-4" });
+  assert.equal(box.info.size, "standard-4");
+  assert.deepEqual(await box.links(), [{ port: 3000, url: "https://3000-cx-aaa111-t.example.com", createdAt: 1 }]);
+  assert.deepEqual(await box.revokeLinks(3000), { revoked: [3000], all: false });
+  assert.deepEqual(await box.revokeLinks(), { revoked: [3000], all: true });
+  assert.deepEqual(
+    seen.map((s) => [s.route, s.body]),
+    [
+      ["GET /v1/sandboxes/web", undefined],
+      ["PATCH /v1/sandboxes/cx-aaa111", { name: "site", idleMinutes: 120 }],
+      ["POST /v1/sandboxes/cx-aaa111/resume", { size: "standard-4" }],
+      ["GET /v1/sandboxes/cx-aaa111/hosts", undefined],
+      ["DELETE /v1/sandboxes/cx-aaa111/hosts/3000", undefined],
+      ["DELETE /v1/sandboxes/cx-aaa111/hosts", undefined],
+    ],
+  );
+});

@@ -59,9 +59,11 @@ The key gives full control of your sandboxes.
 | `cx.get(ref)`, `cx.list()`, `cx.health()` | Look up by id or name, list, check the deployment |
 | `box.exec(cmd, root=, cwd=, timeout_sec=)` | Run shell code, or an argument list, and wait; check `exit_code` |
 | `box.fork(count=, name=, size=, idle_minutes=)` | Up to 10 sandboxes starting from a copy of the disk |
-| `box.host(port)` | HTTPS link to a port on your preview domain |
+| `box.host(port)` | HTTPS link to a port on your preview domain; servers on localhost work too |
+| `box.links()`, `box.revoke_links(port=None)` | The links that work; make one port's link, or all of them, stop working |
+| `box.update(name=, idle_minutes=)` | Rename, or change the idle time |
 | `box.desktop(size=)`, `box.stop_desktop()` | Start the desktop (Chrome, a terminal) and get a link to it |
-| `box.stop()`, `box.resume(from_backup=)`, `box.delete()` | Save and stop, start again, delete |
+| `box.stop()`, `box.resume(from_backup=, size=)`, `box.delete()` | Save and stop, start again (on another size with `size`), delete |
 | `box.refresh()` | Fetch the latest state; `box.id`, `box.name`, `box.state` and `box.info` hold it |
 | `box.settings()`, `box.update_settings(env=, files=)` | Environment variables and files the sandbox gets at every start; `None` removes one |
 | `cx.set_key(provider, key)`, `cx.list_keys()`, `cx.delete_key(provider)` | AI provider keys sandboxes use without holding them (`"anthropic"`, `"openai"`) |

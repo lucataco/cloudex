@@ -80,7 +80,10 @@ func newNewCmd(opts *options) *cobra.Command {
 				req.Files = fileMap
 			}
 			if cmd.Flags().Changed("idle") {
-				minutes := int(idle.Minutes())
+				minutes, err := idleMinutes(idle)
+				if err != nil {
+					return err
+				}
 				req.IdleMinutes = &minutes
 			}
 			fmt.Fprintln(cmd.ErrOrStderr(), "Starting a sandbox. The first start on a host can take a minute while it fetches the image.")
@@ -313,14 +316,83 @@ func newStopCmd(opts *options) *cobra.Command {
 
 func newResumeCmd(opts *options) *cobra.Command {
 	var fromBackup bool
+	var size string
 	cmd := lifecycleCmd(opts, "resume", "Start a stopped sandbox from its saved disk", "Resuming",
 		func(c *api.Client, ctx context.Context, ref string) (*api.Sandbox, error) {
-			return c.Resume(ctx, ref, fromBackup)
+			s, err := c.Resume(ctx, ref, api.ResumeRequest{FromBackup: fromBackup, Size: size})
+			if err == nil && size != "" && s.Size != size {
+				// A deployment from before v0.1.14 ignores the size.
+				return nil, fmt.Errorf("%s is running, but on %s: this deployment can't change sizes yet; update it with cloudex deploy", s.Label(), s.Size)
+			}
+			return s, err
 		}, "is running")
 	cmd.Long = "Start a stopped sandbox from its saved disk. A save expires after 30 days without\n" +
 		"a resume; after that, resume restores /home from the newest backup onto a fresh\n" +
-		"image instead, and anything installed outside /home needs installing again."
+		"image instead, and anything installed outside /home needs installing again.\n\n" +
+		"With --size, the sandbox runs on that size from then on. Its disk must fit the\n" +
+		"new size's (standard-1 8 GB, standard-2 12 GB, standard-3 16 GB, standard-4 20 GB)."
+	cmd.Example = "  cloudex resume\n  cloudex resume my-box --size standard-4"
 	cmd.Flags().BoolVar(&fromBackup, "from-backup", false, "restore /home from the newest backup onto a fresh image instead of using the save")
+	cmd.Flags().StringVar(&size, "size", "", "run on this size from now on: standard-1, standard-2, standard-3 or standard-4")
+	return cmd
+}
+
+// idleMinutes turns --idle into the API's whole minutes, from 1 to 360, or 0 for off.
+func idleMinutes(d time.Duration) (int, error) {
+	if d != 0 && (d < time.Minute || d > 6*time.Hour) {
+		return 0, errors.New("--idle must be 0, or from 1m to 6h")
+	}
+	return int(d.Minutes()), nil
+}
+
+func newSetCmd(opts *options) *cobra.Command {
+	var name string
+	var idle time.Duration
+	cmd := &cobra.Command{
+		Use:   "set [sandbox]",
+		Short: "Rename a sandbox, or change how long it may sit idle",
+		Long: "Change a sandbox's name, or how long it may go without SSH, exec, preview or\n" +
+			"agent activity before it stops and saves its disk. A new idle time applies at\n" +
+			"once, counting from now; 0 keeps the sandbox up until the platform's 6-hour\n" +
+			"limit. To change its size, stop it, then resume it with --size.",
+		Example: "  cloudex set --idle 2h\n  cloudex set my-box --name web",
+		Args:    cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var req api.UpdateRequest
+			if cmd.Flags().Changed("name") {
+				req.Name = &name
+			}
+			if cmd.Flags().Changed("idle") {
+				minutes, err := idleMinutes(idle)
+				if err != nil {
+					return err
+				}
+				req.IdleMinutes = &minutes
+			}
+			if req.Name == nil && req.IdleMinutes == nil {
+				return errors.New("give --name or --idle")
+			}
+			cfg, client, err := opts.load()
+			if err != nil {
+				return err
+			}
+			r, err := ref(cfg, optionalRef(args))
+			if err != nil {
+				return err
+			}
+			s, err := client.Update(cmd.Context(), r, req)
+			if err != nil {
+				return err
+			}
+			if opts.json {
+				return writeJSON(cmd.OutOrStdout(), s)
+			}
+			printSandbox(cmd.OutOrStdout(), s)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&name, "name", "", "a new name")
+	cmd.Flags().DurationVar(&idle, "idle", 0, "stop after this long without activity, such as 30m or 2h; 0 waits for the 6-hour platform limit")
 	return cmd
 }
 

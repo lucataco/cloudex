@@ -11,13 +11,17 @@ import type {
   ExecResult,
   ForkOptions,
   Health,
+  HostLink,
   Provider,
   PromptOptions,
   ProviderKey,
   RepoOptions,
+  ResumeOptions,
+  RevokedLinks,
   SandboxInfo,
   SandboxSettings,
   SettingsChange,
+  UpdateOptions,
 } from "./index.ts";
 
 // Each assignable to the other, with the same field names (assignability alone
@@ -52,4 +56,11 @@ export const checks: [
   Same<RepoOptions, schema.Repo>,
   Same<SandboxSettings, schema.SandboxSettings>,
   Same<SettingsChange, schema.UpdateSettings>,
-] = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
+  Same<UpdateOptions, schema.UpdateSandbox>,
+  Same<ResumeOptions, schema.ResumeRequest>,
+  Same<HostLink, schema.HostLink>,
+  Same<RevokedLinks, schema.RevokedLinks>,
+] = [
+  true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+  true, true,
+];

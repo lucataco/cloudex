@@ -100,16 +100,6 @@ export const KEYS_SCRIPT = String.raw`
 set -euo pipefail
 providers=" $1 "
 profile=/etc/profile.d/cloudex-keys.sh
-# Not about keys, but it needs the same after-restore timing: cloudex prompt
-# runs Claude Code with --dangerously-skip-permissions, the sandbox being the
-# boundary, so its warning about that is accepted ahead of time. A setting
-# already there, true or false, stays.
-runuser -u cloudex -- env HOME=/home/cloudex bash -c '
-  f=$HOME/.claude/settings.json
-  mkdir -p "$HOME/.claude"
-  [ -s "$f" ] || echo "{}" >"$f"
-  jq "if has(\"skipDangerousModePermissionPrompt\") then . else .skipDangerousModePermissionPrompt = true end" "$f" >"$f.new" &&
-    mv "$f.new" "$f" || rm -f "$f.new"' || true
 # Codex opens on a sign-in screen, even with CODEX_API_KEY set, unless it has
 # a login. With an OpenAI key and no login of its own (ChatGPT or a key given
 # to it in the sandbox), it gets an API-key login with the placeholder, which
@@ -128,6 +118,7 @@ esac
 # gets them from /etc/environment, which sshd reads for every session.
 begin="# Cloudex: placeholder provider keys, rewritten at each start" end="# Cloudex: end"
 sed -i "/^$begin\$/,/^$end\$/d" /etc/environment
+[ -z "$(tail -c1 /etc/environment)" ] || echo >>/etc/environment
 if [ -z "$1" ]; then rm -f "$profile"; exit 0; fi
 ca=/etc/cloudflare/certs/cloudflare-containers-ca.crt
 for _ in $(seq 150); do [ -s "$ca" ] && break; sleep 0.1; done

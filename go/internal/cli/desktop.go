@@ -105,7 +105,7 @@ func newDesktopCmd(opts *options) *cobra.Command {
 					return writeJSON(out, map[string]string{"url": url, "size": d.Size})
 				}
 				fmt.Fprintln(out, url)
-				fmt.Fprintln(errOut, "Anyone with this link can use the desktop while the sandbox runs.")
+				fmt.Fprintf(errOut, "Anyone with this link can use the desktop while the sandbox runs. To make it stop working: cloudex host %s %d --revoke\n", s.Label(), d.Port)
 				if !noOpen {
 					openBrowser(url)
 				}

@@ -45,13 +45,15 @@ func newDeployCmd(opts *options) *cobra.Command {
 				Token: token, AccountID: firstNonEmpty(accountID, os.Getenv("CLOUDFLARE_ACCOUNT_ID")),
 				PreviewDomain: previewDomain, PreviewDomainSet: cmd.Flags().Changed("preview-domain"),
 				RememberedPreviewDomain: cfg.PreviewZone, Image: image,
-				ExistingURL: cfg.APIURL, ExistingKey: cfg.APIKey,
+				ExistingURL: cfg.APIURL, ExistingKey: cfg.APIKey, ExistingAccountID: cfg.AccountID,
 				Confirm:   func(q string) bool { return yes || confirm(cmd, q) },
 				SkipCheck: skipCheck, Log: cmd.ErrOrStderr(),
 			})
 			if res != nil {
 				// Save even after a failed check, so status and doctor can see the deployment.
-				if res.APIURL != cfg.APIURL {
+				// Another deployment's sandboxes aren't this one's; the same one at a
+				// new workers.dev address keeps them.
+				if res.APIURL != cfg.APIURL && res.AccountID != cfg.AccountID {
 					cfg.Current = ""
 				}
 				cfg.APIURL, cfg.APIKey, cfg.AccountID, cfg.PreviewZone = res.APIURL, res.APIKey, res.AccountID, res.PreviewZone

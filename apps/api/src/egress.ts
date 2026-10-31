@@ -4,26 +4,45 @@
 //   POST /activity              a long-running job (an agent prompt) says it's still busy
 //   PUT  /backup/<gen>/<n>      one part of a backup, written to R2 (backup.ts)
 //   GET  /backup/<gen>/<n>      one part read back, for a restore
-// The id comes from the props, so a guest can only reach its own backups.
+//   /v1/sandboxes/self/...      the API for the sandbox itself (self.ts)
+// The id comes from the props, so a guest can only reach its own backups, and
+// manage only itself.
 //
 // So do HTTPS requests to AI providers whose keys the deployment holds
 // (keys.ts): the real key goes in here, on the way out.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { backupBucket, partKey } from "./backup";
 import { PROVIDERS, providerForHost, providerKey, UnreadableKey } from "./keys";
+import { selfApi } from "./self";
+import { sameSecret } from "./util";
 
 // When each sandbox last counted a provider call as activity, per isolate.
 const lastPing = new Map<string, number>();
 
 const BACKUP_PART = /^\/backup\/(\d{1,15})\/(\d{1,6})$/;
 
-export class Egress extends WorkerEntrypoint<Env, { id: string }> {
+// selfToken: the run's token for the API a sandbox has for itself, which runs
+// started before it existed don't have.
+export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: string }> {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const provider = providerForHost(url.hostname);
     if (provider) return this.provider(req, url, provider);
     if (url.hostname !== "cloudex.internal") return new Response("not found", { status: 404 });
-    const id = this.ctx.props.id;
+    // Not for web pages the sandbox's browser opens.
+    if (req.headers.has("origin") || req.headers.has("sec-fetch-site")) {
+      return Response.json({ error: "cloudex.internal doesn't answer web pages" }, { status: 403 });
+    }
+    const { id, selfToken } = this.ctx.props;
+    if (url.pathname.startsWith("/v1/")) {
+      // Only with the run's token, which the cloudex command reads from a file
+      // in the sandbox, so that an app there that fetches URLs for its
+      // visitors can't be made to hand out the sandbox's links.
+      if (selfToken && !(await sameSecret(req.headers.get("x-cloudex-self") ?? "", selfToken))) {
+        return Response.json({ error: "only the cloudex command in this sandbox can use this API" }, { status: 403 });
+      }
+      return selfApi.fetch(req, { env: this.env, id });
+    }
 
     const part = BACKUP_PART.exec(url.pathname);
     if (part) return this.backupPart(req, partKey(id, part[1]!, part[2]!));

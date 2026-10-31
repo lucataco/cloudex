@@ -93,9 +93,12 @@ type Options struct {
 	RememberedPreviewDomain string
 	Image                   string
 	// ExistingKey is reused when it still works for the live API, so other
-	// computers configured for this deployment keep working.
-	ExistingURL string
-	ExistingKey string
+	// computers configured for this deployment keep working. It's only tried
+	// on the API at ExistingURL, or on one in ExistingAccountID, the same
+	// deployment after the account's workers.dev subdomain changed.
+	ExistingURL       string
+	ExistingKey       string
+	ExistingAccountID string
 	// Confirm is asked before replacing the API key of a live deployment
 	// whose key this computer doesn't have. Nil means no.
 	Confirm   func(question string) bool
@@ -144,7 +147,8 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	}
 	apiURL := fmt.Sprintf("https://%s.%s.workers.dev", WorkerName, sub)
 
-	live, err := inspect(ctx, apiURL, o.ExistingURL, o.ExistingKey)
+	ours := o.ExistingURL == apiURL || (o.ExistingAccountID == account.ID && isWorkersDevAPI(o.ExistingURL))
+	live, err := inspect(ctx, apiURL, o.ExistingKey, ours)
 	if err != nil {
 		return nil, err
 	}
@@ -152,6 +156,9 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	switch {
 	case live.keyWorks:
 		key = o.ExistingKey
+		if o.ExistingURL != apiURL {
+			log("The account's workers.dev subdomain has changed: the API is now at %s", apiURL)
+		}
 	case live.running:
 		question := fmt.Sprintf("Cloudex is already deployed at %s, and this computer doesn't have its API key.\n"+
 			"Deploying gives it a new key, so other computers using it stop working until they run\n"+
@@ -160,7 +167,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 			return nil, fmt.Errorf("stopped before replacing the API key of %s; run cloudex login --url %s to use it, or cloudex deploy --yes to replace the key", apiURL, apiURL)
 		}
 		log("Replacing the API key of the existing deployment")
-	case o.ExistingKey != "" && o.ExistingURL == apiURL:
+	case o.ExistingKey != "" && ours:
 		key = o.ExistingKey // the API isn't answering; keep what this computer has
 	}
 
@@ -470,7 +477,14 @@ type liveDeployment struct {
 
 // inspect asks the API at apiURL, if there is one, for its preview domain and
 // whether this computer's key still works there.
-func inspect(ctx context.Context, apiURL, existingURL, existingKey string) (liveDeployment, error) {
+// isWorkersDevAPI says whether url is where deploy puts the API on workers.dev.
+func isWorkersDevAPI(url string) bool {
+	return strings.HasPrefix(url, "https://"+WorkerName+".") && strings.HasSuffix(url, ".workers.dev")
+}
+
+// inspect looks at the API at apiURL, and tries existingKey on it if ours:
+// this computer's key goes only to its own deployment.
+func inspect(ctx context.Context, apiURL, existingKey string, ours bool) (liveDeployment, error) {
 	var live liveDeployment
 	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -482,7 +496,7 @@ func inspect(ctx context.Context, apiURL, existingURL, existingKey string) (live
 	if h.PreviewZone != nil {
 		live.previewZone = *h.PreviewZone
 	}
-	if existingKey == "" || existingURL != apiURL {
+	if existingKey == "" || !ours {
 		return live, nil
 	}
 	_, err = api.New(apiURL, existingKey).List(hctx)

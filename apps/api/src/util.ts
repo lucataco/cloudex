@@ -34,8 +34,9 @@ export function errorStatus(e: unknown): { status: number; message: string } {
   return m ? { status: Number(m[1]), message: m[2]! } : { status: 500, message };
 }
 
-// Unguessable, stable token for a preview link: HMAC of sandbox and port.
-export async function previewToken(secret: string, id: string, port: number) {
+// Unguessable, stable token for a preview link: HMAC of sandbox and port, and
+// of the link's version once one has been revoked (see Sandbox.link).
+export async function previewToken(secret: string, id: string, port: number, version?: string) {
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -43,9 +44,16 @@ export async function previewToken(secret: string, id: string, port: number) {
     false,
     ["sign"],
   );
-  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`preview:${id}:${port}`)));
+  const message = `preview:${id}:${port}${version ? `:${version}` : ""}`;
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
   return [...sig.slice(0, 10)].map((b) => ALPHABET[b % ALPHABET.length]).join("");
 }
+
+// The header the Worker passes a preview request's token on in, for the
+// Sandbox object to check against revoked links.
+export const LINK_HEADER = "x-cloudex-link";
+
+export const previewUrl = (zone: string, id: string, port: number, token: string) => `https://${port}-${id}-${token}.${zone}`;
 
 // Compares digests so the check takes the same time whatever the input.
 export async function sameSecret(given: string, expected: string): Promise<boolean> {

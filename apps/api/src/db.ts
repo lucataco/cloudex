@@ -81,6 +81,21 @@ export async function upsertSandbox(db: D1Database, s: Sandbox) {
     .run();
 }
 
+// Before the Sandbox object takes a new name: the index's unique name column is
+// what keeps two sandboxes from sharing one. False if the name is taken.
+export async function renameSandbox(db: D1Database, id: string, name: string): Promise<boolean> {
+  await ensureSchema(db);
+  try {
+    const { meta } = await db.prepare("UPDATE sandboxes SET name = ? WHERE id = ?").bind(name, id).run();
+    // A sandbox missing from the index gets its row back with its next
+    // update; until then the name must be free.
+    return meta.changes > 0 || !(await nameTaken(db, name));
+  } catch (e) {
+    if (/UNIQUE constraint failed/.test(e instanceof Error ? e.message : String(e))) return false;
+    throw e;
+  }
+}
+
 export async function deleteSandbox(db: D1Database, id: string) {
   await ensureSchema(db);
   await db.prepare("DELETE FROM sandboxes WHERE id = ?").bind(id).run();

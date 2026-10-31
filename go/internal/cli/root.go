@@ -68,8 +68,8 @@ func New(version string) *cobra.Command {
 			root.AddCommand(c)
 		}
 	}
-	add("sandbox", newNewCmd(opts), newForkCmd(opts), newListCmd(opts), newInfoCmd(opts), newUseCmd(opts), newEnvCmd(opts),
-		newStopCmd(opts), newResumeCmd(opts), newDeleteCmd(opts))
+	add("sandbox", newNewCmd(opts), newForkCmd(opts), newListCmd(opts), newInfoCmd(opts), newUseCmd(opts), newSetCmd(opts),
+		newEnvCmd(opts), newStopCmd(opts), newResumeCmd(opts), newDeleteCmd(opts))
 	add("connect", newSSHCmd(opts), newDesktopCmd(opts), newExecCmd(opts), newHostCmd(opts), newPromptCmd(opts),
 		newAttachCmd(opts), newAgentsCmd(opts), newSSHConfigCmd(opts))
 	add("setup", newDeployCmd(opts), newLoginCmd(opts), newKeysCmd(opts), newDoctorCmd(opts), newStatusCmd(opts),

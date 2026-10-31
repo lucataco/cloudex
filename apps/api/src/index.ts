@@ -2,7 +2,6 @@
 // v0.1 authenticates with one admin key that `cloudex deploy` mints and stores
 // as a Worker secret.
 import { Hono } from "hono";
-import { ZodError } from "zod";
 import {
   AgentMessage,
   CreateSandbox,
@@ -15,6 +14,7 @@ import {
   ResumeRequest,
   SetProviderKey,
   StartAgent,
+  UpdateSandbox,
   UpdateSettings,
   type Health,
 } from "@cloudex/schema";
@@ -23,8 +23,9 @@ import { openapi } from "@cloudex/schema/openapi";
 import { isAgentId } from "./agents";
 import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
+import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, listKeys, setKey } from "./keys";
-import { errorStatus, fail, isSandboxId, newAgentId, newSandboxId, previewToken, sameSecret } from "./util";
+import { LINK_HEADER, errorStatus, fail, isSandboxId, newAgentId, newSandboxId, previewToken, sameSecret } from "./util";
 
 export { Sandbox } from "./sandbox";
 export { Egress } from "./egress";
@@ -36,17 +37,7 @@ const VERSION = typeof CLOUDEX_VERSION === "string" ? CLOUDEX_VERSION : "dev";
 type Ctx = { Bindings: Env };
 const app = new Hono<Ctx>();
 
-app.onError((e, c) => {
-  if (e instanceof ZodError) {
-    // A bad record key (an environment variable's name, a file's path) carries its reason inside.
-    const why = (i: ZodError["issues"][number]) => (i.code === "invalid_key" && i.issues[0]?.message) || i.message;
-    return c.json({ error: e.issues.map((i) => `${i.path.join(".") || "body"}: ${why(i)}`).join("; ") }, 400);
-  }
-  if (e instanceof SyntaxError) return c.json({ error: "the request body isn't valid JSON" }, 400);
-  const { status, message } = errorStatus(e);
-  if (status >= 500) console.error(message);
-  return c.json({ error: message }, status as 400);
-});
+app.onError(onError);
 
 app.get("/v1/health", (c) =>
   c.json({ ok: true, version: VERSION, previewZone: c.env.PREVIEW_ZONE || null, backups: Boolean(backupBucket(c.env)) } satisfies Health),
@@ -90,12 +81,18 @@ app.get("/v1/sandboxes", async (c) => c.json(await listSandboxes(c.env.DB)));
 
 app.get("/v1/sandboxes/:ref", async (c) => c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.get()));
 
+app.patch("/v1/sandboxes/:ref", async (c) => {
+  const change = UpdateSandbox.parse(await c.req.json());
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.set(change)));
+});
+
 app.post("/v1/sandboxes/:ref/stop", async (c) => c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.stop()));
 
 app.post("/v1/sandboxes/:ref/resume", async (c) => {
   const body = await c.req.text();
-  const { fromBackup } = ResumeRequest.parse(body ? JSON.parse(body) : {});
-  return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.resume(fromBackup));
+  const { fromBackup, size } = ResumeRequest.parse(body ? JSON.parse(body) : {});
+  return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.resume(fromBackup, size));
 });
 
 app.delete("/v1/sandboxes/:ref", async (c) =>
@@ -106,20 +103,6 @@ app.post("/v1/sandboxes/:ref/exec", async (c) => {
   const input = ExecRequest.parse(await c.req.json());
   return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.exec(input));
 });
-
-// A sandbox that's busy (a connection open, a command running) during a deploy
-// keeps its old Durable Object code for 3-5 minutes, so it may not have
-// methods added since.
-async function newMethod<T>(ref: string, call: Promise<T>): Promise<T> {
-  try {
-    return await call;
-  } catch (e) {
-    if (e instanceof Error && /does not implement/.test(e.message)) {
-      fail(409, `${ref} is still running code from before this deployment was updated, so it can't do this yet. A busy sandbox moves to the new code within about 5 minutes; try again then`);
-    }
-    throw e;
-  }
-}
 
 // Forks (see ForkRequest). All of them start from the same save, at the same
 // time. One that fails to start is kept in state error with the reason, like a
@@ -224,14 +207,28 @@ app.get("/v1/sandboxes/:ref/tcp/:port{[0-9]+}", async (c) => {
   return stub.fetch(new Request(`http://sandbox/tcp/${c.req.param("port")}${url.search}`, c.req.raw));
 });
 
+// Preview links: POST hands out a port's link, GET lists the ones that work,
+// DELETE revokes one port's link or, without a port, all of them.
 app.post("/v1/sandboxes/:ref/hosts", async (c) => {
-  const zone = c.env.PREVIEW_ZONE;
-  if (!zone) return c.json({ error: "preview links need a domain: run cloudex deploy --preview-domain <your domain>" }, 400);
   const { port } = HostRequest.parse(await c.req.json());
   const { id, stub } = await sandbox(c.env, c.req.param("ref"));
-  await stub.get();
-  const token = await previewToken(c.env.ADMIN_KEY, id, port);
-  return c.json({ url: `https://${port}-${id}-${token}.${zone}` });
+  return c.json(await hostLink(c.env, id, stub, port));
+});
+
+app.get("/v1/sandboxes/:ref/hosts", async (c) => {
+  const { id, stub } = await sandbox(c.env, c.req.param("ref"));
+  return c.json(await hostLinks(c.env, id, stub));
+});
+
+app.delete("/v1/sandboxes/:ref/hosts", async (c) => {
+  const { id, stub } = await sandbox(c.env, c.req.param("ref"));
+  return c.json(await revokeLinks(id, stub));
+});
+
+app.delete("/v1/sandboxes/:ref/hosts/:port", async (c) => {
+  const port = portParam(c.req.param("port"));
+  const { id, stub } = await sandbox(c.env, c.req.param("ref"));
+  return c.json(await revokeLinks(id, stub, port));
 });
 
 // Settings (settings.ts): environment variables and files, applied at every
@@ -274,14 +271,50 @@ app.all("/v1/*", (c) => c.json({ error: "not found" }, 404));
 // Universal SSL certificate covers it.
 const PREVIEW_HOST = /^(\d{1,5})-(cx-[a-z0-9]{6})-([a-z0-9]{10})\./;
 
+// Proxy headers apps trust, which a visitor could otherwise send themselves.
+const SPOOFABLE = [
+  "forwarded",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-port",
+  "x-forwarded-prefix",
+  "x-forwarded-proto",
+  "x-forwarded-scheme",
+  "x-forwarded-server",
+  "x-forwarded-ssl",
+  "x-real-ip",
+  "client-ip",
+  "true-client-ip",
+  "x-client-ip",
+];
+
+// The Sandbox object checks the token against the links revoked so far. One it
+// didn't make itself before it could revoke, the HMAC of sandbox and port, is
+// checked here first, so that a sandbox still on code from before revoking
+// never serves a token nobody made.
 async function preview(req: Request, env: Env, m: RegExpExecArray): Promise<Response> {
   const [, portText, id, token] = m as unknown as [string, string, string, string];
   const port = Number(portText);
-  if (!(await sameSecret(token, await previewToken(env.ADMIN_KEY, id, port)))) {
+  const stub = env.SANDBOX.getByName(id);
+  const first = await sameSecret(token, await previewToken(env.ADMIN_KEY, id, port));
+  if (!first && !(await stub.checkLink(port, token).catch(() => false))) {
     return new Response("not found", { status: 404 });
   }
   const url = new URL(req.url);
-  return env.SANDBOX.getByName(id).fetch(new Request(`http://sandbox/http/${port}${url.pathname}${url.search}`, req));
+  const fwd = new Request(`http://sandbox/http/${port}${url.pathname}${url.search}`, req);
+  fwd.headers.set(LINK_HEADER, token);
+  // The app sees the link's own host name and the visitor's address, as
+  // behind any proxy; not hosts or addresses the visitor claims.
+  for (const h of SPOOFABLE) fwd.headers.delete(h);
+  fwd.headers.set("x-forwarded-host", url.hostname);
+  fwd.headers.set("x-forwarded-proto", "https");
+  fwd.headers.set("x-forwarded-port", "443");
+  const visitor = req.headers.get("cf-connecting-ip");
+  if (visitor) {
+    fwd.headers.set("x-forwarded-for", visitor);
+    fwd.headers.set("x-real-ip", visitor);
+  }
+  return stub.fetch(fwd);
 }
 
 export default {

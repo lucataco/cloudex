@@ -49,6 +49,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex fork [sandbox] [--name] [--count 1-10]` | New sandboxes that start from a copy of one's disk (also `cloudex new --from <sandbox>`) |
 | `cloudex env [sandbox]`, `env set NAME=VALUE`, `env unset NAME` | A sandbox's environment variables and files (`--file`, `--env-file`); `cloudex new` takes them too, and `--repo` |
 | `cloudex list`, `info`, `use <sandbox>` | See sandboxes and pick the current one |
+| `cloudex set [sandbox] [--name] [--idle 2h]` | Rename a sandbox, or change how long it may sit idle |
 | `cloudex ssh [sandbox] [-- ssh args]` | Shell in over SSH, through your API (no public IP) |
 | `cloudex desktop [sandbox] [--size 1280x720] [--link] [--quality 0-9]` | Open the sandbox's desktop, with Chrome and a terminal, in your browser |
 | `cloudex exec [sandbox] -- <command>` | Run a command and print its output and exit code |
@@ -56,8 +57,8 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex prompt [sandbox] "task"` | Start Claude Code or Codex on a task in tmux and watch it |
 | `cloudex attach [sandbox]` | Reattach to the newest agent session |
 | `cloudex agents start [sandbox] "task"`, `agents`, `logs -f`, `send`, `interrupt` | Run an agent with no terminal and follow it; send follow-ups or steer it |
-| `cloudex host [sandbox] <port>` | HTTPS link to a port, on your preview domain |
-| `cloudex stop`, `resume [--from-backup]`, `delete` | Save, back up and stop; resume from the save or the backup; or delete |
+| `cloudex host [sandbox] <port>`, `--revoke`, `--list`, `--revoke-all` | HTTPS link to a port, on your preview domain (servers on localhost work too); revoke links |
+| `cloudex stop`, `resume [--from-backup] [--size]`, `delete` | Save, back up and stop; resume from the save or the backup, on another size if you like; or delete |
 | `cloudex login --url <api url>` | Use an existing deployment from another computer |
 | `cloudex keys set <anthropic\|openai>`, `keys`, `keys rm` | Let sandboxes use an AI provider key that never enters them |
 | `cloudex doctor`, `status [--show-key]` | Check this computer and the deployment |
@@ -114,6 +115,14 @@ On a slow connection, `--quality 0` (of 0 to 9; 3 by default) cuts the
 bandwidth of moving pictures by more than half; text stays sharp. `--stop`
 ends the desktop and its programs.
 
+**Inside a sandbox**, `cloudex` manages that sandbox and nothing else, with no
+key: `cloudex host 3000` prints a preview link, and `info`, `set --idle` and
+`stop` work too. Claude Code and Codex in the sandbox are told about it, so an
+agent that starts a server can hand you its link. Commands in
+`~/.cloudex/start` run at every start, to bring servers back after a resume.
+For coding agents on your own computer, [skills/cloudex](skills/cloudex/SKILL.md)
+is a skill that teaches them the CLI.
+
 Sandboxes stop and save after `--idle` without SSH, exec, preview or agent
 activity (30 minutes by default), and in any case within Cloudflare's 6-hour
 limit. An open `cloudex ssh` session counts, since it sends a keepalive every
@@ -160,6 +169,7 @@ await (await agent.send("now update the docs")).wait();
 | `packages/schema` | Zod models shared by the API and the SDKs, and the OpenAPI document built from them |
 | `packages/sdk` | The TypeScript SDK, [`cloudex` on npm](https://www.npmjs.com/package/cloudex) |
 | `python` | The Python SDK, [`cloudex` on PyPI](https://pypi.org/project/cloudex/) |
+| `skills/cloudex` | A skill that teaches coding agents on your computer to use the CLI |
 | `scripts/` | `bundle-api.sh` embeds the API in the CLI; `build-cli.sh` builds release archives |
 
 ## Develop

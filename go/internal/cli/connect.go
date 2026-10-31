@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/lucataco/cloudex/go/internal/api"
@@ -74,15 +75,69 @@ func newExecCmd(opts *options) *cobra.Command {
 }
 
 func newHostCmd(opts *options) *cobra.Command {
-	return &cobra.Command{
+	var list, revoke, revokeAll bool
+	cmd := &cobra.Command{
 		Use:   "host [sandbox] <port>",
 		Short: "Get an HTTPS link to a port in a sandbox, on your preview domain",
 		Long: "Print a link that serves a port in the sandbox over HTTPS on the domain you\n" +
 			"chose at deploy time. The link contains a secret token, so only people you\n" +
-			"share it with can open it.",
-		Example: "  cloudex host 3000",
-		Args:    cobra.RangeArgs(1, 2),
+			"share it with can open it. Servers that listen only on localhost work too.\n\n" +
+			"The same port gives the same link until you revoke it with --revoke, which\n" +
+			"makes it stop working at once and closes connections open through it; run\n" +
+			"cloudex host again for a new one. --revoke-all does that for every link to the\n" +
+			"sandbox, the desktop's too, including links made before v0.1.14, which --list\n" +
+			"doesn't show.",
+		Example: "  cloudex host 3000\n  cloudex host my-box 5173\n  cloudex host 3000 --revoke\n  cloudex host --list",
+		Args:    cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			if list || revokeAll {
+				if revoke || (list && revokeAll) {
+					return errors.New("use one of --list, --revoke and --revoke-all")
+				}
+				if len(args) > 1 {
+					return errors.New("--list and --revoke-all take a sandbox, not a port")
+				}
+				cfg, client, err := opts.load()
+				if err != nil {
+					return err
+				}
+				r, err := ref(cfg, optionalRef(args))
+				if err != nil {
+					return err
+				}
+				if revokeAll {
+					res, err := client.RevokeLinks(cmd.Context(), r, 0)
+					if err != nil {
+						return err
+					}
+					if opts.json {
+						return writeJSON(out, res)
+					}
+					_, err = fmt.Fprintf(out, "Every link to %s has stopped working, its desktop's too. Run cloudex host for new ones.\n", r)
+					return err
+				}
+				links, err := client.Links(cmd.Context(), r)
+				if err != nil {
+					return err
+				}
+				if opts.json {
+					return writeJSON(out, links)
+				}
+				if len(links) == 0 {
+					_, err = fmt.Fprintln(out, "No links made since Cloudex v0.1.14. Make one with: cloudex host <port>")
+					return err
+				}
+				tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(tw, "PORT\tLINK\tMADE")
+				for _, l := range links {
+					fmt.Fprintf(tw, "%d\t%s\t%s\n", l.Port, l.URL, ago(l.CreatedAt))
+				}
+				return tw.Flush()
+			}
+			if len(args) == 0 {
+				return errors.New("give a port, such as: cloudex host 3000")
+			}
 			named := ""
 			if len(args) == 2 {
 				named = args[0]
@@ -99,17 +154,32 @@ func newHostCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if revoke {
+				res, err := client.RevokeLinks(cmd.Context(), r, port)
+				if err != nil {
+					return err
+				}
+				if opts.json {
+					return writeJSON(out, res)
+				}
+				_, err = fmt.Fprintf(out, "The link to port %d on %s has stopped working. Run cloudex host %s %d for a new one.\n", port, r, r, port)
+				return err
+			}
 			url, err := client.Host(cmd.Context(), r, port)
 			if err != nil {
 				return err
 			}
 			if opts.json {
-				return writeJSON(cmd.OutOrStdout(), map[string]string{"url": url})
+				return writeJSON(out, map[string]string{"url": url})
 			}
-			_, err = fmt.Fprintln(cmd.OutOrStdout(), url)
+			_, err = fmt.Fprintln(out, url)
 			return err
 		},
 	}
+	cmd.Flags().BoolVar(&revoke, "revoke", false, "make the port's link stop working")
+	cmd.Flags().BoolVar(&revokeAll, "revoke-all", false, "make every link to the sandbox stop working, the desktop's too")
+	cmd.Flags().BoolVar(&list, "list", false, "list the links made since v0.1.14 that still work")
+	return cmd
 }
 
 var agentKinds = map[string]bool{"claude": true, "codex": true}

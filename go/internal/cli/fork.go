@@ -52,7 +52,10 @@ func forkRequest(cmd *cobra.Command, name, size string, count int, idle time.Dur
 	}
 	req := api.ForkRequest{Name: name, Count: count, Size: size}
 	if cmd.Flags().Changed("idle") {
-		minutes := int(idle.Minutes())
+		minutes, err := idleMinutes(idle)
+		if err != nil {
+			return api.ForkRequest{}, err
+		}
 		req.IdleMinutes = &minutes
 	}
 	return req, nil

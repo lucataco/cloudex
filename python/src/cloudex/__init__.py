@@ -28,8 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
-__all__ = ["Agent", "Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "ProviderKey", "Sandbox", "Settings"]
-__version__ = "0.1.11"
+__all__ = ["Agent", "Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "HostLink", "ProviderKey", "Sandbox", "Settings"]
+__version__ = "0.1.14"
 
 
 class CloudexError(Exception):
@@ -74,6 +74,15 @@ class Settings:
     env: List[str]
     files: List[str]  # as ~/path
     repo: Optional[Dict[str, Any]]  # url, dir, branch
+
+
+@dataclass(frozen=True)
+class HostLink:
+    """A preview link handed out that still works."""
+
+    port: int
+    url: str
+    created_at: int  # milliseconds since the epoch
 
 
 @dataclass(frozen=True)
@@ -261,9 +270,17 @@ class Sandbox:
         """Saves the disk, backs up /home and stops."""
         return self._update("POST", "/stop")
 
-    def resume(self, from_backup: bool = False) -> "Sandbox":
-        """Starts from the save, or with from_backup, from a fresh image with /home restored."""
-        return self._update("POST", "/resume", {"fromBackup": True} if from_backup else None)
+    def resume(self, from_backup: bool = False, size: Optional[str] = None) -> "Sandbox":
+        """Starts from the save, or with from_backup, from a fresh image with /home restored.
+
+        With size, it runs on that size from now on; the disk must fit the new size's.
+        """
+        body = _drop_none(fromBackup=True if from_backup else None, size=size)
+        return self._update("POST", "/resume", body or None)
+
+    def update(self, name: Optional[str] = None, idle_minutes: Optional[int] = None) -> "Sandbox":
+        """Renames the sandbox, or changes how long it may sit idle; a new idle time applies at once."""
+        return self._update("PATCH", "", _drop_none(name=name, idleMinutes=idle_minutes))
 
     def delete(self) -> None:
         """Deletes the sandbox and its backups."""
@@ -304,8 +321,23 @@ class Sandbox:
         return [Sandbox(self._client, info) for info in self._client._call("POST", self._path("/fork"), body)]
 
     def host(self, port: int) -> str:
-        """An HTTPS link to a port, on the deployment's preview domain. Anyone with it can use it."""
+        """An HTTPS link to a port, on the deployment's preview domain. Anyone with it can use it.
+
+        The same port gives the same link until it's revoked. Servers that listen
+        only on localhost work too.
+        """
         return self._client._call("POST", self._path("/hosts"), {"port": port})["url"]
+
+    def links(self) -> List[HostLink]:
+        """The preview links handed out since v0.1.14 that still work; older ones
+        aren't listed, and revoke_links() ends them too."""
+        return [HostLink(l["port"], l["url"], l["createdAt"]) for l in self._client._call("GET", self._path("/hosts"))]
+
+    def revoke_links(self, port: Optional[int] = None) -> Dict[str, Any]:
+        """Makes a port's link stop working at once, or without a port, every link to
+        the sandbox, the desktop's too. host() then gives a new link. Returns
+        {"revoked": [ports], "all": bool}."""
+        return self._client._call("DELETE", self._path("/hosts" if port is None else f"/hosts/{port}"))
 
     def desktop(self, size: Optional[str] = None) -> Desktop:
         """Starts the desktop (Chrome and a terminal), or resizes a running one, and links to its viewer.

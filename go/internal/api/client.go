@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -185,15 +186,34 @@ func (c *Client) Stop(ctx context.Context, ref string) (*Sandbox, error) {
 	return &s, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/stop", nil, &s)
 }
 
-// Resume starts a stopped sandbox from its save, or with fromBackup, from a
-// fresh image with /home restored from the newest backup.
-func (c *Client) Resume(ctx context.Context, ref string, fromBackup bool) (*Sandbox, error) {
+// ResumeRequest: FromBackup starts a fresh image with /home restored from the
+// newest backup instead of the save; Size runs the sandbox on another size from
+// then on.
+type ResumeRequest struct {
+	FromBackup bool   `json:"fromBackup,omitempty"`
+	Size       string `json:"size,omitempty"`
+}
+
+// Resume starts a stopped sandbox.
+func (c *Client) Resume(ctx context.Context, ref string, r ResumeRequest) (*Sandbox, error) {
 	var s Sandbox
 	var body any
-	if fromBackup {
-		body = map[string]bool{"fromBackup": true}
+	if r != (ResumeRequest{}) {
+		body = r
 	}
 	return &s, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/resume", body, &s)
+}
+
+// UpdateRequest renames a sandbox, or changes how long it may sit idle; nil
+// fields stay as they are.
+type UpdateRequest struct {
+	Name        *string `json:"name,omitempty"`
+	IdleMinutes *int    `json:"idleMinutes,omitempty"`
+}
+
+func (c *Client) Update(ctx context.Context, ref string, r UpdateRequest) (*Sandbox, error) {
+	var s Sandbox
+	return &s, c.do(ctx, http.MethodPatch, "/v1/sandboxes/"+url.PathEscape(ref), r, &s)
 }
 
 // ForkRequest asks for Count new sandboxes starting from a copy of another's
@@ -257,6 +277,35 @@ func (c *Client) Host(ctx context.Context, ref string, port int) (string, error)
 	}
 	err := c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/hosts", map[string]int{"port": port}, &out)
 	return out.URL, err
+}
+
+// HostLink is a preview link handed out that still works.
+type HostLink struct {
+	Port      int    `json:"port"`
+	URL       string `json:"url"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+func (c *Client) Links(ctx context.Context, ref string) ([]HostLink, error) {
+	var out []HostLink
+	return out, c.do(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/hosts", nil, &out)
+}
+
+// RevokedLinks says which ports' links were revoked; All is every link to
+// the sandbox, including ones handed out before links were listed.
+type RevokedLinks struct {
+	Revoked []int `json:"revoked"`
+	All     bool  `json:"all"`
+}
+
+// RevokeLinks revokes a port's link, or with port 0, every link to the sandbox.
+func (c *Client) RevokeLinks(ctx context.Context, ref string, port int) (*RevokedLinks, error) {
+	path := "/v1/sandboxes/" + url.PathEscape(ref) + "/hosts"
+	if port != 0 {
+		path += "/" + strconv.Itoa(port)
+	}
+	var out RevokedLinks
+	return &out, c.do(ctx, http.MethodDelete, path, nil, &out)
 }
 
 // Desktop is where a sandbox's desktop is served: the viewer page is Path on

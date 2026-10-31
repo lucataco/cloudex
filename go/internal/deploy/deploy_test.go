@@ -59,23 +59,41 @@ func TestInspect(t *testing.T) {
 	defer srv.Close()
 	ctx := context.Background()
 
-	live, err := inspect(ctx, srv.URL, srv.URL, "good")
+	live, err := inspect(ctx, srv.URL, "good", true)
 	if err != nil || !live.running || !live.keyWorks || live.previewZone != "example.dev" {
 		t.Fatalf("good key: %+v, %v", live, err)
 	}
-	live, err = inspect(ctx, srv.URL, srv.URL, "stale")
+	live, err = inspect(ctx, srv.URL, "stale", true)
 	if err != nil || !live.running || live.keyWorks {
 		t.Fatalf("stale key: %+v, %v", live, err)
 	}
-	live, err = inspect(ctx, srv.URL, "", "")
+	live, err = inspect(ctx, srv.URL, "", true)
 	if err != nil || !live.running || live.keyWorks {
 		t.Fatalf("no key: %+v, %v", live, err)
 	}
+	// Another deployment's API never sees this computer's key.
+	live, err = inspect(ctx, srv.URL, "good", false)
+	if err != nil || !live.running || live.keyWorks {
+		t.Fatalf("not ours: %+v, %v", live, err)
+	}
 	gone := httptest.NewServer(http.NotFoundHandler())
 	gone.Close()
-	live, err = inspect(ctx, gone.URL, gone.URL, "good")
+	live, err = inspect(ctx, gone.URL, "good", true)
 	if err != nil || live.running {
 		t.Fatalf("nothing deployed: %+v, %v", live, err)
+	}
+}
+
+func TestIsWorkersDevAPI(t *testing.T) {
+	for url, want := range map[string]bool{
+		"https://cloudex-api.old-name.workers.dev": true,
+		"https://cloudex-api.example.com":          false,
+		"https://other.old-name.workers.dev":       false,
+		"":                                         false,
+	} {
+		if got := isWorkersDevAPI(url); got != want {
+			t.Errorf("%q: %v", url, got)
+		}
 	}
 }
 

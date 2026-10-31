@@ -20,6 +20,10 @@
 //   after the keys; a repo in them is cloned once, when the sandbox is created.
 // - Agents started through the API (agents.ts) run and keep their state in the
 //   guest; this object only passes each call to a script there.
+// - Cloudex's own tools in the guest (guest.ts: the localhost relay, the
+//   cloudex command, notes for agents) are put there at each start, after the
+//   settings, then the user's ~/.cloudex/start runs.
+// - Preview link tokens are checked here, against the links revoked so far.
 import { DurableObject } from "cloudflare:workers";
 import type {
   Desktop,
@@ -28,6 +32,7 @@ import type {
   Sandbox as SandboxRecord,
   SandboxSettings,
   SandboxSize,
+  UpdateSandbox,
   UpdateSettings,
 } from "@cloudex/schema";
 import {
@@ -42,8 +47,9 @@ import {
   writeManifest,
 } from "./backup";
 import { AGENT_BAD_REQUEST, AGENT_BOOT, AGENT_NOT_FOUND, AGENT_SCRIPT } from "./agents";
-import { deleteSandbox, upsertSandbox } from "./db";
+import { deleteSandbox, renameSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } from "./desktop";
+import { PLATFORM_FILES, PLATFORM_SCRIPT, PLATFORM_VERSION, RELAY_NOTHING, RELAY_SCRIPT, START_SCRIPT } from "./guest";
 import { KEYS_SCRIPT, PROVIDERS, listKeys } from "./keys";
 import {
   CLONE_SCRIPT,
@@ -56,7 +62,7 @@ import {
   store,
   view,
 } from "./settings";
-import { fail, sleep, withTimeout } from "./util";
+import { LINK_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
 const READY_CHECK = '[ "$(cat /run/cloudex-ready 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id)" ]';
 const READY_TIMEOUT_MS = 10 * 60_000; // a host without the image pulls it first
@@ -82,6 +88,10 @@ type CreateInput = {
   repo?: string | Repo;
 };
 export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?: StoredSettings };
+// Preview links handed out: a version for all of them, which revoking them all
+// bumps, and one per port, bumped by revoking that port's link. at is when the
+// port's current link was first handed out, null once revoked.
+type Links = { epoch: number; ports: Record<string, { gen: number; at: number | null }> };
 type ExecInput = { cmd: string; root: boolean; cwd?: string; timeoutSec: number };
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
@@ -146,6 +156,19 @@ export class Sandbox extends DurableObject<Env> {
   private lastActivity = Date.now();
   private lastActivitySaved = 0;
   private exitedAt = 0;
+  // Guest ports that listen only on localhost, and the port of the relay for
+  // each, in this run.
+  private relayed = new Map<number, number>();
+  // How to end each WebSocket and streamed answer open through a preview link,
+  // per guest port, so that revoking a link ends the connections it let in, a
+  // desktop's too. revocations counts revokes, for requests in flight meanwhile.
+  private open = new Map<number, Set<() => void>>();
+  private revocations = 0;
+  // A reinstall of the guest tools that a preview started (see relay).
+  private platformFix: Promise<void> | undefined;
+  // Set while remove() runs, so that nothing outside the lifecycle queue
+  // writes the record back.
+  private removing = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -164,7 +187,7 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   private mustRecord(): SandboxRecord {
-    if (!this.record) fail(404, "no such sandbox");
+    if (!this.record || this.removing) fail(404, "no such sandbox");
     return this.record;
   }
 
@@ -265,6 +288,7 @@ export class Sandbox extends DurableObject<Env> {
       }
       await this.boot(from?.snapshot);
       if (settings?.repo && !from) await this.clone(settings.repo);
+      await this.startHook();
       return this.mustRecord();
     });
   }
@@ -304,6 +328,7 @@ export class Sandbox extends DurableObject<Env> {
       if (r.state === "running") {
         this.touch();
         await this.applySettings();
+        await this.applyPlatform().catch((e) => console.error(`[${r.id}] ${message(e)}`));
       }
       return view(next);
     });
@@ -312,6 +337,27 @@ export class Sandbox extends DurableObject<Env> {
   private async applySettings() {
     const secret = await readSecret(this.env.ADMIN_KEY, await this.ctx.storage.get<StoredSettings>("settings"));
     await this.runScript(SETTINGS_SCRIPT, [], "applying the settings", 120_000, JSON.stringify(secret));
+  }
+
+  // Cloudex's tools in the guest (guest.ts). Recorded, so that a sandbox already
+  // running when the deployment is updated gets the new ones (see alarm).
+  private async applyPlatform() {
+    const zone = this.env.PREVIEW_ZONE || "";
+    const selfToken = (await this.ctx.storage.get<string>("selfToken")) ?? "";
+    await this.runScript(PLATFORM_SCRIPT, [zone, selfToken], "setting up the cloudex command", 60_000, PLATFORM_FILES);
+    await this.ctx.storage.put("platform", `${PLATFORM_VERSION}:${zone}`);
+  }
+
+  // The user's ~/.cloudex/start, if there is one, in the background.
+  private async startHook() {
+    const r = this.mustRecord();
+    try {
+      const out = await this.asGuest([START_SCRIPT], "starting ~/.cloudex/start", 60_000);
+      if (out.exitCode !== 0) throw new Error(new TextDecoder().decode(out.stderr).trim().split("\n").pop() || `exit ${out.exitCode}`);
+    } catch (e) {
+      console.error(`[${r.id}] ~/.cloudex/start: ${message(e)}`);
+      await this.update({ notice: [this.mustRecord().notice, `~/.cloudex/start didn't run: ${message(e)}.`].filter(Boolean).join(" ") });
+    }
   }
 
   // The disk a fork starts from: a fresh save of a running sandbox, which keeps
@@ -345,28 +391,48 @@ export class Sandbox extends DurableObject<Env> {
     return this.mustRecord();
   }
 
-  async resume(fromBackup = false): Promise<SandboxRecord> {
+  // With size, the sandbox runs on that size from now on.
+  async resume(fromBackup = false, size?: SandboxSize): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
-      if (r.state === "running") return r;
-      if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}`);
-      const snapshot = await this.ctx.storage.get("snapshot");
-      const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
-      const expired = Boolean(snapshot) && Date.now() - touched > SAVE_LIFETIME_MS;
-      if (fromBackup || expired) {
-        const bucket = backupBucket(this.env);
-        const backup = bucket ? await latestBackup(bucket, r.id) : null;
-        if (backup) {
-          await this.bootFromBackup(backup, fromBackup ? "as asked" : "its save had expired");
-          return this.mustRecord();
-        }
-        if (fromBackup) fail(404, bucket ? `${r.id} has no backup yet` : "backups are off: this deployment has no R2 bucket");
+      if (r.state === "running") {
+        if (size && size !== r.size) fail(409, `${r.name ?? r.id} is running on ${r.size}; stop it, then resume it on ${size}`);
+        return r;
       }
-      await this.boot(snapshot);
-      // Restoring a save restarts its 30 days.
-      if (snapshot) await this.ctx.storage.put("saveTouchedAt", Date.now());
-      return this.mustRecord();
+      if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}`);
+      if (!size || size === r.size) return this.resumeFrom(fromBackup);
+      await this.update({ size });
+      try {
+        return await this.resumeFrom(fromBackup);
+      } catch (e) {
+        // One that didn't start on the new size stays on its old one.
+        await this.update({ size: r.size });
+        const { status, message: why } = errorStatus(e);
+        fail(status, `${why}. It stays on ${r.size}`);
+      }
     });
+  }
+
+  private async resumeFrom(fromBackup: boolean): Promise<SandboxRecord> {
+    const r = this.mustRecord();
+    const snapshot = await this.ctx.storage.get("snapshot");
+    const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
+    const expired = Boolean(snapshot) && Date.now() - touched > SAVE_LIFETIME_MS;
+    if (fromBackup || expired) {
+      const bucket = backupBucket(this.env);
+      const backup = bucket ? await latestBackup(bucket, r.id) : null;
+      if (backup) {
+        await this.bootFromBackup(backup, fromBackup ? "as asked" : "its save had expired");
+        await this.startHook();
+        return this.mustRecord();
+      }
+      if (fromBackup) fail(404, bucket ? `${r.id} has no backup yet` : "backups are off: this deployment has no R2 bucket");
+    }
+    await this.boot(snapshot);
+    // Restoring a save restarts its 30 days.
+    if (snapshot) await this.ctx.storage.put("saveTouchedAt", Date.now());
+    await this.startHook();
+    return this.mustRecord();
   }
 
   private async bootFromBackup(b: BackupManifest, why: string) {
@@ -393,33 +459,131 @@ export class Sandbox extends DurableObject<Env> {
     });
   }
 
+  // A stop asked for from inside the sandbox: its request has to be answered
+  // before the container goes, so the alarm does it a moment later.
+  async requestStop(): Promise<SandboxRecord> {
+    const r = this.mustRecord();
+    if (r.state !== "running") fail(409, `${r.name ?? r.id} is ${r.state}`);
+    await this.ctx.storage.put("stopRequested", true);
+    await this.ctx.storage.setAlarm(Date.now() + 1000);
+    return r;
+  }
+
+  // A new name, or a new idle time, which counts from now.
+  async set(patch: UpdateSandbox): Promise<SandboxRecord> {
+    const r = this.mustRecord();
+    const change: Partial<SandboxRecord> = {};
+    if (patch.name !== undefined && patch.name !== r.name) {
+      if (!(await renameSandbox(this.env.DB, r.id, patch.name))) fail(409, `the name ${patch.name} is taken`);
+      change.name = patch.name;
+    }
+    if (patch.idleMinutes !== undefined) change.idleMinutes = patch.idleMinutes;
+    if (r.state === "running") this.touch();
+    await this.update(change);
+    return this.mustRecord();
+  }
+
+  private async linkState(): Promise<Links> {
+    return (await this.ctx.storage.get<Links>("links")) ?? { epoch: 0, ports: {} };
+  }
+
+  // Until a port's link has been revoked, its token is the HMAC of sandbox and
+  // port alone, as tokens were before links could be revoked.
+  private linkToken(links: Links, port: number, id = this.mustRecord().id) {
+    const gen = links.ports[port]?.gen ?? 0;
+    return previewToken(this.env.ADMIN_KEY, id, port, links.epoch || gen ? `${links.epoch}.${gen}` : undefined);
+  }
+
+  // The token for a port's preview link, which is listed from now on.
+  async link(port: number): Promise<{ token: string; createdAt: number }> {
+    this.mustRecord();
+    const links = await this.linkState();
+    const entry = (links.ports[port] ??= { gen: 0, at: null });
+    entry.at ??= Date.now();
+    await this.ctx.storage.put("links", links);
+    return { token: await this.linkToken(links, port), createdAt: entry.at };
+  }
+
+  async links(): Promise<{ port: number; token: string; createdAt: number }[]> {
+    this.mustRecord();
+    const links = await this.linkState();
+    const listed = Object.entries(links.ports).filter(([, e]) => e.at !== null);
+    const out = await Promise.all(
+      listed.map(async ([p, e]) => ({ port: Number(p), token: await this.linkToken(links, Number(p)), createdAt: e.at! })),
+    );
+    return out.sort((a, b) => a.port - b.port);
+  }
+
+  // A revoked link stops working at once; asking for the port's link again
+  // gives a new one. Without a port, every link to the sandbox goes, including
+  // ones handed out before links were listed.
+  async revokeLinks(port?: number): Promise<{ revoked: number[]; all: boolean }> {
+    this.mustRecord();
+    const links = await this.linkState();
+    let revoked: number[];
+    if (port === undefined) {
+      links.epoch += 1;
+      revoked = Object.entries(links.ports).filter(([, e]) => e.at !== null).map(([p]) => Number(p));
+      for (const e of Object.values(links.ports)) e.at = null;
+    } else {
+      const entry = (links.ports[port] ??= { gen: 0, at: null });
+      entry.gen += 1;
+      entry.at = null;
+      revoked = [port];
+    }
+    await this.ctx.storage.put("links", links);
+    this.revocations++;
+    for (const [p, ends] of this.open) {
+      if (port === undefined || p === port) for (const end of [...ends]) end();
+    }
+    return { revoked: revoked.sort((a, b) => a - b), all: port === undefined };
+  }
+
+  async checkLink(port: number, token: string): Promise<boolean> {
+    const r = this.record;
+    if (!r || this.removing || !token) return false;
+    return sameSecret(token, await this.linkToken(await this.linkState(), port, r.id));
+  }
+
   async remove(): Promise<{ deleted: string }> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
       this.record = { ...r, state: "stopping" }; // so the exit watcher stays out of it
-      if (this.ctx.container?.running) await withTimeout(this.container.destroy(), 60_000, "destroy");
-      const bucket = backupBucket(this.env);
-      if (bucket) {
-        try {
-          await deleteBackups(bucket, r.id);
-        } catch (e) {
-          console.error(`[${r.id}] deleting backups failed: ${message(e)}`);
-        }
+      this.removing = true;
+      try {
+        return await this.removeAll(r);
+      } finally {
+        this.removing = false;
       }
-      await this.ctx.storage.deleteAlarm();
-      await this.ctx.storage.deleteAll();
-      await deleteSandbox(this.env.DB, r.id);
-      this.record = undefined;
-      // Its backups are gone. The last save can't be deleted from a Worker; it
-      // expires on its own 30 days after it was made or last restored.
-      return { deleted: r.id };
     });
+  }
+
+  private async removeAll(r: SandboxRecord): Promise<{ deleted: string }> {
+    if (this.ctx.container?.running) await withTimeout(this.container.destroy(), 60_000, "destroy");
+    const bucket = backupBucket(this.env);
+    if (bucket) {
+      try {
+        await deleteBackups(bucket, r.id);
+      } catch (e) {
+        console.error(`[${r.id}] deleting backups failed: ${message(e)}`);
+      }
+    }
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    await deleteSandbox(this.env.DB, r.id);
+    this.record = undefined;
+    // Its backups are gone. The last save can't be deleted from a Worker; it
+    // expires on its own 30 days after it was made or last restored.
+    return { deleted: r.id };
   }
 
   private async boot(snapshot?: unknown, afterReady?: () => Promise<void>) {
     const r = this.mustRecord();
     const c = this.container;
     const t0 = Date.now();
+    // A new run: no relays yet, and no stop asked for from inside the last one.
+    this.relayed.clear();
+    await this.ctx.storage.delete("stopRequested");
     await this.update({ state: "starting", error: null, notice: null });
     let providers: (keyof typeof PROVIDERS)[] = [];
     try {
@@ -429,6 +593,7 @@ export class Sandbox extends DurableObject<Env> {
     }
     let keysProblem = "";
     let settingsProblem = "";
+    let platformProblem = "";
     try {
       const images = c.images as Record<string, string>;
       c.start({
@@ -439,7 +604,12 @@ export class Sandbox extends DurableObject<Env> {
         labels: { sandbox: r.id },
       } as ContainerStartupOptions);
       this.watch();
-      const egress = this.ctx.exports.Egress({ props: { id: r.id } });
+      // The cloudex command in the sandbox shows this run's token to the API
+      // the sandbox has for itself (self.ts), so that an app in the sandbox
+      // that fetches URLs for its visitors can't be made to call it.
+      const selfToken = [...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, "0")).join("");
+      await this.ctx.storage.put("selfToken", selfToken);
+      const egress = this.ctx.exports.Egress({ props: { id: r.id, selfToken } });
       await withTimeout(c.interceptOutboundHttp("cloudex.internal", egress), 30_000, "routing cloudex.internal");
       for (const p of providers) {
         await withTimeout(c.interceptOutboundHttps(PROVIDERS[p].host, egress), 30_000, `routing ${PROVIDERS[p].host}`);
@@ -466,6 +636,13 @@ export class Sandbox extends DurableObject<Env> {
         settingsProblem = message(e);
         console.error(`[${r.id}] ${settingsProblem}`);
       }
+      // After the settings, whose files may replace ones it adjusts.
+      try {
+        await this.applyPlatform();
+      } catch (e) {
+        platformProblem = message(e);
+        console.error(`[${r.id}] ${platformProblem}`);
+      }
     } catch (e) {
       try {
         if (c.running) await withTimeout(c.destroy(), 60_000, "destroy");
@@ -486,11 +663,12 @@ export class Sandbox extends DurableObject<Env> {
       startedAt: Date.now(),
       stoppedAt: null,
       providerKeys: keysProblem ? [] : providers,
-      ...(keysProblem || settingsProblem
+      ...(keysProblem || settingsProblem || platformProblem
         ? {
             notice: [
               keysProblem && `Provider keys aren't set up in this run: ${keysProblem}.`,
               settingsProblem && `The sandbox's settings aren't applied in this run: ${settingsProblem}.`,
+              platformProblem && `The cloudex command and the localhost relay aren't set up in this run: ${platformProblem}.`,
             ]
               .filter(Boolean)
               .join(" "),
@@ -714,8 +892,27 @@ export class Sandbox extends DurableObject<Env> {
   // look open for half an hour, and an open one alone would hold the box up.
   async alarm() {
     const r = this.record;
+    const stopRequested = await this.ctx.storage.get<boolean>("stopRequested");
+    if (stopRequested) await this.ctx.storage.delete("stopRequested");
     if (!r || r.state !== "running") return;
     if (!this.ctx.container?.running) return this.onExit();
+    if (stopRequested) {
+      try {
+        await this.exclusive(async () => {
+          if (this.record?.state === "running") await this.saveAndDestroy();
+        });
+        console.log(`[${r.id}] stopped from inside`);
+        return;
+      } catch (e) {
+        console.error(`[${r.id}] stop from inside failed: ${message(e)}`);
+      }
+    }
+    // A sandbox running when the deployment was updated gets the new tools.
+    if ((await this.ctx.storage.get("platform")) !== `${PLATFORM_VERSION}:${this.env.PREVIEW_ZONE || ""}`) {
+      await this.exclusive(async () => {
+        if (this.record?.state === "running") await this.applyPlatform();
+      }).catch((e) => console.error(`[${r.id}] ${message(e)}`));
+    }
     const idleMs = r.idleMinutes * 60_000;
     if (idleMs > 0 && Date.now() - this.lastActivity > idleMs) {
       try {
@@ -728,30 +925,53 @@ export class Sandbox extends DurableObject<Env> {
         console.error(`[${r.id}] idle stop failed: ${message(e)}`);
       }
     }
-    await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+    // Sooner if a stop was asked for from inside while this ran.
+    const asked = await this.ctx.storage.get<boolean>("stopRequested");
+    await this.ctx.storage.setAlarm(Date.now() + (asked ? 1000 : ALARM_EVERY_MS));
   }
 
   // The Worker forwards two kinds of request here:
   //   /tcp/<port>[?key=<ssh public key>]  WebSocket bridged to a guest TCP port
   //   /http/<port>/<path>                 an HTTP preview of a guest port
   async fetch(req: Request): Promise<Response> {
+    try {
+      return await this.serve(req);
+    } catch (e) {
+      const { status, message: why } = errorStatus(e);
+      return new Response(`${why}\n`, { status: status === 500 ? 502 : status });
+    }
+  }
+
+  private async serve(req: Request): Promise<Response> {
     const r = this.record;
-    if (!r) return new Response("no such sandbox", { status: 404 });
+    if (!r || this.removing) return new Response("no such sandbox", { status: 404 });
     const url = new URL(req.url);
     const m = /^\/(tcp|http)\/(\d{1,5})(\/.*)?$/.exec(url.pathname);
     if (!m) return new Response("not found", { status: 404 });
     const port = Number(m[2]);
+    const token = req.headers.get(LINK_HEADER) ?? "";
+    const revocations = this.revocations;
+    if (m[1] === "http" && !(await this.checkLink(port, token))) {
+      return new Response("not found", { status: 404 });
+    }
     if (r.state !== "running") {
       return new Response(`${r.id} is ${r.state}. Run: cloudex resume ${r.name ?? r.id}\n`, { status: 409 });
     }
     this.touch();
     if (m[1] === "http") {
-      const target = new URL(`http://container${m[3] ?? "/"}${url.search}`);
-      try {
-        return await this.container.getTcpPort(port).fetch(new Request(target, req));
-      } catch (e) {
-        return new Response(`nothing is answering on port ${port} in ${r.name ?? r.id}: ${message(e)}\n`, { status: 502 });
+      // Host is the preview link's host name, so that dev servers that check it
+      // (Vite) and apps that build links from it get the real one.
+      const host = req.headers.get("x-forwarded-host") ?? "";
+      const name = /^[a-z0-9.-]{1,253}$/.test(host) ? host : "container";
+      const res = await this.preview(port, `http://${name}${m[3] ?? "/"}${url.search}`, req);
+      // A link revoked while this request was on its way doesn't get it.
+      if (this.revocations !== revocations && !(await this.checkLink(port, token))) {
+        res.webSocket?.accept();
+        res.webSocket?.close(1000, "the link was revoked");
+        await res.body?.cancel().catch(() => {});
+        return new Response("not found", { status: 404 });
       }
+      return this.carry(port, res);
     }
     if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("expected a WebSocket upgrade", { status: 426 });
@@ -762,6 +982,147 @@ export class Sandbox extends DurableObject<Env> {
       await this.authorize(key);
     }
     return this.bridge(port);
+  }
+
+  // A preview request for a guest port. A server listening only on localhost
+  // doesn't answer at the sandbox's address, so then a relay (guest.ts) starts
+  // for it, and requests for the port go through the relay while it runs. A
+  // request is sent again after a miss only without a body, which can't be.
+  private async preview(port: number, target: string, req: Request): Promise<Response> {
+    const r = this.mustRecord();
+    const send = (to: number) => {
+      const fwd = new Request(target, req);
+      fwd.headers.delete(LINK_HEADER);
+      return this.container.getTcpPort(to).fetch(fwd);
+    };
+    let why = "";
+    const relay = this.relayed.get(port);
+    for (const to of relay ? [relay, port] : [port]) {
+      try {
+        return await send(to);
+      } catch (e) {
+        why = message(e);
+        if (to !== port) this.relayed.delete(port);
+        if (req.body) break;
+      }
+    }
+    const addr = /not listening in the TCP address (\d{1,3}(?:\.\d{1,3}){3}):\d+/.exec(why)?.[1];
+    if (addr) {
+      const through = await this.relay(port, addr);
+      if (through === null) {
+        return new Response(`nothing is listening on port ${port} in ${r.name ?? r.id}\n`, { status: 502 });
+      }
+      if (through) {
+        if (through !== port) this.relayed.set(port, through);
+        if (req.body) {
+          return new Response(`port ${port} in ${r.name ?? r.id} only just started answering; send that again\n`, {
+            status: 503,
+            headers: { "retry-after": "1" },
+          });
+        }
+        try {
+          return await send(through);
+        } catch (e) {
+          why = message(e);
+          this.relayed.delete(port);
+        }
+      }
+    }
+    return new Response(`nothing is answering on port ${port} in ${r.name ?? r.id}: ${why}\n`, { status: 502 });
+  }
+
+  // A WebSocket or streamed answer passes through here, rather than straight
+  // to the visitor, so that revoking the port's link can end it (revokeLinks).
+  // Answers of a known length, most of a dev server's, go straight through.
+  private carry(port: number, res: Response): Response {
+    const ends = this.open.get(port) ?? new Set<() => void>();
+    this.open.set(port, ends);
+    const upstream = res.webSocket;
+    if (res.status === 101 && upstream) {
+      const pair = new WebSocketPair();
+      const [client, server] = [pair[0], pair[1]];
+      upstream.accept();
+      server.accept();
+      upstream.binaryType = server.binaryType = "arraybuffer";
+      let ended = false;
+      const end = (code = 1000, reason = "") => {
+        if (ended) return;
+        ended = true;
+        ends.delete(end);
+        // close() takes only 1000 and 3000-4999; an abnormal end gets 4000.
+        const sendable = code === 1000 || (code >= 3000 && code <= 4999) ? code : 4000;
+        for (const ws of [server, upstream]) {
+          try {
+            ws.close(sendable, reason);
+          } catch {}
+        }
+      };
+      ends.add(end);
+      upstream.addEventListener("message", (e) => {
+        try {
+          server.send(e.data as ArrayBuffer | string);
+        } catch {
+          end(4000);
+        }
+      });
+      server.addEventListener("message", (e) => {
+        this.touch();
+        try {
+          upstream.send(e.data as ArrayBuffer | string);
+        } catch {
+          end(4000);
+        }
+      });
+      for (const ws of [server, upstream]) {
+        ws.addEventListener("close", (e) => end(e.code, e.reason));
+        ws.addEventListener("error", () => end(4000));
+      }
+      const headers = new Headers();
+      const protocol = res.headers.get("sec-websocket-protocol");
+      if (protocol) headers.set("sec-websocket-protocol", protocol);
+      return new Response(null, { status: 101, webSocket: client, headers });
+    }
+    if (!res.body || res.headers.has("content-length")) return res;
+    const stop = new AbortController();
+    const { readable, writable } = new TransformStream();
+    const end = () => stop.abort();
+    ends.add(end);
+    void res.body
+      .pipeTo(writable, { signal: stop.signal })
+      .catch(() => {})
+      .finally(() => ends.delete(end));
+    return new Response(readable, res);
+  }
+
+  // The guest port that answers for port at addr: port itself, or the port of
+  // a relay to it from localhost (guest.ts). Null when nothing listens on port,
+  // false if the relay didn't start. A sandbox started before the relay
+  // existed gets it first.
+  private async relay(port: number, addr: string, again = true): Promise<number | null | false> {
+    const id = this.record?.id;
+    try {
+      const p = await withTimeout(
+        this.container.exec(["bash", "-c", RELAY_SCRIPT, "cloudex", String(port), addr], { cwd: "/", env: { LANG: "C.UTF-8" } }),
+        15_000,
+        "starting the relay",
+      );
+      const out = await withTimeout(p.output(), 15_000, "starting the relay");
+      const through = Number(new TextDecoder().decode(out.stdout).trim());
+      if (out.exitCode === 0 && Number.isInteger(through) && through > 0 && through < 65536) return through;
+      if (out.exitCode === RELAY_NOTHING) return null;
+      if (out.exitCode === 127 && again) {
+        // One reinstall, in the lifecycle queue, however many previews ask.
+        this.platformFix ??= this.exclusive(async () => {
+          if (this.record?.state === "running") await this.applyPlatform();
+        }).finally(() => (this.platformFix = undefined));
+        await this.platformFix;
+        return this.relay(port, addr, false);
+      }
+      console.error(`[${id}] the relay for port ${port} exited ${out.exitCode}: ${clip(out.stderr).trim().slice(-300)}`);
+    } catch (e) {
+      console.error(`[${id}] the relay for port ${port}: ${message(e)}`);
+    }
+    return false;
   }
 
   // Adds an SSH public key for the cloudex user if it isn't there yet.

@@ -6,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from cloudex import Cloudex, CloudexError, ExecResult, ProviderKey, Settings
+from cloudex import Cloudex, CloudexError, ExecResult, HostLink, ProviderKey, Settings
 
 
 def info(id, **extra):
@@ -91,6 +91,26 @@ class CloudexTest(unittest.TestCase):
         box.delete()
         self.assertEqual(FakeAPI.seen[-2]["body"], {"fromBackup": True})
         self.assertEqual(FakeAPI.seen[-1]["route"], "DELETE /v1/sandboxes/cx-aaa111")
+
+    def test_update_resume_size_and_links(self):
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111", name="web"))
+        FakeAPI.routes["PATCH /v1/sandboxes/cx-aaa111"] = (200, info("cx-aaa111", name="site", idleMinutes=120))
+        FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/resume"] = (200, info("cx-aaa111", size="standard-4"))
+        FakeAPI.routes["GET /v1/sandboxes/cx-aaa111/hosts"] = (200, [{"port": 3000, "url": "https://x", "createdAt": 1}])
+        FakeAPI.routes["DELETE /v1/sandboxes/cx-aaa111/hosts/3000"] = (200, {"revoked": [3000], "all": False})
+        FakeAPI.routes["DELETE /v1/sandboxes/cx-aaa111/hosts"] = (200, {"revoked": [3000], "all": True})
+        box = self.cx.get("web")
+        self.assertEqual(box.update(name="site", idle_minutes=120).name, "site")
+        self.assertEqual(box.resume(size="standard-4").info["size"], "standard-4")
+        self.assertEqual(box.links(), [HostLink(3000, "https://x", 1)])
+        self.assertEqual(box.revoke_links(3000), {"revoked": [3000], "all": False})
+        self.assertTrue(box.revoke_links()["all"])
+        self.assertEqual(
+            [(s["route"], s["body"]) for s in FakeAPI.seen[1:3]],
+            [("PATCH /v1/sandboxes/cx-aaa111", {"name": "site", "idleMinutes": 120}),
+             ("POST /v1/sandboxes/cx-aaa111/resume", {"size": "standard-4"})],
+        )
+        self.assertEqual(FakeAPI.seen[-1]["route"], "DELETE /v1/sandboxes/cx-aaa111/hosts")
 
     def test_exec_quotes_a_list(self):
         FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
