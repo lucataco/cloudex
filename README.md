@@ -134,8 +134,7 @@ API URL and key you pass in.
 
 ```sh
 npm install cloudex
-# Python isn't on PyPI yet:
-pip install 'git+https://github.com/lucataco/cloudex#subdirectory=python'
+pip install cloudex
 ```
 
 The API describes itself at `<your API URL>/v1/openapi.json`.
@@ -160,7 +159,7 @@ await (await agent.send("now update the docs")).wait();
 | `go/cmd/cloudex` | The `cloudex` CLI |
 | `packages/schema` | Zod models shared by the API and the SDKs, and the OpenAPI document built from them |
 | `packages/sdk` | The TypeScript SDK, [`cloudex` on npm](https://www.npmjs.com/package/cloudex) |
-| `python` | The Python SDK (`cloudex` on PyPI, once published) |
+| `python` | The Python SDK, [`cloudex` on PyPI](https://pypi.org/project/cloudex/) |
 | `scripts/` | `bundle-api.sh` embeds the API in the CLI; `build-cli.sh` builds release archives |
 
 ## Develop
