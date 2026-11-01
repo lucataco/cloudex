@@ -39,10 +39,11 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --
 
 # The sandbox user is uid 1000 (the API execs as 1000:1000), so drop the
 # image's stock ubuntu user, which holds that id. sshd ends sessions whose
-# client hasn't answered for 3 minutes.
+# client hasn't answered for 3 minutes. The host keys openssh-server made
+# while installing go: each sandbox makes its own when it first boots.
 RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -s /bin/bash -G sudo,docker cloudex \
   && echo 'cloudex ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/cloudex \
-  && rm -f /home/cloudex/.bash_logout \
+  && rm -f /home/cloudex/.bash_logout /etc/ssh/ssh_host_* \
   && mkdir -p /run/sshd \
   && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
   && printf 'ClientAliveInterval 30\nClientAliveCountMax 6\n' > /etc/ssh/sshd_config.d/cloudex.conf
