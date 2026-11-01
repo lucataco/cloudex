@@ -1,0 +1,186 @@
+#!/usr/bin/python3 -I
+# The image's own list of files, and how a sandbox's disk differs from it, for
+# named saves (apps/api/src/saves.ts). Run as root.
+#
+#   cloudex-files baseline   writes the list to LIST; the image build's last step
+#   cloudex-files diff DIR   compares the disk with LIST and writes, relative to /
+#                            and NUL-separated: DIR/changed, the paths a save
+#                            holds (new and changed files, and directories whose
+#                            owner or mode changed), parents first; and
+#                            DIR/deleted, the image's paths that are gone or are
+#                            now another kind of file. Prints a JSON summary.
+#
+# A file counts as changed when its kind, mode, owner, size or modification
+# time (to the second) differs. The list's SHA-256 identifies the image: a save
+# restores in full only onto an image with the same list.
+import gzip
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+LIST = b"/usr/share/cloudex/image-files.gz"
+
+# Never listed: kernel and runtime filesystems, temporary files, and the list.
+SKIP = {b"/proc", b"/sys", b"/dev", b"/run", b"/tmp", b"/usr/share/cloudex"}
+
+# Left out of saves: what belongs to each sandbox (the platform mounts the
+# first three, and every sandbox makes its own SSH host keys), and Cloudex's
+# own logs.
+OWN = {
+    b"/etc/hostname",
+    b"/etc/hosts",
+    b"/etc/resolv.conf",
+    b"/var/lib/docker/engine-id",
+    b"/var/log/cloudex.log",
+    b"/var/log/sshd.log",
+    b"/var/log/dockerd.log",
+}
+OWN_PREFIXES = (b"/etc/ssh/ssh_host_",)
+
+
+def own(p):
+    return p in OWN or p.startswith(OWN_PREFIXES)
+
+
+def unescape(b):
+    return re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), b)
+
+
+def mount_points():
+    """Mount points other than /, except binds of the root filesystem's own
+    directories (the platform binds /var/lib/docker that way)."""
+    rows = []
+    with open("/proc/self/mountinfo", "rb") as f:
+        for line in f.read().splitlines():
+            fields = line.split(b" ")
+            rows.append((fields[2], unescape(fields[3]), unescape(fields[4])))
+    root = [r for r in rows if r[2] == b"/"][-1]
+    prefix = root[1].rstrip(b"/")
+    return {point for dev, src, point in rows if point != b"/" and not (dev == root[0] and src == prefix + point)}
+
+
+def walk(skip):
+    """Every file on the root filesystem, as (path, lstat), parents first."""
+    stack = [b"/"]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                names = sorted(e.name for e in it)
+        except OSError:
+            continue
+        subdirs = []
+        for name in names:
+            p = os.path.join(d, name)
+            if p in skip:
+                continue
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            yield p, st
+            if stat.S_ISDIR(st.st_mode):
+                subdirs.append(p)
+        stack.extend(reversed(subdirs))
+
+
+def sig(p, st):
+    m = st.st_mode
+    perm = stat.S_IMODE(m)
+    who = f"{st.st_uid} {st.st_gid}"
+    if stat.S_ISREG(m):
+        return f"f {perm:o} {who} {st.st_size} {st.st_mtime_ns // 1_000_000_000}"
+    if stat.S_ISDIR(m):
+        return f"d {perm:o} {who}"
+    if stat.S_ISLNK(m):
+        return f"l {who} {os.readlink(p).hex()}"
+    if stat.S_ISCHR(m) or stat.S_ISBLK(m):
+        return f"{'c' if stat.S_ISCHR(m) else 'b'} {perm:o} {who} {st.st_rdev}"
+    if stat.S_ISFIFO(m):
+        return f"p {perm:o} {who}"
+    return None  # a socket, which tar can't keep
+
+
+def baseline():
+    skip = SKIP | mount_points()
+    out = bytearray()
+    for p, st in walk(skip):
+        s = sig(p, st)
+        if s is not None:
+            out += s.encode() + b"\t" + p + b"\0"
+    os.makedirs(os.path.dirname(LIST), exist_ok=True)
+    tmp = LIST + b".tmp"
+    with open(tmp, "wb") as f:
+        f.write(gzip.compress(bytes(out), mtime=0))
+    os.replace(tmp, LIST)
+
+
+def under(p, dirs):
+    while p not in (b"/", b""):
+        if p in dirs:
+            return True
+        p = os.path.dirname(p)
+    return False
+
+
+def diff(out_dir):
+    with open(LIST, "rb") as f:
+        raw = f.read()
+    base = {}
+    for rec in gzip.decompress(raw).split(b"\0"):
+        if rec:
+            s, _, p = rec.partition(b"\t")
+            base[p] = s.decode()
+    skip = SKIP | mount_points()
+    seen = set()
+    changed, retyped = [], []
+    size = home = 0
+    for p, st in walk(skip):
+        if own(p):
+            continue
+        s = sig(p, st)
+        if s is None:
+            continue
+        seen.add(p)
+        was = base.get(p)
+        if was == s:
+            continue
+        if was is not None and was[0] != s[0]:
+            retyped.append(p)
+        changed.append(p)
+        if s[0] == "f":
+            size += st.st_size
+        if p.startswith(b"/home/"):
+            home += 1
+    gone = [p for p in base if p not in seen and not own(p) and not under(p, skip)]
+    # Only the topmost of the paths to delete: removing a directory removes
+    # what was in it.
+    deleted, dirs = [], set()
+    for p in sorted(gone + retyped):
+        if not under(os.path.dirname(p), dirs):
+            deleted.append(p)
+            dirs.add(p)
+    rel = lambda paths: b"".join(p[1:] + b"\0" for p in paths)
+    with open(os.path.join(out_dir, b"changed"), "wb") as f:
+        f.write(rel(changed))
+    with open(os.path.join(out_dir, b"deleted"), "wb") as f:
+        f.write(rel(deleted))
+    print(json.dumps({
+        "image": hashlib.sha256(raw).hexdigest(),
+        "files": len(changed),
+        "rawBytes": size,
+        "home": home,
+        "deleted": len(deleted),
+    }))
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["baseline"]:
+        baseline()
+    elif len(sys.argv) == 3 and sys.argv[1] == "diff":
+        diff(os.fsencode(sys.argv[2]))
+    else:
+        sys.exit("usage: cloudex-files baseline | diff DIR")

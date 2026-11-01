@@ -49,4 +49,10 @@ RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -s /bin/bash -G sudo,docke
 
 COPY entrypoint.sh /usr/local/bin/cloudex-entrypoint
 COPY bin/ /usr/local/bin/
+
+# Last: the list of the image's files, which named saves are compared with, so
+# that a save holds only what a sandbox changed. Images built FROM this one
+# should run it again as their own last step.
+RUN cloudex-files baseline
+
 ENTRYPOINT ["/usr/local/bin/cloudex-entrypoint"]

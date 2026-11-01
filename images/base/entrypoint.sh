@@ -11,6 +11,19 @@ log "entrypoint start sandbox=${CLOUDEX_SANDBOX:-?}"
 # a DNS label and breaks tools such as Python's http.server.
 [ -n "${CLOUDEX_SANDBOX:-}" ] && hostname "${CLOUDEX_SANDBOX}"
 
+# A sandbox started from a named save waits here while its controller restores
+# the save onto the disk, so that nothing runs from the image's files
+# meanwhile. It gives up after 30 minutes.
+if [ "${CLOUDEX_HOLD:-}" = 1 ]; then
+  cat /proc/sys/kernel/random/boot_id > /run/cloudex-held
+  log "held for a restore"
+  for _ in $(seq 3600); do
+    [ -e /run/cloudex-go ] && break
+    sleep 0.5
+  done
+  log "restore done"
+fi
+
 # Trust the egress CA when HTTPS interception is on.
 if [ -f /etc/cloudflare/certs/cloudflare-containers-ca.crt ]; then
   cp /etc/cloudflare/certs/cloudflare-containers-ca.crt /usr/local/share/ca-certificates/cloudflare-containers-ca.crt
