@@ -33,7 +33,7 @@ export async function writeManifest(bucket: R2Bucket, id: string, m: BackupManif
   });
 }
 
-async function listAll(bucket: R2Bucket, prefix: string): Promise<string[]> {
+export async function listAll(bucket: R2Bucket, prefix: string): Promise<string[]> {
   const keys: string[] = [];
   let cursor: string | undefined;
   do {
@@ -71,9 +71,13 @@ export async function deleteBackups(bucket: R2Bucket, id: string, keep?: number)
   return doomed.length;
 }
 
-// The guest side. Runs as root with python3 from the base image.
-//   put GEN          stdin -> parts; prints {"parts": N, "bytes": B}
-//   get GEN PARTS    parts -> stdout, in order, four in flight
+// The guest side, for backups and named saves (saves.ts). Runs as root with
+// python3 from the base image. BASE is a path such as /backup/<gen>, whose
+// parts are BASE/0, BASE/1 and so on.
+//   put BASE          stdin -> parts; prints {"parts": N, "bytes": B}
+//   get BASE PARTS    parts -> stdout, in order, four in flight
+//   send PATH         stdin -> one object, for small ones
+//   fetch PATH        one object -> stdout
 export const HELPER = String.raw`
 import concurrent.futures as cf, http.client, json, sys
 PART, JOBS = 64 << 20, 4
@@ -97,7 +101,7 @@ def call(method, path, body=None):
             err = e
     raise err
 
-def put(gen):
+def put(base):
     parts = total = 0
     with cf.ThreadPoolExecutor(JOBS) as ex:
         pending = set()
@@ -105,7 +109,7 @@ def put(gen):
             data = sys.stdin.buffer.read(PART)
             if not data:
                 break
-            pending.add(ex.submit(call, "PUT", f"/backup/{gen}/{parts}", data))
+            pending.add(ex.submit(call, "PUT", f"{base}/{parts}", data))
             parts += 1
             total += len(data)
             if len(pending) >= JOBS:
@@ -116,21 +120,26 @@ def put(gen):
             f.result()
     print(json.dumps({"parts": parts, "bytes": total}))
 
-def get(gen, parts):
+def get(base, parts):
     out = sys.stdout.buffer
     with cf.ThreadPoolExecutor(JOBS) as ex:
         futures = {}
         for n in range(parts):
             for m in range(n, min(n + JOBS, parts)):
                 if m not in futures:
-                    futures[m] = ex.submit(call, "GET", f"/backup/{gen}/{m}")
+                    futures[m] = ex.submit(call, "GET", f"{base}/{m}")
             out.write(futures.pop(n).result())
     out.flush()
 
-if sys.argv[1] == "put":
+op = sys.argv[1]
+if op == "put":
     put(sys.argv[2])
-else:
+elif op == "get":
     get(sys.argv[2], int(sys.argv[3]))
+elif op == "send":
+    call("PUT", sys.argv[2], sys.stdin.buffer.read())
+else:
+    sys.stdout.buffer.write(call("GET", sys.argv[2]))
 `;
 
 // $1 is HELPER, $2 the generation. Caches are left out; tar's exit status 1
@@ -141,12 +150,12 @@ cd /
 paths=(home)
 for f in etc/ssh/ssh_host_*; do [ -e "$f" ] && paths+=("$f"); done
 { tar --numeric-owner --xattrs --warning=no-file-changed --exclude='home/*/.cache' -cf - "${"$"}{paths[@]}" || [ $? -eq 1 ]; } |
-  zstd -q -T0 -3 | python3 -c "$1" put "$2"
+  zstd -q -T0 -3 | python3 -c "$1" put "/backup/$2"
 `;
 
 // $1 is HELPER, $2 the generation, $3 its part count. sshd reloads the restored host keys.
 export const RESTORE_SCRIPT = String.raw`
 set -euo pipefail
-python3 -c "$1" get "$2" "$3" | zstd -q -d | tar --numeric-owner --xattrs -C / -xpf -
+python3 -c "$1" get "/backup/$2" "$3" | zstd -q -d | tar --numeric-owner --xattrs -C / -xpf -
 pkill -HUP -x sshd || true
 `;

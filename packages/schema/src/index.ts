@@ -33,6 +33,8 @@ export const Sandbox = z.object({
   notice: z.string().nullable().optional(),
   // The sandbox this one is a fork of.
   forkedFrom: z.string().nullable().optional(),
+  // The named save (Save) this one started from.
+  fromSave: z.string().nullable().optional(),
   // Providers whose keys this run uses without holding them (see ProviderKey).
   providerKeys: z.array(z.string()).optional(),
   error: z.string().nullable(),
@@ -118,6 +120,40 @@ export const ForkRequest = z.object({
   idleMinutes: z.number().int().min(0).max(360).optional(),
 });
 export type ForkRequest = z.input<typeof ForkRequest>;
+
+// A named save: a copy of a sandbox's disk, kept in the account's R2 bucket
+// under a name until it's deleted, that new sandboxes start from (the same
+// ForkRequest options as a fork). It holds every file that differs from the
+// sandbox image, so installed packages, Docker images and /home, and the
+// sandbox's settings; SSH host keys and Cloudex's logs are left out. It is made
+// from a running sandbox, which keeps running. A save restores in full onto the
+// image it was made on; onto another image, only /home comes back. Saving
+// under a name that's taken replaces that save.
+export const SaveKind = z.enum(["disk", "home"]);
+export type SaveKind = z.infer<typeof SaveKind>;
+
+export const Save = z.object({
+  name: z.string(),
+  id: z.string(), // sv-xxxxxxxxxx, new each time the name is saved
+  sandbox: z.string(), // the id of the sandbox it was made from
+  // disk: every file that differs from the image. home: /home only, from an
+  // image without a list of its own files (images before v0.1.15).
+  kind: SaveKind,
+  // The sandbox's size and idle minutes, the defaults for sandboxes started from it.
+  size: SandboxSize,
+  idleMinutes: z.number().int(),
+  files: z.number().int(), // paths it holds
+  rawBytes: z.number().int(), // their size
+  bytes: z.number().int(), // its size in R2, compressed
+  createdAt: z.number().int(),
+  ms: z.number().int(), // how long making it took
+  // Only in the answer to a new save: whether it replaced an earlier save of the name.
+  replaced: z.boolean().optional(),
+});
+export type Save = z.infer<typeof Save>;
+
+export const CreateSave = z.object({ name: Name });
+export type CreateSave = z.input<typeof CreateSave>;
 
 // fromBackup starts the image fresh and restores the newest backup, instead of
 // resuming from the save. Resume does this by itself when the save has expired.
@@ -289,7 +325,7 @@ export const Health = z.object({
   ok: z.literal(true),
   version: z.string(),
   previewZone: z.string().nullable(),
-  backups: z.boolean().optional(),
+  backups: z.boolean().optional(), // the deployment has an R2 bucket, for backups and named saves
 });
 export type Health = z.infer<typeof Health>;
 

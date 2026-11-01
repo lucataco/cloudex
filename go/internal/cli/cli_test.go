@@ -464,6 +464,7 @@ func TestForkMakesTheForkCurrent(t *testing.T) {
 
 func TestNewFromMakesSeveralForks(t *testing.T) {
 	f := withFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/web": sandboxJSON,
 		"POST /v1/sandboxes/web/fork": "!201 [" + forkJSON("cx-fff111", "agent-1", "running", "") + "," +
 			forkJSON("cx-fff222", "agent-2", "running", "") + "]",
 	})
@@ -472,7 +473,7 @@ func TestNewFromMakesSeveralForks(t *testing.T) {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}
 	var body map[string]any
-	json.Unmarshal([]byte(f.bodies[0]), &body)
+	json.Unmarshal([]byte(f.bodies[1]), &body)
 	if body["count"] != float64(2) || body["idleMinutes"] != float64(60) {
 		t.Fatalf("request body %v", body)
 	}

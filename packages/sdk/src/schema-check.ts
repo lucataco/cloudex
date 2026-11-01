@@ -20,6 +20,7 @@ import type {
   RevokedLinks,
   SandboxInfo,
   SandboxSettings,
+  SaveInfo,
   SettingsChange,
   UpdateOptions,
 } from "./index.ts";
@@ -60,7 +61,9 @@ export const checks: [
   Same<ResumeOptions, schema.ResumeRequest>,
   Same<HostLink, schema.HostLink>,
   Same<RevokedLinks, schema.RevokedLinks>,
+  Same<SaveInfo, schema.Save>,
+  Same<{ name: string }, schema.CreateSave>,
 ] = [
   true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-  true, true,
+  true, true, true, true,
 ];

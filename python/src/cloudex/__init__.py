@@ -28,8 +28,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
-__all__ = ["Agent", "Cloudex", "CloudexError", "Desktop", "ExecResult", "Health", "HostLink", "ProviderKey", "Sandbox", "Settings"]
-__version__ = "0.1.14"
+__all__ = [
+    "Agent",
+    "Cloudex",
+    "CloudexError",
+    "Desktop",
+    "ExecResult",
+    "Health",
+    "HostLink",
+    "ProviderKey",
+    "Sandbox",
+    "Save",
+    "Settings",
+]
+__version__ = "0.1.15"
 
 
 class CloudexError(Exception):
@@ -83,6 +95,29 @@ class HostLink:
     port: int
     url: str
     created_at: int  # milliseconds since the epoch
+
+
+@dataclass(frozen=True)
+class Save:
+    """A named save: a copy of a sandbox's disk in the deployment's R2 bucket,
+    kept until it's deleted, that new sandboxes start from
+    (Cloudex.start_from_save). It holds every file that differs from the
+    sandbox image, and the sandbox's settings. Onto a newer image, only /home
+    is restored.
+    """
+
+    name: str
+    id: str  # sv-xxxxxxxxxx, new each time the name is saved
+    sandbox: str  # the id of the sandbox it was made from
+    kind: str  # disk: every file that differs from the image; home: /home only, from an image before v0.1.15
+    size: str  # the defaults for sandboxes started from it
+    idle_minutes: int
+    files: int  # paths it holds, and their size
+    raw_bytes: int
+    bytes: int  # its size in R2, compressed
+    created_at: int  # milliseconds since the epoch
+    ms: int  # how long making it took
+    replaced: Optional[bool] = None  # only from Sandbox.save: whether it replaced an earlier save of the name
 
 
 @dataclass(frozen=True)
@@ -186,6 +221,34 @@ class Cloudex:
     def delete_key(self, provider: str) -> None:
         self._call("DELETE", "/v1/keys/" + urllib.parse.quote(provider, safe=""))
 
+    def list_saves(self) -> List[Save]:
+        """The named saves, newest first. Make one with Sandbox.save."""
+        return [_save(s) for s in self._call("GET", "/v1/saves")]
+
+    def get_save(self, name: str) -> Save:
+        return _save(self._call("GET", _save_path(name)))
+
+    def delete_save(self, name: str) -> None:
+        """Deletes a named save for good. Sandboxes started from it keep their disks."""
+        self._call("DELETE", _save_path(name))
+
+    def start_from_save(
+        self,
+        save: str,
+        count: int = 1,
+        name: Optional[str] = None,
+        size: Optional[str] = None,
+        idle_minutes: Optional[int] = None,
+    ) -> List["Sandbox"]:
+        """Starts sandboxes (1 to 10) from a named save, with the same options as a fork.
+
+        Size and idle minutes default to the saved sandbox's. Restoring takes
+        about 15 seconds per GB. Ones that failed to start come back in state
+        "error"; resume() tries again.
+        """
+        body = _drop_none(name=name, count=count, size=size, idleMinutes=idle_minutes)
+        return [Sandbox(self, info) for info in self._call("POST", _save_path(save) + "/sandboxes", body)]
+
     def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.api_url + path, data=data, method=method)
@@ -216,8 +279,29 @@ def _settings(s: Dict[str, Any]) -> Settings:
     return Settings(env=s["env"], files=s["files"], repo=s.get("repo"))
 
 
+def _save(s: Dict[str, Any]) -> Save:
+    return Save(
+        name=s["name"],
+        id=s["id"],
+        sandbox=s["sandbox"],
+        kind=s["kind"],
+        size=s["size"],
+        idle_minutes=s["idleMinutes"],
+        files=s["files"],
+        raw_bytes=s["rawBytes"],
+        bytes=s["bytes"],
+        created_at=s["createdAt"],
+        ms=s["ms"],
+        replaced=s.get("replaced"),
+    )
+
+
 def _sandbox_path(ref: str) -> str:
     return "/v1/sandboxes/" + urllib.parse.quote(ref, safe="")
+
+
+def _save_path(name: str) -> str:
+    return "/v1/saves/" + urllib.parse.quote(name, safe="")
 
 
 class Sandbox:
@@ -246,6 +330,11 @@ class Sandbox:
     @property
     def forked_from(self) -> Optional[str]:
         return self.info.get("forkedFrom")
+
+    @property
+    def from_save(self) -> Optional[str]:
+        """The named save this sandbox started from."""
+        return self.info.get("fromSave")
 
     @property
     def provider_keys(self) -> List[str]:
@@ -319,6 +408,15 @@ class Sandbox:
         """
         body = _drop_none(name=name, count=count, size=size, idleMinutes=idle_minutes)
         return [Sandbox(self._client, info) for info in self._client._call("POST", self._path("/fork"), body)]
+
+    def save(self, name: str) -> Save:
+        """Saves this running sandbox's disk under a name, to start new sandboxes from.
+
+        Unlike its own save, a named save stays until it's deleted. The sandbox
+        keeps running; saving takes about 15 seconds per GB of changes. A
+        taken name's save is replaced. See Cloudex.start_from_save.
+        """
+        return _save(self._client._call("POST", self._path("/saves"), {"name": name}))
 
     def host(self, port: int) -> str:
         """An HTTPS link to a port, on the deployment's preview domain. Anyone with it can use it.

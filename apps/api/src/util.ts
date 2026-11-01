@@ -24,6 +24,8 @@ function randomString(n: number) {
 export const newSandboxId = () => `cx-${randomString(6)}`;
 export const newAgentId = () => `ag-${randomString(8)}`;
 
+export const newSaveId = () => `sv-${randomString(10)}`;
+
 export const isSandboxId = (s: string) => /^cx-[a-z0-9]{6}$/.test(s);
 
 // Errors that cross the Durable Object RPC boundary keep only their message, so

@@ -136,6 +136,30 @@ class CloudexTest(unittest.TestCase):
         self.assertEqual([(f.name, f.state, f.forked_from) for f in forks], [("a-1", "running", "cx-aaa111"), ("a-2", "error", None)])
         self.assertEqual(forks[0].stop().state, "stopped")
 
+    def test_named_saves(self):
+        save = {
+            "name": "base", "id": "sv-aaaaaaaaaa", "sandbox": "cx-aaa111", "kind": "disk", "size": "standard-2",
+            "idleMinutes": 30, "files": 12, "rawBytes": 2048, "bytes": 1024, "createdAt": 1, "ms": 900,
+        }
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/saves"] = (201, dict(save, replaced=True))
+        FakeAPI.routes["GET /v1/saves"] = (200, [save])
+        FakeAPI.routes["POST /v1/saves/base/sandboxes"] = (201, [info("cx-bbb111", name="b-1", fromSave="base")])
+        FakeAPI.routes["DELETE /v1/saves/base"] = (200, {"deleted": "base"})
+        made = self.cx.get("web").save("base")
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"name": "base"})
+        self.assertEqual((made.kind, made.raw_bytes, made.replaced), ("disk", 2048, True))
+        self.assertEqual([s.name for s in self.cx.list_saves()], ["base"])
+        self.assertIsNone(self.cx.list_saves()[0].replaced)
+        boxes = self.cx.start_from_save("base", count=2, name="b")
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"name": "b", "count": 2})
+        self.assertEqual([(b.name, b.from_save) for b in boxes], [("b-1", "base")])
+        self.cx.delete_save("base")
+        self.assertEqual(FakeAPI.seen[-1]["route"], "DELETE /v1/saves/base")
+        with self.assertRaises(CloudexError) as e:
+            self.cx.get_save("gone")
+        self.assertEqual(e.exception.status, 404)
+
     def test_desktop_links_to_the_viewer(self):
         FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
         FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/desktop"] = (

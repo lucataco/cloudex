@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"text/tabwriter"
 	"time"
 
 	"github.com/lucataco/cloudex/go/internal/api"
@@ -43,6 +42,23 @@ func newForkCmd(opts *options) *cobra.Command {
 	cmd.Flags().DurationVar(&idle, "idle", 0, "stop after this long without activity (default: the original's)")
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make the fork the current sandbox")
 	return cmd
+}
+
+// runNewFrom starts sandboxes for new --from: forks of a sandbox, or
+// sandboxes from a named save.
+func runNewFrom(cmd *cobra.Command, opts *options, from string, req api.ForkRequest, noUse bool) error {
+	_, client, err := opts.load()
+	if err != nil {
+		return err
+	}
+	ref, save, err := fromSave(cmd.Context(), client, from)
+	if err != nil {
+		return err
+	}
+	if save {
+		return runStartFromSave(cmd, opts, ref, req, noUse)
+	}
+	return runFork(cmd, opts, ref, req, noUse)
 }
 
 // forkRequest checks the flags shared by fork and new --from.
@@ -106,20 +122,7 @@ func runFork(cmd *cobra.Command, opts *options, from string, req api.ForkRequest
 			fmt.Fprintln(out, "It is now the current sandbox. Connect with: cloudex ssh")
 		}
 	} else {
-		tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tSTATE")
-		for _, f := range forks {
-			name := "-"
-			if f.Name != nil {
-				name = *f.Name
-			}
-			state := f.State
-			if f.Error != nil {
-				state += ": " + *f.Error
-			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", f.ID, name, state)
-		}
-		tw.Flush()
+		printStarted(out, forks)
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d forks didn't start; resume them to try again, or delete them", failed, len(forks))

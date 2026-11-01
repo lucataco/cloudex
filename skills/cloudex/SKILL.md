@@ -14,6 +14,7 @@ description: Run code, servers and coding agents in Cloudex sandboxes, Ubuntu ma
 - `cloudex stop <sandbox>` saves the whole disk and stops; `cloudex resume <sandbox>` starts it again from the save. Programs don't start again by themselves: commands in `~/.cloudex/start` inside the sandbox run at every start.
 - A sandbox stops by itself after 30 minutes without activity. `cloudex set <sandbox> --idle 2h` changes that.
 - `cloudex fork <sandbox> --count 3 --name try` makes copies with the same disk, named try-1 to try-3, for parallel work.
+- `cloudex save <sandbox> <name>` keeps a copy of a running sandbox's disk under a name until it's deleted; `cloudex new --from <name>` starts sandboxes from it, so an environment set up once can be reused. `cloudex saves` lists the saves. Saving under a name that already exists replaces that save: ask the user before replacing one you didn't make, or before deleting one (`cloudex saves rm <name> --yes`).
 - `cloudex delete <sandbox> --yes` deletes a sandbox and its data for good. Ask the user before deleting one you didn't create.
 - Sandboxes cost the user money while they run. Stop or delete the ones you no longer need.
 

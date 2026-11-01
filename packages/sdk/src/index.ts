@@ -32,9 +32,40 @@ export interface SandboxInfo {
   notice?: string | null;
   /** The id of the sandbox this one is a fork of. */
   forkedFrom?: string | null;
+  /** The named save this one started from. */
+  fromSave?: string | null;
   /** Providers whose keys this run uses without holding them (see Cloudex.setKey). */
   providerKeys?: string[];
   error: string | null;
+}
+
+/**
+ * A named save: a copy of a sandbox's disk in the deployment's R2 bucket, kept
+ * until it's deleted, that new sandboxes start from (Cloudex.startFromSave).
+ * It holds every file that differs from the sandbox image, and the sandbox's
+ * settings. Onto a newer image, only /home is restored.
+ */
+export interface SaveInfo {
+  name: string;
+  /** sv-xxxxxxxxxx, new each time the name is saved. */
+  id: string;
+  /** The id of the sandbox it was made from. */
+  sandbox: string;
+  /** disk: every file that differs from the image. home: /home only, from an image before v0.1.15. */
+  kind: "disk" | "home";
+  /** The defaults for sandboxes started from it. */
+  size: SandboxSize;
+  idleMinutes: number;
+  /** Paths it holds, and their size. */
+  files: number;
+  rawBytes: number;
+  /** Its size in R2, compressed. */
+  bytes: number;
+  createdAt: number;
+  /** How long making it took. */
+  ms: number;
+  /** Only from Sandbox.save: whether it replaced an earlier save of the name. */
+  replaced?: boolean;
 }
 
 /** An AI provider whose key the deployment can hold for sandboxes. */
@@ -300,6 +331,31 @@ export class Cloudex {
     await this.#call("DELETE", `/v1/keys/${provider}`);
   }
 
+  /** The named saves, newest first. Make one with Sandbox.save. */
+  listSaves(): Promise<SaveInfo[]> {
+    return this.#call("GET", "/v1/saves");
+  }
+
+  getSave(name: string): Promise<SaveInfo> {
+    return this.#call("GET", savePath(name));
+  }
+
+  /** Deletes a named save for good. Sandboxes started from it keep their disks. */
+  async deleteSave(name: string): Promise<void> {
+    await this.#call("DELETE", savePath(name));
+  }
+
+  /**
+   * Starts sandboxes from a named save, with the same options as a fork; size
+   * and idle minutes default to the saved sandbox's. Restoring takes about 15
+   * seconds per GB. Ones that failed to start come back in state "error";
+   * resume() tries again.
+   */
+  async startFromSave(name: string, options: ForkOptions = {}): Promise<Sandbox[]> {
+    const list = await this.#call<SandboxInfo[]>("POST", `${savePath(name)}/sandboxes`, options);
+    return list.map((info) => this.#wrap(info));
+  }
+
   #wrap(info: SandboxInfo) {
     return new Sandbox(info, (method, path, body) => this.#call(method, path, body));
   }
@@ -420,6 +476,16 @@ export class Sandbox {
   async fork(options: ForkOptions = {}): Promise<Sandbox[]> {
     const forks = await this.#call<SandboxInfo[]>("POST", this.#path("/fork"), options);
     return forks.map((info) => new Sandbox(info, this.#call));
+  }
+
+  /**
+   * Saves this running sandbox's disk under a name, to start new sandboxes
+   * from with Cloudex.startFromSave. Unlike its own save, a named save stays
+   * until it's deleted. The sandbox keeps running; saving takes about 15
+   * seconds per GB of changes. A taken name's save is replaced.
+   */
+  save(name: string): Promise<SaveInfo> {
+    return this.#call("POST", this.#path("/saves"), { name });
   }
 
   /**
@@ -589,6 +655,7 @@ export class Agent {
 }
 
 const sandboxPath = (ref: string) => `/v1/sandboxes/${encodeURIComponent(ref)}`;
+const savePath = (name: string) => `/v1/saves/${encodeURIComponent(name)}`;
 
 /** Quotes one argument for bash. */
 export function shellQuote(arg: string): string {

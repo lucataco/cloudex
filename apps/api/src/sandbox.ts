@@ -24,11 +24,16 @@
 //   cloudex command, notes for agents) are put there at each start, after the
 //   settings, then the user's ~/.cloudex/start runs.
 // - Preview link tokens are checked here, against the links revoked so far.
+// - Named saves (saves.ts) are made from a running sandbox by a script, into
+//   R2. A sandbox started from one boots held, so that the save is restored
+//   before anything in it runs, and keeps the save to restore again until it
+//   has a save of its own.
 import { DurableObject } from "cloudflare:workers";
 import type {
   Desktop,
   ExecResult,
   Repo,
+  Save,
   Sandbox as SandboxRecord,
   SandboxSettings,
   SandboxSize,
@@ -52,6 +57,17 @@ import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } fro
 import { PLATFORM_FILES, PLATFORM_SCRIPT, PLATFORM_VERSION, RELAY_NOTHING, RELAY_SCRIPT, START_SCRIPT } from "./guest";
 import { KEYS_SCRIPT, PROVIDERS, listKeys } from "./keys";
 import {
+  RESTORE_SAVE_SCRIPT,
+  SAVE_SCRIPT,
+  type SaveManifest,
+  type SaveSummary,
+  deleteSaveObjects,
+  getSave,
+  readManifest,
+  recordSave,
+  saveView,
+} from "./saves";
+import {
   CLONE_SCRIPT,
   SETTINGS_SCRIPT,
   type StoredSettings,
@@ -64,11 +80,19 @@ import {
 } from "./settings";
 import { LINK_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
-const READY_CHECK = '[ "$(cat /run/cloudex-ready 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id)" ]';
+// Exits 0 once the entrypoint is ready in this boot, and 3 while it holds for
+// a restore (CLOUDEX_HOLD).
+const BOOT_CHECK =
+  'b=$(cat /proc/sys/kernel/random/boot_id); [ "$(cat /run/cloudex-ready 2>/dev/null)" = "$b" ] && exit 0; ' +
+  '[ "$(cat /run/cloudex-held 2>/dev/null)" = "$b" ] && exit 3; exit 1';
 const READY_TIMEOUT_MS = 10 * 60_000; // a host without the image pulls it first
 const SAVE_TIMEOUT_MS = 15 * 60_000; // 15 GiB took 179 s in the spikes
 const BACKUP_TIMEOUT_MS = 20 * 60_000; // about 110 MiB/s each way in the spikes
 const DESKTOP_TIMEOUT_MS = 10 * 60_000; // the first start installs about 950 MB
+// Named saves move at about 110 MiB/s each way, as backups do; a held
+// entrypoint gives up after 30 minutes.
+const NAMED_SAVE_TIMEOUT_MS = 30 * 60_000;
+const RESTORE_SAVE_TIMEOUT_MS = 25 * 60_000;
 // A save expires 30 days after it was made or last restored; past this, resume
 // restores the backup instead of trying the save.
 const SAVE_LIFETIME_MS = 29 * 24 * 3600_000;
@@ -248,13 +272,16 @@ export class Sandbox extends DurableObject<Env> {
     });
   }
 
-  // With from, the sandbox is a fork and starts from that save (see forkPoint).
-  async create(id: string, input: CreateInput, from?: ForkSource): Promise<SandboxRecord> {
+  // With from, the sandbox is a fork and starts from that save (see forkPoint);
+  // with save, it starts from that named save.
+  async create(id: string, input: CreateInput, from?: ForkSource, save?: SaveManifest): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       if (this.record) fail(409, `${id} already exists`);
-      // A fork gets the original's settings; checked before anything is kept.
+      // A fork gets the original's settings, and a sandbox started from a save
+      // the settings saved with it; checked before anything is kept.
       const settings =
         from?.settings ??
+        save?.settings ??
         (input.env || input.files || input.repo
           ? await store(
               this.env.ADMIN_KEY,
@@ -277,6 +304,7 @@ export class Sandbox extends DurableObject<Env> {
         savedBytes: null,
         error: null,
         ...(from ? { forkedFrom: from.sandbox } : {}),
+        ...(save ? { fromSave: save.name } : {}),
       };
       await this.update({});
       if (settings) await this.ctx.storage.put("settings", settings);
@@ -286,8 +314,10 @@ export class Sandbox extends DurableObject<Env> {
         await this.ctx.storage.put("snapshot", from.snapshot);
         await this.ctx.storage.put("saveTouchedAt", Date.now());
       }
-      await this.boot(from?.snapshot);
-      if (settings?.repo && !from) await this.clone(settings.repo);
+      // The same for a named save, which is restored again until then.
+      if (save) await this.ctx.storage.put("fromSave", save);
+      await this.boot(from?.snapshot, undefined, save);
+      if (settings?.repo && !from && !save) await this.clone(settings.repo);
       await this.startHook();
       return this.mustRecord();
     });
@@ -427,6 +457,25 @@ export class Sandbox extends DurableObject<Env> {
         return this.mustRecord();
       }
       if (fromBackup) fail(404, bucket ? `${r.id} has no backup yet` : "backups are off: this deployment has no R2 bucket");
+    }
+    // Started from a named save, and stopped before it made a save of its own:
+    // it starts from that save again, or from the newest save of its name if
+    // it has been saved over, or from the image if it's gone.
+    const fromSave = snapshot ? undefined : await this.ctx.storage.get<SaveManifest>("fromSave");
+    if (fromSave) {
+      const m = await this.currentSave(fromSave);
+      let note = "";
+      if (!m) {
+        await this.ctx.storage.delete("fromSave");
+        note = `The save ${fromSave.name} it started from has been deleted, and it had no save of its own yet, so it started from the image.`;
+      } else if (m.id !== fromSave.id) {
+        await this.ctx.storage.put("fromSave", m);
+        note = `The save ${m.name} was saved over after it started, and it had no save of its own yet, so it started from the newer save.`;
+      }
+      await this.boot(undefined, undefined, m ?? undefined);
+      if (note) await this.update({ notice: [note, this.mustRecord().notice].filter(Boolean).join(" ") });
+      await this.startHook();
+      return this.mustRecord();
     }
     await this.boot(snapshot);
     // Restoring a save restarts its 30 days.
@@ -577,7 +626,9 @@ export class Sandbox extends DurableObject<Env> {
     return { deleted: r.id };
   }
 
-  private async boot(snapshot?: unknown, afterReady?: () => Promise<void>) {
+  // With restore, the sandbox starts from the image and that named save is
+  // restored onto it first.
+  private async boot(snapshot?: unknown, afterReady?: () => Promise<void>, restore?: SaveManifest) {
     const r = this.mustRecord();
     const c = this.container;
     const t0 = Date.now();
@@ -594,13 +645,15 @@ export class Sandbox extends DurableObject<Env> {
     let keysProblem = "";
     let settingsProblem = "";
     let platformProblem = "";
+    let restoreNotice = "";
     try {
       const images = c.images as Record<string, string>;
       c.start({
         ...(snapshot ? { containerSnapshot: snapshot } : { image: images.base }),
         instance: r.size,
         enableInternet: true,
-        env: { CLOUDEX_SANDBOX: r.id },
+        // CLOUDEX_HOLD: the entrypoint waits for the restore before starting anything.
+        env: { CLOUDEX_SANDBOX: r.id, ...(restore ? { CLOUDEX_HOLD: "1" } : {}) },
         labels: { sandbox: r.id },
       } as ContainerStartupOptions);
       this.watch();
@@ -614,7 +667,14 @@ export class Sandbox extends DurableObject<Env> {
       for (const p of providers) {
         await withTimeout(c.interceptOutboundHttps(PROVIDERS[p].host, egress), 30_000, `routing ${PROVIDERS[p].host}`);
       }
-      await this.waitReady(t0);
+      const held = await this.waitReady(t0, Boolean(restore));
+      if (restore) {
+        restoreNotice = await this.restoreSave(restore, held);
+        if (held) {
+          await this.runScript("touch /run/cloudex-go", [], "letting the sandbox start", 30_000);
+          await this.waitReady(Date.now());
+        }
+      }
       if (afterReady) await afterReady();
       // After any restore of /home, which holds Claude Code's settings. Also run
       // with no providers, to clear placeholders a save may still hold.
@@ -656,16 +716,17 @@ export class Sandbox extends DurableObject<Env> {
     } catch (e) {
       console.error(`[${r.id}] ${message(e)}`);
     }
-    console.log(`[${r.id}] ready in ${Date.now() - t0} ms (${snapshot ? "from save" : "fresh"})`);
+    console.log(`[${r.id}] ready in ${Date.now() - t0} ms (${snapshot ? "from save" : restore ? `from the save ${restore.name}` : "fresh"})`);
     this.touch();
     await this.update({
       state: "running",
       startedAt: Date.now(),
       stoppedAt: null,
       providerKeys: keysProblem ? [] : providers,
-      ...(keysProblem || settingsProblem || platformProblem
+      ...(keysProblem || settingsProblem || platformProblem || restoreNotice
         ? {
             notice: [
+              restoreNotice,
               keysProblem && `Provider keys aren't set up in this run: ${keysProblem}.`,
               settingsProblem && `The sandbox's settings aren't applied in this run: ${settingsProblem}.`,
               platformProblem && `The cloudex command and the localhost relay aren't set up in this run: ${platformProblem}.`,
@@ -678,15 +739,19 @@ export class Sandbox extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
   }
 
-  // Ready means the entrypoint wrote this boot's id. exec() waits while the VM boots.
-  private async waitReady(since: number) {
+  // Ready means the entrypoint wrote this boot's id. exec() waits while the VM
+  // boots. With hold, also returns once the entrypoint holds for a restore:
+  // true then, false when it's ready (an image too old to hold).
+  private async waitReady(since: number, hold = false): Promise<boolean> {
     const c = this.container;
     let last = "";
     while (Date.now() - since < READY_TIMEOUT_MS) {
       if (this.exitedAt > since) throw new Error("the container exited while booting");
       try {
-        const p = await withTimeout(c.exec(["sh", "-c", READY_CHECK]), 60_000, "readiness check");
-        if ((await p.exitCode) === 0) return;
+        const p = await withTimeout(c.exec(["sh", "-c", BOOT_CHECK]), 60_000, "readiness check");
+        const code = await p.exitCode;
+        if (code === 0) return false;
+        if (code === 3 && hold) return true;
       } catch (e) {
         last = message(e);
       }
@@ -696,6 +761,105 @@ export class Sandbox extends DurableObject<Env> {
       `not ready after ${READY_TIMEOUT_MS / 60_000} minutes (${last || "no answer"}). ` +
         "A newly deployed image can take a while to reach every host; try again shortly",
     );
+  }
+
+  // The named save m, or the one that has replaced it under its name since;
+  // null if the name is gone.
+  private async currentSave(m: SaveManifest): Promise<SaveManifest | null> {
+    const bucket = backupBucket(this.env);
+    if (!bucket) return null;
+    if (await readManifest(bucket, m.id)) return m;
+    const now = await getSave(this.env.DB, m.name);
+    return now ? readManifest(bucket, now.id) : null;
+  }
+
+  // Restores a named save onto this boot: all of it while the entrypoint is
+  // held, if the image is the one it was made on; otherwise /home. Returns a
+  // notice for a partial restore.
+  private async restoreSave(m: SaveManifest, held: boolean): Promise<string> {
+    const r = this.mustRecord();
+    const bucket = backupBucket(this.env);
+    if (!bucket || !(await readManifest(bucket, m.id))) {
+      throw new Error(`the save ${m.name} it starts from has been deleted or saved over since`);
+    }
+    const t0 = Date.now();
+    await this.ctx.storage.put("saveGrant", { id: m.id, mode: "read" });
+    let scope: string;
+    try {
+      const args = [HELPER, m.id, String(m.parts), m.image ?? "", String(m.home), held ? "held" : "running"];
+      scope = (await this.runScript(RESTORE_SAVE_SCRIPT, args, `restoring the save ${m.name}`, RESTORE_SAVE_TIMEOUT_MS)).trim();
+    } catch (e) {
+      if (/No space left on device/.test(message(e))) {
+        throw new Error(`the save ${m.name} (${m.rawBytes} bytes) doesn't fit on ${r.size}'s disk; start it on a bigger size`);
+      }
+      throw e;
+    } finally {
+      await this.ctx.storage.delete("saveGrant");
+    }
+    console.log(`[${r.id}] restored ${scope === "all" ? "the save" : "/home from the save"} ${m.name} (${m.bytes} bytes) in ${Date.now() - t0} ms`);
+    if (scope === "all") return "";
+    if (m.kind === "home") return `Restored /home from the save ${m.name}, which holds only /home: it was made on an image from before v0.1.15.`;
+    return `Restored /home from the save ${m.name}. It was made on another version of the sandbox image, so anything installed outside /home needs installing again.`;
+  }
+
+  // Saves this running sandbox under a name (saves.ts), replacing any save of
+  // that name once it's done. The sandbox keeps running.
+  async saveAs(name: string, id: string): Promise<Save> {
+    return this.exclusive(async () => {
+      const r = this.mustRun();
+      const bucket = backupBucket(this.env);
+      if (!bucket) fail(501, "named saves need an R2 bucket, and this deployment has none: turn R2 on in the Cloudflare dashboard, then run cloudex deploy");
+      const t0 = Date.now();
+      await this.ctx.storage.put("saveGrant", { id, mode: "write" });
+      let out: string;
+      try {
+        out = await this.runScript(SAVE_SCRIPT, [HELPER, id], `saving ${r.name ?? r.id}`, NAMED_SAVE_TIMEOUT_MS);
+      } catch (e) {
+        await deleteSaveObjects(bucket, id).catch(() => {});
+        throw e;
+      } finally {
+        await this.ctx.storage.delete("saveGrant");
+        this.touch();
+      }
+      const last = out.trim().split("\n").pop() ?? "";
+      let s: SaveSummary | undefined;
+      try {
+        s = JSON.parse(last) as SaveSummary;
+      } catch {}
+      const counts = s ? [s.parts, s.bytes, s.rawBytes, s.files, s.home, s.deleted] : [];
+      if (!s || !counts.every(Number.isInteger) || !s.parts || (s.kind !== "disk" && s.kind !== "home")) {
+        await deleteSaveObjects(bucket, id).catch(() => {});
+        throw new Error(`unexpected output from the save script: ${last.slice(0, 200)}`);
+      }
+      const m: SaveManifest = {
+        id,
+        name,
+        sandbox: r.id,
+        kind: s.kind,
+        image: s.image || null,
+        parts: s.parts,
+        bytes: s.bytes,
+        rawBytes: s.rawBytes,
+        files: s.files,
+        home: s.home,
+        deleted: s.deleted,
+        size: r.size,
+        idleMinutes: r.idleMinutes,
+        createdAt: t0,
+        ms: Date.now() - t0,
+        settings: await this.ctx.storage.get<StoredSettings>("settings"),
+      };
+      const replaced = await recordSave(this.env.DB, bucket, m);
+      console.log(`[${r.id}] saved as ${name} (${s.kind}, ${s.files} paths, ${s.bytes} bytes) in ${m.ms} ms`);
+      return { ...saveView(m), replaced };
+    });
+  }
+
+  // Whether this sandbox may read or write a named save's objects now: only
+  // while this object restores or makes that save (egress.ts asks).
+  async saveAccess(id: string): Promise<"read" | "write" | null> {
+    const grant = await this.ctx.storage.get<{ id: string; mode: "read" | "write" }>("saveGrant");
+    return grant?.id === id ? grant.mode : null;
   }
 
   private async save() {
@@ -708,6 +872,8 @@ export class Sandbox extends DurableObject<Env> {
     );
     await this.ctx.storage.put("snapshot", snap);
     await this.ctx.storage.put("saveTouchedAt", Date.now());
+    // A sandbox started from a named save resumes from its own save from now on.
+    await this.ctx.storage.delete("fromSave");
     await this.update({ savedAt: Date.now(), savedBytes: snap.size ?? null });
     console.log(`[${r.id}] saved ${snap.size} bytes in ${Date.now() - t0} ms`);
   }

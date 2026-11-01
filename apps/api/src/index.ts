@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import {
   AgentMessage,
   CreateSandbox,
+  CreateSave,
   DesktopRequest,
   ExecRequest,
   ForkRequest,
@@ -12,6 +13,7 @@ import {
   Name,
   Provider,
   ResumeRequest,
+  type SandboxSize,
   SetProviderKey,
   StartAgent,
   UpdateSandbox,
@@ -25,7 +27,20 @@ import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, listKeys, setKey } from "./keys";
-import { LINK_HEADER, VERSION, errorStatus, fail, isSandboxId, newAgentId, newSandboxId, previewToken, sameSecret } from "./util";
+import type { ForkSource } from "./sandbox";
+import { type SaveManifest, deleteSave, getSave, listSaves, readManifest } from "./saves";
+import {
+  LINK_HEADER,
+  VERSION,
+  errorStatus,
+  fail,
+  isSandboxId,
+  newAgentId,
+  newSandboxId,
+  newSaveId,
+  previewToken,
+  sameSecret,
+} from "./util";
 
 export { Sandbox } from "./sandbox";
 export { Egress } from "./egress";
@@ -101,40 +116,98 @@ app.post("/v1/sandboxes/:ref/exec", async (c) => {
   return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.exec(input));
 });
 
-// Forks (see ForkRequest). All of them start from the same save, at the same
-// time. One that fails to start is kept in state error with the reason, like a
-// failed new, and resuming it tries again.
-app.post("/v1/sandboxes/:ref/fork", async (c) => {
-  const body = await c.req.text();
-  const input = ForkRequest.parse(body ? JSON.parse(body) : {});
-  const ref = c.req.param("ref");
+// The names ForkRequest asks for, checked before anything starts.
+async function copyNames(env: Env, input: z.output<typeof ForkRequest>): Promise<(string | null)[]> {
   const names = Array.from({ length: input.count }, (_, i) =>
     !input.name ? null : input.count === 1 ? input.name : `${input.name}-${i + 1}`,
   );
   for (const name of names) {
     if (!name) continue;
     const ok = Name.safeParse(name);
-    if (!ok.success) return c.json({ error: `can't name a fork ${name}: ${ok.error.issues[0]?.message}` }, 400);
-    if (await nameTaken(c.env.DB, name)) return c.json({ error: `the name ${name} is taken` }, 409);
+    if (!ok.success) fail(400, `can't name a sandbox ${name}: ${ok.error.issues[0]?.message}`);
+    if (await nameTaken(env.DB, name)) fail(409, `the name ${name} is taken`);
   }
-  const { stub } = await sandbox(c.env, ref);
-  const original = await stub.get();
-  const from = await newMethod(ref, stub.forkPoint());
-  const size = input.size ?? original.size;
-  const idleMinutes = input.idleMinutes ?? original.idleMinutes;
-  const forks = await Promise.all(
+  return names;
+}
+
+// Starts sandboxes from one fork point or named save, all at once. One that
+// fails to start is kept in state error with the reason, like a failed new,
+// and resuming it tries again.
+function startCopies(
+  env: Env,
+  names: (string | null)[],
+  opts: { size: SandboxSize; idleMinutes: number },
+  of: string,
+  from?: ForkSource,
+  save?: SaveManifest,
+) {
+  return Promise.all(
     names.map(async (name) => {
       const id = newSandboxId();
-      const fork = c.env.SANDBOX.getByName(id);
+      const copy = env.SANDBOX.getByName(id);
       try {
-        return await fork.create(id, { name, size, idleMinutes }, from);
+        return await copy.create(id, { name, ...opts }, from, save);
       } catch (e) {
-        console.error(`[${id}] fork of ${original.id} didn't start: ${errorStatus(e).message}`);
-        return await fork.get();
+        console.error(`[${id}] start from ${of} failed: ${errorStatus(e).message}`);
+        return await copy.get();
       }
     }),
   );
-  return c.json(forks, 201);
+}
+
+// Forks (see ForkRequest), which all start from the same save, at the same time.
+app.post("/v1/sandboxes/:ref/fork", async (c) => {
+  const body = await c.req.text();
+  const input = ForkRequest.parse(body ? JSON.parse(body) : {});
+  const ref = c.req.param("ref");
+  const names = await copyNames(c.env, input);
+  const { stub } = await sandbox(c.env, ref);
+  const original = await stub.get();
+  const from = await newMethod(ref, stub.forkPoint());
+  const opts = { size: input.size ?? original.size, idleMinutes: input.idleMinutes ?? original.idleMinutes };
+  return c.json(await startCopies(c.env, names, opts, original.id, from), 201);
+});
+
+// Named saves (saves.ts): made from a running sandbox, which keeps running;
+// sandboxes start from one like forks, with the same options.
+function bucket(env: Env) {
+  const b = backupBucket(env);
+  if (!b) fail(501, "named saves need an R2 bucket, and this deployment has none: turn R2 on in the Cloudflare dashboard, then run cloudex deploy");
+  return b;
+}
+
+async function namedSave(env: Env, name: string) {
+  const save = await getSave(env.DB, name);
+  if (!save) fail(404, `no save named ${name}`);
+  return save;
+}
+
+app.post("/v1/sandboxes/:ref/saves", async (c) => {
+  const { name } = CreateSave.parse(await c.req.json());
+  bucket(c.env);
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.saveAs(name, newSaveId())), 201);
+});
+
+app.get("/v1/saves", async (c) => c.json(await listSaves(c.env.DB)));
+
+app.get("/v1/saves/:name", async (c) => c.json(await namedSave(c.env, c.req.param("name"))));
+
+app.delete("/v1/saves/:name", async (c) => {
+  const name = c.req.param("name");
+  if (!(await deleteSave(c.env.DB, bucket(c.env), name))) fail(404, `no save named ${name}`);
+  return c.json({ deleted: name });
+});
+
+app.post("/v1/saves/:name/sandboxes", async (c) => {
+  const body = await c.req.text();
+  const input = ForkRequest.parse(body ? JSON.parse(body) : {});
+  const save = await namedSave(c.env, c.req.param("name"));
+  const manifest = await readManifest(bucket(c.env), save.id);
+  if (!manifest) fail(409, `the save ${save.name} was saved over or deleted just now; try again`);
+  const names = await copyNames(c.env, input);
+  const opts = { size: input.size ?? save.size, idleMinutes: input.idleMinutes ?? save.idleMinutes };
+  return c.json(await startCopies(c.env, names, opts, `the save ${save.name}`, undefined, manifest), 201);
 });
 
 // The desktop: POST starts it (installing it the first time) or resizes it; DELETE stops it.

@@ -40,25 +40,27 @@ func newNewCmd(opts *options) *cobra.Command {
 			"--env, --env-file and --file give it environment variables and files at every\n" +
 			"start (see cloudex env), and --repo clones a repo into its home directory.\n\n" +
 			"With --from, the new sandboxes start from a copy of another's disk, and its\n" +
-			"settings; see cloudex fork.",
+			"settings (see cloudex fork), or from a named save (see cloudex save). When a\n" +
+			"sandbox and a save share a name, the sandbox wins; --from save:<name> picks the save.",
 		Example: "  cloudex new --name my-box\n" +
 			"  cloudex new --repo https://github.com/you/app --env GH_TOKEN=$(gh auth token) --env-file .env\n" +
-			"  cloudex new --from my-box --count 3 --name agent",
+			"  cloudex new --from my-box --count 3 --name agent\n" +
+			"  cloudex new --from base --name task-1",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			settingsFlags := len(envPairs)+len(envFiles)+len(files) > 0 || repo != ""
 			if from != "" && settingsFlags {
-				return errors.New("--env, --env-file, --file and --repo don't go with --from: forks get the original's settings; change them after with cloudex env set")
+				return errors.New("--env, --env-file, --file and --repo don't go with --from: the new sandboxes get the settings of the sandbox or save; change them after with cloudex env set")
 			}
 			if from != "" {
 				req, err := forkRequest(cmd, name, size, count, idle)
 				if err != nil {
 					return err
 				}
-				return runFork(cmd, opts, from, req, noUse)
+				return runNewFrom(cmd, opts, from, req, noUse)
 			}
 			if cmd.Flags().Changed("count") {
-				return errors.New("--count needs --from: it makes several forks of one sandbox")
+				return errors.New("--count needs --from: it starts several sandboxes from one sandbox or save")
 			}
 			cfg, client, err := opts.load()
 			if err != nil {
@@ -116,8 +118,8 @@ func newNewCmd(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&size, "size", "", "standard-1, standard-2 (default), standard-3 or standard-4")
 	cmd.Flags().DurationVar(&idle, "idle", 30*time.Minute, "stop after this long without activity; 0 waits for the 6-hour platform limit")
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make it the current sandbox")
-	cmd.Flags().StringVar(&from, "from", "", "start from a copy of this sandbox's disk (a fork)")
-	cmd.Flags().IntVar(&count, "count", 1, fmt.Sprintf("with --from, how many forks to make, up to %d", maxForks))
+	cmd.Flags().StringVar(&from, "from", "", "start from a copy of this sandbox's disk (a fork), or from this named save")
+	cmd.Flags().IntVar(&count, "count", 1, fmt.Sprintf("with --from, how many sandboxes to start, up to %d", maxForks))
 	cmd.Flags().StringArrayVar(&envPairs, "env", nil, "NAME=VALUE: an environment variable (repeatable)")
 	cmd.Flags().StringArrayVar(&envFiles, "env-file", nil, "read NAME=VALUE lines from this file (repeatable)")
 	cmd.Flags().StringArrayVar(&files, "file", nil, "DEST=SRC: put the local file SRC at DEST in the sandbox's home (repeatable)")
@@ -235,6 +237,9 @@ func printSandbox(w io.Writer, s *api.Sandbox) {
 	}
 	if s.ForkedFrom != nil {
 		fmt.Fprintf(tw, "Forked from\t%s\n", *s.ForkedFrom)
+	}
+	if s.FromSave != nil {
+		fmt.Fprintf(tw, "From save\t%s\n", *s.FromSave)
 	}
 	if len(s.ProviderKeys) > 0 && s.State == "running" {
 		fmt.Fprintf(tw, "Provider keys\t%s, added on the way out\n", strings.Join(s.ProviderKeys, ", "))

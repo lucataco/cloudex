@@ -35,6 +35,7 @@ type Sandbox struct {
 	BackupError  *string  `json:"backupError"`
 	Notice       *string  `json:"notice"`
 	ForkedFrom   *string  `json:"forkedFrom"`
+	FromSave     *string  `json:"fromSave"`
 	ProviderKeys []string `json:"providerKeys"`
 	Error        *string  `json:"error"`
 }
@@ -249,6 +250,53 @@ type ForkRequest struct {
 func (c *Client) Fork(ctx context.Context, ref string, r ForkRequest) ([]Sandbox, error) {
 	var forks []Sandbox
 	return forks, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/fork", r, &forks)
+}
+
+// Save is a named save: a copy of a sandbox's disk in the deployment's R2
+// bucket that new sandboxes start from. Kind is "disk" (every file that
+// differs from the image) or "home" (/home only, from an older image).
+type Save struct {
+	Name        string `json:"name"`
+	ID          string `json:"id"`
+	Sandbox     string `json:"sandbox"`
+	Kind        string `json:"kind"`
+	Size        string `json:"size"`
+	IdleMinutes int    `json:"idleMinutes"`
+	Files       int64  `json:"files"`
+	RawBytes    int64  `json:"rawBytes"`
+	Bytes       int64  `json:"bytes"`
+	CreatedAt   int64  `json:"createdAt"`
+	MS          int64  `json:"ms"`
+	Replaced    *bool  `json:"replaced,omitempty"`
+}
+
+func savePath(name string) string { return "/v1/saves/" + url.PathEscape(name) }
+
+// SaveAs saves a running sandbox under a name, replacing any save of that name.
+func (c *Client) SaveAs(ctx context.Context, ref, name string) (*Save, error) {
+	var s Save
+	return &s, c.do(ctx, http.MethodPost, "/v1/sandboxes/"+url.PathEscape(ref)+"/saves", map[string]string{"name": name}, &s)
+}
+
+func (c *Client) ListSaves(ctx context.Context) ([]Save, error) {
+	var saves []Save
+	return saves, c.do(ctx, http.MethodGet, "/v1/saves", nil, &saves)
+}
+
+func (c *Client) GetSave(ctx context.Context, name string) (*Save, error) {
+	var s Save
+	return &s, c.do(ctx, http.MethodGet, savePath(name), nil, &s)
+}
+
+func (c *Client) DeleteSave(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodDelete, savePath(name), nil, nil)
+}
+
+// StartFromSave starts sandboxes from a named save, with the options of a
+// fork, and returns them, including any that failed to start (state "error").
+func (c *Client) StartFromSave(ctx context.Context, name string, r ForkRequest) ([]Sandbox, error) {
+	var list []Sandbox
+	return list, c.do(ctx, http.MethodPost, savePath(name)+"/sandboxes", r, &list)
 }
 
 func (c *Client) Settings(ctx context.Context, ref string) (*Settings, error) {

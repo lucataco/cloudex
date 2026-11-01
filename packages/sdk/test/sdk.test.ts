@@ -117,6 +117,39 @@ test("fork returns working sandboxes", async () => {
   assert.equal(seen.at(-1)?.auth, "Bearer k");
 });
 
+test("named saves: save, list, start from and delete", async () => {
+  const save = {
+    name: "base",
+    id: "sv-aaaaaaaaaa",
+    sandbox: "cx-aaa111",
+    kind: "disk",
+    size: "standard-2",
+    idleMinutes: 30,
+    files: 12,
+    rawBytes: 2048,
+    bytes: 1024,
+    createdAt: 1,
+    ms: 900,
+  };
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["POST /v1/sandboxes/cx-aaa111/saves"] = [201, { ...save, replaced: false }];
+  routes["GET /v1/saves"] = [200, [save]];
+  routes["POST /v1/saves/base/sandboxes"] = [201, [info("cx-bbb111", { name: "b", fromSave: "base" })]];
+  routes["DELETE /v1/saves/base"] = [200, { deleted: "base" }];
+  const cx = new Cloudex({ apiUrl: url, apiKey: "k" });
+  const box = await cx.get("web");
+  assert.equal((await box.save("base")).replaced, false);
+  assert.deepEqual(seen.at(-1)?.body, { name: "base" });
+  assert.deepEqual(await cx.listSaves(), [save]);
+  const [copy] = await cx.startFromSave("base", { name: "b" });
+  assert.deepEqual(seen.at(-1)?.body, { name: "b" });
+  assert.equal(copy!.info.fromSave, "base");
+  assert.equal(copy!.state, "running");
+  await cx.deleteSave("base");
+  assert.equal(seen.at(-1)?.route, "DELETE /v1/saves/base");
+  await assert.rejects(cx.getSave("gone"), (e: CloudexError) => e.status === 404);
+});
+
 test("desktop returns a link to the viewer", async () => {
   routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
   routes["POST /v1/sandboxes/cx-aaa111/desktop"] = [

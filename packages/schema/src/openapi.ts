@@ -8,6 +8,7 @@ import {
   AgentMessage,
   ApiError,
   CreateSandbox,
+  CreateSave,
   Desktop,
   DesktopRequest,
   ExecRequest,
@@ -23,6 +24,7 @@ import {
   RevokedLinks,
   Sandbox,
   SandboxSettings,
+  Save,
   SetProviderKey,
   StartAgent,
   UpdateSandbox,
@@ -33,6 +35,7 @@ import {
 // responses as returned.
 const requests = {
   CreateSandbox,
+  CreateSave,
   ForkRequest,
   ResumeRequest,
   ExecRequest,
@@ -47,6 +50,7 @@ const requests = {
 const responses = {
   Sandbox,
   SandboxSettings,
+  Save,
   ExecResult,
   HostResult,
   HostLink,
@@ -75,6 +79,14 @@ const sandboxRef = {
   in: "path",
   required: true,
   description: "The sandbox's id (cx-xxxxxx) or name",
+  schema: { type: "string" },
+};
+
+const saveName = {
+  name: "name",
+  in: "path",
+  required: true,
+  description: "The save's name",
   schema: { type: "string" },
 };
 
@@ -169,6 +181,44 @@ export function openapi(version: string) {
             "returned in state error, with the reason; resuming one tries again.",
           requestBody: body("ForkRequest", false),
           responses: { 201: ok("The forks", { type: "array", items: ref("Sandbox") }) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/saves": {
+        parameters: [sandboxRef],
+        post: op("createSave", "Save a running sandbox's disk under a name, to start new sandboxes from", {
+          description:
+            "The save holds every file that differs from the sandbox image, and the sandbox's settings, in the " +
+            "deployment's R2 bucket until it's deleted. The sandbox keeps running. A save of a taken name " +
+            "replaces that save once it's done. Takes about 15 seconds per GB of changes.",
+          requestBody: body("CreateSave"),
+          responses: { 201: ok("The save", ref("Save")) },
+        }),
+      },
+      "/v1/saves": {
+        get: op("listSaves", "List the named saves, newest first", {
+          responses: { 200: ok("The saves", { type: "array", items: ref("Save") }) },
+        }),
+      },
+      "/v1/saves/{name}": {
+        parameters: [saveName],
+        get: op("getSave", "Get a named save", { responses: { 200: ok("The save", ref("Save")) } }),
+        delete: op("deleteSave", "Delete a named save for good", {
+          description: "Sandboxes already started from it keep their disks.",
+          responses: {
+            200: ok("Deleted", { type: "object", properties: { deleted: { type: "string" } }, required: ["deleted"] }),
+          },
+        }),
+      },
+      "/v1/saves/{name}/sandboxes": {
+        parameters: [saveName],
+        post: op("startFromSave", "Start sandboxes from a named save", {
+          description:
+            "Each restores the save onto a fresh sandbox before anything in it starts. Size and idle minutes " +
+            "default to the saved sandbox's. Onto a newer sandbox image, only /home is restored, and the " +
+            "sandbox's notice says so. Ones that fail to start are returned in state error, with the reason; " +
+            "resuming one tries again.",
+          requestBody: body("ForkRequest", false),
+          responses: { 201: ok("The new sandboxes", { type: "array", items: ref("Sandbox") }) },
         }),
       },
       "/v1/sandboxes/{ref}/exec": {

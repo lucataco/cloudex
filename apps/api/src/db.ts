@@ -1,5 +1,6 @@
 // D1 is only the index behind `cloudex list` and name lookups. Each Sandbox
 // Durable Object owns its own state and writes its row here when it changes.
+// It also holds the names of named saves (saves.ts) and the provider keys.
 import type { Sandbox } from "@cloudex/schema";
 
 const SCHEMA = [
@@ -16,6 +17,20 @@ const SCHEMA = [
     saved_at INTEGER,
     saved_bytes INTEGER,
     error TEXT
+  )`,
+  // Named saves (saves.ts): the name, and the id of its objects in R2.
+  `CREATE TABLE IF NOT EXISTS saves (
+    name TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
+    sandbox TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    size TEXT NOT NULL,
+    idle_minutes INTEGER NOT NULL,
+    files INTEGER NOT NULL,
+    raw_bytes INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    ms INTEGER NOT NULL
   )`,
   // AI provider keys (keys.ts), encrypted.
   `CREATE TABLE IF NOT EXISTS provider_keys (

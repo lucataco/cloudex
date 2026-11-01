@@ -4,15 +4,19 @@
 //   POST /activity              a long-running job (an agent prompt) says it's still busy
 //   PUT  /backup/<gen>/<n>      one part of a backup, written to R2 (backup.ts)
 //   GET  /backup/<gen>/<n>      one part read back, for a restore
+//   PUT  /saves/<id>/<n|meta>   part of a named save being made (saves.ts)
+//   GET  /saves/<id>/<n|meta>   part of a named save being restored
 //   /v1/sandboxes/self/...      the API for the sandbox itself (self.ts)
 // The id comes from the props, so a guest can only reach its own backups, and
-// manage only itself.
+// manage only itself. A named save's objects are open to a sandbox only while
+// its Sandbox object makes or restores that save.
 //
 // So do HTTPS requests to AI providers whose keys the deployment holds
 // (keys.ts): the real key goes in here, on the way out.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { backupBucket, partKey } from "./backup";
 import { PROVIDERS, providerForHost, providerKey, UnreadableKey } from "./keys";
+import { SAVE_PATH, saveObjectKey } from "./saves";
 import { selfApi } from "./self";
 import { sameSecret } from "./util";
 
@@ -45,10 +49,19 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
     }
 
     const part = BACKUP_PART.exec(url.pathname);
-    if (part) return this.backupPart(req, partKey(id, part[1]!, part[2]!));
+    if (part) return this.object(req, partKey(id, part[1]!, part[2]!));
+
+    const sandbox = this.env.SANDBOX.getByName(id);
+    const save = SAVE_PATH.exec(url.pathname);
+    if (save) {
+      const access = await sandbox.saveAccess(save[1]!).catch(() => null);
+      if (access !== (req.method === "PUT" ? "write" : "read")) {
+        return new Response("this sandbox isn't making or restoring that save\n", { status: 403 });
+      }
+      return this.object(req, saveObjectKey(save[1]!, save[2]!));
+    }
 
     if (req.method !== "POST") return new Response("not found", { status: 404 });
-    const sandbox = this.env.SANDBOX.getByName(id);
     switch (url.pathname) {
       case "/save-on-term":
         return Response.json(await sandbox.guestTerm());
@@ -90,7 +103,8 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
     return fetch(url.toString(), { method: req.method, headers, body: req.body, redirect: "manual" });
   }
 
-  private async backupPart(req: Request, key: string): Promise<Response> {
+  // An object in the R2 bucket: a part of a backup or of a named save.
+  private async object(req: Request, key: string): Promise<Response> {
     const bucket = backupBucket(this.env);
     if (!bucket) return new Response("backups are off: this deployment has no R2 bucket\n", { status: 501 });
     if (req.method === "GET") {

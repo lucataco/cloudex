@@ -47,6 +47,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 |---|---|
 | `cloudex new [--name] [--size standard-2] [--idle 30m]` | Create and start a sandbox; it becomes the current one |
 | `cloudex fork [sandbox] [--name] [--count 1-10]` | New sandboxes that start from a copy of one's disk (also `cloudex new --from <sandbox>`) |
+| `cloudex save [sandbox] <name>`, `saves`, `saves rm <name>` | Keep a copy of a sandbox's disk under a name, for good; start sandboxes from it with `cloudex new --from <name>` |
 | `cloudex env [sandbox]`, `env set NAME=VALUE`, `env unset NAME` | A sandbox's environment variables and files (`--file`, `--env-file`); `cloudex new` takes them too, and `--repo` |
 | `cloudex list`, `info`, `use <sandbox>` | See sandboxes and pick the current one |
 | `cloudex set [sandbox] [--name] [--idle 2h]` | Rename a sandbox, or change how long it may sit idle |
@@ -102,6 +103,20 @@ is copied from its last save. `--count 10 --name agent` makes `agent-1` to
 separate sandbox with its own id, saves and backups, and `cloudex info` shows
 what it was forked from. A sandbox whose save has expired needs a `resume`
 before it can be forked.
+
+**Named saves.** A sandbox's own save goes 30 days after it was last made or
+resumed from. `cloudex save my-box base` keeps a copy of a running sandbox's
+disk in your R2 bucket under a name until you delete it, and `cloudex new
+--from base` (with `--count` and `--name`, like a fork) starts new sandboxes
+from it. Set up a sandbox once (packages, Docker images, repos, agent logins,
+`~/.cloudex/start`) and start as many as you like from it later. The image
+lists its own files, so a save holds only what the sandbox changed, plus its
+settings; SSH host keys are left out, so each new sandbox makes its own. Saving
+and restoring each take about 15 seconds per GB. A save restores in full onto
+the image it was made on; after a `cloudex deploy` that brings a new image,
+only `/home` comes back, and the new sandbox's notice says so. Saving under a
+taken name replaces that save. `cloudex saves` lists them, and `saves rm`
+deletes one. Named saves need R2, like backups.
 
 **Desktop.** `cloudex desktop` starts a desktop in the sandbox (TigerVNC,
 openbox, Chrome and a terminal) and opens it in your browser through noVNC. The
