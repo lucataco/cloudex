@@ -204,7 +204,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		backups = false
 		log("Backups of /home are off: %s", r2Problem(err))
 	} else {
-		log("R2 bucket %s (%s) for backups of /home", BucketName, map[bool]string{true: "created", false: "existing"}[made])
+		log("R2 bucket %s (%s) for backups and named saves", BucketName, map[bool]string{true: "created", false: "existing"}[made])
 	}
 
 	if key == "" {
