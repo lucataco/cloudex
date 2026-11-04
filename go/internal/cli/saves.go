@@ -255,6 +255,8 @@ func plural(n int64, word string) string {
 	switch {
 	case n == 1:
 		return "1 " + word
+	case word == "file and directory":
+		return fmt.Sprintf("%d files and directories", n)
 	case strings.HasSuffix(word, "y"):
 		return fmt.Sprintf("%d %sies", n, strings.TrimSuffix(word, "y"))
 	}

@@ -187,7 +187,7 @@ func (r *runner) run(spec runSpec) (err error) {
 			return fmt.Errorf("copying the files: %w", err)
 		}
 		workdir = res.Path
-		r.say("copied %d files and directories (%s, %s compressed) to %s", entries, humanBytes(size), humanBytes(info.Size()), res.Path)
+		r.say("copied %s (%s, %s compressed) to %s", plural(int64(entries), "file and directory"), humanBytes(size), humanBytes(info.Size()), res.Path)
 	}
 
 	c, err := client.StartCommand(ctx, id, api.StartCommandRequest{Cmd: r.line, Cwd: workdir, TimeoutSec: int(spec.timeout.Seconds())})
