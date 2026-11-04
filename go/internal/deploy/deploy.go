@@ -27,7 +27,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
@@ -228,13 +227,13 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
-	if o.PreviewDomainSet {
-		// Before the upload: if this fails, the live Worker still names the
-		// zone, so running deploy again finds it.
-		for _, old := range previousZones(zone, live.previewZone, o.RememberedPreviewDomain) {
-			if err := retirePreviews(ctx, cf, account.ID, old, log); err != nil {
-				return nil, err
-			}
+	// Only the zone the live Worker names, since one this computer merely
+	// remembers may serve another deployment now. Before the upload, so that
+	// if this fails, the live Worker still names the zone and running deploy
+	// again finds it.
+	if o.PreviewDomainSet && live.previewZone != "" && live.previewZone != zone {
+		if err := retirePreviews(ctx, cf, account.ID, live.previewZone, log); err != nil {
+			return nil, err
 		}
 	}
 
@@ -617,18 +616,6 @@ func lookupZone(ctx context.Context, cf *cloudflare.Client, account, zone string
 		return "", tokenNeeds("looking up "+zone, permZone, err)
 	}
 	return id, err
-}
-
-// previousZones lists the zones that had preview links, other than the one
-// that has them now.
-func previousZones(now string, before ...string) []string {
-	var zones []string
-	for _, z := range before {
-		if z != "" && z != now && !slices.Contains(zones, z) {
-			zones = append(zones, z)
-		}
-	}
-	return zones
 }
 
 // retirePreviews takes preview links off zone: the Worker route, so its

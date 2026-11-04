@@ -375,6 +375,30 @@ func TestSwitchingPreviewDomainRemovesTheOldRoute(t *testing.T) {
 	}
 }
 
+// A zone only this computer remembers may have been set up since by another
+// deployment that relies on the route or the record.
+func TestSwitchingPreviewDomainLeavesAZoneOnlyRemembered(t *testing.T) {
+	w, deleted := previewsOn(t)
+	w.zone = ""
+	w.cf["GET /zones"] = func(r *http.Request) (int, any) {
+		if name := r.URL.Query().Get("name"); name == "old.dev" {
+			return 200, []any{map[string]any{"id": "z0", "name": name}}
+		}
+		return 200, []any{map[string]any{"id": "z1", "name": "new.dev"}}
+	}
+	w.cf["PUT /accounts/acc/workers/scripts/cloudex-api/routes"] = func(*http.Request) (int, any) { return 200, []any{} }
+	w.cf["GET /zones/z1/dns_records"] = func(*http.Request) (int, any) { return 200, []any{} }
+	w.cf["POST /zones/z1/dns_records"] = func(*http.Request) (int, any) { return 200, map[string]any{} }
+	_, err := Run(context.Background(), w.options(func(o *Options) {
+		o.ExistingURL, o.ExistingKey = "https://"+apiHost, oldKey
+		o.RememberedPreviewDomain = "old.dev"
+		o.PreviewDomain, o.PreviewDomainSet = "new.dev", true
+	}))
+	if err != nil || len(*deleted) != 0 || w.zone != "new.dev" {
+		t.Fatalf("error %v, deleted %v, the Worker's zone is %q", err, *deleted, w.zone)
+	}
+}
+
 func TestDeployingAgainKeepsThePreviewRoute(t *testing.T) {
 	w, deleted := previewsOn(t)
 	w.cf["PUT /accounts/acc/workers/scripts/cloudex-api/routes"] = func(*http.Request) (int, any) { return 200, []any{} }
