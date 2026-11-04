@@ -35,7 +35,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
   && rm -rf /var/lib/apt/lists/*
 
 # Agent CLIs. Users sign in once inside the sandbox; the login survives stop and resume.
-RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force
+# They can't update themselves (the npm prefix is root's), so Claude Code's
+# updater is off rather than failing in red on every start.
+RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force \
+  && echo DISABLE_AUTOUPDATER=1 >> /etc/environment \
+  && echo 'export DISABLE_AUTOUPDATER=1' > /etc/profile.d/cloudex-agents.sh
 
 # The sandbox user is uid 1000 (the API execs as 1000:1000), so drop the
 # image's stock ubuntu user, which holds that id. sshd ends sessions whose
