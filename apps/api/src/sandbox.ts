@@ -1081,15 +1081,14 @@ export class Sandbox extends DurableObject<Env> {
   // GNU timeout puts the command in a process group of its own and stops the
   // whole group, so what it started in the background goes too; the abort is
   // a backstop.
-
   private async startExec(input: ExecInput, signal: AbortSignal): Promise<ExecProcess> {
     const home = input.root ? "/root" : GUEST_HOME;
     // A relative directory, or one starting with ~, is in the home directory.
     const cwd = !input.cwd ? home : input.cwd.startsWith("/") ? input.cwd : `${home}/${input.cwd.replace(/^~(\/|$)/, "")}`;
     // The container runtime reports a missing directory as a missing command.
     if (input.cwd) {
-      const check = await this.container.exec(["test", "-d", cwd], { cwd: "/" });
-      if ((await check.exitCode) !== 0) fail(400, `there's no directory ${cwd} in the sandbox`);
+      const found = this.container.exec(["test", "-d", cwd], { cwd: "/", signal }).then((p) => p.exitCode);
+      if ((await withTimeout(found, 30_000, "checking the directory")) !== 0) fail(400, `there's no directory ${cwd} in the sandbox`);
     }
     return this.container.exec(guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root), {
       cwd,
@@ -1133,6 +1132,12 @@ export class Sandbox extends DurableObject<Env> {
       this.execs--;
       throw e;
     }
+    // Counted until the command exits, not until a client that stopped
+    // reading has taken all its output.
+    const exited = p.exitCode.finally(() => {
+      this.execs--;
+      this.touch();
+    });
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();
     const enc = new TextEncoder();
@@ -1184,7 +1189,7 @@ export class Sandbox extends DurableObject<Env> {
     const done = (async () => {
       let grace: ReturnType<typeof setTimeout> | null = null;
       try {
-        const exitCode = await p.exitCode;
+        const exitCode = await exited;
         grace = setTimeout(stop, EXIT_GRACE_MS);
         await pumps;
         await send({ type: "exit", exitCode, timedOut: timedOut(exitCode, t0, input.timeoutSec) || ctl.signal.aborted, ms: Date.now() - t0 });
@@ -1195,7 +1200,6 @@ export class Sandbox extends DurableObject<Env> {
         clearInterval(keepalive);
         stop();
         clearTimeout(timer);
-        this.execs--;
         this.touch();
         await writer.close().catch(() => {});
       }
