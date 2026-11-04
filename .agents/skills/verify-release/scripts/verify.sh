@@ -288,6 +288,11 @@ http.server.HTTPServer((\"127.0.0.1\", 8127), H).serve_forever()"'
 		cx desktop "$A" --link
 		durl=$(field .url)
 		ok C22 "desktop --link serves noVNC" [ "$(http "$durl")" = 200 ]
+		cx desktop "$A" --link --size 1024x768
+		cx desktop "$A" --link
+		ok C22b "desktop again without --size keeps the size" is "$(field .size)" 1024x768
+		cx exec "$A" -- 'stat -c %u /'
+		ok C22c "/ is owned by root, so tools that check it work" is "$OUT" 0
 		cx desktop "$A" --stop
 		ok C23 "desktop --stop" [ "$(field .stopped)" = true ]
 	else
