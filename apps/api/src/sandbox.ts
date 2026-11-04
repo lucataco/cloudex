@@ -213,6 +213,8 @@ export class Sandbox extends DurableObject<Env> {
   // Foreground execs running now, which count as activity for as long as they run.
   private execs = 0;
   private exitedAt = 0;
+  // The exit watcher of the container started last (see watch).
+  private exited: Promise<void> = Promise.resolve();
   // Guest ports that listen only on localhost, and the port of the relay for
   // each, in this run.
   private relayed = new Map<number, number>();
@@ -306,7 +308,7 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   private watch() {
-    this.container.monitor().then(
+    this.exited = this.container.monitor().then(
       () => this.onExit(),
       (e) => this.onExit(e),
     );
@@ -711,6 +713,10 @@ export class Sandbox extends DurableObject<Env> {
   private async boot(snapshot?: unknown, afterReady?: () => Promise<void>, restore?: SaveManifest) {
     const r = this.mustRecord();
     const c = this.container;
+    // A stop whose destroy failed can leave the last run's container up. It
+    // goes before t0, so that waitReady doesn't take its exit for this run's.
+    if (c.running) await this.destroyContainer(r.id);
+    if (c.running) fail(503, `${r.name ?? r.id} didn't start: its last run hasn't stopped yet; try again in a minute`);
     const t0 = Date.now();
     // A new run: no relays yet, and no stop asked for from inside the last one.
     this.relayed.clear();
@@ -784,9 +790,7 @@ export class Sandbox extends DurableObject<Env> {
         console.error(`[${r.id}] ${platformProblem}`);
       }
     } catch (e) {
-      try {
-        if (c.running) await withTimeout(c.destroy(), 60_000, "destroy");
-      } catch {}
+      if (c.running) await this.destroyContainer(r.id);
       const why = message(e);
       await this.update({ state: r.savedAt ? "stopped" : "error", error: `start failed: ${why}` });
       fail(503, `${r.name ?? r.id} didn't start: ${why}`);
@@ -970,14 +974,27 @@ export class Sandbox extends DurableObject<Env> {
       fail(500, `couldn't save ${r.name ?? r.id}, so it is still running: ${message(e)}`);
     }
     await this.backup();
-    try {
-      await withTimeout(this.container.destroy(), 60_000, "destroy");
-    } catch (e) {
-      // The save and the backup are done, so it counts as stopped either way.
-      console.error(`[${r.id}] ${message(e)}`);
-    }
     await this.ctx.storage.deleteAlarm();
+    // The save and the backup are done, so it counts as stopped either way.
+    await this.destroyContainer(r.id);
     await this.update({ state: "stopped", stoppedAt: Date.now(), error: null });
+  }
+
+  // Destroys the container and waits until its exit is seen. One that doesn't
+  // go keeps billing, so the alarm tries again.
+  private async destroyContainer(id: string) {
+    try {
+      await withTimeout(Promise.all([this.container.destroy(), this.exited]), 60_000, "destroy");
+    } catch (e) {
+      console.error(`[${id}] ${message(e)}; trying again in a minute`);
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+    }
+  }
+
+  // A container still up after its sandbox stopped or failed to start.
+  private leftOver() {
+    const state = this.record?.state;
+    return (state === "stopped" || state === "error") && Boolean(this.ctx.container?.running);
   }
 
   // Called through the outbound handler when the platform sends SIGTERM.
@@ -1373,6 +1390,11 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.record;
     const stopRequested = await this.ctx.storage.get<boolean>("stopRequested");
     if (stopRequested) await this.ctx.storage.delete("stopRequested");
+    if (r && this.leftOver()) {
+      return this.exclusive(async () => {
+        if (this.leftOver()) await this.destroyContainer(r.id);
+      });
+    }
     if (!r || r.state !== "running") return;
     if (!this.ctx.container?.running) return this.onExit();
     if (stopRequested) {
