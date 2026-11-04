@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
@@ -374,6 +375,30 @@ func TestSwitchingPreviewDomainRemovesTheOldRoute(t *testing.T) {
 	}
 }
 
+// A zone only this computer remembers may have been set up since by another
+// deployment that relies on the route or the record.
+func TestSwitchingPreviewDomainLeavesAZoneOnlyRemembered(t *testing.T) {
+	w, deleted := previewsOn(t)
+	w.zone = ""
+	w.cf["GET /zones"] = func(r *http.Request) (int, any) {
+		if name := r.URL.Query().Get("name"); name == "old.dev" {
+			return 200, []any{map[string]any{"id": "z0", "name": name}}
+		}
+		return 200, []any{map[string]any{"id": "z1", "name": "new.dev"}}
+	}
+	w.cf["PUT /accounts/acc/workers/scripts/cloudex-api/routes"] = func(*http.Request) (int, any) { return 200, []any{} }
+	w.cf["GET /zones/z1/dns_records"] = func(*http.Request) (int, any) { return 200, []any{} }
+	w.cf["POST /zones/z1/dns_records"] = func(*http.Request) (int, any) { return 200, map[string]any{} }
+	_, err := Run(context.Background(), w.options(func(o *Options) {
+		o.ExistingURL, o.ExistingKey = "https://"+apiHost, oldKey
+		o.RememberedPreviewDomain = "old.dev"
+		o.PreviewDomain, o.PreviewDomainSet = "new.dev", true
+	}))
+	if err != nil || len(*deleted) != 0 || w.zone != "new.dev" {
+		t.Fatalf("error %v, deleted %v, the Worker's zone is %q", err, *deleted, w.zone)
+	}
+}
+
 func TestDeployingAgainKeepsThePreviewRoute(t *testing.T) {
 	w, deleted := previewsOn(t)
 	w.cf["PUT /accounts/acc/workers/scripts/cloudex-api/routes"] = func(*http.Request) (int, any) { return 200, []any{} }
@@ -435,13 +460,18 @@ func TestR2ProblemNamesThePermission(t *testing.T) {
 	}
 }
 
-func TestCheckSandboxDeletesLeftoverTestSandboxes(t *testing.T) {
+// Another deploy may be using a recent test sandbox, and a user's sandbox may
+// have a name that only looks like one.
+func TestCheckSandboxDeletesOnlyOldTestSandboxes(t *testing.T) {
 	w := newWorld(t)
 	w.deployed, w.key = true, oldKey
+	hourAgo, minutesAgo := time.Now().Add(-time.Hour).UnixMilli(), time.Now().Add(-5*time.Minute).UnixMilli()
 	w.sandboxes = []map[string]any{
-		{"id": "cx-old1", "name": "deploy-check-ab12"},
-		{"id": "cx-mine", "name": "web"},
-		{"id": "cx-none", "name": nil},
+		{"id": "cx-old1", "name": "deploy-check-ab12", "createdAt": hourAgo},
+		{"id": "cx-busy", "name": "deploy-check-cd34", "createdAt": minutesAgo},
+		{"id": "cx-ci01", "name": "deploy-check-3f9a7c1", "createdAt": hourAgo},
+		{"id": "cx-mine", "name": "web", "createdAt": hourAgo},
+		{"id": "cx-none", "name": nil, "createdAt": hourAgo},
 	}
 	client := apiClient(w)
 	var logged []string

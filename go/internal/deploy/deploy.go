@@ -26,7 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"slices"
+	"regexp"
 	"strings"
 	"time"
 
@@ -227,13 +227,13 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
-	if o.PreviewDomainSet {
-		// Before the upload: if this fails, the live Worker still names the
-		// zone, so running deploy again finds it.
-		for _, old := range previousZones(zone, live.previewZone, o.RememberedPreviewDomain) {
-			if err := retirePreviews(ctx, cf, account.ID, old, log); err != nil {
-				return nil, err
-			}
+	// Only the zone the live Worker names, since one this computer merely
+	// remembers may serve another deployment now. Before the upload, so that
+	// if this fails, the live Worker still names the zone and running deploy
+	// again finds it.
+	if o.PreviewDomainSet && live.previewZone != "" && live.previewZone != zone {
+		if err := retirePreviews(ctx, cf, account.ID, live.previewZone, log); err != nil {
+			return nil, err
 		}
 	}
 
@@ -618,18 +618,6 @@ func lookupZone(ctx context.Context, cf *cloudflare.Client, account, zone string
 	return id, err
 }
 
-// previousZones lists the zones that had preview links, other than the one
-// that has them now.
-func previousZones(now string, before ...string) []string {
-	var zones []string
-	for _, z := range before {
-		if z != "" && z != now && !slices.Contains(zones, z) {
-			zones = append(zones, z)
-		}
-	}
-	return zones
-}
-
 // retirePreviews takes preview links off zone: the Worker route, so its
 // other subdomains stop reaching the Worker, and the wildcard record Cloudex
 // added. A zone the token can't see is left alone.
@@ -678,6 +666,13 @@ func waitHealthy(ctx context.Context, client *api.Client) error {
 	}
 }
 
+// testSandboxName matches the names checkSandbox gives its sandboxes. Each
+// lives through one start of up to 12 minutes, so one older than
+// leftoverTestSandbox was left by a deploy that was stopped, not one running now.
+var testSandboxName = regexp.MustCompile(`^deploy-check-[0-9a-f]{4}$`)
+
+const leftoverTestSandbox = 40 * time.Minute
+
 // checkSandbox starts, uses and deletes a throwaway sandbox. A newly pushed
 // image can take up to 20 minutes to become startable, so it keeps trying.
 func checkSandbox(ctx context.Context, client *api.Client, log func(string, ...any)) error {
@@ -687,7 +682,10 @@ func checkSandbox(ctx context.Context, client *api.Client, log func(string, ...a
 	idle := 5
 	if left, err := client.List(ctx); err == nil {
 		for _, s := range left {
-			if s.Name != nil && strings.HasPrefix(*s.Name, "deploy-check-") && client.Delete(ctx, s.ID) == nil {
+			if s.Name == nil || !testSandboxName.MatchString(*s.Name) || time.Since(time.UnixMilli(s.CreatedAt)) < leftoverTestSandbox {
+				continue
+			}
+			if client.Delete(ctx, s.ID) == nil {
 				log("Deleted %s, left over from an earlier deploy", *s.Name)
 			}
 		}

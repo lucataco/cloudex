@@ -172,7 +172,7 @@ func newProxyCmd(opts *options) *cobra.Command {
 						return err
 					}
 					if err := trackSSHName(dir, r, s.ID); err != nil {
-						return err
+						fmt.Fprintf(cmd.ErrOrStderr(), "cloudex: couldn't record which sandbox %s%s is (%v). If ssh says its host key has changed, use cloudex ssh %s\n", r, sshHostSuffix, err, r)
 					}
 					r = s.ID
 				}
@@ -261,12 +261,27 @@ func writeSSHNames(dir string, names map[string]string) error {
 	return writeFileAtomic(sshNamesPath(dir), append(data, '\n'), 0o600)
 }
 
+// writeFileAtomic writes through a temporary file of its own, so that proxies
+// running at once don't write over each other's.
 func writeFileAtomic(path string, data []byte, mode fs.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Chmod(mode)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
 }
 
 // trackSSHName drops name's host keys unless name already pointed at id.

@@ -146,6 +146,12 @@ function wrongState(r: SandboxRecord) {
   return `${name} is ${r.state}; resume it first`;
 }
 
+// The error of a sandbox that stopped before it could save, saying what resume starts it from.
+const unsavedStop = (r: SandboxRecord, how: string) =>
+  r.savedAt
+    ? `${how} before it could save; resume starts from its last save or backup`
+    : `${how} before its first save; resume starts it over, without its changes`;
+
 function clip(buf: ArrayBuffer) {
   const text = new TextDecoder().decode(buf.byteLength > OUTPUT_LIMIT ? buf.slice(0, OUTPUT_LIMIT) : buf);
   return buf.byteLength > OUTPUT_LIMIT ? `${text}\n[cloudex: output cut at 1 MiB of ${buf.byteLength} bytes]` : text;
@@ -213,6 +219,8 @@ export class Sandbox extends DurableObject<Env> {
   // Foreground execs running now, which count as activity for as long as they run.
   private execs = 0;
   private exitedAt = 0;
+  // The exit watcher of the container started last (see watch).
+  private exited: Promise<void> = Promise.resolve();
   // Guest ports that listen only on localhost, and the port of the relay for
   // each, in this run.
   private relayed = new Map<number, number>();
@@ -239,11 +247,15 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   // A start or stop that an eviction or a deploy cut off has nobody left to
-  // finish it. A box still running carries on; otherwise it counts as stopped,
-  // or as a failed start if it never made a save.
+  // finish it. A stop whose box still runs carries on running. A cut-off
+  // start's box goes, because a restore in it may be half done, which its
+  // next save would keep over the good copy, and its keys, settings and tools
+  // aren't set up. Either way it counts as stopped, or as a failed start if it
+  // never made a save.
   private async repair(r: SandboxRecord) {
-    if (this.ctx.container?.running) {
-      await this.update({ state: "running", ...(r.state === "starting" ? { startedAt: Date.now() } : {}) });
+    const running = this.ctx.container?.running;
+    if (r.state === "stopping" && running) {
+      await this.update({ state: "running" });
       await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
     } else {
       const savedThisRun = r.state === "stopping" && (r.savedAt ?? 0) >= (r.startedAt ?? 0);
@@ -254,8 +266,10 @@ export class Sandbox extends DurableObject<Env> {
           ? null
           : r.state === "starting"
             ? "start failed: it was cut off partway by an update or restart of the deployment"
-            : "stopped before it could save; resume starts from its last save or backup",
+            : unsavedStop(r, "stopped"),
       });
+      // Queued, not awaited, because blockConcurrencyWhile resets the object after 30 s.
+      if (running) void this.exclusive(() => this.destroyContainer(r.id));
     }
     console.log(`[${r.id}] was ${r.state} after a restart; now ${this.record?.state}`);
   }
@@ -306,7 +320,7 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   private watch() {
-    this.container.monitor().then(
+    this.exited = this.container.monitor().then(
       () => this.onExit(),
       (e) => this.onExit(e),
     );
@@ -324,7 +338,7 @@ export class Sandbox extends DurableObject<Env> {
     await this.update({
       state: "stopped",
       stoppedAt: Date.now(),
-      error: savedThisRun ? null : "stopped by the platform before it could save; resume starts from its last save or backup",
+      error: savedThisRun ? null : unsavedStop(r, "stopped by the platform"),
     });
   }
 
@@ -711,6 +725,10 @@ export class Sandbox extends DurableObject<Env> {
   private async boot(snapshot?: unknown, afterReady?: () => Promise<void>, restore?: SaveManifest) {
     const r = this.mustRecord();
     const c = this.container;
+    // A stop whose destroy failed can leave the last run's container up. It
+    // goes before t0, so that waitReady doesn't take its exit for this run's.
+    if (c.running) await this.destroyContainer(r.id);
+    if (c.running) fail(503, `${r.name ?? r.id} didn't start: its last run hasn't stopped yet; try again in a minute`);
     const t0 = Date.now();
     // A new run: no relays yet, and no stop asked for from inside the last one.
     this.relayed.clear();
@@ -784,9 +802,7 @@ export class Sandbox extends DurableObject<Env> {
         console.error(`[${r.id}] ${platformProblem}`);
       }
     } catch (e) {
-      try {
-        if (c.running) await withTimeout(c.destroy(), 60_000, "destroy");
-      } catch {}
+      if (c.running) await this.destroyContainer(r.id);
       const why = message(e);
       await this.update({ state: r.savedAt ? "stopped" : "error", error: `start failed: ${why}` });
       fail(503, `${r.name ?? r.id} didn't start: ${why}`);
@@ -970,14 +986,27 @@ export class Sandbox extends DurableObject<Env> {
       fail(500, `couldn't save ${r.name ?? r.id}, so it is still running: ${message(e)}`);
     }
     await this.backup();
-    try {
-      await withTimeout(this.container.destroy(), 60_000, "destroy");
-    } catch (e) {
-      // The save and the backup are done, so it counts as stopped either way.
-      console.error(`[${r.id}] ${message(e)}`);
-    }
     await this.ctx.storage.deleteAlarm();
+    // The save and the backup are done, so it counts as stopped either way.
+    await this.destroyContainer(r.id);
     await this.update({ state: "stopped", stoppedAt: Date.now(), error: null });
+  }
+
+  // Destroys the container and waits until its exit is seen. One that doesn't
+  // go keeps billing, so the alarm tries again.
+  private async destroyContainer(id: string) {
+    try {
+      await withTimeout(Promise.all([this.container.destroy(), this.exited]), 60_000, "destroy");
+    } catch (e) {
+      console.error(`[${id}] ${message(e)}; trying again in a minute`);
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+    }
+  }
+
+  // A container still up after its sandbox stopped or failed to start.
+  private leftOver() {
+    const state = this.record?.state;
+    return (state === "stopped" || state === "error") && Boolean(this.ctx.container?.running);
   }
 
   // Called through the outbound handler when the platform sends SIGTERM.
@@ -1052,15 +1081,14 @@ export class Sandbox extends DurableObject<Env> {
   // GNU timeout puts the command in a process group of its own and stops the
   // whole group, so what it started in the background goes too; the abort is
   // a backstop.
-
   private async startExec(input: ExecInput, signal: AbortSignal): Promise<ExecProcess> {
     const home = input.root ? "/root" : GUEST_HOME;
     // A relative directory, or one starting with ~, is in the home directory.
     const cwd = !input.cwd ? home : input.cwd.startsWith("/") ? input.cwd : `${home}/${input.cwd.replace(/^~(\/|$)/, "")}`;
     // The container runtime reports a missing directory as a missing command.
     if (input.cwd) {
-      const check = await this.container.exec(["test", "-d", cwd], { cwd: "/" });
-      if ((await check.exitCode) !== 0) fail(400, `there's no directory ${cwd} in the sandbox`);
+      const found = this.container.exec(["test", "-d", cwd], { cwd: "/", signal }).then((p) => p.exitCode);
+      if ((await withTimeout(found, 30_000, "checking the directory")) !== 0) fail(400, `there's no directory ${cwd} in the sandbox`);
     }
     return this.container.exec(guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root), {
       cwd,
@@ -1104,6 +1132,12 @@ export class Sandbox extends DurableObject<Env> {
       this.execs--;
       throw e;
     }
+    // Counted until the command exits, not until a client that stopped
+    // reading has taken all its output.
+    const exited = p.exitCode.finally(() => {
+      this.execs--;
+      this.touch();
+    });
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();
     const enc = new TextEncoder();
@@ -1155,7 +1189,7 @@ export class Sandbox extends DurableObject<Env> {
     const done = (async () => {
       let grace: ReturnType<typeof setTimeout> | null = null;
       try {
-        const exitCode = await p.exitCode;
+        const exitCode = await exited;
         grace = setTimeout(stop, EXIT_GRACE_MS);
         await pumps;
         await send({ type: "exit", exitCode, timedOut: timedOut(exitCode, t0, input.timeoutSec) || ctl.signal.aborted, ms: Date.now() - t0 });
@@ -1166,7 +1200,6 @@ export class Sandbox extends DurableObject<Env> {
         clearInterval(keepalive);
         stop();
         clearTimeout(timer);
-        this.execs--;
         this.touch();
         await writer.close().catch(() => {});
       }
@@ -1373,6 +1406,11 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.record;
     const stopRequested = await this.ctx.storage.get<boolean>("stopRequested");
     if (stopRequested) await this.ctx.storage.delete("stopRequested");
+    if (r && this.leftOver()) {
+      return this.exclusive(async () => {
+        if (this.leftOver()) await this.destroyContainer(r.id);
+      });
+    }
     if (!r || r.state !== "running") return;
     if (!this.ctx.container?.running) return this.onExit();
     if (stopRequested) {
@@ -1411,6 +1449,9 @@ export class Sandbox extends DurableObject<Env> {
     }
     // Sooner if a stop was asked for from inside while this ran.
     const asked = await this.ctx.storage.get<boolean>("stopRequested");
+    // None after a stop or delete that ran ahead of it in the queue, since an
+    // alarm brings a deleted sandbox's storage back.
+    if (this.record?.state !== "running") return;
     await this.ctx.storage.setAlarm(Date.now() + (asked ? 1000 : ALARM_EVERY_MS));
   }
 

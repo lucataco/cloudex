@@ -238,6 +238,23 @@ test("without options it uses the environment, then the CLI's saved deployment",
   assert.equal(seen.at(-1)?.auth, "Bearer from-config");
 });
 
+test("the saved key goes to the saved URL however either is written, as in the CLI", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cloudex-sdk-"));
+  await writeFile(join(dir, "config.json"), JSON.stringify({ apiUrl: "https://Cloudex-API.x.workers.dev:443/", apiKey: "saved" }));
+  process.env.CLOUDEX_CONFIG_DIR = dir;
+  const sent: { url: string; auth: unknown }[] = [];
+  const fetch = async (input: string, init: RequestInit) => {
+    sent.push({ url: input, auth: (init.headers as Record<string, string>).authorization });
+    return new Response(JSON.stringify({ ok: true, version: "v0", previewZone: null }), { headers: { "content-type": "application/json" } });
+  };
+  for (const apiUrl of [" CLOUDEX-API.X.WORKERS.DEV ", "HTTPS://cloudex-api.x.workers.dev//", "https://cloudex-api.x.workers.dev:443"]) {
+    await new Cloudex({ apiUrl, fetch }).health();
+    assert.deepEqual(sent.pop(), { url: "https://cloudex-api.x.workers.dev/v1/health", auth: "Bearer saved" }, apiUrl);
+  }
+  await assert.rejects(new Cloudex({ apiUrl: "http://cloudex-api.x.workers.dev", fetch }).health(), /no API key for http:/);
+  assert.equal(sent.length, 0);
+});
+
 test("no deployment is a clear error", async () => {
   process.env.CLOUDEX_CONFIG_DIR = await mkdtemp(join(tmpdir(), "cloudex-sdk-"));
   await assert.rejects(new Cloudex().list(), (e: unknown) => {
@@ -555,11 +572,12 @@ test("a failed connection is a CloudexError with the URL", async () => {
   await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", resolve));
   const gone = `http://127.0.0.1:${(closed.address() as AddressInfo).port}`;
   await new Promise((resolve) => closed.close(resolve));
-  for (const apiUrl of [gone, "no-scheme.example"]) {
+  const noScheme = gone.replace("http://", "");
+  for (const [apiUrl, tried] of [[gone, gone], [noScheme, `https://${noScheme}`]] as const) {
     await assert.rejects(new Cloudex({ apiUrl, apiKey: "k" }).list(), (e: unknown) => {
       assert.ok(e instanceof CloudexError);
       assert.equal(e.status, 0);
-      assert.ok(e.message.startsWith(`can't reach ${apiUrl}: `), e.message);
+      assert.ok(e.message.startsWith(`can't reach ${tried}: `), e.message);
       return true;
     });
   }

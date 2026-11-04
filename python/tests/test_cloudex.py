@@ -435,11 +435,11 @@ class CloudexTest(unittest.TestCase):
         self.assertEqual(box.download_archive("app"), tgz)
 
     def test_unreachable_api(self):
-        for url in ("http://127.0.0.1:9", "no-scheme.example"):
+        for url, tried in (("http://127.0.0.1:9", "http://127.0.0.1:9"), ("127.0.0.1:9", "https://127.0.0.1:9")):
             with self.assertRaises(CloudexError) as caught:
                 Cloudex(url, "k").list()
             self.assertEqual(caught.exception.status, 0)
-            self.assertTrue(str(caught.exception).startswith(f"can't reach {url}: "), str(caught.exception))
+            self.assertTrue(str(caught.exception).startswith(f"can't reach {tried}: "), str(caught.exception))
 
     def test_a_timeout_is_an_error_with_the_url(self):
         FakeAPI.routes["GET /v1/sandboxes"] = lambda handler: time.sleep(0.5)
@@ -523,6 +523,26 @@ class CloudexTest(unittest.TestCase):
             os.environ["CLOUDEX_API_KEY"] = "from-env"
             Cloudex().health()
             self.assertEqual(FakeAPI.seen[-1]["auth"], "Bearer from-env")
+
+    def test_the_saved_key_goes_to_the_saved_url_however_either_is_written(self):
+        sent = []
+
+        def urlopen(req, timeout=None):
+            sent.append((req.full_url, req.get_header("Authorization")))
+            raise OSError("not sent")
+
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w") as f:
+                json.dump({"apiUrl": "https://Cloudex-API.x.workers.dev:443/", "apiKey": "saved"}, f)
+            os.environ["CLOUDEX_CONFIG_DIR"] = d
+            with mock.patch("urllib.request.urlopen", urlopen):
+                for url in (" CLOUDEX-API.X.WORKERS.DEV ", "HTTPS://cloudex-api.x.workers.dev//", "https://cloudex-api.x.workers.dev:443"):
+                    with self.assertRaises(CloudexError):
+                        Cloudex(url).health()
+                    self.assertEqual(sent.pop(), ("https://cloudex-api.x.workers.dev/v1/health", "Bearer saved"), url)
+            with self.assertRaisesRegex(CloudexError, "no API key for http:"):
+                Cloudex("http://cloudex-api.x.workers.dev")
+        self.assertEqual(sent, [])
 
     def test_desktop_without_a_preview_domain_fails_before_starting_anything(self):
         FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))

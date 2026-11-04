@@ -17,6 +17,11 @@ func TestNormalizeURL(t *testing.T) {
 		"127.0.0.1:8787/":                    "https://127.0.0.1:8787",
 		"http://127.0.0.1:8787":              "http://127.0.0.1:8787",
 		" https://x.dev \n":                  "https://x.dev",
+		"HTTPS://Cloudex-API.X.Workers.dev/": "https://cloudex-api.x.workers.dev",
+		"https://x.dev:443/":                 "https://x.dev",
+		"x.dev:443":                          "https://x.dev",
+		"http://x.dev:443":                   "http://x.dev:443",
+		"https://x.dev:8443/Path":            "https://x.dev:8443/Path",
 		"":                                   "",
 	} {
 		if got := NormalizeURL(in); got != want {
