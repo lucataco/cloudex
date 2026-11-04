@@ -207,3 +207,35 @@ func TestForkNamesTheCurrentSandboxByItsName(t *testing.T) {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}
 }
+
+func TestExecHelpSaysStandardInputIsNotSent(t *testing.T) {
+	_, out, _ := run(t, "exec", "--help")
+	for _, want := range []string{"Standard input isn't sent", "cloudex cp <sandbox>:file -", "binary"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("exec --help lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestDesktopSendsASizeOnlyWhenGivenOne(t *testing.T) {
+	f := &fakeAPI{t: t, routes: map[string]string{
+		"GET /v1/sandboxes/web":                sandboxJSON,
+		"POST /v1/sandboxes/cx-abc123/desktop": desktopJSON,
+		"POST /v1/sandboxes/cx-abc123/hosts":   `{"url":"https://6080-cx-abc123-tok.example.com"}`,
+	}}
+	serveFake(t, f)
+	defer func(old func(string)) { openBrowser = old }(openBrowser)
+	openBrowser = func(string) {}
+	if code, _, errOut := run(t, "desktop", "web", "--link"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if f.bodies[1] != `{}` {
+		t.Fatalf("a bare desktop sent %s", f.bodies[1])
+	}
+	if code, _, errOut := run(t, "desktop", "web", "--link", "--size", "1920x1080"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if f.bodies[4] != `{"size":"1920x1080"}` {
+		t.Fatalf("--size sent %s", f.bodies[4])
+	}
+}

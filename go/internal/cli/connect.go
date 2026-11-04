@@ -32,6 +32,10 @@ func newExecCmd(opts *options) *cobra.Command {
 			"--timeout (at most 1h) stops the command and everything it started. Ctrl-C stops\n" +
 			"it too. For longer jobs, and servers, use --detach: the command keeps running in\n" +
 			"the sandbox, and cloudex commands shows it and its output.\n\n" +
+			"Standard input isn't sent to the command; it sees none. To send data in, use\n" +
+			"cloudex cp (a <from> of - reads standard input), or ssh with a redirect:\n" +
+			"cloudex ssh <sandbox> -- 'cat > file' < file. Output is text, so for a binary\n" +
+			"file use cloudex cp <sandbox>:file - instead.\n\n" +
 			"With --json, prints the result as JSON once the command ends, output cut at\n" +
 			"1 MiB per stream; with --detach, the background command.",
 		Example: "  cloudex exec -- npm test\n" +
