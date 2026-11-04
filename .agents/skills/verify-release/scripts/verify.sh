@@ -192,9 +192,9 @@ if want lifecycle; then
 	ok L29 "new refuses a repo URL with a token in it and points to GH_TOKEN" [ "$CODE" != 0 -a "$(has "$ERR" GH_TOKEN && echo y)" = y ]
 	cx set "$P-f-1" --idle 1m
 	cx exec "$P-f-1" --timeout 5m -- 'sleep 150; echo alive'
-	out=$OUT
+	quiet=$OUT
 	cx info "$P-f-1"
-	ok L30 "a quiet foreground exec keeps a sandbox from idling" [ "$out" = alive -a "$(field .state)" = running ]
+	ok L30 "a quiet foreground exec keeps a sandbox from idling" [ "$quiet" = alive -a "$(field .state)" = running ]
 	cx set "$P-f-1" --idle 30m
 	echo f >"$work/ef"
 	cx env set "$P-f-1" --file ".vr-e=$work/ef"
