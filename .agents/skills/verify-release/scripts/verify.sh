@@ -338,6 +338,18 @@ fi
 
 # ---------------------------------------------------------------- agents
 if want agents; then
+	cx status
+	apiv=$(field .apiVersion)
+	# Before v0.1.17 the API stored any key, so this check would replace the real one.
+	if [[ $(printf '%s\nv0.1.17\n' "${apiv%%-*}" | sort -V | head -1) == v0.1.17 ]]; then
+		before=$("$CX" keys --json 2>/dev/null | jq -c 'map([.provider, .updatedAt])')
+		printf 'sk-ant-api03-notarealkey000000000000\n' | "$CX" keys set anthropic >"$work/o" 2>"$work/e"
+		CODE=$? OUT=$(cat "$work/o") ERR=$(cat "$work/e")
+		after=$("$CX" keys --json 2>/dev/null | jq -c 'map([.provider, .updatedAt])')
+		ok A0 "keys set refuses a key the provider rejects, and keeps the stored one" [ "$CODE" != 0 -a "$(has "$ERR" rejected && echo y)" = y -a "$before" = "$after" ]
+	else
+		skip A0 "keys set refuses a rejected key" "the API is $apiv, which stores any key"
+	fi
 	cx keys
 	providers=$(field 'map(.provider) | join(" ")' 2>/dev/null)
 	if [[ -z $providers || $providers == null ]]; then
