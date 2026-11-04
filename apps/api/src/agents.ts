@@ -81,17 +81,25 @@ show() {
 }
 
 # Under q.lock. A turn whose runner is gone without ending it was cut off by a
-# stop or a fork; queued messages go with it. Messages queued without a runner
-# (one that failed to start) get one.
+# stop or a fork; queued messages go with it, and the next turn resumes the
+# conversation it started. Messages queued without a runner (one that failed
+# to start) get one.
 reconcile() {
   running "$d" && return 0
-  local cur
+  local cur sid
   cur=$(jq '.current // empty' "$d/state.json")
   if [ -n "$cur" ]; then
     rm -f "$d"/queue/*.json
     local err="this turn didn't finish: the sandbox stopped, or was forked, while it ran"
+    # A stop mid-write leaves a torn last line; it goes, so that end_turn's event starts a line of its own.
+    [ -z "$(tail -c 1 "$d/events.jsonl")" ] ||
+      { head -n "$(wc -l <"$d/events.jsonl")" "$d/events.jsonl" >"$d/events.new" && mv "$d/events.new" "$d/events.jsonl"; }
+    sid=$(jq -nrR --argjson turn "$cur" '[inputs | fromjson? | select(.turn == $turn and .type == "event")
+      | .event | .session_id // .thread_id // empty] | last // empty' "$d/events.jsonl")
     end_turn "$cur" null true "$err"
-    set_state --arg err "$err" --argjson at "$(now)" '.current = null | .lastMessage = null | .lastExitCode = null | .error = $err | .updatedAt = $at'
+    set_state --arg err "$err" --arg sid "$sid" --argjson at "$(now)" \
+      '.sessionId = (if $sid == "" then .sessionId else $sid end) | .current = null | .lastMessage = null
+       | .lastExitCode = null | .error = $err | .updatedAt = $at'
   elif [ -n "$(ls "$d/queue")" ]; then
     launch
   fi
