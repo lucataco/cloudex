@@ -1445,6 +1445,9 @@ export class Sandbox extends DurableObject<Env> {
     }
     // Sooner if a stop was asked for from inside while this ran.
     const asked = await this.ctx.storage.get<boolean>("stopRequested");
+    // None after a stop or delete that ran ahead of it in the queue, since an
+    // alarm brings a deleted sandbox's storage back.
+    if (this.record?.state !== "running") return;
     await this.ctx.storage.setAlarm(Date.now() + (asked ? 1000 : ALARM_EVERY_MS));
   }
 
