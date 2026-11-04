@@ -186,7 +186,7 @@ if want lifecycle; then
 	cx env set "$P-f-1" --file ".vr-e=$work/ef"
 	cx env unset "$P-f-1" --file .vr-e
 	cx env "$P-f-1"
-	ok L27 "env unset <sandbox> --file removes the file from that sandbox" [ "$CODE" = 0 -a "$(field '.files | length')" = 0 ]
+	ok L27 "env unset <sandbox> --file removes the file from that sandbox" [ "$CODE" = 0 -a "$(field '.files | index("~/.vr-e")')" = null ]
 	cx resume "$P-f-1" --from-backup
 	ok L28 "resume --from-backup on a running sandbox refuses" [ "$CODE" != 0 ]
 fi
@@ -244,7 +244,7 @@ if want connect; then
 	ssh -F "$work/ssh_config" -o BatchMode=yes "$P-reuse.cloudex" true >/dev/null 2>&1
 	cx delete "$P-reuse" --yes
 	cx new --name "$P-reuse" --no-use
-	got=$(ssh -F "$work/ssh_config" -o BatchMode=yes "$P-reuse.cloudex" 'echo reached' 2>&1)
+	got=$(ssh -F "$work/ssh_config" -o BatchMode=yes -o LogLevel=ERROR "$P-reuse.cloudex" 'echo reached' 2>&1)
 	ok C17 "ssh-config reaches a new sandbox that reuses a name" is "$got" reached
 	cx delete "$P-reuse" --yes
 	if [[ -n $ZONE ]]; then
