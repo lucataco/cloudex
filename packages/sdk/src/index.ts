@@ -80,7 +80,7 @@ export interface ProviderKey {
 }
 
 export interface CreateOptions {
-  /** Lowercase letters, digits and dashes; 2-32 characters. */
+  /** 2-32 lowercase letters, digits and dashes, starting with a letter and not ending with a dash. Can't start with cx-, which marks sandbox ids. */
   name?: string;
   /** Default standard-2. */
   size?: SandboxSize;
@@ -432,7 +432,9 @@ export class Cloudex {
    * Sets a provider's key. Sandboxes started from then on get a placeholder,
    * and the real key is added to their HTTPS calls to the provider on the way
    * out, so it never enters a sandbox, its saves, backups or forks. A changed
-   * key reaches running sandboxes within a minute.
+   * key reaches running sandboxes within a minute. The key is tried with the
+   * provider first; if the provider rejects it, this throws a CloudexError
+   * (status 400) with what the provider said.
    */
   setKey(provider: Provider, key: string): Promise<ProviderKey> {
     return this.#call("PUT", `/v1/keys/${provider}`, { key });

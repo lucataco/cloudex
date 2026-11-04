@@ -194,13 +194,18 @@ func (c *Client) failure(ctx context.Context, res *http.Response, data []byte) *
 var htmlTitle = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 
 // plainError makes an answer that isn't the API's JSON readable: an HTML error
-// page (from Cloudflare, say) becomes its title.
+// page (from Cloudflare, say) becomes its status and title, without saying the
+// status twice when the title starts with it.
 func plainError(status, body string) string {
 	body = strings.TrimSpace(body)
 	if strings.HasPrefix(body, "<") {
 		title := ""
 		if m := htmlTitle.FindStringSubmatch(body); m != nil {
 			title = strings.Join(strings.Fields(m[1]), " ")
+		}
+		code, _, _ := strings.Cut(status, " ")
+		if strings.HasPrefix(title, code) {
+			return title
 		}
 		return strings.TrimSpace(status + " " + title)
 	}

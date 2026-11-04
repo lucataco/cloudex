@@ -29,7 +29,7 @@ import { isCommandId } from "./commands";
 import { backupBucket } from "./backup";
 import { deleteSandbox, idForName, listSandboxes, nameTaken } from "./db";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
-import { deleteKey, listKeys, setKey } from "./keys";
+import { deleteKey, keyRefusal, listKeys, setKey } from "./keys";
 import { NO_SUCH_SANDBOX, type ForkSource } from "./sandbox";
 import { type SaveManifest, deleteSave, getSave, listSaves, readManifest } from "./saves";
 import {
@@ -446,6 +446,8 @@ function provider(name: string) {
 app.put("/v1/keys/:provider", async (c) => {
   const p = provider(c.req.param("provider"));
   const { key } = SetProviderKey.parse(await c.req.json());
+  const refusal = await keyRefusal(p, key);
+  if (refusal) fail(400, refusal);
   return c.json(await setKey(c.env, p, key));
 });
 

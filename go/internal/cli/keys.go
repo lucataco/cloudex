@@ -23,7 +23,10 @@ func newKeysCmd(opts *options) *cobra.Command {
 			"that get a placeholder key, and the real one is added to their HTTPS calls to\n" +
 			"the provider as they leave, so it never enters a sandbox, its saves, backups or\n" +
 			"forks. Claude Code, Codex, the providers' SDKs and curl work as if the key were\n" +
-			"there. A key a sandbox brings itself, or a subscription login, is used as is.\n\n" +
+			"there. A key a sandbox brings itself is used as is. While a provider's key is\n" +
+			"stored here, Claude Code and Codex in a sandbox use it even if someone signs in\n" +
+			"there with a subscription; to use a subscription instead, remove the key with\n" +
+			"cloudex keys rm.\n\n" +
 			"A new provider reaches a running sandbox when it next starts (stop it, then\n" +
 			"resume it, to start it now); a changed key reaches it within a minute. With no\n" +
 			"subcommand, lists the keys.",
@@ -43,7 +46,8 @@ func newKeysCmd(opts *options) *cobra.Command {
 		Use:   "set <anthropic|openai>",
 		Short: "Store a provider's key",
 		Long: "Store a provider's API key. It's read from a hidden prompt, from standard input\n" +
-			"when piped, or with --from-env from $ANTHROPIC_API_KEY or $OPENAI_API_KEY.",
+			"when piped, or with --from-env from $ANTHROPIC_API_KEY or $OPENAI_API_KEY.\n" +
+			"The provider is asked whether it accepts the key first, and a key it rejects isn't stored.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			provider := args[0]

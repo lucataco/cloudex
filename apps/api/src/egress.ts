@@ -81,8 +81,10 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
     const headers = new Headers(req.headers);
     const sent = spec.sent(headers);
     // Anthropic's error shape, whose error.message OpenAI's clients read too.
-    // Not a 401: Claude Code retries one whose message it doesn't know.
-    const refuse = (message: string) => Response.json({ type: "error", error: { type: "permission_error", message } }, { status: 403 });
+    // Cloudex's own refusals aren't a 401: Claude Code retries one whose message it doesn't know.
+    const answer = (status: number, type: string, message: string) => Response.json({ type: "error", error: { type, message } }, { status });
+    const refuse = (message: string) => answer(403, "permission_error", message);
+    let added = false;
     if (!sent || sent === spec.placeholder) {
       let key: string | null;
       try {
@@ -91,9 +93,13 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
         if (!(e instanceof UnreadableKey)) throw e;
         return refuse(`Cloudex can't read its stored ${name} key: the deployment's admin key changed after it was set. Set it again with: cloudex keys set ${name}`);
       }
-      if (key) spec.set(headers, key);
-      // A placeholder with no key behind it: the key was removed after this run started.
-      else if (sent) return refuse(`no ${name} key is set in Cloudex. Set one with: cloudex keys set ${name}`);
+      if (key) {
+        spec.set(headers, key);
+        added = true;
+      } else if (sent) {
+        // A placeholder with no key behind it: the key was removed after this run started.
+        return refuse(`no ${name} key is set in Cloudex. Set one with: cloudex keys set ${name}`);
+      }
     }
     // An agent working counts as activity, at most twice a minute.
     const id = this.ctx.props.id;
@@ -102,7 +108,13 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
       this.ctx.waitUntil(this.env.SANDBOX.getByName(id).ping().catch(() => {}));
     }
     headers.delete("host");
-    return fetch(url.toString(), { method: req.method, headers, body: req.body, redirect: "manual" });
+    const res = await fetch(url.toString(), { method: req.method, headers, body: req.body, redirect: "manual" });
+    // The provider's own 401 for a key Cloudex added doesn't say whose key it was.
+    if (added && res.status === 401) {
+      await res.body?.cancel();
+      return answer(401, "authentication_error", `${spec.label} rejected the key stored with cloudex keys set ${name}. Set a working one with: cloudex keys set ${name}`);
+    }
+    return res;
   }
 
   // An object in the R2 bucket: a part of a backup or of a named save.
