@@ -230,6 +230,7 @@ export class Sandbox extends DurableObject<Env> {
   // Set while remove() runs, so that nothing outside the lifecycle queue
   // writes the record back.
   private removing = false;
+  private inactivitySet = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -239,6 +240,9 @@ export class Sandbox extends DurableObject<Env> {
       // After an eviction or deploy, reattach the exit watcher to a running box.
       if (ctx.container?.running) this.watch();
       if (this.record?.state === "starting" || this.record?.state === "stopping") await this.repair(this.record);
+      if (this.record?.state === "running" && ctx.container?.running && (await ctx.storage.getAlarm()) === null) {
+        await ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+      }
     });
   }
 
@@ -264,8 +268,12 @@ export class Sandbox extends DurableObject<Env> {
             ? "start failed: it was cut off partway by an update or restart of the deployment"
             : unsavedStop(r, "stopped"),
       });
-      // Queued, not awaited, because blockConcurrencyWhile resets the object after 30 s.
-      if (running) void this.exclusive(() => this.destroyContainer(r.id));
+      // Queued, not awaited, because blockConcurrencyWhile resets the object
+      // after 30 s; the alarm finishes the job if this object goes first.
+      if (running) {
+        await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+        void this.exclusive(() => this.destroyContainer(r.id)).catch((e) => console.error(`[${r.id}] ${message(e)}`));
+      }
     }
     console.log(`[${r.id}] was ${r.state} after a restart; now ${this.record?.state}`);
   }
@@ -802,11 +810,7 @@ export class Sandbox extends DurableObject<Env> {
       await this.update({ state: r.savedAt ? "stopped" : "error", error: `start failed: ${why}` });
       fail(503, `${r.name ?? r.id} didn't start: ${why}`);
     }
-    try {
-      await withTimeout(c.setInactivityTimeout(PLATFORM_MAX_INACTIVITY_MS), 30_000, "setInactivityTimeout");
-    } catch (e) {
-      console.error(`[${r.id}] ${message(e)}`);
-    }
+    await this.setInactivity(r.id);
     console.log(`[${r.id}] ready in ${Date.now() - t0} ms (${snapshot ? "from save" : restore ? `from the save ${restore.name}` : "fresh"})`);
     this.touch();
     await this.update({
@@ -990,10 +994,21 @@ export class Sandbox extends DurableObject<Env> {
   // A container that doesn't go keeps billing, so the alarm tries again.
   private async destroyContainer(id: string) {
     try {
-      await withTimeout(Promise.all([this.container.destroy(), this.exited]), 60_000, "destroy");
+      await withTimeout(this.container.destroy(), 60_000, "destroy");
+      // The exit watcher may never settle for a box that never got an instance.
+      await Promise.race([this.exited, sleep(10_000)]);
     } catch (e) {
       console.error(`[${id}] ${message(e)}; trying again in a minute`);
       await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+    }
+  }
+
+  private async setInactivity(id: string) {
+    try {
+      await withTimeout(this.container.setInactivityTimeout(PLATFORM_MAX_INACTIVITY_MS), 30_000, "setInactivityTimeout");
+      this.inactivitySet = true;
+    } catch (e) {
+      console.error(`[${id}] ${message(e)}`);
     }
   }
 
@@ -1403,6 +1418,9 @@ export class Sandbox extends DurableObject<Env> {
     }
     if (!r || r.state !== "running") return;
     if (!this.ctx.container?.running) return this.onExit();
+    // An object that restarted, as after a deploy, leaves its running box on
+    // the platform's short default until it's set again.
+    if (!this.inactivitySet) await this.setInactivity(r.id);
     if (stopRequested) {
       try {
         await this.exclusive(async () => {
