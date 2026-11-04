@@ -46,7 +46,8 @@ func newSaveCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "Saving %s as %s. It keeps running; this takes about 15 seconds per GB of changes.\n", r, name)
+			shown := display(cmd.Context(), client, r)
+			fmt.Fprintf(cmd.ErrOrStderr(), "Saving %s as %s. It keeps running; this takes about 15 seconds per GB of changes.\n", shown, name)
 			ctx, cancel := context.WithTimeout(cmd.Context(), saveTimeout)
 			defer cancel()
 			s, err := client.SaveAs(ctx, r, name)
@@ -61,7 +62,7 @@ func newSaveCmd(opts *options) *cobra.Command {
 			if s.Kind == "home" {
 				what = "/home only: the sandbox's image is from before v0.1.15, whose saves can't hold the rest of the disk"
 			}
-			fmt.Fprintf(out, "Saved %s as %s: %s in %s, %s stored.\n", r, s.Name, plural(s.Files, "path"), humanBytes(s.RawBytes), humanBytes(s.Bytes))
+			fmt.Fprintf(out, "Saved %s as %s: %s in %s, %s stored.\n", shown, s.Name, plural(s.Files, "path"), humanBytes(s.RawBytes), humanBytes(s.Bytes))
 			fmt.Fprintf(out, "It holds %s.\n", what)
 			if s.Replaced != nil && *s.Replaced {
 				fmt.Fprintf(out, "It replaces the earlier save of %s.\n", s.Name)
@@ -94,7 +95,17 @@ func newSavesCmd(opts *options) *cobra.Command {
 				}
 				return writeJSON(cmd.OutOrStdout(), saves)
 			}
-			printSaves(cmd.OutOrStdout(), saves)
+			names := map[string]string{}
+			if len(saves) > 0 {
+				if list, err := client.List(cmd.Context()); err == nil {
+					for _, s := range list {
+						if s.Name != nil {
+							names[s.ID] = *s.Name
+						}
+					}
+				}
+			}
+			printSaves(cmd.OutOrStdout(), saves, names)
 			return nil
 		},
 	}
@@ -102,7 +113,8 @@ func newSavesCmd(opts *options) *cobra.Command {
 	return cmd
 }
 
-func printSaves(w io.Writer, saves []api.Save) {
+// printSaves lists saves; names turns the ids of the sandboxes they came from into names.
+func printSaves(w io.Writer, saves []api.Save, names map[string]string) {
 	if len(saves) == 0 {
 		fmt.Fprintln(w, "No saves. Make one with: cloudex save [sandbox] <name>")
 		return
@@ -114,7 +126,11 @@ func printSaves(w io.Writer, saves []api.Save) {
 		if s.Kind == "home" {
 			holds = "/home"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, holds, humanBytes(s.RawBytes), humanBytes(s.Bytes), ago(s.CreatedAt), s.Sandbox)
+		from := s.Sandbox
+		if name, ok := names[from]; ok {
+			from = name
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, holds, humanBytes(s.RawBytes), humanBytes(s.Bytes), ago(s.CreatedAt), from)
 	}
 	tw.Flush()
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"regexp"
@@ -93,7 +94,7 @@ func newAgentsStartCmd(opts *options) *cobra.Command {
 			"the sandbox is the boundary.",
 		Example: "  cloudex agents start \"make the tests pass\"\n" +
 			"  cloudex agents start web --agent codex --cwd app \"add a dark mode\"\n  cloudex agents start -d - < task.md",
-		Args: cobra.RangeArgs(1, 2),
+		Args: taskArgs(2, "task"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !agentKinds[agent] {
 				return fmt.Errorf("unknown agent %q: use claude or codex", agent)
@@ -112,18 +113,16 @@ func newAgentsStartCmd(opts *options) *cobra.Command {
 			}
 			a, err := client.StartAgent(cmd.Context(), r, api.StartAgentRequest{Prompt: task, Agent: agent, Cwd: cwd, Model: model})
 			if err != nil {
-				return err
+				return unquoted(err, args)
 			}
 			if detach {
 				if opts.json {
 					return writeJSON(cmd.OutOrStdout(), a)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "Started %s (%s). Follow it with: cloudex agents logs -f %s\n", a.ID, a.Agent, a.ID)
+				fmt.Fprintf(cmd.OutOrStdout(), "Started %s (%s). Follow it with: cloudex agents logs -f %s %s\n", a.ID, a.Agent, r, a.ID)
 				return nil
 			}
-			if !opts.json {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Started %s (%s). Ctrl-C stops following; the agent keeps working.\n", a.ID, a.Agent)
-			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "Started %s (%s). Ctrl-C stops following; the agent keeps working.\n", a.ID, a.Agent)
 			return followAgent(cmd, opts, client, r, a, 0)
 		},
 	}
@@ -170,7 +169,7 @@ func newAgentsSendCmd(opts *options) *cobra.Command {
 			"start. A message of - is read from standard input.",
 		Example: "  cloudex agents send \"now add a test for the empty case\"\n" +
 			"  cloudex agents send --interrupt ag-1a2b3c4d \"stop, use the existing helper instead\"",
-		Args: cobra.RangeArgs(1, 3),
+		Args: taskArgs(3, "message"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			message, err := readPrompt(cmd, args[len(args)-1])
 			if err != nil {
@@ -178,7 +177,7 @@ func newAgentsSendCmd(opts *options) *cobra.Command {
 			}
 			client, r, a, err := pickAgent(cmd, opts, args[:len(args)-1])
 			if err != nil {
-				return err
+				return unquoted(err, args)
 			}
 			from := a.Events
 			if a, err = client.SendAgent(cmd.Context(), r, a.ID, message, interrupt); err != nil {
@@ -277,8 +276,49 @@ func followAgent(cmd *cobra.Command, opts *options, client *api.Client, r string
 	cmd.SetContext(ctx)
 	err := printAgentEvents(cmd, opts, client, r, a, from, true)
 	if ctx.Err() != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "\nStopped following %s; it keeps working. Follow it again with: cloudex agents logs -f %s\n", a.ID, a.ID)
+		fmt.Fprintf(cmd.ErrOrStderr(), "\nStopped following %s; it keeps working. Follow it again with: cloudex agents logs -f %s %s\n", a.ID, r, a.ID)
 		return nil
+	}
+	if lostTouch(err) {
+		fmt.Fprintf(cmd.ErrOrStderr(), "\nLost touch with %s; the agent keeps working. Follow it again with: cloudex agents logs -f %s %s\n", r, r, a.ID)
+	}
+	return err
+}
+
+// lostTouch is true for an error from the network or from the API being down,
+// as opposed to an answer to what was asked.
+func lostTouch(err error) bool {
+	var apiErr *api.Error
+	var netErr net.Error
+	switch {
+	case err == nil, errors.Is(err, context.Canceled):
+		return false
+	case errors.As(err, &apiErr):
+		return apiErr.Status >= 500
+	}
+	return errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// taskArgs allows one to max arguments for [sandbox] <task> and the like, and
+// says what to do about the usual way to exceed them: a task left unquoted.
+func taskArgs(max int, what string) cobra.PositionalArgs {
+	return func(_ *cobra.Command, args []string) error {
+		switch {
+		case len(args) == 0:
+			return fmt.Errorf("give the %s, in quotes", what)
+		case len(args) > max:
+			return fmt.Errorf("too many arguments: put the %s in quotes, as one argument", what)
+		}
+		return nil
+	}
+}
+
+// unquoted adds to a "no sandbox named" answer when the first of two
+// arguments may have been the start of a task that wasn't quoted.
+func unquoted(err error, args []string) error {
+	var apiErr *api.Error
+	if len(args) == 2 && errors.As(err, &apiErr) && apiErr.Status == 404 && strings.HasPrefix(apiErr.Message, "no sandbox named ") {
+		return fmt.Errorf("%w. If %q was the start of your task, put the whole task in quotes", err, args[0])
 	}
 	return err
 }

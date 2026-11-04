@@ -23,6 +23,15 @@ import (
 	"github.com/lucataco/cloudex/go/internal/update/updatetest"
 )
 
+// git sets these for the commands that rebase --exec and hooks run, and the
+// tests that run git in a temporary repository would commit into that repo.
+func TestMain(m *testing.M) {
+	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"} {
+		os.Unsetenv(k)
+	}
+	os.Exit(m.Run())
+}
+
 // fakeAPI records requests and answers with canned JSON per "METHOD /path".
 type fakeAPI struct {
 	t        *testing.T
@@ -688,12 +697,16 @@ func TestEnvSetAndUnset(t *testing.T) {
 	run(t, "env", "set", "A=1")
 	run(t, "env", "unset", "web", "A", "--file", "~/.npmrc")
 	run(t, "env", "unset", "ONLY")
-	want := []string{"PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings", "PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings"}
+	run(t, "env", "unset", "web", "--file", "~/.npmrc")
+	want := []string{"PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings", "PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings", "PATCH /v1/sandboxes/web/settings"}
 	if !reflect.DeepEqual(f.requests, want) {
 		t.Fatalf("requests %v", f.requests)
 	}
 	if f.bodies[2] != `{"env":{"A":null},"files":{"~/.npmrc":null}}` || f.bodies[3] != `{"env":{"ONLY":null}}` {
 		t.Fatalf("unset bodies %s / %s", f.bodies[2], f.bodies[3])
+	}
+	if f.bodies[4] != `{"files":{"~/.npmrc":null}}` {
+		t.Fatalf("unset <sandbox> --file body %s", f.bodies[4])
 	}
 	if code, out, _ := run(t, "env", "web"); code != 0 || !strings.Contains(out, "Files      ~/.npmrc") {
 		t.Fatalf("list: code %d, %q", code, out)

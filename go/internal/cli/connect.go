@@ -21,7 +21,7 @@ import (
 func newExecCmd(opts *options) *cobra.Command {
 	var root, detach bool
 	var cwd string
-	var timeout time.Duration
+	timeout := 10 * time.Minute
 	cmd := &cobra.Command{
 		Use:   "exec [sandbox] -- <command>",
 		Short: "Run a command in a sandbox, or start one in the background",
@@ -32,6 +32,10 @@ func newExecCmd(opts *options) *cobra.Command {
 			"--timeout (at most 1h) stops the command and everything it started. Ctrl-C stops\n" +
 			"it too. For longer jobs, and servers, use --detach: the command keeps running in\n" +
 			"the sandbox, and cloudex commands shows it and its output.\n\n" +
+			"Standard input isn't sent to the command; it sees none. To send data in, use\n" +
+			"cloudex cp (a <from> of - reads standard input), or ssh with a redirect:\n" +
+			"cloudex ssh <sandbox> -- 'cat > file' < file. Output is text, so for a binary\n" +
+			"file use cloudex cp <sandbox>:file - instead.\n\n" +
 			"With --json, prints the result as JSON once the command ends, output cut at\n" +
 			"1 MiB per stream; with --detach, the background command.",
 		Example: "  cloudex exec -- npm test\n" +
@@ -131,7 +135,7 @@ func newExecCmd(opts *options) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&root, "root", false, "run as root")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory (default: the user's home)")
-	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "stop the command after this long (at most 1h; with --detach, any, and none by default)")
+	cmd.Flags().Var(durationFlag{&timeout}, "timeout", "stop the command after this long, such as 30m (at most 1h; with --detach, any, and none by default)")
 	cmd.Flags().BoolVarP(&detach, "detach", "d", false, "start the command in the background and print its id")
 	return cmd
 }
@@ -159,6 +163,12 @@ func shellWord(s string) string {
 	return shellQuote(s)
 }
 
+// isNumber is for telling a port from a sandbox, whose name starts with a letter.
+func isNumber(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
 func newHostCmd(opts *options) *cobra.Command {
 	var list, revoke, revokeAll bool
 	cmd := &cobra.Command{
@@ -180,7 +190,7 @@ func newHostCmd(opts *options) *cobra.Command {
 				if revoke || (list && revokeAll) {
 					return errors.New("use one of --list, --revoke and --revoke-all")
 				}
-				if len(args) > 1 {
+				if len(args) > 1 || len(args) == 1 && isNumber(args[0]) {
 					return errors.New("--list and --revoke-all take a sandbox, not a port")
 				}
 				cfg, client, err := opts.load()
@@ -283,7 +293,7 @@ func newPromptCmd(opts *options) *cobra.Command {
 			"sandbox's disk. Agents run without their own permission prompts; the sandbox\n" +
 			"is the boundary.",
 		Example: "  cloudex prompt \"make the tests pass\"\n  cloudex prompt my-box --agent codex \"add a dark mode\"",
-		Args:    cobra.RangeArgs(1, 2),
+		Args:    taskArgs(2, "task"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !agentKinds[agent] {
 				return fmt.Errorf("unknown agent %q: use claude or codex", agent)
@@ -293,12 +303,17 @@ func newPromptCmd(opts *options) *cobra.Command {
 				named = args[0]
 			}
 			task := args[len(args)-1]
-			start := fmt.Sprintf("cloudex-agent start %s %s", agent, shellQuote(task))
-			remote := fmt.Sprintf(`name=$(%s) && echo "Started $name. Detach with Ctrl-b d; reattach with cloudex attach." && sleep 1 && exec cloudex-agent attach "$name"`, start)
-			if detach {
-				remote = fmt.Sprintf(`name=$(%s) && echo "Started $name. Watch it with: cloudex attach"`, start)
+			// The hint goes inside double quotes in the remote shell, so only a name that is safe there is put in it.
+			attach := "cloudex attach"
+			if sandboxRefRE.MatchString(named) {
+				attach += " " + named
 			}
-			return sshRun(cmd, opts, named, !detach, remote)
+			start := fmt.Sprintf("cloudex-agent start %s %s", agent, shellQuote(task))
+			remote := fmt.Sprintf(`name=$(%s) && echo "Started $name. Detach with Ctrl-b d; reattach with %s." && sleep 1 && exec cloudex-agent attach "$name"`, start, attach)
+			if detach {
+				remote = fmt.Sprintf(`name=$(%s) && echo "Started $name. Watch it with: %s"`, start, attach)
+			}
+			return unquoted(sshRun(cmd, opts, named, !detach, remote), args)
 		},
 	}
 	cmd.Flags().StringVar(&agent, "agent", "claude", "claude or codex")
@@ -310,18 +325,33 @@ func newAttachCmd(opts *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "attach [sandbox] [session]",
 		Short: "Reattach to an agent session (the newest by default)",
-		Args:  cobra.MaximumNArgs(2),
+		Long: "Reattach to a session that cloudex prompt started, the newest by default. A\n" +
+			"session is named like agent-1104-153012; cloudex prompt prints its name.",
+		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			named, session := "", ""
-			if len(args) > 0 {
-				named = args[0]
-			}
-			if len(args) > 1 {
-				session = shellQuote(args[1])
+			named, session := attachTarget(args)
+			if session != "" {
+				session = shellQuote(session)
 			}
 			return sshRun(cmd, opts, named, true, "cloudex-agent attach "+session)
 		},
 	}
+}
+
+var sessionRE = regexp.MustCompile(`^agent-\d{4}-\d{6}(-\d+)?$`)
+
+// attachTarget reads [sandbox] [session]. A lone argument that looks like a
+// session's name is one; sandboxes can be named agent-1 and so on, but not like that.
+func attachTarget(args []string) (named, session string) {
+	switch {
+	case len(args) == 2:
+		return args[0], args[1]
+	case len(args) == 1 && sessionRE.MatchString(args[0]):
+		return "", args[0]
+	case len(args) == 1:
+		return args[0], ""
+	}
+	return "", ""
 }
 
 // sshRun runs a remote command over SSH, with a terminal when tty is set.
@@ -338,8 +368,8 @@ func sshRun(cmd *cobra.Command, opts *options, named string, tty bool, remote st
 	if err != nil {
 		return err
 	}
-	if s.State != "running" {
-		return fmt.Errorf("%s is %s; start it with: cloudex resume %s", s.Label(), s.State, s.Label())
+	if err := needRunning(s); err != nil {
+		return err
 	}
 	args := []string{}
 	if tty {
