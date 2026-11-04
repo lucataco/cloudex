@@ -146,6 +146,12 @@ function wrongState(r: SandboxRecord) {
   return `${name} is ${r.state}; resume it first`;
 }
 
+// The error of a sandbox that stopped before it could save, saying what resume starts it from.
+const unsavedStop = (r: SandboxRecord, how: string) =>
+  r.savedAt
+    ? `${how} before it could save; resume starts from its last save or backup`
+    : `${how} before its first save; resume starts it over, without its changes`;
+
 function clip(buf: ArrayBuffer) {
   const text = new TextDecoder().decode(buf.byteLength > OUTPUT_LIMIT ? buf.slice(0, OUTPUT_LIMIT) : buf);
   return buf.byteLength > OUTPUT_LIMIT ? `${text}\n[cloudex: output cut at 1 MiB of ${buf.byteLength} bytes]` : text;
@@ -241,11 +247,15 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   // A start or stop that an eviction or a deploy cut off has nobody left to
-  // finish it. A box still running carries on; otherwise it counts as stopped,
-  // or as a failed start if it never made a save.
+  // finish it. A stop whose box still runs carries on running. A cut-off
+  // start's box goes, because a restore in it may be half done, which its
+  // next save would keep over the good copy, and its keys, settings and tools
+  // aren't set up. Either way it counts as stopped, or as a failed start if it
+  // never made a save.
   private async repair(r: SandboxRecord) {
-    if (this.ctx.container?.running) {
-      await this.update({ state: "running", ...(r.state === "starting" ? { startedAt: Date.now() } : {}) });
+    const running = this.ctx.container?.running;
+    if (r.state === "stopping" && running) {
+      await this.update({ state: "running" });
       await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
     } else {
       const savedThisRun = r.state === "stopping" && (r.savedAt ?? 0) >= (r.startedAt ?? 0);
@@ -256,8 +266,10 @@ export class Sandbox extends DurableObject<Env> {
           ? null
           : r.state === "starting"
             ? "start failed: it was cut off partway by an update or restart of the deployment"
-            : "stopped before it could save; resume starts from its last save or backup",
+            : unsavedStop(r, "stopped"),
       });
+      // Queued, not awaited, because blockConcurrencyWhile resets the object after 30 s.
+      if (running) void this.exclusive(() => this.destroyContainer(r.id));
     }
     console.log(`[${r.id}] was ${r.state} after a restart; now ${this.record?.state}`);
   }
@@ -326,7 +338,7 @@ export class Sandbox extends DurableObject<Env> {
     await this.update({
       state: "stopped",
       stoppedAt: Date.now(),
-      error: savedThisRun ? null : "stopped by the platform before it could save; resume starts from its last save or backup",
+      error: savedThisRun ? null : unsavedStop(r, "stopped by the platform"),
     });
   }
 
