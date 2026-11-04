@@ -38,7 +38,10 @@ func newRunCmd(opts *options) *cobra.Command {
 			"The command runs in the background in the sandbox, so a dropped connection\n" +
 			"doesn't stop it, and has no time limit unless --timeout sets one. Ctrl-C stops\n" +
 			"it and deletes the sandbox. --keep keeps the sandbox, and --keep-on-failure\n" +
-			"keeps it when the command fails or is stopped, to look around with cloudex ssh.",
+			"keeps it when the command fails or is stopped, to look around with cloudex ssh.\n\n" +
+			"A directory copied back by --out leaves out .git directories, hard links,\n" +
+			"devices, symlinks that point outside it, and files the sandbox user can't read;\n" +
+			"the summary on standard error counts what was left out, but not unreadable files.",
 		Example: "  cloudex run -- npm test\n" +
 			"  cloudex run --from node-base --out dist -- 'npm ci && npm run build'\n" +
 			"  cloudex run --env CI=1 --keep-on-failure -- make check",
@@ -152,7 +155,7 @@ func (r *runner) run(spec runSpec) (err error) {
 		}
 		defer os.Remove(archive.Name())
 		defer archive.Close()
-		if err := checkUploadSize(archive, "The files in "+dir); err != nil {
+		if err := checkUploadSize(archive, "The upload from "+dir); err != nil {
 			return err
 		}
 	}

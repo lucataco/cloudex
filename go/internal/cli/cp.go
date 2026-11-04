@@ -37,7 +37,7 @@ func remotePath(s string) (sandbox, p string, ok bool) {
 }
 
 func newCpCmd(opts *options) *cobra.Command {
-	var root bool
+	var root, ignored bool
 	cmd := &cobra.Command{
 		Use:   "cp <from> <to>",
 		Short: "Copy files and directories into or out of a sandbox",
@@ -48,7 +48,11 @@ func newCpCmd(opts *options) *cobra.Command {
 			"goes inside it; otherwise it's created as <to>. A file keeps its permissions,\n" +
 			"and a directory goes as a tar.gz. A <from> of - reads a file from standard\n" +
 			"input, and a <to> of - writes one to standard output. Uploads are limited to\n" +
-			"100 MB at a time (Cloudflare's limit); for more, use rsync over cloudex ssh-config.",
+			"100 MB at a time (Cloudflare's limit); for more, use rsync over cloudex ssh-config.\n\n" +
+			"A directory copied out of a sandbox leaves out .git directories, hard links,\n" +
+			"devices, symlinks that point outside it, and files the sandbox user can't read\n" +
+			"(--root reads them). The summary on standard error counts what was left out,\n" +
+			"but not the files that couldn't be read.",
 		Example: "  cloudex cp report.csv :data/\n" +
 			"  cloudex cp ./site my-box:/srv/site\n" +
 			"  cloudex cp :app/dist ./dist\n" +
@@ -82,13 +86,20 @@ func newCpCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if msg != "" && !opts.json {
+			if msg != "" {
 				fmt.Fprintln(cmd.ErrOrStderr(), msg)
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&root, "root", false, "read and write in the sandbox as root")
+	// Habit from cp, scp and rsync: directories always copy whole.
+	cmd.Flags().BoolVarP(&ignored, "recursive", "r", false, "accepted and ignored")
+	cmd.Flags().BoolVarP(&ignored, "archive", "a", false, "accepted and ignored")
+	cmd.Flags().BoolVarP(&ignored, "R", "R", false, "accepted and ignored")
+	for _, name := range []string{"recursive", "archive", "R"} {
+		cmd.Flags().MarkHidden(name)
+	}
 	return cmd
 }
 
@@ -235,6 +246,9 @@ func download(ctx context.Context, client *api.Client, r, src, dest string, root
 	var m uint32
 	if _, err := fmt.Sscanf(info.Mode, "%o", &m); err == nil && info.Type == "file" {
 		mode = fs.FileMode(m).Perm()
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(dest), ".cloudex-*")
 	if err != nil {
