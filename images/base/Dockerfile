@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git openssh-server sudo tmux rsync jq unzip zip less \
       vim-tiny build-essential pkg-config python3 python3-pip python3-venv procps \
       iproute2 iputils-ping dnsutils htop file xz-utils zstd squashfs-tools pv \
-      libnss-myhostname \
+      libnss-myhostname bubblewrap \
   && rm -rf /var/lib/apt/lists/*
 
 # Node 22 for the agent CLIs.
