@@ -5,6 +5,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -56,7 +57,7 @@ func Load() (*Config, error) {
 	}
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s can't be read (%v): fix it, or delete it and run cloudex login or cloudex deploy again", p, err)
 	}
 	return &c, nil
 }

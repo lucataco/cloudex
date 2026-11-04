@@ -20,17 +20,18 @@ description: Run code, servers and coding agents in Cloudex sandboxes, Ubuntu ma
 
 ## Running things
 
-- `cloudex exec <sandbox> -- '<shell command>'` runs a command with bash as the cloudex user in its home directory, prints its output as it comes, and exits with its exit code. It stops the command after 10 minutes by default; `--timeout 1h` is the most. `--root` runs as root, `--cwd app` runs in ~/app. Several arguments after `--` are quoted for you: `cloudex exec web -- python3 -c 'print(1)'`.
-- Long jobs and servers go in the background: `cloudex exec -d web -- 'cd app && npm run dev'` prints a command id (cm-...). `cloudex commands web` lists them, `cloudex commands logs -f web <id>` follows the output until it ends and exits with its code, and `cloudex commands kill web <id>` stops it. Then `cloudex host web 5173` gives an HTTPS link to share with the user. Servers that listen only on localhost work. `cloudex host web 5173 --revoke` makes a link stop working.
-- `cloudex cp ./file web:path/` and `cloudex cp web:path ./local` copy files and directories in and out (`:path` is the current sandbox), up to 100 MB at a time.
+- `cloudex exec <sandbox> -- '<shell command>'` runs a command with bash as the cloudex user in its home directory, prints its output as it comes, and exits with its exit code. It stops the command after 10 minutes by default; `--timeout 1h` is the most. `--root` runs as root, `--cwd app` runs in ~/app (/root/app with `--root`). Several arguments after `--` are quoted for you: `cloudex exec web -- python3 -c 'print(1)'`. `exec` doesn't send standard input: a command that reads it sees it end at once. To put text in a file, use `cloudex cp - web:g`. Its output is text, so copy binary files out with `cloudex cp web:f ./f`.
+- Long jobs and servers go in the background: `cloudex exec -d web -- 'cd app && npm run dev'` prints a command id (cm-...). `cloudex commands web` lists them, `cloudex commands logs -f web <id>` follows the output until it ends and exits with its code, and `cloudex commands kill web <id>` stops it, and `cloudex commands rm web <id>` deletes a finished command's record and output. Then `cloudex host web 5173` gives an HTTPS link to share with the user. Servers that listen only on localhost work. `cloudex host web 5173 --revoke` makes a link stop working.
+- `cloudex cp ./file web:path/` and `cloudex cp web:path ./local` copy files and directories in and out (`:path` is the current sandbox). Uploads are limited to 100 MB at a time; downloads aren't. Copying a directory out leaves out `.git` directories. `-` is standard input or output: `cloudex cp - web:f`.
 - `cloudex run -- '<command>'` runs a command in a fresh sandbox with the current directory's files (what git would commit), prints its output, and deletes the sandbox; `--from <save>` starts from a named save, `--out dist` copies a result back, and it exits with the command's code. Use it for tests and builds that shouldn't run on this computer.
 - Docker works inside, with `--network host` only.
 - For many files or repeated syncs, run `cloudex ssh-config >> ~/.ssh/config` once; then `scp` and `rsync` reach `<sandbox>.cloudex`, for example `rsync -a ./app/ web.cloudex:app/`.
 
 ## Agents in a sandbox
 
-- `cloudex agents start <sandbox> "<task>"` starts Claude Code there (`--agent codex` for Codex) with no terminal and prints what it does until the turn ends; `-d` returns at once.
-- `cloudex agents logs <sandbox> -f` follows the newest agent, `cloudex agents send <sandbox> "<message>"` continues its conversation, and `cloudex agents interrupt <sandbox>` stops its turn.
+- `cloudex agents start <sandbox> "<task>"` starts Claude Code there (`--agent codex` for Codex) with no terminal. On a terminal it prints what the agent does until the turn ends. Without one it prints a raw JSON event per line, tool output included, so use `cloudex agents start -d <sandbox> "<task>"`, which returns at once, and then `cloudex agents logs <sandbox> --json=false` to read what it did (`-f` waits until the turn ends).
+- `cloudex agents logs <sandbox> -f` follows the most recently active agent, `cloudex agents send <sandbox> "<message>"` continues its conversation, and `cloudex agents interrupt <sandbox>` stops its turn.
+- If an agent fails to sign in or authenticate, ask the user to run `cloudex keys set anthropic` (or `openai`). The key is stored outside the sandbox, and sandboxes started afterwards use it; one that is already running needs `cloudex stop` and `cloudex resume` to pick up a first key for that provider.
 - Inside a sandbox, `cloudex` manages only that sandbox: `cloudex host <port>`, `cloudex info`, `cloudex set --idle <time>` and `cloudex stop`.
 
 ## When something breaks

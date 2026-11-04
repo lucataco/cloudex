@@ -16,7 +16,8 @@ export const FILE_FORBIDDEN = 13;
 // $1 is the operation, $2 the path:
 //   stat <path>                          the path's FileInfo, with a directory's entries
 //   check <path> <file|any>              FileInfo of a path to read: a readable file, or anything
-//   write <path> <mode or ''>            the contents on stdin; prints the new file's FileInfo
+//   write <path> <mode or ''> <bytes or ''>  the contents on stdin, exactly bytes long if given;
+//                                        prints the new file's FileInfo
 //   delete <path> <recursive 0|1>        prints the FileInfo of what went
 //   mkdir <path>                         for an archive upload; prints its FileInfo
 export const FILE_SCRIPT = String.raw`
@@ -123,6 +124,9 @@ elif op == "write":
     try:
         with os.fdopen(fd, "wb") as f:
             shutil.copyfileobj(sys.stdin.buffer, f, 1 << 20)
+            # An upload cut off on its way in looks like a shorter file.
+            if sys.argv[4] and f.tell() != int(sys.argv[4]):
+                fail(4, "the upload ended after %d of %s bytes, so %s wasn't changed" % (f.tell(), sys.argv[4], p))
             if sys.argv[3]:
                 mode = int(sys.argv[3], 8)
             else:

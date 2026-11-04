@@ -15,8 +15,8 @@ case "${1:-}" in
     # The sandbox is the isolation boundary, so agents run without their own
     # permission prompts and sandboxes.
     case "$agent" in
-      claude) run=(claude --dangerously-skip-permissions "$prompt") ;;
-      codex) run=(codex --dangerously-bypass-approvals-and-sandbox "$prompt") ;;
+      claude) run=(claude --dangerously-skip-permissions -- "$prompt") ;;
+      codex) run=(codex --dangerously-bypass-approvals-and-sandbox -- "$prompt") ;;
       *) echo "unknown agent: $agent (use claude or codex)" >&2; exit 2 ;;
     esac
     command -v "${run[0]}" >/dev/null || { echo "$agent isn't installed in this sandbox" >&2; exit 1; }
@@ -27,7 +27,7 @@ case "${1:-}" in
     echo "$name"
     ;;
   attach)
-    name=${2:-$(tmux list-sessions -F '#{session_created} #{session_name}' 2>/dev/null | awk '$2 ~ /^agent-/' | sort -n | tail -1 | cut -d' ' -f2)}
+    name=${2:-$(tmux list-sessions -F '#{session_created} #{session_name}' 2>/dev/null | awk '$2 ~ /^agent-/' | sort -n | tail -1 | cut -d' ' -f2 || true)}
     [ -n "$name" ] || { echo "no agent sessions; start one with cloudex prompt" >&2; exit 1; }
     exec tmux attach -t "$name"
     ;;

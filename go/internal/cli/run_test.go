@@ -319,3 +319,103 @@ func TestCpNamesADownloadAfterWhatWasAskedFor(t *testing.T) {
 		t.Fatal("wrote .zshrc")
 	}
 }
+
+func TestPackDirFollowsASymlinkedRoot(t *testing.T) {
+	release := t.TempDir()
+	os.WriteFile(filepath.Join(release, "a.txt"), []byte("hello"), 0o644)
+	current := filepath.Join(t.TempDir(), "current")
+	if err := os.Symlink(release, current); err != nil {
+		t.Skip("no symlinks here:", err)
+	}
+	var buf bytes.Buffer
+	if n, _, err := packDir(&buf, current, nil); err != nil || n != 1 {
+		t.Fatalf("packed %d entries, %v", n, err)
+	}
+	dst := t.TempDir()
+	if _, _, err := unpack(&buf, dst); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "a.txt")); string(b) != "hello" {
+		t.Fatalf("a.txt is %q", b)
+	}
+}
+
+func TestCpMakesTheLocalDirectoriesItNeeds(t *testing.T) {
+	withFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/web/files":         `{"path":"/home/cloudex/report.txt","type":"file","size":3,"mode":"644","mtime":1}`,
+		"GET /v1/sandboxes/web/files/content": "abc",
+	})
+	dir := t.TempDir()
+	for _, dest := range []string{filepath.Join(dir, "new", "dir") + "/", filepath.Join(dir, "other", "copy.txt")} {
+		if code, _, errOut := run(t, "cp", "web:report.txt", dest); code != 0 {
+			t.Fatalf("cp to %s: code %d: %s", dest, code, errOut)
+		}
+	}
+	for _, p := range []string{"new/dir/report.txt", "other/copy.txt"} {
+		if b, err := os.ReadFile(filepath.Join(dir, p)); err != nil || string(b) != "abc" {
+			t.Fatalf("%s: %q %v", p, b, err)
+		}
+	}
+}
+
+func TestRunCopiesBackIntoADirectoryThatDoesntExist(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	withFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes":                                      sandboxJSON,
+		"POST /v1/sandboxes/cx-abc123/commands":                   command("running", "null", "null"),
+		"GET /v1/sandboxes/cx-abc123/commands/cm-1a2b3c4d/output": `{"data":"","offset":0,"next":6,"command":` + command("exited", "0", "5") + `}`,
+		"GET /v1/sandboxes/cx-abc123/files":                       `{"path":"/home/cloudex/lcov.info","type":"file","size":3,"mode":"600","mtime":1}`,
+		"GET /v1/sandboxes/cx-abc123/files/content":               "abc",
+		"DELETE /v1/sandboxes/cx-abc123":                          `{"deleted":"cx-abc123"}`,
+	})
+	if code, _, errOut := run(t, "run", "--no-upload", "--out", "coverage/lcov.info", "--", "make"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "coverage", "lcov.info")); err != nil || string(b) != "abc" {
+		t.Fatalf("coverage/lcov.info: %q %v", b, err)
+	}
+}
+
+func TestCpSaysWhatItDidOnStandardErrorWhenPiped(t *testing.T) {
+	withFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/web/files":         `{"path":"/home/cloudex/report.txt","type":"file","size":3,"mode":"644","mtime":1}`,
+		"GET /v1/sandboxes/web/files/content": "abc",
+	})
+	var out, errOut bytes.Buffer
+	dest := filepath.Join(t.TempDir(), "report.txt")
+	if code := Run("test", []string{"--json", "cp", "-r", "-a", "-R", "web:report.txt", dest}, &out, &errOut); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut.String())
+	}
+	if out.Len() != 0 || !strings.Contains(errOut.String(), "Copied web:/home/cloudex/report.txt to "+dest) {
+		t.Fatalf("stdout %q, stderr %q", out.String(), errOut.String())
+	}
+}
+
+func TestCommandsLogsFollowExitsLikeBashForAnySignal(t *testing.T) {
+	for sig, want := range map[string]int{"SEGV": 139, "ABRT": 134, "KILL": 137, "34": 162, "TERM": 143} {
+		ended := strings.Replace(command("killed", "null", "5"), `"signal":null`, `"signal":"`+sig+`"`, 1)
+		newFakeAPI(t, map[string]string{
+			"GET /v1/sandboxes/web/commands/cm-1a2b3c4d/output": `{"data":"","offset":0,"next":6,"command":` + ended + `}`,
+		})
+		if code, _, errOut := run(t, "commands", "logs", "-f", "web", "cm-1a2b3c4d"); code != want {
+			t.Errorf("%s: exit %d, want %d (%s)", sig, code, want, errOut)
+		}
+	}
+}
+
+func TestCommandsKillHintNamesTheSandbox(t *testing.T) {
+	newFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes/web/commands/cm-1a2b3c4d/kill":       command("running", "null", "null"),
+		"POST /v1/sandboxes/cx-abc123/commands/cm-1a2b3c4d/kill": command("running", "null", "null"),
+	})
+	(&config.Config{Current: "cx-abc123"}).Save()
+	_, out, _ := run(t, "commands", "kill", "web", "cm-1a2b3c4d")
+	if !strings.Contains(out, "cloudex commands kill --signal KILL web cm-1a2b3c4d") {
+		t.Fatalf("stdout %q", out)
+	}
+	_, out, _ = run(t, "commands", "kill", "cm-1a2b3c4d")
+	if !strings.Contains(out, "cloudex commands kill --signal KILL cm-1a2b3c4d\n") {
+		t.Fatalf("stdout %q", out)
+	}
+}

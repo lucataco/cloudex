@@ -92,11 +92,11 @@ func newEnvCmd(opts *options) *cobra.Command {
 		Aliases: []string{"rm"},
 		Short:   "Remove environment variables, and files with --file",
 		Long: "Remove environment variables, and with --file, files the settings put in the\n" +
-			"home directory. With two or more arguments, a first one that could be a\n" +
-			"sandbox is taken as one. " + settingsAfter,
+			"home directory. A first argument that could be a sandbox is taken as one when\n" +
+			"another argument follows, or --file is given. " + settingsAfter,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			named := ""
-			if len(args) > 1 && sandboxRefRE.MatchString(args[0]) {
+			if len(args) > 0 && (len(args) > 1 || len(unsetFiles) > 0) && sandboxRefRE.MatchString(args[0]) {
 				named, args = args[0], args[1:]
 			}
 			if len(args) == 0 && len(unsetFiles) == 0 {

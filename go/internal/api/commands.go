@@ -121,13 +121,7 @@ func (c *Client) request(ctx context.Context, method, path string, body io.Reade
 	if res.StatusCode >= 300 {
 		defer res.Body.Close()
 		data, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		var e struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(data, &e) != nil || e.Error == "" {
-			e.Error = plainError(res.Status, string(data))
-		}
-		return nil, &Error{Status: res.StatusCode, Message: e.Error}
+		return nil, c.failure(ctx, res, data)
 	}
 	return res, nil
 }

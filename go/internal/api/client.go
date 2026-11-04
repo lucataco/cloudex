@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -108,13 +109,37 @@ type Error struct {
 func (e *Error) Error() string { return e.Message }
 
 type Client struct {
-	BaseURL string
-	Key     string
-	HTTP    *http.Client
+	BaseURL    string
+	Key        string
+	HTTP       *http.Client
+	CLIVersion string
 }
 
 func New(baseURL, key string) *Client {
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Key: key, HTTP: &http.Client{}}
+	return &Client{BaseURL: NormalizeURL(baseURL), Key: key, HTTP: &http.Client{}}
+}
+
+// NormalizeURL gives every way of writing a deployment's URL one form, so that
+// the saved key matches its deployment. The SDKs' normalizeUrl and
+// _normalize_url must agree with it.
+func NormalizeURL(u string) string {
+	u = strings.TrimRight(strings.TrimSpace(u), "/")
+	if u == "" {
+		return ""
+	}
+	if !strings.Contains(u, "://") {
+		u = "https://" + u
+	}
+	scheme, rest, _ := strings.Cut(u, "://")
+	host, path := rest, ""
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		host, path = rest[:i], rest[i:]
+	}
+	scheme, host = strings.ToLower(scheme), strings.ToLower(host)
+	if scheme == "https" {
+		host = strings.TrimSuffix(host, ":443")
+	}
+	return scheme + "://" + host + path
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
@@ -138,6 +163,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 	res, err := c.HTTP.Do(req)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return context.Canceled
+		}
 		return fmt.Errorf("can't reach the Cloudex API at %s: %w", c.BaseURL, err)
 	}
 	defer res.Body.Close()
@@ -146,13 +174,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return err
 	}
 	if res.StatusCode >= 300 {
-		var e struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(data, &e) != nil || e.Error == "" {
-			e.Error = plainError(res.Status, string(data))
-		}
-		return &Error{Status: res.StatusCode, Message: e.Error}
+		return c.failure(ctx, res, data)
 	}
 	if out == nil {
 		return nil
@@ -160,16 +182,42 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	return json.Unmarshal(data, out)
 }
 
+// The API answers a route it doesn't have with {"error":"not found"}, and
+// every real 404 says what is missing, so that answer means the deployment is
+// older than the CLI. The health route has existed from the start, so it never
+// means that.
+func (c *Client) failure(ctx context.Context, res *http.Response, data []byte) *Error {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(data, &e) != nil || e.Error == "" {
+		e.Error = plainError(res.Status, string(data))
+	}
+	if res.StatusCode == http.StatusNotFound && e.Error == "not found" && res.Request.URL.Path != "/v1/health" {
+		e.Error = "this deployment is older than the CLI"
+		if h, err := c.Health(ctx); err == nil && c.CLIVersion != "" {
+			e.Error += fmt.Sprintf(" (%s vs %s)", h.Version, c.CLIVersion)
+		}
+		e.Error += ": update it with cloudex deploy"
+	}
+	return &Error{Status: res.StatusCode, Message: e.Error}
+}
+
 var htmlTitle = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 
 // plainError makes an answer that isn't the API's JSON readable: an HTML error
-// page (from Cloudflare, say) becomes its title.
+// page (from Cloudflare, say) becomes its status and title, without saying the
+// status twice when the title starts with it.
 func plainError(status, body string) string {
 	body = strings.TrimSpace(body)
 	if strings.HasPrefix(body, "<") {
 		title := ""
 		if m := htmlTitle.FindStringSubmatch(body); m != nil {
 			title = strings.Join(strings.Fields(m[1]), " ")
+		}
+		code, _, _ := strings.Cut(status, " ")
+		if strings.HasPrefix(title, code) {
+			return title
 		}
 		return strings.TrimSpace(status + " " + title)
 	}

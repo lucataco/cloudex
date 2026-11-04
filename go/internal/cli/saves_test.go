@@ -12,16 +12,17 @@ const saveJSON = `{"name":"base","id":"sv-aaaaaaaaaa","sandbox":"cx-abc123","kin
 
 func TestSaveSavesTheCurrentSandbox(t *testing.T) {
 	f := withFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/cx-abc123":        sandboxJSON,
 		"POST /v1/sandboxes/cx-abc123/saves": "!201 " + strings.Replace(saveJSON, `"ms":20000`, `"ms":20000,"replaced":true`, 1),
 	})
 	cfg, _ := config.Load()
 	cfg.Current = "cx-abc123"
 	cfg.Save()
 	code, out, errOut := run(t, "save", "base")
-	if code != 0 || f.bodies[0] != `{"name":"base"}` {
+	if code != 0 || f.bodies[1] != `{"name":"base"}` {
 		t.Fatalf("code %d, body %v, stderr %q", code, f.bodies, errOut)
 	}
-	for _, want := range []string{"Saved cx-abc123 as base: 1234 paths in 2.0 GiB, 700.0 MiB stored.", "replaces the earlier save", "cloudex new --from base"} {
+	for _, want := range []string{"Saved web as base: 1234 paths in 2.0 GiB, 700.0 MiB stored.", "replaces the earlier save", "cloudex new --from base"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("stdout %q lacks %q", out, want)
 		}
@@ -100,5 +101,16 @@ func TestNewFromNothing(t *testing.T) {
 	withFakeAPI(t, map[string]string{})
 	if code, _, errOut := run(t, "new", "--from", "nope"); code == 0 || !strings.Contains(errOut, "no sandbox or save named nope") {
 		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestSavesNamesTheSandboxesTheyCameFrom(t *testing.T) {
+	withFakeAPI(t, map[string]string{
+		"GET /v1/saves":     "[" + saveJSON + "," + strings.NewReplacer(`"name":"base"`, `"name":"old"`, `"sandbox":"cx-abc123"`, `"sandbox":"cx-gone99"`).Replace(saveJSON) + "]",
+		"GET /v1/sandboxes": "[" + sandboxJSON + "]",
+	})
+	code, out, errOut := run(t, "saves")
+	if code != 0 || !strings.Contains(out, "web\n") || !strings.Contains(out, "cx-gone99\n") || strings.Contains(out, "cx-abc123") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}
 }

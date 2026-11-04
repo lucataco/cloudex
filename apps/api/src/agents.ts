@@ -85,13 +85,20 @@ show() {
 # (one that failed to start) get one.
 reconcile() {
   running "$d" && return 0
-  local cur
+  local cur sid
   cur=$(jq '.current // empty' "$d/state.json")
   if [ -n "$cur" ]; then
     rm -f "$d"/queue/*.json
     local err="this turn didn't finish: the sandbox stopped, or was forked, while it ran"
+    # A stop mid-write leaves a torn last line; it goes, so that end_turn's event starts a line of its own.
+    [ -z "$(tail -c 1 "$d/events.jsonl")" ] ||
+      { head -n "$(wc -l <"$d/events.jsonl")" "$d/events.jsonl" >"$d/events.new" && mv "$d/events.new" "$d/events.jsonl"; }
+    sid=$(jq -nrR --argjson turn "$cur" '[inputs | fromjson? | select(.turn == $turn and .type == "event")
+      | .event | .session_id // .thread_id // empty] | last // empty' "$d/events.jsonl")
     end_turn "$cur" null true "$err"
-    set_state --arg err "$err" --argjson at "$(now)" '.current = null | .lastMessage = null | .lastExitCode = null | .error = $err | .updatedAt = $at'
+    set_state --arg err "$err" --arg sid "$sid" --argjson at "$(now)" \
+      '.sessionId = (if $sid == "" then .sessionId else $sid end) | .current = null | .lastMessage = null
+       | .lastExitCode = null | .error = $err | .updatedAt = $at'
   elif [ -n "$(ls "$d/queue")" ]; then
     launch
   fi
@@ -201,7 +208,8 @@ run_turn() { # turn
 
 case $op in
   start)
-    id=$1 agent=$2 cwd=$3 model=$4
+    id=$1 agent=$2 model=$4
+    cwd=$(sed 's|^~$||; s|^~/||' <<<"$3")
     command -v "$agent" >/dev/null || fail 4 "$agent isn't installed in this sandbox"
     cd "$HOME" && cwd=$(cd "$cwd" 2>/dev/null && pwd) || fail 4 "there's no directory $3 in the sandbox"
     d=$root/$id
@@ -248,8 +256,9 @@ case $op in
       busy "$d" || break
       sleep 0.25
     done
-    LC_ALL=C awk -v after="$after" -v max=524288 \
-      'NR > after { if (n && bytes + length($0) > max) exit; print; bytes += length($0) + 1; n++ }' "$d/events.jsonl" |
+    # Whole lines only: the runner may be partway through writing the last one.
+    LC_ALL=C awk -v after="$after" -v total="$(wc -l <"$d/events.jsonl")" -v max=524288 \
+      'NR > total { exit } NR > after { if (n && bytes + length($0) > max) exit; print; bytes += length($0) + 1; n++ }' "$d/events.jsonl" |
       jq -cs --argjson after "$after" --argjson agent "$(show "$d")" \
         '{events: [to_entries[] | {seq: (.key + $after + 1)} + .value], next: ($after + length), agent: $agent}'
     ;;

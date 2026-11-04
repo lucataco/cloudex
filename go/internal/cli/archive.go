@@ -22,6 +22,10 @@ const uploadLimit = 100 << 20
 // dir. Directories in the list are packed whole. Returns the number of
 // entries and their total size.
 func packDir(w io.Writer, dir string, files []string) (int, int64, error) {
+	// WalkDir doesn't descend into a root that is a symlink.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	n, size := 0, int64(0)

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/config"
 	"github.com/lucataco/cloudex/go/internal/update"
 	"github.com/spf13/cobra"
@@ -23,6 +24,10 @@ var executable = self
 // isRelease is false for builds from source, which report "dev".
 func isRelease(version string) bool {
 	return strings.HasPrefix(version, "v")
+}
+
+func deploymentIsOlder(cliVersion string, h *api.Health) bool {
+	return isRelease(cliVersion) && update.Newer(cliVersion, h.Version)
 }
 
 func newUpdateCmd(version string, opts *options) *cobra.Command {
@@ -92,7 +97,7 @@ func updateDeployment(cmd *cobra.Command, opts *options, exe, version string, ch
 		fmt.Fprintf(cmd.ErrOrStderr(), "Couldn't check your deployment: %v\n", err)
 		return nil
 	}
-	if !isRelease(version) || !update.Newer(version, h.Version) {
+	if !deploymentIsOlder(version, h) {
 		fmt.Fprintf(out, "Your deployment runs %s.\n", h.Version)
 		return nil
 	}
@@ -137,12 +142,20 @@ func saveLatest(latest string) {
 	os.WriteFile(p, data, 0o600)
 }
 
+func updateCheckOff() bool {
+	switch strings.ToLower(os.Getenv("CLOUDEX_NO_UPDATE_CHECK")) {
+	case "", "0", "false":
+		return false
+	}
+	return true
+}
+
 // startUpdateCheck looks for a newer release at most once a day, in the
 // background, when a person is at the terminal. The function it returns
 // prints a one-line notice if there is one.
 func startUpdateCheck(version string, args []string, stderr io.Writer) func() {
 	f, ok := stderr.(*os.File)
-	if !ok || !isTerminal(f) || !isRelease(version) || os.Getenv("CLOUDEX_NO_UPDATE_CHECK") != "" {
+	if !ok || !isTerminal(f) || !isRelease(version) || updateCheckOff() {
 		return func() {}
 	}
 	for _, a := range args {
@@ -154,6 +167,10 @@ func startUpdateCheck(version string, args []string, stderr io.Writer) func() {
 			break
 		}
 	}
+	return checkForUpdate(version, stderr)
+}
+
+func checkForUpdate(version string, stderr io.Writer) func() {
 	p, err := updateCheckPath()
 	if err != nil {
 		return func() {}
@@ -166,6 +183,9 @@ func startUpdateCheck(version string, args []string, stderr io.Writer) func() {
 	if time.Since(time.Unix(last.CheckedAt, 0)) < 24*time.Hour {
 		close(done)
 	} else {
+		// Record the attempt first, so a GitHub that never answers slows one
+		// command a day, not every one.
+		saveLatest(last.Latest)
 		go func() {
 			defer close(done)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

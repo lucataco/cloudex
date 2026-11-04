@@ -5,12 +5,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/config"
@@ -276,5 +280,161 @@ func TestOneLine(t *testing.T) {
 		if got := oneLine(in, 10); got != want {
 			t.Errorf("oneLine(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestKeysSetChecksTheProviderBeforeAskingForAKey(t *testing.T) {
+	f := withFakeAPI(t, nil)
+	code, _, errOut := run(t, "keys", "set", "gemini")
+	if code != 1 || !strings.Contains(errOut, "unknown provider gemini: use anthropic or openai") || strings.Contains(errOut, "no key") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	if len(f.requests) != 0 {
+		t.Fatalf("sent %v", f.requests)
+	}
+}
+
+func TestKeysSetSaysHowARunningSandboxGetsTheKey(t *testing.T) {
+	withFakeAPI(t, map[string]string{"PUT /v1/keys/openai": `{"provider":"openai","hint":"…wxyz","updatedAt":5}`})
+	t.Setenv("OPENAI_API_KEY", "sk-test-wxyz")
+	code, out, errOut := run(t, "keys", "set", "openai", "--from-env")
+	if code != 0 || !strings.Contains(out, "already uses an openai key") || !strings.Contains(out, "cloudex stop <sandbox>, then cloudex resume <sandbox>") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
+func TestAgentsStartAlwaysSaysTheAgentID(t *testing.T) {
+	f := &fakeAgents{
+		answers: map[string]string{"POST /v1/sandboxes/cx-abc123/agents": agentJSON("ag-aaaaaaaa", "running", 0, 1, "null")},
+		events: []string{
+			`{"events":[],"next":0,"agent":` + agentJSON("ag-aaaaaaaa", "idle", 0, 1, "0") + `}`,
+		},
+	}
+	newFakeAgents(t, f)
+	var out, errOut bytes.Buffer
+	if code := Run("test", []string{"--json", "agents", "start", "fix it"}, &out, &errOut); code != 0 || !strings.Contains(errOut.String(), "Started ag-aaaaaaaa (claude)") {
+		t.Fatalf("code %d, stderr %q", code, errOut.String())
+	}
+}
+
+func TestAgentsStartDetachedHintNamesTheSandbox(t *testing.T) {
+	f := &fakeAgents{answers: map[string]string{"POST /v1/sandboxes/web/agents": agentJSON("ag-aaaaaaaa", "running", 0, 1, "null")}}
+	newFakeAgents(t, f)
+	code, out, errOut := run(t, "agents", "start", "-d", "web", "fix it")
+	if code != 0 || !strings.Contains(out, "cloudex agents logs -f web ag-aaaaaaaa") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
+func TestAnUnquotedTaskIsToldToBeQuoted(t *testing.T) {
+	newFakeAgents(t, &fakeAgents{})
+	for _, args := range [][]string{
+		{"prompt", "fix", "the", "bug"},
+		{"agents", "start", "fix", "the", "bug"},
+		{"agents", "send", "now", "add", "a", "test"},
+	} {
+		if code, _, errOut := run(t, args...); code != 1 || !strings.Contains(errOut, "in quotes") {
+			t.Fatalf("%v: code %d, stderr %q", args, code, errOut)
+		}
+	}
+	newFakeAPI(t, map[string]string{"POST /v1/sandboxes/fix/agents": `!404 {"error":"no sandbox named fix"}`})
+	code, _, errOut := run(t, "agents", "start", "fix", "bug")
+	if code != 1 || !strings.Contains(errOut, `no sandbox named fix. If "fix" was the start of your task, put the whole task in quotes`) {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestAttachTreatsASessionNameAsASession(t *testing.T) {
+	for _, c := range []struct {
+		args           []string
+		named, session string
+	}{
+		{nil, "", ""},
+		{[]string{"web"}, "web", ""},
+		{[]string{"agent-1"}, "agent-1", ""},
+		{[]string{"agent-1104-153012"}, "", "agent-1104-153012"},
+		{[]string{"agent-1104-153012-2"}, "", "agent-1104-153012-2"},
+		{[]string{"web", "agent-1104-153012"}, "web", "agent-1104-153012"},
+	} {
+		if named, session := attachTarget(c.args); named != c.named || session != c.session {
+			t.Errorf("attachTarget(%q) = %q, %q", c.args, named, session)
+		}
+	}
+}
+
+func fakeSSH(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a shell script")
+	}
+	dir := t.TempDir()
+	log := filepath.Join(dir, "args")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + log + "\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return log
+}
+
+func TestPromptAndAttachHintsNameTheSandbox(t *testing.T) {
+	log := fakeSSH(t)
+	withFakeAPI(t, map[string]string{"GET /v1/sandboxes/web": sandboxJSON})
+	if code, _, errOut := run(t, "prompt", "-d", "web", "fix it"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if b, _ := os.ReadFile(log); !strings.Contains(string(b), `Watch it with: cloudex attach web"`) {
+		t.Fatalf("ssh got %q", b)
+	}
+	if code, _, errOut := run(t, "prompt", "web", "fix it"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if b, _ := os.ReadFile(log); !strings.Contains(string(b), "reattach with cloudex attach web.") {
+		t.Fatalf("ssh got %q", b)
+	}
+	if code, _, errOut := run(t, "attach", "web", "agent-1104-153012"); code != 0 {
+		t.Fatalf("code %d: %s", code, errOut)
+	}
+	if b, _ := os.ReadFile(log); !strings.Contains(string(b), "cloudex-agent attach 'agent-1104-153012'") {
+		t.Fatalf("ssh got %q", b)
+	}
+}
+
+func TestFollowingAgentSaysHowToFollowAgainWhenTheNetworkFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/events") {
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			conn.Close()
+			return
+		}
+		io.WriteString(w, agentJSON("ag-aaaaaaaa", "running", 1, 1, "null"))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", srv.URL)
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	code, _, errOut := run(t, "agents", "logs", "-f", "web", "ag-aaaaaaaa")
+	if code != 1 || !strings.Contains(errOut, "Follow it again with: cloudex agents logs -f web ag-aaaaaaaa") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	if lostTouch(exitError{2}) || lostTouch(&api.Error{Status: 404, Message: "no agent"}) || !lostTouch(&api.Error{Status: 502, Message: "bad gateway"}) {
+		t.Fatal("lostTouch misjudged an error")
+	}
+}
+
+func TestFollowingACommandSaysHowToFollowAgainWhenTheNetworkFails(t *testing.T) {
+	defer func(f time.Duration, e time.Duration) { commandRetryFor, commandRetryEvery = f, e }(commandRetryFor, commandRetryEvery)
+	commandRetryFor, commandRetryEvery = 20*time.Millisecond, 10*time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", srv.URL)
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	code, _, errOut := run(t, "commands", "logs", "-f", "web", "cm-1a2b3c4d")
+	if code != 1 || !strings.Contains(errOut, "Follow cm-1a2b3c4d again with: cloudex commands logs -f web cm-1a2b3c4d") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
 	}
 }

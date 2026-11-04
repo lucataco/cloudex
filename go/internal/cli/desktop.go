@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,7 +47,7 @@ func newDesktopCmd(opts *options) *cobra.Command {
 		Example: "  cloudex desktop\n  cloudex desktop my-box --size 1920x1080\n  cloudex desktop --link\n  cloudex desktop --stop",
 		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !screenSize.MatchString(size) {
+			if size != "" && !screenSize.MatchString(size) {
 				return fmt.Errorf("bad size %q: use WIDTHxHEIGHT, such as 1280x720", size)
 			}
 			if quality < 0 || quality > 9 {
@@ -68,14 +67,14 @@ func newDesktopCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if s.State != "running" {
-				return fmt.Errorf("%s is %s; start it with: cloudex resume %s", s.Label(), s.State, s.Label())
+			if err := needRunning(s); err != nil {
+				return err
 			}
 			out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 
 			if stop {
 				if err := client.StopDesktop(ctx, s.ID); err != nil {
-					return desktopError(err)
+					return err
 				}
 				if opts.json {
 					return writeJSON(out, map[string]bool{"stopped": true})
@@ -89,7 +88,7 @@ func newDesktopCmd(opts *options) *cobra.Command {
 			d, err := client.Desktop(startCtx, s.ID, size)
 			cancelStart()
 			if err != nil {
-				return desktopError(err)
+				return err
 			}
 			if cmd.Flags().Changed("quality") {
 				d.Path = withQuery(d.Path, "quality", strconv.Itoa(quality))
@@ -132,7 +131,7 @@ func newDesktopCmd(opts *options) *cobra.Command {
 			return forward(ctx, ln, client, s.ID, d.Port, errOut)
 		},
 	}
-	cmd.Flags().StringVar(&size, "size", "1280x720", "screen size; a running desktop is resized")
+	cmd.Flags().StringVar(&size, "size", "", "screen size, WIDTHxHEIGHT (a new desktop gets 1280x720; a running one is resized only when you give this)")
 	cmd.Flags().BoolVar(&link, "link", false, "print an HTTPS link on your preview domain instead of using a local port")
 	cmd.Flags().IntVar(&port, "port", 0, fmt.Sprintf("local port to use (default %d, or a free one)", desktopLocalPort))
 	cmd.Flags().IntVar(&quality, "quality", 3, "picture quality, 0 to 9: lower uses less bandwidth on moving images (text stays sharp)")
@@ -150,15 +149,6 @@ func withQuery(path, key, value string) string {
 	}
 	values.Set(key, value)
 	return page + "?" + values.Encode()
-}
-
-// desktopError explains a 404 from a deployment that predates the desktop.
-func desktopError(err error) error {
-	var apiErr *api.Error
-	if errors.As(err, &apiErr) && apiErr.Status == 404 && apiErr.Message == "not found" {
-		return errors.New("this deployment doesn't have the desktop yet; update it with: cloudex deploy")
-	}
-	return err
 }
 
 // listenLocal listens on localhost: on port if given, else on the usual port

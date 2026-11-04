@@ -116,6 +116,7 @@ const GUEST_HOME = "/home/cloudex";
 const OUTPUT_LIMIT = 1 << 20;
 const FILE_TIMEOUT_MS = 30 * 60_000; // an upload or unpack of up to 100 MB
 const KEEPALIVE_MS = 15_000; // the longest a streamed exec stays quiet
+const REPLAY_LIMIT = 1 << 20;
 const SSH_KEY = /^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^\n]*)?$/;
 
 type CreateInput = {
@@ -133,7 +134,21 @@ export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?:
 type Links = { epoch: number; ports: Record<string, { gen: number; at: number | null }> };
 type ExecInput = { cmd: string; root: boolean; cwd?: string; timeoutSec: number };
 
+export const NO_SUCH_SANDBOX = "no such sandbox";
+
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
+
+function wrongState(r: SandboxRecord) {
+  const name = r.name ?? r.id;
+  if (r.state === "starting" || r.state === "stopping") return `${name} is ${r.state}; try again in a moment`;
+  if (r.state === "error") return `${name} didn't start; resume it to try again, or delete it`;
+  return `${name} is ${r.state}; resume it first`;
+}
+
+const unsavedStop = (r: SandboxRecord, how: string) =>
+  r.savedAt
+    ? `${how} before it could save; resume starts from its last save or backup`
+    : `${how} before its first save; resume starts it over, without its changes`;
 
 function clip(buf: ArrayBuffer) {
   const text = new TextDecoder().decode(buf.byteLength > OUTPUT_LIMIT ? buf.slice(0, OUTPUT_LIMIT) : buf);
@@ -199,7 +214,9 @@ export class Sandbox extends DurableObject<Env> {
   private queue: Promise<unknown> = Promise.resolve();
   private lastActivity = Date.now();
   private lastActivitySaved = 0;
+  private execs = 0;
   private exitedAt = 0;
+  private exited: Promise<void> = Promise.resolve();
   // Guest ports that listen only on localhost, and the port of the relay for
   // each, in this run.
   private relayed = new Map<number, number>();
@@ -213,6 +230,7 @@ export class Sandbox extends DurableObject<Env> {
   // Set while remove() runs, so that nothing outside the lifecycle queue
   // writes the record back.
   private removing = false;
+  private inactivitySet = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -221,7 +239,43 @@ export class Sandbox extends DurableObject<Env> {
       this.lastActivity = (await ctx.storage.get<number>("lastActivity")) ?? Date.now();
       // After an eviction or deploy, reattach the exit watcher to a running box.
       if (ctx.container?.running) this.watch();
+      if (this.record?.state === "starting" || this.record?.state === "stopping") await this.repair(this.record);
+      if (this.record?.state === "running" && ctx.container?.running && (await ctx.storage.getAlarm()) === null) {
+        await ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+      }
     });
+  }
+
+  // A start or stop that an eviction or a deploy cut off has nobody left to
+  // finish it. A stop whose box still runs carries on running. A cut-off
+  // start's box goes, because a restore in it may be half done, which its
+  // next save would keep over the good copy, and its keys, settings and tools
+  // aren't set up. Either way it counts as stopped, or as a failed start if it
+  // never made a save.
+  private async repair(r: SandboxRecord) {
+    const running = this.ctx.container?.running;
+    if (r.state === "stopping" && running) {
+      await this.update({ state: "running" });
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+    } else {
+      const savedThisRun = r.state === "stopping" && (r.savedAt ?? 0) >= (r.startedAt ?? 0);
+      await this.update({
+        state: r.savedAt ? "stopped" : "error",
+        stoppedAt: Date.now(),
+        error: savedThisRun
+          ? null
+          : r.state === "starting"
+            ? "start failed: it was cut off partway by an update or restart of the deployment"
+            : unsavedStop(r, "stopped"),
+      });
+      // Queued, not awaited, because blockConcurrencyWhile resets the object
+      // after 30 s; the alarm finishes the job if this object goes first.
+      if (running) {
+        await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+        void this.exclusive(() => this.destroyContainer(r.id)).catch((e) => console.error(`[${r.id}] ${message(e)}`));
+      }
+    }
+    console.log(`[${r.id}] was ${r.state} after a restart; now ${this.record?.state}`);
   }
 
   private get container() {
@@ -231,14 +285,14 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   private mustRecord(): SandboxRecord {
-    if (!this.record || this.removing) fail(404, "no such sandbox");
+    if (!this.record || this.removing) fail(404, NO_SUCH_SANDBOX);
     return this.record;
   }
 
   // The record of a running sandbox, for work inside it, which counts as activity.
   private mustRun(): SandboxRecord {
     const r = this.mustRecord();
-    if (r.state !== "running") fail(409, `${r.name ?? r.id} is ${r.state}; resume it first`);
+    if (r.state !== "running") fail(409, wrongState(r));
     this.touch();
     return r;
   }
@@ -270,7 +324,7 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   private watch() {
-    this.container.monitor().then(
+    this.exited = this.container.monitor().then(
       () => this.onExit(),
       (e) => this.onExit(e),
     );
@@ -288,7 +342,7 @@ export class Sandbox extends DurableObject<Env> {
     await this.update({
       state: "stopped",
       stoppedAt: Date.now(),
-      error: savedThisRun ? null : "stopped by the platform before it could save; resume starts from the previous save",
+      error: savedThisRun ? null : unsavedStop(r, "stopped by the platform"),
     });
   }
 
@@ -336,7 +390,13 @@ export class Sandbox extends DurableObject<Env> {
       }
       // The same for a named save, which is restored again until then.
       if (save) await this.ctx.storage.put("fromSave", save);
-      await this.boot(from?.snapshot, undefined, save);
+      try {
+        await this.boot(from?.snapshot, undefined, save);
+      } catch (e) {
+        const { status, message: why } = errorStatus(e);
+        const r = this.mustRecord();
+        fail(status, `${why.replace(/\.$/, "")}. ${r.name ?? r.id} is kept, in state ${r.state}: resume it to try again, or delete it`);
+      }
       if (settings?.repo && !from && !save) await this.clone(settings.repo);
       await this.startHook();
       return this.mustRecord();
@@ -345,15 +405,22 @@ export class Sandbox extends DurableObject<Env> {
 
   private async clone(repo: NonNullable<StoredSettings["repo"]>) {
     const t0 = Date.now();
-    const out = await this.asGuest([CLONE_SCRIPT, repo.url, repo.dir, repo.branch ?? ""], "cloning", 10 * 60_000);
-    const why = new TextDecoder().decode(out.stderr).trim().split("\n").slice(-2).join(" ");
-    if (out.exitCode === 0) {
-      console.log(`[${this.mustRecord().id}] cloned ${repo.url} in ${Date.now() - t0} ms${why ? `: ${why}` : ""}`);
-      return;
+    let why: string;
+    let hint = "";
+    try {
+      const out = await this.asGuest([CLONE_SCRIPT, repo.url, repo.dir, repo.branch ?? ""], "cloning", 10 * 60_000);
+      const err = new TextDecoder().decode(out.stderr).trim().split("\n").slice(-2).join(" ");
+      if (out.exitCode === 0) {
+        console.log(`[${this.mustRecord().id}] cloned ${repo.url} in ${Date.now() - t0} ms${err ? `: ${err}` : ""}`);
+        return;
+      }
+      why = err || `git exited with code ${out.exitCode}`;
+      // GitHub asks for a login for a private repo, and for one that isn't there.
+      if (/could not read Username/.test(err)) hint = " If it's private, set GH_TOKEN in the sandbox's env.";
+    } catch (e) {
+      why = message(e);
     }
-    // GitHub asks for a login for a private repo, and for one that isn't there.
-    const hint = /could not read Username/.test(why) ? " If it's private, set GH_TOKEN in the sandbox's env." : "";
-    const notice = `Couldn't clone ${repo.url} into ~/${repo.dir}: ${why || `git exited with code ${out.exitCode}`}.${hint}`;
+    const notice = `Couldn't clone ${repo.url} into ~/${repo.dir}: ${why}.${hint}`;
     await this.update({ notice: [this.mustRecord().notice, notice].filter(Boolean).join(" ") });
   }
 
@@ -424,14 +491,15 @@ export class Sandbox extends DurableObject<Env> {
           "saving the disk",
         );
         console.log(`[${r.id}] saved ${snap.size} bytes for a fork in ${Date.now() - t0} ms`);
+        this.touch();
         return { sandbox: r.id, snapshot: { id: snap.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
       }
-      if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}; try again when it has finished`);
+      if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
       const snapshot = await this.ctx.storage.get<{ id: string }>("snapshot");
-      if (!snapshot) fail(409, `${r.id} has no saved disk to fork; resume it, then fork it`);
+      if (!snapshot) fail(409, `${r.name ?? r.id} has no saved disk to fork; resume it, then fork it`);
       const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
       if (Date.now() - touched > SAVE_LIFETIME_MS) {
-        fail(409, `${r.id}'s save has expired; resume it (which restores its backup), then fork it`);
+        fail(409, `${r.name ?? r.id}'s save has expired; resume it (which restores its backup), then fork it`);
       }
       return { sandbox: r.id, snapshot: { id: snapshot.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
     });
@@ -446,10 +514,11 @@ export class Sandbox extends DurableObject<Env> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
       if (r.state === "running") {
+        if (fromBackup) fail(409, `${r.name ?? r.id} is running; stop it, then resume it from its backup`);
         if (size && size !== r.size) fail(409, `${r.name ?? r.id} is running on ${r.size}; stop it, then resume it on ${size}`);
         return r;
       }
-      if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}`);
+      if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
       if (!size || size === r.size) return this.resumeFrom(fromBackup);
       await this.update({ size });
       try {
@@ -466,22 +535,23 @@ export class Sandbox extends DurableObject<Env> {
   private async resumeFrom(fromBackup: boolean): Promise<SandboxRecord> {
     const r = this.mustRecord();
     const snapshot = await this.ctx.storage.get("snapshot");
+    const fromSave = snapshot ? undefined : await this.ctx.storage.get<SaveManifest>("fromSave");
     const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
     const expired = Boolean(snapshot) && Date.now() - touched > SAVE_LIFETIME_MS;
-    if (fromBackup || expired) {
+    const homeOnlyInBackup = !snapshot && !fromSave && r.savedAt !== null;
+    if (fromBackup || expired || homeOnlyInBackup) {
       const bucket = backupBucket(this.env);
       const backup = bucket ? await latestBackup(bucket, r.id) : null;
       if (backup) {
-        await this.bootFromBackup(backup, fromBackup ? "as asked" : "its save had expired");
+        await this.bootFromBackup(backup, fromBackup ? "as asked" : expired ? "its save had expired" : "it stopped before it could save");
         await this.startHook();
         return this.mustRecord();
       }
-      if (fromBackup) fail(404, bucket ? `${r.id} has no backup yet` : "backups are off: this deployment has no R2 bucket");
+      if (fromBackup) fail(404, bucket ? `${r.name ?? r.id} has no backup yet` : "backups are off: this deployment has no R2 bucket");
     }
     // Started from a named save, and stopped before it made a save of its own:
     // it starts from that save again, or from the newest save of its name if
     // it has been saved over, or from the image if it's gone.
-    const fromSave = snapshot ? undefined : await this.ctx.storage.get<SaveManifest>("fromSave");
     if (fromSave) {
       const m = await this.currentSave(fromSave);
       let note = "";
@@ -522,7 +592,7 @@ export class Sandbox extends DurableObject<Env> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
       if (r.state === "stopped" || r.state === "error") return r;
-      if (r.state !== "running") fail(409, `${r.id} is ${r.state}`);
+      if (r.state !== "running") fail(409, wrongState(r));
       await this.saveAndDestroy();
       return this.mustRecord();
     });
@@ -532,7 +602,7 @@ export class Sandbox extends DurableObject<Env> {
   // before the container goes, so the alarm does it a moment later.
   async requestStop(): Promise<SandboxRecord> {
     const r = this.mustRecord();
-    if (r.state !== "running") fail(409, `${r.name ?? r.id} is ${r.state}`);
+    if (r.state !== "running") fail(409, wrongState(r));
     await this.ctx.storage.put("stopRequested", true);
     await this.ctx.storage.setAlarm(Date.now() + 1000);
     return r;
@@ -621,6 +691,11 @@ export class Sandbox extends DurableObject<Env> {
       this.removing = true;
       try {
         return await this.removeAll(r);
+      } catch (e) {
+        // Undo the stopping mark so it can be deleted again. A container
+        // already destroyed shows up as an exit at the next alarm.
+        this.record = r;
+        throw e;
       } finally {
         this.removing = false;
       }
@@ -629,6 +704,9 @@ export class Sandbox extends DurableObject<Env> {
 
   private async removeAll(r: SandboxRecord): Promise<{ deleted: string }> {
     if (this.ctx.container?.running) await withTimeout(this.container.destroy(), 60_000, "destroy");
+    // Before its storage, so that a later failure leaves a sandbox to delete
+    // again, not an index row holding its name.
+    await deleteSandbox(this.env.DB, r.id);
     const bucket = backupBucket(this.env);
     if (bucket) {
       try {
@@ -639,7 +717,6 @@ export class Sandbox extends DurableObject<Env> {
     }
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
-    await deleteSandbox(this.env.DB, r.id);
     this.record = undefined;
     // Its backups are gone. The last save can't be deleted from a Worker; it
     // expires on its own 30 days after it was made or last restored.
@@ -651,6 +728,10 @@ export class Sandbox extends DurableObject<Env> {
   private async boot(snapshot?: unknown, afterReady?: () => Promise<void>, restore?: SaveManifest) {
     const r = this.mustRecord();
     const c = this.container;
+    // A stop whose destroy failed can leave the last run's container up. It
+    // goes before t0, so that waitReady doesn't take its exit for this run's.
+    if (c.running) await this.destroyContainer(r.id);
+    if (c.running) fail(503, `${r.name ?? r.id} didn't start: its last run hasn't stopped yet; try again in a minute`);
     const t0 = Date.now();
     // A new run: no relays yet, and no stop asked for from inside the last one.
     this.relayed.clear();
@@ -724,18 +805,12 @@ export class Sandbox extends DurableObject<Env> {
         console.error(`[${r.id}] ${platformProblem}`);
       }
     } catch (e) {
-      try {
-        if (c.running) await withTimeout(c.destroy(), 60_000, "destroy");
-      } catch {}
+      if (c.running) await this.destroyContainer(r.id);
       const why = message(e);
       await this.update({ state: r.savedAt ? "stopped" : "error", error: `start failed: ${why}` });
-      fail(503, `${r.id} didn't start: ${why}`);
+      fail(503, `${r.name ?? r.id} didn't start: ${why}`);
     }
-    try {
-      await withTimeout(c.setInactivityTimeout(PLATFORM_MAX_INACTIVITY_MS), 30_000, "setInactivityTimeout");
-    } catch (e) {
-      console.error(`[${r.id}] ${message(e)}`);
-    }
+    await this.setInactivity(r.id);
     console.log(`[${r.id}] ready in ${Date.now() - t0} ms (${snapshot ? "from save" : restore ? `from the save ${restore.name}` : "fresh"})`);
     this.touch();
     await this.update({
@@ -905,12 +980,41 @@ export class Sandbox extends DurableObject<Env> {
       await this.save();
     } catch (e) {
       await this.update({ state: "running", error: `save failed: ${message(e)}` });
-      fail(500, `couldn't save ${r.id}, so it is still running: ${message(e)}`);
+      // An alarm that came while it was stopping didn't set the next one.
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+      fail(500, `couldn't save ${r.name ?? r.id}, so it is still running: ${message(e)}`);
     }
     await this.backup();
-    await withTimeout(this.container.destroy(), 60_000, "destroy");
     await this.ctx.storage.deleteAlarm();
+    // The save and the backup are done, so it counts as stopped either way.
+    await this.destroyContainer(r.id);
     await this.update({ state: "stopped", stoppedAt: Date.now(), error: null });
+  }
+
+  // A container that doesn't go keeps billing, so the alarm tries again.
+  private async destroyContainer(id: string) {
+    try {
+      await withTimeout(this.container.destroy(), 60_000, "destroy");
+      // The exit watcher may never settle for a box that never got an instance.
+      await Promise.race([this.exited, sleep(10_000)]);
+    } catch (e) {
+      console.error(`[${id}] ${message(e)}; trying again in a minute`);
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+    }
+  }
+
+  private async setInactivity(id: string) {
+    try {
+      await withTimeout(this.container.setInactivityTimeout(PLATFORM_MAX_INACTIVITY_MS), 30_000, "setInactivityTimeout");
+      this.inactivitySet = true;
+    } catch (e) {
+      console.error(`[${id}] ${message(e)}`);
+    }
+  }
+
+  private leftOver() {
+    const state = this.record?.state;
+    return (state === "stopped" || state === "error") && Boolean(this.ctx.container?.running);
   }
 
   // Called through the outbound handler when the platform sends SIGTERM.
@@ -982,23 +1086,25 @@ export class Sandbox extends DurableObject<Env> {
     this.touch();
   }
 
-  // The command line and options exec runs a command with. GNU timeout puts the
-  // command in a process group of its own and stops the whole group, so
-  // what it started in the background goes too; the abort is a backstop.
-  private execArgs(input: ExecInput, signal: AbortSignal): [string[], ContainerExecOptions] {
+  private async startExec(input: ExecInput, signal: AbortSignal): Promise<ExecProcess> {
     const home = input.root ? "/root" : GUEST_HOME;
     // A relative directory, or one starting with ~, is in the home directory.
     const cwd = !input.cwd ? home : input.cwd.startsWith("/") ? input.cwd : `${home}/${input.cwd.replace(/^~(\/|$)/, "")}`;
-    return [
-      guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root),
-      {
-        cwd,
-        env: input.root
-          ? { HOME: "/root", USER: "root", LANG: "C.UTF-8", TERM: "dumb" }
-          : { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8", TERM: "dumb" },
-        signal,
-      },
-    ];
+    // The container runtime reports a missing directory as a missing command.
+    if (input.cwd) {
+      const found = this.container.exec(["test", "-d", cwd], { cwd: "/", signal }).then((p) => p.exitCode);
+      if ((await withTimeout(found, 30_000, "checking the directory")) !== 0) fail(400, `there's no directory ${cwd} in the sandbox`);
+    }
+    // GNU timeout puts the command in a process group of its own and stops the
+    // whole group, so what it started in the background goes too; the abort is
+    // a backstop.
+    return this.container.exec(guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root), {
+      cwd,
+      env: input.root
+        ? { HOME: "/root", USER: "root", LANG: "C.UTF-8", TERM: "dumb" }
+        : { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8", TERM: "dumb" },
+      signal,
+    });
   }
 
   async exec(input: ExecInput): Promise<ExecResult> {
@@ -1006,12 +1112,14 @@ export class Sandbox extends DurableObject<Env> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), input.timeoutSec * 1000 + 30_000);
     const t0 = Date.now();
+    this.execs++;
     try {
-      const p = await this.container.exec(...this.execArgs(input, ctl.signal));
+      const p = await this.startExec(input, ctl.signal);
       const out = await readOutput(p);
       return { ...out, timedOut: timedOut(out.exitCode, t0, input.timeoutSec) || ctl.signal.aborted, ms: Date.now() - t0 };
     } finally {
       clearTimeout(timer);
+      this.execs--;
       this.touch();
     }
   }
@@ -1024,12 +1132,20 @@ export class Sandbox extends DurableObject<Env> {
     const timer = setTimeout(() => ctl.abort(), input.timeoutSec * 1000 + 30_000);
     const t0 = Date.now();
     let p: ExecProcess;
+    this.execs++;
     try {
-      p = await this.container.exec(...this.execArgs(input, ctl.signal));
+      p = await this.startExec(input, ctl.signal);
     } catch (e) {
       clearTimeout(timer);
+      this.execs--;
       throw e;
     }
+    // Counted until the command exits, not until a client that stopped
+    // reading has taken all its output.
+    const exited = p.exitCode.finally(() => {
+      this.execs--;
+      this.touch();
+    });
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();
     const enc = new TextEncoder();
@@ -1081,7 +1197,7 @@ export class Sandbox extends DurableObject<Env> {
     const done = (async () => {
       let grace: ReturnType<typeof setTimeout> | null = null;
       try {
-        const exitCode = await p.exitCode;
+        const exitCode = await exited;
         grace = setTimeout(stop, EXIT_GRACE_MS);
         await pumps;
         await send({ type: "exit", exitCode, timedOut: timedOut(exitCode, t0, input.timeoutSec) || ctl.signal.aborted, ms: Date.now() - t0 });
@@ -1171,10 +1287,11 @@ export class Sandbox extends DurableObject<Env> {
     return JSON.parse(await this.fileOp("delete", [path, recursive ? "1" : "0"], root, undefined, 10 * 60_000));
   }
 
-  async writeFile(path: string, root: boolean, mode: string | null, body: ReadableStream | null): Promise<FileInfo> {
+  async writeFile(path: string, root: boolean, mode: string | null, body: ReadableStream | null, bytes?: number): Promise<FileInfo> {
     this.mustRun();
     try {
-      return JSON.parse(await this.fileOp("write", [path, mode ?? ""], root, body ?? new Response("").body!, FILE_TIMEOUT_MS));
+      const args = [path, mode ?? "", bytes === undefined ? "" : String(bytes)];
+      return JSON.parse(await this.fileOp("write", args, root, body ?? new Response("").body!, FILE_TIMEOUT_MS));
     } finally {
       this.touch();
     }
@@ -1257,16 +1374,15 @@ export class Sandbox extends DurableObject<Env> {
     }
   }
 
-  // Starts the desktop, installing it the first time, or resizes a running one.
-  async desktop(size: string): Promise<Desktop> {
+  async desktop(size?: string): Promise<Desktop> {
     const r = this.mustRun();
     const t0 = Date.now();
     try {
-      const out = await this.runScript(DESKTOP_SCRIPT, [size, r.name ?? r.id], "starting the desktop", DESKTOP_TIMEOUT_MS);
+      const out = await this.runScript(DESKTOP_SCRIPT, [size ?? "", r.name ?? r.id], "starting the desktop", DESKTOP_TIMEOUT_MS);
       const last = out.trim().split("\n").pop() ?? "";
-      const { installed, started } = JSON.parse(last) as { installed: boolean; started: boolean };
-      console.log(`[${r.id}] desktop ${started ? "started" : "running"} at ${size}${installed ? ", installed" : ""} in ${Date.now() - t0} ms`);
-      return { port: DESKTOP_PORT, path: DESKTOP_VIEWER, size, installed, started };
+      const { installed, started, size: shown } = JSON.parse(last) as { installed: boolean; started: boolean; size: string };
+      console.log(`[${r.id}] desktop ${started ? "started" : "running"} at ${shown}${installed ? ", installed" : ""} in ${Date.now() - t0} ms`);
+      return { port: DESKTOP_PORT, path: DESKTOP_VIEWER, size: shown, installed, started };
     } finally {
       this.touch();
     }
@@ -1280,6 +1396,12 @@ export class Sandbox extends DurableObject<Env> {
     return { stopped: true };
   }
 
+  private idle() {
+    const r = this.record;
+    const idleMs = (r?.idleMinutes ?? 0) * 60_000;
+    return r?.state === "running" && idleMs > 0 && this.execs === 0 && Date.now() - this.lastActivity > idleMs;
+  }
+
   // Idle stop. The platform's own inactivity timer only sees incoming
   // connections, so this is what actually ends a quiet box. An open bridge
   // counts only while its client sends something (ssh keepalives every 30 s,
@@ -1289,8 +1411,16 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.record;
     const stopRequested = await this.ctx.storage.get<boolean>("stopRequested");
     if (stopRequested) await this.ctx.storage.delete("stopRequested");
+    if (r && this.leftOver()) {
+      return this.exclusive(async () => {
+        if (this.leftOver()) await this.destroyContainer(r.id);
+      });
+    }
     if (!r || r.state !== "running") return;
     if (!this.ctx.container?.running) return this.onExit();
+    // An object that restarted, as after a deploy, leaves its running box on
+    // the platform's short default until it's set again.
+    if (!this.inactivitySet) await this.setInactivity(r.id);
     if (stopRequested) {
       try {
         await this.exclusive(async () => {
@@ -1308,20 +1438,28 @@ export class Sandbox extends DurableObject<Env> {
         if (this.record?.state === "running") await this.applyPlatform();
       }).catch((e) => console.error(`[${r.id}] ${message(e)}`));
     }
-    const idleMs = r.idleMinutes * 60_000;
-    if (idleMs > 0 && Date.now() - this.lastActivity > idleMs) {
+    if (this.idle()) {
       try {
-        await this.exclusive(async () => {
-          if (this.record?.state === "running") await this.saveAndDestroy();
+        // Asked again in the queue: what ran ahead of it, such as a long save,
+        // may have been activity.
+        const stopped = await this.exclusive(async () => {
+          if (!this.idle()) return false;
+          await this.saveAndDestroy();
+          return true;
         });
-        console.log(`[${r.id}] stopped after ${r.idleMinutes} idle minutes`);
-        return;
+        if (stopped) {
+          console.log(`[${r.id}] stopped after ${r.idleMinutes} idle minutes`);
+          return;
+        }
       } catch (e) {
         console.error(`[${r.id}] idle stop failed: ${message(e)}`);
       }
     }
     // Sooner if a stop was asked for from inside while this ran.
     const asked = await this.ctx.storage.get<boolean>("stopRequested");
+    // None after a stop or delete that ran ahead of it in the queue, since an
+    // alarm brings a deleted sandbox's storage back.
+    if (this.record?.state !== "running") return;
     await this.ctx.storage.setAlarm(Date.now() + (asked ? 1000 : ALARM_EVERY_MS));
   }
 
@@ -1350,7 +1488,7 @@ export class Sandbox extends DurableObject<Env> {
       return new Response("not found", { status: 404 });
     }
     if (r.state !== "running") {
-      return new Response(`${r.id} is ${r.state}. Run: cloudex resume ${r.name ?? r.id}\n`, { status: 409 });
+      return new Response(`${wrongState(r)}\n`, { status: 409 });
     }
     this.touch();
     if (m[1] === "http") {
@@ -1382,11 +1520,17 @@ export class Sandbox extends DurableObject<Env> {
   // A preview request for a guest port. A server listening only on localhost
   // doesn't answer at the sandbox's address, so then a relay (guest.ts) starts
   // for it, and requests for the port go through the relay while it runs. A
-  // request is sent again after a miss only without a body, which can't be.
+  // body with a content-length up to REPLAY_LIMIT is held here, so that the
+  // request can be sent again after a miss; any other goes only once.
   private async preview(port: number, target: string, req: Request): Promise<Response> {
     const r = this.mustRecord();
+    const length = req.headers.get("content-length");
+    const held = req.body && length !== null && Number(length) <= REPLAY_LIMIT ? await req.arrayBuffer() : null;
+    const once = held === null && req.body !== null;
     const send = (to: number) => {
-      const fwd = new Request(target, req);
+      const fwd = held
+        ? new Request(target, { method: req.method, headers: req.headers, body: held, redirect: req.redirect })
+        : new Request(target, req);
       fwd.headers.delete(LINK_HEADER);
       return this.container.getTcpPort(to).fetch(fwd);
     };
@@ -1398,7 +1542,7 @@ export class Sandbox extends DurableObject<Env> {
       } catch (e) {
         why = message(e);
         if (to !== port) this.relayed.delete(port);
-        if (req.body) break;
+        if (once) break;
       }
     }
     const addr = /not listening in the TCP address (\d{1,3}(?:\.\d{1,3}){3}):\d+/.exec(why)?.[1];
@@ -1409,7 +1553,7 @@ export class Sandbox extends DurableObject<Env> {
       }
       if (through) {
         if (through !== port) this.relayed.set(port, through);
-        if (req.body) {
+        if (once) {
           return new Response(`port ${port} in ${r.name ?? r.id} only just started answering; send that again\n`, {
             status: 503,
             headers: { "retry-after": "1" },

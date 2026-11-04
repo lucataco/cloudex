@@ -33,6 +33,22 @@ test("every operation has an id and a success response", () => {
   assert.equal(ids.size, 46);
 });
 
+test("responses take fields added later", () => {
+  const closed: string[] = [];
+  const walk = (v: unknown, at: string): void => {
+    if (Array.isArray(v)) v.forEach((x, i) => walk(x, `${at}/${i}`));
+    else if (v && typeof v === "object") {
+      for (const [k, x] of Object.entries(v)) {
+        if (k === "additionalProperties" && x === false) closed.push(at);
+        walk(x, `${at}/${k}`);
+      }
+    }
+  };
+  const { schemas } = openapi("test").components;
+  for (const name of ["Sandbox", "Health", "ExecEvent", "AgentEvents", "Error"]) walk(schemas[name], name);
+  assert.deepEqual(closed, []);
+});
+
 test("request bodies leave defaulted fields optional", () => {
   const create = openapi("test").components.schemas.CreateSandbox as { required?: string[] };
   assert.deepEqual(create.required ?? [], []);

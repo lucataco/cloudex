@@ -77,8 +77,15 @@ const responses = {
   Error: ApiError,
 };
 
+// Responses stay open to fields added later, which a strict generated client
+// would otherwise reject.
 function jsonSchema(model: z.ZodType, io: "input" | "output") {
-  const { $schema: _, ...schema } = z.toJSONSchema(model, { io });
+  const { $schema: _, ...schema } = z.toJSONSchema(model, {
+    io,
+    override: ({ jsonSchema }) => {
+      if (io === "output" && jsonSchema.additionalProperties === false) delete jsonSchema.additionalProperties;
+    },
+  });
   return schema;
 }
 
@@ -491,7 +498,8 @@ export function openapi(version: string) {
         put: op("setKey", "Set a provider's key", {
           description:
             "Sandboxes started from then on get a placeholder key, and the real one is added to their " +
-            "HTTPS calls to the provider on the way out. A changed key reaches running sandboxes within a minute.",
+            "HTTPS calls to the provider on the way out. A changed key reaches running sandboxes within a minute. " +
+            "The key is tried with the provider first: a 400 says what the provider answered when it rejects the key.",
           requestBody: body("SetProviderKey"),
           responses: { 200: ok("The stored key", ref("ProviderKey")) },
         }),

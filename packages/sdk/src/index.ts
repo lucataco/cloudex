@@ -1,7 +1,8 @@
 // The Cloudex SDK: create, fork and drive sandboxes from TypeScript or
 // JavaScript. It talks to the /v1 API that `cloudex deploy` set up in your
-// Cloudflare account, and runs anywhere fetch does: Node, Bun, Deno, Workers
-// and browsers. It has no dependencies.
+// Cloudflare account, and runs anywhere fetch does: Node, Bun, Deno and
+// Workers. The API sends no CORS headers, so it isn't for browser pages. It has
+// no dependencies.
 //
 // The types below mirror the models in @cloudex/schema; schema-check.ts makes
 // any difference a type error.
@@ -79,7 +80,7 @@ export interface ProviderKey {
 }
 
 export interface CreateOptions {
-  /** Lowercase letters, digits and dashes; 2-32 characters. */
+  /** 2-32 lowercase letters, digits and dashes, starting with a letter and not ending with a dash. Can't start with cx-, which marks sandbox ids. */
   name?: string;
   /** Default standard-2. */
   size?: SandboxSize;
@@ -371,7 +372,7 @@ export interface Health {
 export interface CloudexOptions {
   /** Default: $CLOUDEX_API_URL, then the CLI's saved deployment. */
   apiUrl?: string;
-  /** Default: $CLOUDEX_API_KEY, then the CLI's saved deployment. */
+  /** Default: $CLOUDEX_API_KEY, then the CLI's saved key, but only if apiUrl is the saved deployment's. */
   apiKey?: string;
   /** A fetch to use instead of the global one. */
   fetch?: (input: string, init: RequestInit) => Promise<Response>;
@@ -406,7 +407,7 @@ export class Cloudex {
     return this.#call("GET", "/v1/health");
   }
 
-  /** All sandboxes, newest first. */
+  /** All sandboxes, newest first, as a summary: get() or refresh() has every field (notice, forkedFrom, fromSave, providerKeys, backup*). */
   async list(): Promise<Sandbox[]> {
     const list = await this.#call<SandboxInfo[]>("GET", "/v1/sandboxes");
     return list.map((info) => this.#wrap(info));
@@ -431,7 +432,9 @@ export class Cloudex {
    * Sets a provider's key. Sandboxes started from then on get a placeholder,
    * and the real key is added to their HTTPS calls to the provider on the way
    * out, so it never enters a sandbox, its saves, backups or forks. A changed
-   * key reaches running sandboxes within a minute.
+   * key reaches running sandboxes within a minute. The key is tried with the
+   * provider first; if the provider rejects it, this throws a CloudexError
+   * (status 400) with what the provider said.
    */
   setKey(provider: Provider, key: string): Promise<ProviderKey> {
     return this.#call("PUT", `/v1/keys/${provider}`, { key });
@@ -485,22 +488,29 @@ export class Cloudex {
     };
     // Node and Deno send a stream only when told it's one-way.
     if (typeof ReadableStream !== "undefined" && body instanceof ReadableStream) init.duplex = "half";
-    const res = await this.#fetch(url + path, init);
+    let res: Response;
+    try {
+      res = await this.#fetch(url + path, init);
+    } catch (e) {
+      throw unreachable(url, e);
+    }
     if (!res.ok) {
-      const text = await res.text();
+      const text = await readText(res);
       let error: unknown;
       try {
         error = (JSON.parse(text) as { error?: unknown }).error;
       } catch {
         error = undefined;
       }
-      throw new CloudexError(res.status, typeof error === "string" ? error : text.trim() || res.statusText);
+      const message = typeof error === "string" ? error : plainError(res.status, text) || res.statusText;
+      throw new CloudexError(res.status, res.status === 404 && message === "not found" ? OLDER_DEPLOYMENT : message);
     }
     return res;
   };
 
   // The same order as the CLI: options, then the environment, then the
-  // deployment saved by `cloudex deploy` or `cloudex login`.
+  // deployment saved by `cloudex deploy` or `cloudex login`. The saved key goes
+  // only to the saved URL, so a URL passed in can't be sent the admin key.
   async #resolve() {
     const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
     let url = this.#options.apiUrl ?? env.CLOUDEX_API_URL;
@@ -508,16 +518,25 @@ export class Cloudex {
     if (!url || !key) {
       const saved = await savedDeployment(env.CLOUDEX_CONFIG_DIR);
       url ||= saved?.apiUrl;
-      key ||= saved?.apiKey;
+      if (!key && url && saved?.apiUrl && normalizeUrl(url) === normalizeUrl(saved.apiUrl)) key = saved.apiKey;
     }
+    url = normalizeUrl(url ?? "");
+    // Let a later call find a deployment or key set up since.
     if (!url) {
-      this.#endpoint = undefined; // let a later call find a deployment set up since
+      this.#endpoint = undefined;
       throw new CloudexError(
         0,
         "no Cloudex deployment: pass apiUrl and apiKey, set CLOUDEX_API_URL and CLOUDEX_API_KEY, or run cloudex login",
       );
     }
-    return { url: url.replace(/\/+$/, ""), key: key ?? "" };
+    if (!key) {
+      this.#endpoint = undefined;
+      throw new CloudexError(
+        0,
+        `no API key for ${url}: pass apiKey or set CLOUDEX_API_KEY. The CLI's saved key is used only with the deployment it was saved for`,
+      );
+    }
+    return { url, key };
   }
 }
 
@@ -578,10 +597,20 @@ export class Sandbox {
   /**
    * Runs a command with `bash -lc` and waits for it. A string is run as shell
    * code; an array is quoted, one argument per element. A failing command
-   * doesn't throw: check exitCode.
+   * doesn't throw: check exitCode. It reads the API's stream of output, which
+   * keeps a long command from hitting Node's five-minute wait for a response.
    */
-  exec(command: string | string[], options: ExecOptions = {}): Promise<ExecResult> {
-    return this.#call("POST", this.#path("/exec"), { cmd: commandLine(command), ...options });
+  async exec(command: string | string[], options: ExecOptions = {}): Promise<ExecResult> {
+    const res = await this.#startExec(command, options);
+    if (!isStream(res)) return readJson<ExecResult>(res);
+    const stdout = new Clipped();
+    const stderr = new Clipped();
+    for await (const e of execEvents(res)) {
+      if (e.type === "stdout") stdout.add(e.data);
+      else if (e.type === "stderr") stderr.add(e.data);
+      else return { exitCode: e.exitCode, stdout: stdout.text(), stderr: stderr.text(), timedOut: e.timedOut, ms: e.ms };
+    }
+    throw new CloudexError(0, "the exec stream ended before the command did");
   }
 
   /**
@@ -596,22 +625,21 @@ export class Sandbox {
     command: string | string[],
     options: ExecOptions = {},
   ): AsyncGenerator<ExecStreamEvent, void, undefined> {
-    const body = JSON.stringify({ cmd: commandLine(command), ...options, stream: true });
-    const res = await this.#send("POST", this.#path("/exec"), body, "application/json");
-    if (!res.headers.get("content-type")?.includes("ndjson")) {
+    const res = await this.#startExec(command, options);
+    if (!isStream(res)) {
       const r = await readJson<ExecResult>(res);
       if (r.stdout) yield { type: "stdout", data: r.stdout };
       if (r.stderr) yield { type: "stderr", data: r.stderr };
       yield { type: "exit", exitCode: r.exitCode, timedOut: r.timedOut, ms: r.ms };
       return;
     }
-    for await (const line of lines(res)) {
-      const event = JSON.parse(line) as ExecEvent;
-      if (event.type === "error") throw new CloudexError(0, event.error);
-      if (event.type === "stdout" || event.type === "stderr" || event.type === "exit") yield event;
-      if (event.type === "exit") return;
-    }
-    throw new CloudexError(0, "the exec stream ended before the command did");
+    yield* execEvents(res);
+  }
+
+  // An API before v0.1.16 ignores stream and answers once, with JSON.
+  #startExec(command: string | string[], options: ExecOptions) {
+    const body = JSON.stringify({ cmd: commandLine(command), ...options, stream: true });
+    return this.#send("POST", this.#path("/exec"), body, "application/json");
   }
 
   /**
@@ -684,7 +712,7 @@ export class Sandbox {
   /** A file's contents. */
   async readFile(path: string, options: FileOptions = {}): Promise<Uint8Array> {
     const res = await this.#send("GET", this.#filePath("/content", path, options));
-    return new Uint8Array(await res.arrayBuffer());
+    return readBytes(res);
   }
 
   /**
@@ -693,7 +721,8 @@ export class Sandbox {
    * request to 100 MB on most plans.
    */
   async writeFile(path: string, data: FileData, options: FileOptions & { mode?: string | number } = {}): Promise<FileInfo> {
-    const mode = typeof options.mode === "number" ? options.mode.toString(8) : options.mode;
+    // The API wants 3 or 4 octal digits.
+    const mode = typeof options.mode === "number" ? options.mode.toString(8).padStart(3, "0") : options.mode;
     const res = await this.#send("PUT", this.#filePath("/content", path, { ...options, mode }), data, "application/octet-stream");
     return readJson(res);
   }
@@ -705,8 +734,7 @@ export class Sandbox {
 
   /** A directory's contents, or one file, as a tar.gz. Files the user can't read are left out. */
   async downloadArchive(path: string, options: FileOptions = {}): Promise<Uint8Array> {
-    const res = await this.#send("GET", this.#filePath("/archive", path, options));
-    return new Uint8Array(await res.arrayBuffer());
+    return readBytes(await this.#send("GET", this.#filePath("/archive", path, options)));
   }
 
   /** Unpacks a tar.gz into a directory, making it if need be. */
@@ -759,10 +787,14 @@ export class Sandbox {
 
   /**
    * Starts the desktop (Chrome and a terminal), or resizes a running one, and
-   * returns a link to its viewer on the preview domain. The first start
-   * installs it, which takes a minute or two.
+   * returns a link to its viewer on the preview domain, so the deployment needs
+   * one. The first start installs it, which takes a minute or two.
    */
   async desktop(options: { size?: string } = {}): Promise<Desktop & { url: string }> {
+    // Checked first: starting the desktop without a way to link to it would only fail afterwards.
+    if (!(await this.#call<Health>("GET", "/v1/health")).previewZone) {
+      throw new CloudexError(400, "preview links need a domain: run cloudex deploy --preview-domain <your domain>");
+    }
     const d = await this.#call<Desktop>("POST", this.#path("/desktop"), options);
     return { ...d, url: `${await this.host(d.port)}/${d.path}` };
   }
@@ -918,9 +950,95 @@ const savePath = (name: string) => `/v1/saves/${encodeURIComponent(name)}`;
 const commandLine = (command: string | string[]) =>
   typeof command === "string" ? command : command.map(shellQuote).join(" ");
 
+const OLDER_DEPLOYMENT = "this deployment is older than the SDK and doesn't have that call; update it with: cloudex deploy";
+
+// Must agree with the CLI's NormalizeURL, so that the saved key matches its
+// deployment however either URL is written.
+function normalizeUrl(url: string) {
+  let u = url.trim().replace(/\/+$/, "");
+  if (!u) return u;
+  if (!u.includes("://")) u = `https://${u}`;
+  const at = u.indexOf("://");
+  const scheme = u.slice(0, at).toLowerCase();
+  const rest = u.slice(at + 3);
+  const slash = rest.includes("/") ? rest.indexOf("/") : rest.length;
+  const host = rest.slice(0, slash).toLowerCase();
+  return `${scheme}://${scheme === "https" ? host.replace(/:443$/, "") : host}${rest.slice(slash)}`;
+}
+
+// A failed fetch or a body that broke off. Node's fetch says only "fetch failed"
+// or "terminated"; the reason is in cause.
+function unreachable(url: string, e: unknown): CloudexError {
+  const cause = e instanceof Error && e.cause instanceof Error ? e.cause : e;
+  const reason = cause instanceof Error ? cause.message || (cause as { code?: string }).code : String(cause);
+  return new CloudexError(0, `can't reach ${url}: ${reason || "no answer"}`);
+}
+
+const origin = (res: Response) => (res.url ? new URL(res.url).origin : "the API");
+
+async function readBody<T>(res: Response, read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (e) {
+    throw unreachable(origin(res), e);
+  }
+}
+
+const readText = (res: Response) => readBody(res, () => res.text());
+const readBytes = async (res: Response) => new Uint8Array(await readBody(res, () => res.arrayBuffer()));
+
+const htmlTitle = /<title[^>]*>([\s\S]*?)<\/title>/i;
+
+// An answer that isn't the API's JSON, such as Cloudflare's HTML error page,
+// becomes its status and title; other text is cut at 500 characters.
+function plainError(status: number, body: string): string {
+  body = body.trim();
+  if (body.startsWith("<")) {
+    const title = (htmlTitle.exec(body)?.[1] ?? "").split(/\s+/).filter(Boolean).join(" ");
+    return title.startsWith(String(status)) ? title : `${status} ${title}`.trim();
+  }
+  const chars = [...body];
+  return chars.length > 500 ? `${chars.slice(0, 500).join("")}…` : body;
+}
+
 async function readJson<T>(res: Response): Promise<T> {
-  const text = await res.text();
+  const text = await readText(res);
   return (text ? JSON.parse(text) : undefined) as T;
+}
+
+const isStream = (res: Response) => Boolean(res.headers.get("content-type")?.includes("ndjson"));
+
+async function* execEvents(res: Response): AsyncGenerator<ExecStreamEvent> {
+  for await (const line of lines(res)) {
+    const event = JSON.parse(line) as ExecEvent;
+    if (event.type === "error") throw new CloudexError(0, event.error);
+    if (event.type === "stdout" || event.type === "stderr" || event.type === "exit") yield event;
+    if (event.type === "exit") return;
+  }
+  throw new CloudexError(0, "the exec stream ended before the command did");
+}
+
+const OUTPUT_LIMIT = 1024 * 1024;
+
+// One stream of an exec's output, cut the way the API cuts it: the first
+// 1 MiB, then a note with the full size.
+class Clipped {
+  #text = "";
+  #kept = 0;
+  #total = 0;
+
+  add(data: string) {
+    const bytes = new TextEncoder().encode(data);
+    this.#total += bytes.length;
+    const room = OUTPUT_LIMIT - this.#kept;
+    if (room <= 0) return;
+    this.#text += bytes.length <= room ? data : new TextDecoder().decode(bytes.subarray(0, room));
+    this.#kept += Math.min(bytes.length, room);
+  }
+
+  text() {
+    return this.#total > OUTPUT_LIMIT ? `${this.#text}\n[cloudex: output cut at 1 MiB of ${this.#total} bytes]` : this.#text;
+  }
 }
 
 // The lines of a response, as they come. Stopping early cancels the response.
@@ -931,7 +1049,7 @@ async function* lines(res: Response): AsyncGenerator<string> {
   let rest = "";
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readBody(res, () => reader.read());
       rest += done ? decoder.decode() : decoder.decode(value, { stream: true });
       const parts = rest.split("\n");
       rest = done ? "" : parts.pop()!;
@@ -950,7 +1068,7 @@ export function shellQuote(arg: string): string {
 
 // The CLI keeps its deployment in ~/.config/cloudex/config.json. Only Node-like
 // runtimes have a file system; the module name is a variable so that bundlers
-// for browsers and Workers leave it alone.
+// for Workers leave it alone.
 async function savedDeployment(dir?: string): Promise<{ apiUrl?: string; apiKey?: string } | undefined> {
   const load = (name: string) => import(/* @vite-ignore */ name);
   try {

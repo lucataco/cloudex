@@ -23,6 +23,15 @@ import (
 	"github.com/lucataco/cloudex/go/internal/update/updatetest"
 )
 
+// git sets these for the commands that rebase --exec and hooks run, and the
+// tests that run git in a temporary repository would commit into that repo.
+func TestMain(m *testing.M) {
+	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"} {
+		os.Unsetenv(k)
+	}
+	os.Exit(m.Run())
+}
+
 // fakeAPI records requests and answers with canned JSON per "METHOD /path".
 type fakeAPI struct {
 	t        *testing.T
@@ -77,7 +86,7 @@ const sandboxJSON = `{"id":"cx-abc123","name":"web","size":"standard-2","state":
 "createdAt":1,"updatedAt":1,"startedAt":1,"stoppedAt":null,"savedAt":null,"savedBytes":null,"error":null}`
 
 func TestStatusShowsAPIVersion(t *testing.T) {
-	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`})
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`, "GET /v1/sandboxes": `[]`})
 	code, out, errOut := run(t, "status")
 	if code != 0 || !strings.Contains(out, "version 1.2.3") {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
@@ -181,6 +190,23 @@ func TestLoginSavesTheDeployment(t *testing.T) {
 	}
 }
 
+func TestLoginAgainKeepsTheCurrentSandboxWhenTheURLIsWrittenDifferently(t *testing.T) {
+	srv := newFakeAPI(t, map[string]string{
+		"GET /v1/health":    `{"ok":true,"version":"0.1.2","previewZone":null}`,
+		"GET /v1/sandboxes": `[]`,
+	})
+	t.Setenv("CLOUDEX_API_URL", "")
+	if err := (&config.Config{APIURL: strings.ToUpper(srv.URL) + "/", APIKey: "test-key", Current: "cx-abc123"}).Save(); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errOut := run(t, "login", "--url", srv.URL); code != 0 {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	if cfg, _ := config.Load(); cfg.Current != "cx-abc123" {
+		t.Fatalf("login forgot the current sandbox: %+v", cfg)
+	}
+}
+
 func TestLoginRejectsAWrongKey(t *testing.T) {
 	srv := newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"0.1.2","previewZone":null}`})
 	t.Setenv("CLOUDEX_API_KEY", "wrong")
@@ -196,7 +222,7 @@ func TestLoginRejectsAWrongKey(t *testing.T) {
 }
 
 func TestStatusHidesTheKeyUnlessAsked(t *testing.T) {
-	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`})
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`, "GET /v1/sandboxes": `[]`})
 	_, out, _ := run(t, "status")
 	if strings.Contains(out, "test-key") {
 		t.Fatalf("status printed the key: %q", out)
@@ -204,6 +230,70 @@ func TestStatusHidesTheKeyUnlessAsked(t *testing.T) {
 	_, out, _ = run(t, "status", "--show-key")
 	if !strings.Contains(out, "test-key") {
 		t.Fatalf("status --show-key didn't print the key: %q", out)
+	}
+}
+
+func TestVersionFlag(t *testing.T) {
+	for _, flag := range []string{"--version", "-v"} {
+		code, out, errOut := runVersion(t, "v0.1.17", flag)
+		if code != 0 || out != "cloudex v0.1.17\n" {
+			t.Fatalf("%s: code %d, stdout %q, stderr %q", flag, code, out, errOut)
+		}
+	}
+}
+
+func TestLoginAssumesHTTPSWithoutAScheme(t *testing.T) {
+	srv := newFakeAPI(t, nil)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	code, _, errOut := run(t, "login", "--url", host+"/")
+	// The fake API speaks plain HTTP, so the call fails, but at https://.
+	if code != 1 || !strings.Contains(errOut, "can't reach the Cloudex API at https://"+host+":") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestSavedKeyGoesOnlyToTheSavedDeployment(t *testing.T) {
+	saved := &fakeAPI{t: t, routes: map[string]string{"GET /v1/sandboxes": `[]`}}
+	savedSrv := httptest.NewServer(saved)
+	defer savedSrv.Close()
+	other := &fakeAPI{t: t, routes: map[string]string{"GET /v1/sandboxes": `[]`}}
+	otherSrv := httptest.NewServer(other)
+	defer otherSrv.Close()
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", "")
+	t.Setenv("CLOUDEX_API_KEY", "")
+	if err := (&config.Config{APIURL: savedSrv.URL, APIKey: "test-key"}).Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if code, _, errOut := run(t, "--api-url", savedSrv.URL+"/", "list"); code != 0 {
+		t.Fatalf("saved deployment: code %d, stderr %q", code, errOut)
+	}
+	if code, _, errOut := run(t, "--api-url", "HTTP"+strings.TrimPrefix(savedSrv.URL, "http"), "list"); code != 0 {
+		t.Fatalf("saved deployment with its scheme in capitals: code %d, stderr %q", code, errOut)
+	}
+	code, _, errOut := run(t, "--api-url", otherSrv.URL, "list")
+	if code != 1 || !strings.Contains(errOut, "CLOUDEX_API_KEY") || len(other.requests) != 0 {
+		t.Fatalf("other deployment: code %d, stderr %q, it saw %v", code, errOut, other.requests)
+	}
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	if code, _, errOut := run(t, "--api-url", otherSrv.URL, "list"); code != 0 {
+		t.Fatalf("with a key: code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestACorruptConfigNamesTheFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLOUDEX_CONFIG_DIR", dir)
+	t.Setenv("CLOUDEX_API_URL", "")
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range []string{"status", "deploy"} {
+		code, _, errOut := run(t, cmd)
+		if code != 1 || !strings.Contains(errOut, filepath.Join(dir, "config.json")) {
+			t.Fatalf("%s: code %d, stderr %q", cmd, code, errOut)
+		}
 	}
 }
 
@@ -532,6 +622,16 @@ func TestKeysSetFromEnvSendsTheKey(t *testing.T) {
 	}
 }
 
+func TestKeysSetShowsWhyTheProviderRejectedTheKey(t *testing.T) {
+	const why = "Anthropic rejected that key (401: invalid x-api-key), so it wasn't stored. Check the key and try again."
+	withFakeAPI(t, map[string]string{"PUT /v1/keys/anthropic": `!400 {"error":"` + why + `"}`})
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-oat01-test")
+	code, out, errOut := run(t, "keys", "set", "anthropic", "--from-env")
+	if code != 1 || !strings.Contains(errOut, why) || strings.Contains(out, "Stored") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
 func TestKeysSetFromEnvNeedsTheVariable(t *testing.T) {
 	withFakeAPI(t, nil)
 	t.Setenv("OPENAI_API_KEY", "")
@@ -627,12 +727,16 @@ func TestEnvSetAndUnset(t *testing.T) {
 	run(t, "env", "set", "A=1")
 	run(t, "env", "unset", "web", "A", "--file", "~/.npmrc")
 	run(t, "env", "unset", "ONLY")
-	want := []string{"PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings", "PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings"}
+	run(t, "env", "unset", "web", "--file", "~/.npmrc")
+	want := []string{"PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings", "PATCH /v1/sandboxes/web/settings", "PATCH /v1/sandboxes/cx-cur111/settings", "PATCH /v1/sandboxes/web/settings"}
 	if !reflect.DeepEqual(f.requests, want) {
 		t.Fatalf("requests %v", f.requests)
 	}
 	if f.bodies[2] != `{"env":{"A":null},"files":{"~/.npmrc":null}}` || f.bodies[3] != `{"env":{"ONLY":null}}` {
 		t.Fatalf("unset bodies %s / %s", f.bodies[2], f.bodies[3])
+	}
+	if f.bodies[4] != `{"files":{"~/.npmrc":null}}` {
+		t.Fatalf("unset <sandbox> --file body %s", f.bodies[4])
 	}
 	if code, out, _ := run(t, "env", "web"); code != 0 || !strings.Contains(out, "Files      ~/.npmrc") {
 		t.Fatalf("list: code %d, %q", code, out)

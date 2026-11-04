@@ -215,8 +215,19 @@ func (c *Client) ZoneID(ctx context.Context, account, name string) (string, erro
 			return z.ID, nil
 		}
 	}
-	return "", fmt.Errorf("%s isn't a zone in this Cloudflare account; add the domain to the account first", name)
+	return "", &NoZoneError{Name: name}
 }
+
+type NoZoneError struct{ Name string }
+
+func (e *NoZoneError) Error() string {
+	return e.Name + " isn't a zone in this Cloudflare account; add the domain to the account first"
+}
+
+const (
+	wildcardTarget  = "100::"
+	wildcardComment = "Cloudex preview links"
+)
 
 // EnsureWildcardRecord makes *.zone resolve through Cloudflare so the Worker
 // route can answer preview hosts. 100:: is the usual placeholder for a
@@ -232,8 +243,33 @@ func (c *Client) EnsureWildcardRecord(ctx context.Context, zoneID, zone string) 
 	if len(records) > 0 {
 		return false, nil
 	}
-	body := map[string]any{"type": "AAAA", "name": "*." + zone, "content": "100::", "proxied": true, "comment": "Cloudex preview links"}
+	body := map[string]any{"type": "AAAA", "name": "*." + zone, "content": wildcardTarget, "proxied": true, "comment": wildcardComment}
 	return true, c.do(ctx, http.MethodPost, "/zones/"+zoneID+"/dns_records", body, nil)
+}
+
+// DeleteWildcardRecord removes the *.zone record EnsureWildcardRecord makes.
+// A record with the same name that isn't recognizably that one stays.
+func (c *Client) DeleteWildcardRecord(ctx context.Context, zoneID, zone string) (deleted bool, err error) {
+	var records []struct {
+		ID      string `json:"id"`
+		Type    string `json:"type"`
+		Content string `json:"content"`
+		Comment string `json:"comment"`
+	}
+	q := url.Values{"name": {"*." + zone}}
+	if err := c.do(ctx, http.MethodGet, "/zones/"+zoneID+"/dns_records?"+q.Encode(), nil, &records); err != nil {
+		return false, err
+	}
+	for _, r := range records {
+		if r.Type != "AAAA" || r.Content != wildcardTarget || r.Comment != wildcardComment {
+			continue
+		}
+		if err := c.do(ctx, http.MethodDelete, "/zones/"+zoneID+"/dns_records/"+url.PathEscape(r.ID), nil, nil); err != nil {
+			return deleted, err
+		}
+		deleted = true
+	}
+	return deleted, nil
 }
 
 // PrepareImage asks Cloudflare to get a digest-pinned image in the account's
@@ -362,6 +398,29 @@ func (c *Client) RouteWorker(ctx context.Context, account, script, zoneID, zone,
 		}
 	}
 	return c.do(ctx, http.MethodPost, "/zones/"+zoneID+"/workers/routes", map[string]string{"pattern": pattern, "script": script}, nil)
+}
+
+// DeleteWorkerRoutes removes the zone's routes with this pattern that go to
+// script, and says whether there were any. Another Worker's route stays.
+func (c *Client) DeleteWorkerRoutes(ctx context.Context, zoneID, script, pattern string) (deleted bool, err error) {
+	var routes []struct {
+		ID      string `json:"id"`
+		Pattern string `json:"pattern"`
+		Script  string `json:"script"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/zones/"+zoneID+"/workers/routes", nil, &routes); err != nil {
+		return false, err
+	}
+	for _, r := range routes {
+		if r.Pattern != pattern || r.Script != script {
+			continue
+		}
+		if err := c.do(ctx, http.MethodDelete, "/zones/"+zoneID+"/workers/routes/"+url.PathEscape(r.ID), nil, nil); err != nil {
+			return deleted, err
+		}
+		deleted = true
+	}
+	return deleted, nil
 }
 
 // privateError names things in the account, such as another Worker, that

@@ -11,6 +11,10 @@ log "entrypoint start sandbox=${CLOUDEX_SANDBOX:-?}"
 # a DNS label and breaks tools such as Python's http.server.
 [ -n "${CLOUDEX_SANDBOX:-}" ] && hostname "${CLOUDEX_SANDBOX}"
 
+# The platform hands over / owned by another uid, which tools that check the
+# owners of a path's parents refuse; Claude Code then turns its messaging off.
+[ "$(stat -c %u /)" = 0 ] || chown root:root /
+
 # A sandbox started from a named save waits here while its controller restores
 # the save onto the disk, so that nothing runs from the image's files
 # meanwhile. It gives up after 30 minutes.

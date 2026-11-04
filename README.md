@@ -5,7 +5,9 @@ is a Linux machine with a shell, Docker, SSH and coding agents. Stopping saves i
 disk; resuming brings it back. You pay Cloudflare directly; there is no Cloudex
 service in between. Site: [cloudex.build](https://cloudex.build).
 
-**Status: v0.1, pre-alpha.** Expect rough edges and breaking changes.
+**Status: v0.1.17 is the long-term-support release of v0.1.** It gets bug fixes
+while v0.2 is built, and v0.1 commands, API routes and SDK calls won't change in
+a breaking way.
 
 ## What you need
 
@@ -54,7 +56,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex ssh [sandbox] [-- ssh args]` | Shell in over SSH, through your API (no public IP) |
 | `cloudex desktop [sandbox] [--size 1280x720] [--link] [--quality 0-9]` | Open the sandbox's desktop, with Chrome and a terminal, in your browser |
 | `cloudex exec [sandbox] -- <command>` | Run a command, printing its output as it comes and ending with its exit code; `-d` leaves it running in the background |
-| `cloudex commands [sandbox]`, `commands logs -f <id>`, `commands kill <id>` | List background commands, follow their output, stop them |
+| `cloudex commands [sandbox]`, `commands logs -f <id>`, `commands kill <id>`, `commands rm <id>` | List background commands, follow their output, stop them, delete a finished one's record and output |
 | `cloudex cp <from> <to>` | Copy files and directories into or out of a sandbox (`web:path`, or `:path` for the current one) |
 | `cloudex run [--from <save>] -- <command>` | Run a command in a fresh sandbox with this directory's files, copy back `--out` paths, and delete it; for CI |
 | `cloudex ssh-config >> ~/.ssh/config` | Lets `scp`, `rsync` and editors reach `<sandbox>.cloudex` |
@@ -83,8 +85,11 @@ in your deployment, encrypted. Sandboxes started after that get a placeholder
 key, and the real one is added to their HTTPS calls to the provider as they
 leave, so it never enters a sandbox, its saves, backups or forks. Claude Code,
 Codex, the providers' SDKs and curl work as if the key were there, with no
-sign-in. A key a sandbox brings itself, or a subscription
-login, is used as is. A new provider reaches a running sandbox when it next
+sign-in. `cloudex keys set` tries the key with the provider first and refuses one
+it rejects. A key a sandbox brings itself is used as is. While the deployment
+holds a provider's key, Claude Code and Codex in a sandbox use it even if someone
+signs in there with a subscription; to use a subscription instead, remove the
+key with `cloudex keys rm`. A new provider reaches a running sandbox when it next
 starts; a changed or removed key reaches it within a minute. `cloudex info`
 shows which providers a sandbox uses this way. The keys are encrypted with the
 admin key, so after `cloudex deploy --yes` replaces it, set them again.
@@ -124,11 +129,15 @@ deletes one. Named saves need R2, like backups.
 **Commands, files and CI.** `cloudex exec` streams a command's output as it's
 printed, and `exec -d` leaves a long job or a server running in the background,
 with its output kept on the sandbox's disk for `cloudex commands logs -f`.
-`cloudex cp` copies files and directories in and out. `cloudex run -- npm test`
-starts a sandbox (or one from a named save, with `--from`), copies in the files
-git would commit, runs the command, copies back what `--out` names, deletes the
-sandbox and exits with the command's code, so a CI step can run its tests in
-your Cloudflare account.
+`cloudex cp` copies files and directories in and out; copying a directory out
+leaves out `.git` directories, hard links, and links that point outside it.
+`exec` doesn't send standard input to the command, and its output is text: put
+a file in a sandbox with `cloudex cp`, and copy a binary file out with
+`cloudex cp web:file ./file`. `cloudex run -- npm test` starts a sandbox (or
+one from a named save, with `--from`), copies in the files git would commit,
+runs the command, copies back what `--out` names, deletes the sandbox and exits
+with the command's code, so a CI step can run its tests in your Cloudflare
+account.
 
 **Desktop.** `cloudex desktop` starts a desktop in the sandbox (TigerVNC,
 openbox, Chrome and a terminal) and opens it in your browser through noVNC. The
@@ -162,12 +171,15 @@ is saved with the disk, and copied into forks.
 ## SDKs
 
 The [TypeScript SDK](packages/sdk) and the [Python SDK](python) do what the CLI
-does from code: create, fork, exec, host links, desktop, stop and resume. They
-also drive agents, like `cloudex agents`: start Claude Code or Codex on a task
-with no terminal, follow its events, send it follow-ups, and interrupt or steer
-it. The agent and its conversation live on the sandbox's disk, so a fork can
-take the same conversation somewhere else. The SDKs use the deployment the CLI saved, or an
-API URL and key you pass in.
+does from code: create, fork, exec, host links, desktop, stop and resume, and
+named saves (`box.save`, `cx.startFromSave`). They also drive agents, like
+`cloudex agents`: start Claude Code or Codex on a task with no terminal, follow
+its events, send it follow-ups, and interrupt or steer it. The agent and its
+conversation live on the sandbox's disk, so a fork can take the same
+conversation somewhere else. The SDKs use the deployment the CLI saved, or an
+API URL and key you pass in. The saved key is used only with the saved URL; for
+any other URL, pass the key too. They are for servers and scripts: the API sends
+no CORS headers, so a browser page can't call it.
 
 ```sh
 npm install cloudex
@@ -229,6 +241,9 @@ deploy` builds the image from `images/base` (Docker needed), then set the
 `ADMIN_KEY` secret and point the CLI at it with `CLOUDEX_API_URL` and
 `CLOUDEX_API_KEY`. A newly pushed image can take up to 20 minutes before a
 sandbox can start on it.
+
+Before a release, run the verify-release skill
+(`.agents/skills/verify-release/SKILL.md`) against a test deployment.
 
 Releases: push a `v*` tag. CI publishes `ghcr.io/lucataco/cloudex-base:<tag>` and
 CLI archives built against it.

@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -33,12 +34,17 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/cloudflare"
 )
 
 //go:embed assets
 var assets embed.FS
+
+// readAsset reads a file of the embedded API bundle; tests replace it, since
+// the bundle is built by scripts/bundle-api.sh and isn't in the repository.
+var readAsset = assets.ReadFile
 
 // DefaultImage is the published sandbox image. Release builds pin it to their
 // version with -ldflags "-X github.com/lucataco/cloudex/go/internal/deploy.DefaultImage=...".
@@ -101,9 +107,13 @@ type Options struct {
 	ExistingAccountID string
 	// Confirm is asked before replacing the API key of a live deployment
 	// whose key this computer doesn't have. Nil means no.
-	Confirm   func(question string) bool
-	SkipCheck bool
-	Log       io.Writer
+	Confirm func(question string) bool
+	// OnInstalled is called as soon as the API Worker is installed, with the
+	// key it now holds, before the slow steps that follow. An error stops the
+	// deploy.
+	OnInstalled func(Result) error
+	SkipCheck   bool
+	Log         io.Writer
 }
 
 type Result struct {
@@ -117,7 +127,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	log := func(format string, args ...any) { fmt.Fprintf(o.Log, "  "+format+"\n", args...) }
 	cf := cloudflare.New(o.Token)
 
-	worker, err := assets.ReadFile("assets/worker.js")
+	worker, err := readAsset("assets/worker.js")
 	if err != nil {
 		return nil, errors.New("this cloudex build has no API bundle; build it with scripts/bundle-api.sh first")
 	}
@@ -125,7 +135,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		CompatibilityDate  string   `json:"compatibility_date"`
 		CompatibilityFlags []string `json:"compatibility_flags"`
 	}
-	if data, err := assets.ReadFile("assets/meta.json"); err != nil || json.Unmarshal(data, &meta) != nil {
+	if data, err := readAsset("assets/meta.json"); err != nil || json.Unmarshal(data, &meta) != nil {
 		return nil, errors.New("this cloudex build's API bundle is incomplete; rebuild it with scripts/bundle-api.sh")
 	}
 
@@ -135,12 +145,15 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	}
 	log("Account %s (%s)", account.Name, account.ID)
 	if err := cf.CheckContainers(ctx, account.ID); err != nil {
+		if denied(err) {
+			return nil, tokenNeeds("checking that the account can run containers", permContainers, err)
+		}
 		return nil, fmt.Errorf("this account can't run containers yet: %w", err)
 	}
 	log("Containers are available (Workers Paid)")
 	sub, err := cf.WorkersSubdomain(ctx, account.ID)
 	if err != nil {
-		return nil, err
+		return nil, stepError("looking up the workers.dev subdomain", permScripts, err)
 	}
 	if sub == "" {
 		return nil, errors.New("this account has no workers.dev subdomain yet: open Workers & Pages in the Cloudflare dashboard once to choose one, then run cloudex deploy again")
@@ -162,11 +175,12 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	case live.running:
 		question := fmt.Sprintf("Cloudex is already deployed at %s, and this computer doesn't have its API key.\n"+
 			"Deploying gives it a new key, so other computers using it stop working until they run\n"+
-			"cloudex login with the new key. To use it from here instead, run: cloudex login --url %s", apiURL, apiURL)
+			"cloudex login with the new key. %s\n"+
+			"To use it from here instead, run: cloudex login --url %s", apiURL, keyReplacedEffects, apiURL)
 		if o.Confirm == nil || !o.Confirm(question) {
 			return nil, fmt.Errorf("stopped before replacing the API key of %s; run cloudex login --url %s to use it, or cloudex deploy --yes to replace the key", apiURL, apiURL)
 		}
-		log("Replacing the API key of the existing deployment")
+		log("Replacing the API key of the existing deployment. %s", keyReplacedEffects)
 	case o.ExistingKey != "" && ours:
 		key = o.ExistingKey // the API isn't answering; keep what this computer has
 	}
@@ -180,7 +194,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	}
 	zoneID := ""
 	if zone != "" {
-		if zoneID, err = cf.ZoneID(ctx, account.ID, zone); err != nil {
+		if zoneID, err = lookupZone(ctx, cf, account.ID, zone); err != nil {
 			return nil, err
 		}
 	}
@@ -195,7 +209,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 
 	dbID, created, err := cf.EnsureD1(ctx, account.ID, DatabaseName)
 	if err != nil {
-		return nil, fmt.Errorf("D1 database: %w", err)
+		return nil, stepError("D1 database", permD1, err)
 	}
 	log("D1 database %s (%s)", DatabaseName, map[bool]string{true: "created", false: "existing"}[created])
 
@@ -213,6 +227,16 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
+	// Only the zone the live Worker names, since one this computer merely
+	// remembers may serve another deployment now. Before the upload, so that
+	// if this fails, the live Worker still names the zone and running deploy
+	// again finds it.
+	if o.PreviewDomainSet && live.previewZone != "" && live.previewZone != zone {
+		if err := retirePreviews(ctx, cf, account.ID, live.previewZone, log); err != nil {
+			return nil, err
+		}
+	}
+
 	md := workerMetadata(meta.CompatibilityDate, meta.CompatibilityFlags, image, dbID, zone, key, backups)
 	if err := installWorker(ctx, cf, account.ID, md, worker, zoneID, zone, log); err != nil {
 		return nil, err
@@ -221,11 +245,17 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	if live.running {
 		log("Sandboxes keep running. Busy connections (ssh, desktops) move to the new version within about 5 minutes and may drop then; reconnect if one does")
 	}
+	res := &Result{APIURL: apiURL, APIKey: key, AccountID: account.ID, PreviewZone: zone}
+	if o.OnInstalled != nil {
+		if err := o.OnInstalled(*res); err != nil {
+			return res, err
+		}
+	}
 
 	if zone != "" {
 		made, err := cf.EnsureWildcardRecord(ctx, zoneID, zone)
 		if err != nil {
-			return nil, fmt.Errorf("preview DNS record: %w", err)
+			return res, stepError("preview DNS record", permDNS, err)
 		}
 		if made {
 			log("Added a proxied *.%s record for preview links", zone)
@@ -233,7 +263,6 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		log("Preview links on *.%s; its other subdomains pass through to their origins", zone)
 	}
 
-	res := &Result{APIURL: apiURL, APIKey: key, AccountID: account.ID, PreviewZone: zone}
 	client := api.New(apiURL, key)
 	if err := waitHealthy(ctx, client); err != nil {
 		return res, err
@@ -247,7 +276,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 func pickAccount(ctx context.Context, cf *cloudflare.Client, want string) (cloudflare.Account, error) {
 	accounts, err := cf.Accounts(ctx)
 	if err != nil {
-		return cloudflare.Account{}, fmt.Errorf("checking the API token: %w", err)
+		return cloudflare.Account{}, stepError("checking the API token", permAccount, err)
 	}
 	for _, a := range accounts {
 		if a.ID == want {
@@ -307,22 +336,23 @@ func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, 
 	dst := fmt.Sprintf("%s/%s/%s:%s", registryHost, account, imageRepo, tag)
 	user, pass, err := cf.RegistryCredentials(ctx, account, 30)
 	if err != nil {
-		return "", fmt.Errorf("registry credentials: %w", err)
+		return "", stepError("registry credentials", permContainers, err)
 	}
 	dstRef, err := name.ParseReference(dst)
 	if err != nil {
 		return "", err
 	}
+	platform := remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"})
 	opts := []remote.Option{
 		remote.WithContext(ctx),
 		remote.WithAuthFromKeychain(authn.NewMultiKeychain(registryKeychain{user, pass}, authn.DefaultKeychain)),
-		remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"}),
+		platform,
 	}
 	log("Copying the sandbox image %s into your account (about 700 MB the first time)", src)
 	t0 := time.Now()
 	// Copy only the linux/amd64 image, even when the source is a multi-platform
 	// index or carries attestations.
-	desc, err := remote.Get(srcRef, opts...)
+	desc, err := readImage(srcRef, remote.WithContext(ctx), platform)
 	if err != nil {
 		return "", fmt.Errorf("reading the sandbox image: %w", err)
 	}
@@ -339,6 +369,18 @@ func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, 
 	}
 	log("Image copied in %s", time.Since(t0).Round(time.Second))
 	return fmt.Sprintf("%s/%s/%s@%s", registryHost, account, imageRepo, digest), nil
+}
+
+// readImage reads the source image without credentials, so a stale docker
+// login can't break a public image. An image that needs a login, such as a
+// private one given with --image, is read again with the docker credentials.
+func readImage(ref name.Reference, opts ...remote.Option) (*remote.Descriptor, error) {
+	desc, err := remote.Get(ref, append(opts, remote.WithAuth(authn.Anonymous))...)
+	var terr *transport.Error
+	if errors.As(err, &terr) && (terr.StatusCode == http.StatusUnauthorized || terr.StatusCode == http.StatusForbidden) {
+		return remote.Get(ref, append(opts, remote.WithAuthFromKeychain(authn.DefaultKeychain))...)
+	}
+	return desc, err
 }
 
 // How many times writeImage tries, and its pause after the first failure;
@@ -382,7 +424,7 @@ func r2Problem(err error) string {
 	case errors.As(err, &cfErr) && cfErr.Code == 10042:
 		return "R2 isn't turned on for this account. Turn it on in the Cloudflare dashboard (R2 Object Storage; the free tier is enough), then run cloudex deploy again"
 	case errors.As(err, &cfErr) && (cfErr.Status == 403 || cfErr.Code == 10000):
-		return "this API token can't use R2. Make a new one with the link in cloudex deploy --help, which now includes R2, then run cloudex deploy again"
+		return "this API token can't use R2. Add the " + permR2 + " permission to it, or make a new token with the link in cloudex deploy --help, then run cloudex deploy again"
 	default:
 		return err.Error()
 	}
@@ -399,7 +441,7 @@ func prepareImage(ctx context.Context, cf *cloudflare.Client, account, image str
 		status, reason, err := cf.PrepareImage(ctx, account, image)
 		switch {
 		case err != nil:
-			return fmt.Errorf("preparing the sandbox image: %w", err)
+			return stepError("preparing the sandbox image", permContainers, err)
 		case status == "ready":
 			return nil
 		case status == "error":
@@ -427,25 +469,25 @@ func prepareImage(ctx context.Context, cf *cloudflare.Client, account, image str
 func installWorker(ctx context.Context, cf *cloudflare.Client, account string, md map[string]any, code []byte, zoneID, zone string, log func(string, ...any)) error {
 	log("Uploading the API Worker")
 	if err := cf.UploadWorker(ctx, account, WorkerName, md, "worker.js", code); err != nil {
-		return fmt.Errorf("uploading the API Worker: %w", err)
+		return stepError("uploading the API Worker", permScripts, err)
 	}
 	ns, err := cf.DurableObjectNamespace(ctx, account, WorkerName, "Sandbox")
 	if err != nil {
-		return err
+		return stepError("reading the API Worker's Durable Objects", permScripts, err)
 	}
 	made, err := cf.EnsureContainerApplication(ctx, account, containerName, ns)
 	if err != nil {
-		return fmt.Errorf("container application: %w", err)
+		return stepError("container application", permContainers, err)
 	}
 	if made {
 		log("Created the container application %s", containerName)
 	}
 	if err := cf.EnableWorkersDev(ctx, account, WorkerName); err != nil {
-		return fmt.Errorf("turning on the workers.dev URL: %w", err)
+		return stepError("turning on the workers.dev URL", permScripts, err)
 	}
 	if zone != "" {
 		if err := cf.RouteWorker(ctx, account, WorkerName, zoneID, zone, "*."+zone+"/*"); err != nil {
-			return fmt.Errorf("preview route: %w", err)
+			return stepError("preview route", permRoutes, err)
 		}
 	}
 	return nil
@@ -533,6 +575,69 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// The permissions of the token that TokenURL asks for, by the step that needs each.
+const (
+	permAccount    = "Account Settings Read"
+	permScripts    = "Workers Scripts Write"
+	permContainers = "Workers Containers Write"
+	permD1         = "D1 Write"
+	permR2         = "Workers R2 Storage Write"
+	permRoutes     = "Workers Routes Write"
+	permDNS        = "DNS Write"
+	permZone       = "Zone Read"
+)
+
+const keyReplacedEffects = "Sandboxes' environment variables and files, the provider keys set with cloudex keys, and preview links stop working too."
+
+func denied(err error) bool {
+	var cfErr *cloudflare.Error
+	return errors.As(err, &cfErr) && (cfErr.Status == http.StatusForbidden || cfErr.Code == 10000)
+}
+
+func tokenNeeds(step, permission string, err error) error {
+	return fmt.Errorf("%s: this API token isn't allowed to do that. It needs the %s permission. Add it to the token, or make a new token with the link in cloudex deploy --help, then run cloudex deploy again (%w)", step, permission, err)
+}
+
+func stepError(step, permission string, err error) error {
+	if denied(err) {
+		return tokenNeeds(step, permission, err)
+	}
+	return fmt.Errorf("%s: %w", step, err)
+}
+
+func lookupZone(ctx context.Context, cf *cloudflare.Client, account, zone string) (string, error) {
+	id, err := cf.ZoneID(ctx, account, zone)
+	if denied(err) {
+		return "", tokenNeeds("looking up "+zone, permZone, err)
+	}
+	return id, err
+}
+
+func retirePreviews(ctx context.Context, cf *cloudflare.Client, account, zone string, log func(string, ...any)) error {
+	zoneID, err := lookupZone(ctx, cf, account, zone)
+	var noZone *cloudflare.NoZoneError
+	if errors.As(err, &noZone) {
+		log("Preview links were on %s, which isn't a zone this token can reach; leaving its route and records alone", zone)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	removed, err := cf.DeleteWorkerRoutes(ctx, zoneID, WorkerName, "*."+zone+"/*")
+	if err != nil {
+		return stepError("removing the preview route of "+zone, permRoutes, err)
+	}
+	if removed {
+		log("Removed the preview route *.%s/*; the other subdomains of %s no longer reach the API", zone, zone)
+	}
+	if deleted, err := cf.DeleteWildcardRecord(ctx, zoneID, zone); err != nil {
+		log("Couldn't remove the *.%s record Cloudex added (%v); delete it in the Cloudflare dashboard if you don't need it", zone, err)
+	} else if deleted {
+		log("Removed the *.%s record Cloudex added", zone)
+	}
+	return nil
+}
+
 func waitHealthy(ctx context.Context, client *api.Client) error {
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
@@ -553,6 +658,13 @@ func waitHealthy(ctx context.Context, client *api.Client) error {
 	}
 }
 
+// testSandboxName matches the names checkSandbox gives its sandboxes. Each
+// lives through one start of up to 12 minutes, so one older than
+// leftoverTestSandbox was left by a deploy that was stopped, not one running now.
+var testSandboxName = regexp.MustCompile(`^deploy-check-[0-9a-f]{4}$`)
+
+const leftoverTestSandbox = 40 * time.Minute
+
 // checkSandbox starts, uses and deletes a throwaway sandbox. A newly pushed
 // image can take up to 20 minutes to become startable, so it keeps trying.
 func checkSandbox(ctx context.Context, client *api.Client, log func(string, ...any)) error {
@@ -560,6 +672,16 @@ func checkSandbox(ctx context.Context, client *api.Client, log func(string, ...a
 	rand.Read(suffix)
 	name := "deploy-check-" + hex.EncodeToString(suffix)
 	idle := 5
+	if left, err := client.List(ctx); err == nil {
+		for _, s := range left {
+			if s.Name == nil || !testSandboxName.MatchString(*s.Name) || time.Since(time.UnixMilli(s.CreatedAt)) < leftoverTestSandbox {
+				continue
+			}
+			if client.Delete(ctx, s.ID) == nil {
+				log("Deleted %s, left over from an earlier deploy", *s.Name)
+			}
+		}
+	}
 	log("Starting a test sandbox (a new image can take several minutes to reach Cloudflare's hosts)")
 	deadline := time.Now().Add(30 * time.Minute)
 	t0 := time.Now()

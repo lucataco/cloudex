@@ -19,7 +19,7 @@ import (
 
 func newRunCmd(opts *options) *cobra.Command {
 	var name, size, from, dir, workdir string
-	var idle, timeout time.Duration
+	idle, timeout := 30*time.Minute, time.Duration(0)
 	var envPairs, envFiles, outs []string
 	var noUpload, keep, keepOnFailure bool
 	cmd := &cobra.Command{
@@ -38,7 +38,10 @@ func newRunCmd(opts *options) *cobra.Command {
 			"The command runs in the background in the sandbox, so a dropped connection\n" +
 			"doesn't stop it, and has no time limit unless --timeout sets one. Ctrl-C stops\n" +
 			"it and deletes the sandbox. --keep keeps the sandbox, and --keep-on-failure\n" +
-			"keeps it when the command fails or is stopped, to look around with cloudex ssh.",
+			"keeps it when the command fails or is stopped, to look around with cloudex ssh.\n\n" +
+			"A directory copied back by --out leaves out .git directories, hard links,\n" +
+			"devices, symlinks that point outside it, and files the sandbox user can't read;\n" +
+			"the summary on standard error counts what was left out, but not unreadable files.",
 		Example: "  cloudex run -- npm test\n" +
 			"  cloudex run --from node-base --out dist -- 'npm ci && npm run build'\n" +
 			"  cloudex run --env CI=1 --keep-on-failure -- make check",
@@ -68,8 +71,8 @@ func newRunCmd(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&from, "from", "", "start from this named save, or a fork of this sandbox")
 	cmd.Flags().StringVar(&name, "name", "", "a name for the sandbox (default: none)")
 	cmd.Flags().StringVar(&size, "size", "", "standard-1, standard-2 (default), standard-3 or standard-4")
-	cmd.Flags().DurationVar(&idle, "idle", 30*time.Minute, "stop the sandbox after this long without activity, if it's kept")
-	cmd.Flags().DurationVar(&timeout, "timeout", 0, "stop the command after this long (default: no limit)")
+	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop the sandbox after this long without activity, if it's kept")
+	cmd.Flags().Var(durationFlag{&timeout}, "timeout", "stop the command after this long, such as 30m (default: no limit)")
 	cmd.Flags().StringVar(&dir, "dir", ".", "the directory to copy into the sandbox")
 	cmd.Flags().StringVar(&workdir, "workdir", "", "where it goes in the sandbox, and the command runs (default: the directory's name, in the home directory)")
 	cmd.Flags().BoolVar(&noUpload, "no-upload", false, "don't copy any files; run in the home directory unless --workdir says")
@@ -152,7 +155,7 @@ func (r *runner) run(spec runSpec) (err error) {
 		}
 		defer os.Remove(archive.Name())
 		defer archive.Close()
-		if err := checkUploadSize(archive, "The files in "+dir); err != nil {
+		if err := checkUploadSize(archive, "The upload from "+dir); err != nil {
 			return err
 		}
 	}
