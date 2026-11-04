@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -75,7 +74,7 @@ func newDesktopCmd(opts *options) *cobra.Command {
 
 			if stop {
 				if err := client.StopDesktop(ctx, s.ID); err != nil {
-					return desktopError(err)
+					return err
 				}
 				if opts.json {
 					return writeJSON(out, map[string]bool{"stopped": true})
@@ -89,7 +88,7 @@ func newDesktopCmd(opts *options) *cobra.Command {
 			d, err := client.Desktop(startCtx, s.ID, size)
 			cancelStart()
 			if err != nil {
-				return desktopError(err)
+				return err
 			}
 			if cmd.Flags().Changed("quality") {
 				d.Path = withQuery(d.Path, "quality", strconv.Itoa(quality))
@@ -150,15 +149,6 @@ func withQuery(path, key, value string) string {
 	}
 	values.Set(key, value)
 	return page + "?" + values.Encode()
-}
-
-// desktopError explains a 404 from a deployment that predates the desktop.
-func desktopError(err error) error {
-	var apiErr *api.Error
-	if errors.As(err, &apiErr) && apiErr.Status == 404 && apiErr.Message == "not found" {
-		return errors.New("this deployment doesn't have the desktop yet; update it with: cloudex deploy")
-	}
-	return err
 }
 
 // listenLocal listens on localhost: on port if given, else on the usual port
