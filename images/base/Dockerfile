@@ -34,10 +34,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
   && apt-get update && apt-get install -y --no-install-recommends gh \
   && rm -rf /var/lib/apt/lists/*
 
-# Agent CLIs. Users sign in once inside the sandbox; the login survives stop and resume.
-# They can't update themselves (the npm prefix is root's), so Claude Code's
-# updater is off rather than failing in red on every start.
-RUN npm install -g @anthropic-ai/claude-code @openai/codex && npm cache clean --force \
+# Agent CLIs, pinned to the versions a release was verified with: cloudex
+# agents reads their JSON output. Users sign in once inside the sandbox; the
+# login survives stop and resume. They can't update themselves (the npm prefix
+# is root's), so Claude Code's updater is off rather than failing on every start.
+RUN npm install -g @anthropic-ai/claude-code@2.1.318 @openai/codex@0.166.0 && npm cache clean --force \
   && echo DISABLE_AUTOUPDATER=1 >> /etc/environment \
   && echo 'export DISABLE_AUTOUPDATER=1' > /etc/profile.d/cloudex-agents.sh
 
