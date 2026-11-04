@@ -106,6 +106,13 @@ if want setup; then
 	ok S09 "update --check answers" [ "$CODE" = 0 ]
 	cx info nosuchsandbox-$P
 	ok S10 "a wrong sandbox name says so" has "$ERR" "no sandbox named"
+	cx --version
+	ok S11 "cloudex --version works" [ "$CODE" = 0 ]
+	if printf '%s\n' "$key" | CLOUDEX_CONFIG_DIR=$work/fourth "$CX" login --url "${API_URL#https://}" >/dev/null 2>&1; then
+		pass S12 "login accepts an API URL without https://"
+	else
+		fail S12 "login accepts an API URL without https://" "login failed"
+	fi
 fi
 
 # ---------------------------------------------------------------- lifecycle
@@ -175,6 +182,13 @@ if want lifecycle; then
 	ok L25 "saves rm deletes the save" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 0 ]
 	cx new --from "$P-nosave" --name "$P-x"
 	ok L26 "new --from something missing fails clearly" [ "$CODE" != 0 ]
+	echo f >"$work/ef"
+	cx env set "$P-f-1" --file ".vr-e=$work/ef"
+	cx env unset "$P-f-1" --file .vr-e
+	cx env "$P-f-1"
+	ok L27 "env unset <sandbox> --file removes the file from that sandbox" [ "$CODE" = 0 -a "$(field '.files | length')" = 0 ]
+	cx resume "$P-f-1" --from-backup
+	ok L28 "resume --from-backup on a running sandbox refuses" [ "$CODE" != 0 ]
 fi
 
 # ---------------------------------------------------------------- connect
@@ -239,6 +253,16 @@ if want connect; then
 		cx host "$A" 8123
 		url=$(field .url)
 		ok C18 "host links a localhost server" [ "$(curl -s --max-time 30 "$url")" = served ]
+		cx exec -d "$A" -- 'exec python3 -c "
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        b = self.rfile.read(int(self.headers.get(\"content-length\", 0)))
+        self.send_response(200); self.end_headers(); self.wfile.write(b\"got \" + b)
+http.server.HTTPServer((\"127.0.0.1\", 8127), H).serve_forever()"'
+		sleep 2
+		cx host "$A" 8127
+		ok C18b "the first POST to a localhost server through a new link works" [ "$(curl -s --max-time 30 -X POST -d hello "$(field .url)")" = "got hello" ]
 		cx host "$A" --list
 		ok C19 "host --list shows the link" has "$OUT" "$url"
 		cx host "$A" 8123 --revoke
@@ -264,6 +288,15 @@ if want connect; then
 	(cd "$run" && "$CX" run --out out -- 'mkdir out && echo built >out/r.txt' >"$work/o" 2>"$work/e")
 	CODE=$?
 	ok C25 "run --out copies results back" [ "$CODE" = 0 -a "$(cat "$run/out/r.txt" 2>/dev/null)" = built ]
+	(cd "$run" && "$CX" run --out cov/deep/lcov.info -- 'mkdir -p cov/deep && echo lcov >cov/deep/lcov.info' >"$work/o" 2>"$work/e")
+	CODE=$? ERR=$(cat "$work/e")
+	ok C27 "run --out of a nested file makes the local directories" [ "$CODE" = 0 -a "$(cat "$run/cov/deep/lcov.info" 2>/dev/null)" = lcov ]
+	ln -sfn "$work/tree" "$work/link"
+	cx cp "$work/link" "$A:vr-link"
+	cx exec "$A" -- 'cat vr-link/a.txt'
+	ok C28 "cp of a symlinked directory copies what it points to" is "$OUT" one
+	cx cp "$A:vr-tree/a.txt" "$work/newdir/a.txt"
+	ok C29 "cp into a local directory that doesn't exist yet" [ "$(cat "$work/newdir/a.txt" 2>/dev/null)" = one ]
 	cx list
 	ok C26 "run deletes its sandboxes" [ "$(jq length <<<"$OUT")" = "$before" ]
 fi
