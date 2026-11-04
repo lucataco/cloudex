@@ -85,8 +85,11 @@ in your deployment, encrypted. Sandboxes started after that get a placeholder
 key, and the real one is added to their HTTPS calls to the provider as they
 leave, so it never enters a sandbox, its saves, backups or forks. Claude Code,
 Codex, the providers' SDKs and curl work as if the key were there, with no
-sign-in. A key a sandbox brings itself, or a subscription
-login, is used as is. A new provider reaches a running sandbox when it next
+sign-in. `cloudex keys set` tries the key with the provider first and refuses one
+it rejects. A key a sandbox brings itself is used as is. While the deployment
+holds a provider's key, Claude Code and Codex in a sandbox use it even if someone
+signs in there with a subscription; to use a subscription instead, remove the
+key with `cloudex keys rm`. A new provider reaches a running sandbox when it next
 starts; a changed or removed key reaches it within a minute. `cloudex info`
 shows which providers a sandbox uses this way. The keys are encrypted with the
 admin key, so after `cloudex deploy --yes` replaces it, set them again.
@@ -238,6 +241,9 @@ deploy` builds the image from `images/base` (Docker needed), then set the
 `ADMIN_KEY` secret and point the CLI at it with `CLOUDEX_API_URL` and
 `CLOUDEX_API_KEY`. A newly pushed image can take up to 20 minutes before a
 sandbox can start on it.
+
+Before a release, run the verify-release skill
+(`.agents/skills/verify-release/SKILL.md`) against a test deployment.
 
 Releases: push a `v*` tag. CI publishes `ghcr.io/lucataco/cloudex-base:<tag>` and
 CLI archives built against it.

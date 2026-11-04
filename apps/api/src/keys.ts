@@ -3,8 +3,8 @@
 // sandbox started while a provider has a key gets a placeholder key instead,
 // and its HTTPS traffic to that provider passes through the outbound handler
 // (egress.ts), which puts the real key in when a request carries the
-// placeholder or no key at all. Keys sandboxes bring themselves, and
-// subscription logins, pass through untouched.
+// placeholder or no key at all. Keys sandboxes bring themselves pass through
+// untouched.
 import type { Provider } from "@cloudex/schema";
 import { ensureSchema } from "./db";
 import { open, seal } from "./seal";
