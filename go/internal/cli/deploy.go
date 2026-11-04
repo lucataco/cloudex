@@ -46,21 +46,20 @@ func newDeployCmd(opts *options) *cobra.Command {
 				PreviewDomain: previewDomain, PreviewDomainSet: cmd.Flags().Changed("preview-domain"),
 				RememberedPreviewDomain: cfg.PreviewZone, Image: image,
 				ExistingURL: cfg.APIURL, ExistingKey: cfg.APIKey, ExistingAccountID: cfg.AccountID,
-				Confirm:   func(q string) bool { return yes || confirm(cmd, q) },
+				Confirm: func(q string) bool { return yes || confirm(cmd, q) },
+				// Save the key as soon as the Worker holds it, so an interrupted
+				// deploy, or a failed check, doesn't lose it.
+				OnInstalled: func(res deploy.Result) error {
+					// Another deployment's sandboxes aren't this one's; the same one at a
+					// new workers.dev address keeps them.
+					if res.APIURL != cfg.APIURL && res.AccountID != cfg.AccountID {
+						cfg.Current = ""
+					}
+					cfg.APIURL, cfg.APIKey, cfg.AccountID, cfg.PreviewZone = res.APIURL, res.APIKey, res.AccountID, res.PreviewZone
+					return cfg.Save()
+				},
 				SkipCheck: skipCheck, Log: cmd.ErrOrStderr(),
 			})
-			if res != nil {
-				// Save even after a failed check, so status and doctor can see the deployment.
-				// Another deployment's sandboxes aren't this one's; the same one at a
-				// new workers.dev address keeps them.
-				if res.APIURL != cfg.APIURL && res.AccountID != cfg.AccountID {
-					cfg.Current = ""
-				}
-				cfg.APIURL, cfg.APIKey, cfg.AccountID, cfg.PreviewZone = res.APIURL, res.APIKey, res.AccountID, res.PreviewZone
-				if saveErr := cfg.Save(); saveErr != nil {
-					return saveErr
-				}
-			}
 			if err != nil {
 				return err
 			}
@@ -135,7 +134,11 @@ func newDoctorCmd(opts *options) *cobra.Command {
 			check(err == nil, "ssh is installed", "install an OpenSSH client; cloudex ssh, scp and prompt use it")
 
 			cfg, client, err := opts.load()
-			check(err == nil, "a deployment is configured", "run cloudex deploy")
+			notConfigured := ""
+			if err != nil {
+				notConfigured = err.Error()
+			}
+			check(err == nil, "a deployment is configured", notConfigured)
 			if err == nil {
 				version := "?"
 				h, err := client.Health(cmd.Context())
@@ -145,8 +148,15 @@ func newDoctorCmd(opts *options) *cobra.Command {
 				check(err == nil, fmt.Sprintf("the API at %s answers (version %s)", client.BaseURL, version),
 					fmt.Sprintf("the API at %s doesn't answer: %v", client.BaseURL, err))
 				if err == nil {
+					if deploymentIsOlder(opts.version, h) {
+						check(false, "", fmt.Sprintf("the deployment runs %s, older than this CLI (%s): run cloudex deploy to update it", h.Version, opts.version))
+					}
 					_, err := client.List(cmd.Context())
-					check(err == nil, "the API key works", fmt.Sprintf("the API rejected the key (%v); run cloudex deploy again", err))
+					bad := fmt.Sprintf("the API failed the key check: %v", err)
+					if isUnauthorized(err) {
+						bad = "the API rejected the key. " + keyAdvice(client.BaseURL)
+					}
+					check(err == nil, "the API key works", bad)
 				}
 			}
 			if token := os.Getenv("CLOUDFLARE_API_TOKEN"); token != "" && cfg != nil && cfg.AccountID != "" {

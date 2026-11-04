@@ -77,7 +77,7 @@ const sandboxJSON = `{"id":"cx-abc123","name":"web","size":"standard-2","state":
 "createdAt":1,"updatedAt":1,"startedAt":1,"stoppedAt":null,"savedAt":null,"savedBytes":null,"error":null}`
 
 func TestStatusShowsAPIVersion(t *testing.T) {
-	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`})
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`, "GET /v1/sandboxes": `[]`})
 	code, out, errOut := run(t, "status")
 	if code != 0 || !strings.Contains(out, "version 1.2.3") {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
@@ -196,7 +196,7 @@ func TestLoginRejectsAWrongKey(t *testing.T) {
 }
 
 func TestStatusHidesTheKeyUnlessAsked(t *testing.T) {
-	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`})
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`, "GET /v1/sandboxes": `[]`})
 	_, out, _ := run(t, "status")
 	if strings.Contains(out, "test-key") {
 		t.Fatalf("status printed the key: %q", out)
@@ -204,6 +204,67 @@ func TestStatusHidesTheKeyUnlessAsked(t *testing.T) {
 	_, out, _ = run(t, "status", "--show-key")
 	if !strings.Contains(out, "test-key") {
 		t.Fatalf("status --show-key didn't print the key: %q", out)
+	}
+}
+
+func TestVersionFlag(t *testing.T) {
+	for _, flag := range []string{"--version", "-v"} {
+		code, out, errOut := runVersion(t, "v0.1.17", flag)
+		if code != 0 || out != "cloudex v0.1.17\n" {
+			t.Fatalf("%s: code %d, stdout %q, stderr %q", flag, code, out, errOut)
+		}
+	}
+}
+
+func TestLoginAssumesHTTPSWithoutAScheme(t *testing.T) {
+	srv := newFakeAPI(t, nil)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	code, _, errOut := run(t, "login", "--url", host+"/")
+	// The fake API speaks plain HTTP, so the call fails, but at https://.
+	if code != 1 || !strings.Contains(errOut, "can't reach the Cloudex API at https://"+host+":") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestSavedKeyGoesOnlyToTheSavedDeployment(t *testing.T) {
+	saved := &fakeAPI{t: t, routes: map[string]string{"GET /v1/sandboxes": `[]`}}
+	savedSrv := httptest.NewServer(saved)
+	defer savedSrv.Close()
+	other := &fakeAPI{t: t, routes: map[string]string{"GET /v1/sandboxes": `[]`}}
+	otherSrv := httptest.NewServer(other)
+	defer otherSrv.Close()
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", "")
+	t.Setenv("CLOUDEX_API_KEY", "")
+	if err := (&config.Config{APIURL: savedSrv.URL, APIKey: "test-key"}).Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if code, _, errOut := run(t, "--api-url", savedSrv.URL+"/", "list"); code != 0 {
+		t.Fatalf("saved deployment: code %d, stderr %q", code, errOut)
+	}
+	code, _, errOut := run(t, "--api-url", otherSrv.URL, "list")
+	if code != 1 || !strings.Contains(errOut, "CLOUDEX_API_KEY") || len(other.requests) != 0 {
+		t.Fatalf("other deployment: code %d, stderr %q, it saw %v", code, errOut, other.requests)
+	}
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	if code, _, errOut := run(t, "--api-url", otherSrv.URL, "list"); code != 0 {
+		t.Fatalf("with a key: code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestACorruptConfigNamesTheFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLOUDEX_CONFIG_DIR", dir)
+	t.Setenv("CLOUDEX_API_URL", "")
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range []string{"status", "deploy"} {
+		code, _, errOut := run(t, cmd)
+		if code != 1 || !strings.Contains(errOut, filepath.Join(dir, "config.json")) {
+			t.Fatalf("%s: code %d, stderr %q", cmd, code, errOut)
+		}
 	}
 }
 

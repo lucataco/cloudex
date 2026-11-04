@@ -25,7 +25,7 @@ func newLoginCmd(opts *options) *cobra.Command {
 		Example: "  cloudex login --url https://cloudex-api.example.workers.dev",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			url = strings.TrimRight(firstNonEmpty(url, opts.apiURL, os.Getenv("CLOUDEX_API_URL")), "/")
+			url = api.NormalizeURL(firstNonEmpty(url, opts.apiURL, os.Getenv("CLOUDEX_API_URL")))
 			if url == "" {
 				return errors.New("give the deployment's API URL: cloudex login --url https://cloudex-api.<subdomain>.workers.dev")
 			}

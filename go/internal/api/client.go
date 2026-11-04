@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -111,10 +112,22 @@ type Client struct {
 	BaseURL string
 	Key     string
 	HTTP    *http.Client
+	// CLIVersion is named in the error for a route this deployment doesn't have.
+	CLIVersion string
 }
 
 func New(baseURL, key string) *Client {
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Key: key, HTTP: &http.Client{}}
+	return &Client{BaseURL: NormalizeURL(baseURL), Key: key, HTTP: &http.Client{}}
+}
+
+// NormalizeURL drops trailing slashes and assumes https:// for an address
+// given without a scheme.
+func NormalizeURL(u string) string {
+	u = strings.TrimRight(strings.TrimSpace(u), "/")
+	if u != "" && !strings.Contains(u, "://") {
+		return "https://" + u
+	}
+	return u
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
@@ -138,6 +151,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 	res, err := c.HTTP.Do(req)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return context.Canceled
+		}
 		return fmt.Errorf("can't reach the Cloudex API at %s: %w", c.BaseURL, err)
 	}
 	defer res.Body.Close()
@@ -146,18 +162,33 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return err
 	}
 	if res.StatusCode >= 300 {
-		var e struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(data, &e) != nil || e.Error == "" {
-			e.Error = plainError(res.Status, string(data))
-		}
-		return &Error{Status: res.StatusCode, Message: e.Error}
+		return c.failure(ctx, res, data)
 	}
 	if out == nil {
 		return nil
 	}
 	return json.Unmarshal(data, out)
+}
+
+// failure turns an error answer into an *Error. The API answers a route it
+// doesn't have with {"error":"not found"}, and every real 404 says what is
+// missing, so that answer means the deployment is older than the CLI. The
+// health route has existed from the start, so it never means that.
+func (c *Client) failure(ctx context.Context, res *http.Response, data []byte) *Error {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(data, &e) != nil || e.Error == "" {
+		e.Error = plainError(res.Status, string(data))
+	}
+	if res.StatusCode == http.StatusNotFound && e.Error == "not found" && res.Request.URL.Path != "/v1/health" {
+		e.Error = "this deployment is older than the CLI"
+		if h, err := c.Health(ctx); err == nil && c.CLIVersion != "" {
+			e.Error += fmt.Sprintf(" (%s vs %s)", h.Version, c.CLIVersion)
+		}
+		e.Error += ": update it with cloudex deploy"
+	}
+	return &Error{Status: res.StatusCode, Message: e.Error}
 }
 
 var htmlTitle = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
