@@ -49,7 +49,7 @@ func newLoginCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if cfg.APIURL != url {
+			if api.NormalizeURL(cfg.APIURL) != url {
 				*cfg = config.Config{} // a different deployment: drop its account and current sandbox
 			}
 			cfg.APIURL, cfg.APIKey, cfg.PreviewZone = url, key, ""

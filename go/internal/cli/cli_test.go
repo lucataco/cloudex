@@ -190,6 +190,23 @@ func TestLoginSavesTheDeployment(t *testing.T) {
 	}
 }
 
+func TestLoginAgainKeepsTheCurrentSandboxWhenTheURLIsWrittenDifferently(t *testing.T) {
+	srv := newFakeAPI(t, map[string]string{
+		"GET /v1/health":    `{"ok":true,"version":"0.1.2","previewZone":null}`,
+		"GET /v1/sandboxes": `[]`,
+	})
+	t.Setenv("CLOUDEX_API_URL", "")
+	if err := (&config.Config{APIURL: strings.ToUpper(srv.URL) + "/", APIKey: "test-key", Current: "cx-abc123"}).Save(); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errOut := run(t, "login", "--url", srv.URL); code != 0 {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	if cfg, _ := config.Load(); cfg.Current != "cx-abc123" {
+		t.Fatalf("login forgot the current sandbox: %+v", cfg)
+	}
+}
+
 func TestLoginRejectsAWrongKey(t *testing.T) {
 	srv := newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"0.1.2","previewZone":null}`})
 	t.Setenv("CLOUDEX_API_KEY", "wrong")
