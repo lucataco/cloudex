@@ -385,9 +385,20 @@ func newSetCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			var renamed *string
+			if req.Name != nil {
+				before, err := client.Get(cmd.Context(), r)
+				if err != nil {
+					return err
+				}
+				renamed = before.Name
+			}
 			s, err := client.Update(cmd.Context(), r, req)
 			if err != nil {
 				return err
+			}
+			if renamed != nil && *renamed != *req.Name {
+				forgetSSHName(*renamed)
 			}
 			if opts.json {
 				return writeJSON(cmd.OutOrStdout(), s)
@@ -437,6 +448,9 @@ func newDeleteCmd(opts *options) *cobra.Command {
 			defer cancel()
 			if err := client.Delete(ctx, s.ID); err != nil {
 				return err
+			}
+			if s.Name != nil {
+				forgetSSHName(*s.Name)
 			}
 			if cfg.Current == s.ID || cfg.Current == r {
 				cfg.Current = ""

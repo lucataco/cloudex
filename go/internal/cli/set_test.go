@@ -16,7 +16,10 @@ func serveFake(t *testing.T, f *fakeAPI) {
 }
 
 func TestSetSendsOnlyWhatChanged(t *testing.T) {
-	f := &fakeAPI{t: t, routes: map[string]string{"PATCH /v1/sandboxes/web": strings.Replace(sandboxJSON, `"idleMinutes":30`, `"idleMinutes":120`, 1)}}
+	f := &fakeAPI{t: t, routes: map[string]string{
+		"GET /v1/sandboxes/web":   sandboxJSON,
+		"PATCH /v1/sandboxes/web": strings.Replace(sandboxJSON, `"idleMinutes":30`, `"idleMinutes":120`, 1),
+	}}
 	serveFake(t, f)
 	code, out, errOut := run(t, "set", "web", "--idle", "2h")
 	if code != 0 || !strings.Contains(out, "after 120 minutes") {
@@ -25,8 +28,8 @@ func TestSetSendsOnlyWhatChanged(t *testing.T) {
 	if f.bodies[0] != `{"idleMinutes":120}` {
 		t.Fatalf("body %q", f.bodies[0])
 	}
-	if code, _, _ := run(t, "set", "web", "--name", "site", "--idle", "0"); code != 0 || f.bodies[1] != `{"name":"site","idleMinutes":0}` {
-		t.Fatalf("code %d, body %q", code, f.bodies[1])
+	if code, _, _ := run(t, "set", "web", "--name", "site", "--idle", "0"); code != 0 || f.bodies[len(f.bodies)-1] != `{"name":"site","idleMinutes":0}` {
+		t.Fatalf("code %d, bodies %q", code, f.bodies)
 	}
 }
 
