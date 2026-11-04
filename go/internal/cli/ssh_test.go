@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lucataco/cloudex/go/internal/config"
@@ -106,6 +108,57 @@ func TestProxyForgetsANameThatMovedBeforeDialing(t *testing.T) {
 	}
 	if got := readSSHNames(dir)["web"]; got != "cx-new222" {
 		t.Fatalf("recorded %q", got)
+	}
+}
+
+func TestProxyConnectsWhenItCantRecordTheName(t *testing.T) {
+	f := proxyAPI(t, "cx-abc123")
+	dir, _ := config.Dir()
+	if err := os.MkdirAll(filepath.Join(sshNamesPath(dir), "blocker"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, _, errOut := run(t, "proxy", "web.cloudex", "22")
+	if want := []string{"GET /v1/sandboxes/web", "GET /v1/sandboxes/cx-abc123/tcp/22"}; !reflect.DeepEqual(f.requests, want) {
+		t.Fatalf("requests %v, want %v: the tunnel is dialed anyway", f.requests, want)
+	}
+	if !strings.Contains(errOut, "cloudex ssh web") {
+		t.Fatalf("stderr %q", errOut)
+	}
+}
+
+func TestWriteFileAtomicTakesWritersAtOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ssh-names.json")
+	const size = 64 << 10
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			data := []byte(strings.Repeat(strconv.Itoa(i), size))
+			for range 20 {
+				if err := writeFileAtomic(path, data, 0o600); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) != size || strings.Count(string(data), string(data[:1])) != size {
+		t.Fatalf("the file is a mix of writes (%d bytes): %v", len(data), err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("left behind %v", entries)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", info.Mode())
 	}
 }
 
