@@ -93,7 +93,8 @@ async function sandbox(env: Env, ref: string) {
 }
 
 app.post("/v1/sandboxes", async (c) => {
-  const input = CreateSandbox.parse(await c.req.json().catch(() => ({})));
+  const body = await c.req.text();
+  const input = CreateSandbox.parse(body ? JSON.parse(body) : {});
   if (input.name && (await nameTaken(c.env.DB, input.name))) {
     return c.json({ error: `the name ${input.name} is taken` }, 409);
   }
