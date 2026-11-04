@@ -19,7 +19,7 @@ import (
 
 func newRunCmd(opts *options) *cobra.Command {
 	var name, size, from, dir, workdir string
-	var idle, timeout time.Duration
+	idle, timeout := 30*time.Minute, time.Duration(0)
 	var envPairs, envFiles, outs []string
 	var noUpload, keep, keepOnFailure bool
 	cmd := &cobra.Command{
@@ -68,8 +68,8 @@ func newRunCmd(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&from, "from", "", "start from this named save, or a fork of this sandbox")
 	cmd.Flags().StringVar(&name, "name", "", "a name for the sandbox (default: none)")
 	cmd.Flags().StringVar(&size, "size", "", "standard-1, standard-2 (default), standard-3 or standard-4")
-	cmd.Flags().DurationVar(&idle, "idle", 30*time.Minute, "stop the sandbox after this long without activity, if it's kept")
-	cmd.Flags().DurationVar(&timeout, "timeout", 0, "stop the command after this long (default: no limit)")
+	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop the sandbox after this long without activity, if it's kept")
+	cmd.Flags().Var(durationFlag{&timeout}, "timeout", "stop the command after this long, such as 30m (default: no limit)")
 	cmd.Flags().StringVar(&dir, "dir", ".", "the directory to copy into the sandbox")
 	cmd.Flags().StringVar(&workdir, "workdir", "", "where it goes in the sandbox, and the command runs (default: the directory's name, in the home directory)")
 	cmd.Flags().BoolVar(&noUpload, "no-upload", false, "don't copy any files; run in the home directory unless --workdir says")

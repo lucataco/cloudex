@@ -21,7 +21,7 @@ import (
 func newExecCmd(opts *options) *cobra.Command {
 	var root, detach bool
 	var cwd string
-	var timeout time.Duration
+	timeout := 10 * time.Minute
 	cmd := &cobra.Command{
 		Use:   "exec [sandbox] -- <command>",
 		Short: "Run a command in a sandbox, or start one in the background",
@@ -131,7 +131,7 @@ func newExecCmd(opts *options) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&root, "root", false, "run as root")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory (default: the user's home)")
-	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "stop the command after this long (at most 1h; with --detach, any, and none by default)")
+	cmd.Flags().Var(durationFlag{&timeout}, "timeout", "stop the command after this long, such as 30m (at most 1h; with --detach, any, and none by default)")
 	cmd.Flags().BoolVarP(&detach, "detach", "d", false, "start the command in the background and print its id")
 	return cmd
 }
@@ -338,8 +338,8 @@ func sshRun(cmd *cobra.Command, opts *options, named string, tty bool, remote st
 	if err != nil {
 		return err
 	}
-	if s.State != "running" {
-		return fmt.Errorf("%s is %s; start it with: cloudex resume %s", s.Label(), s.State, s.Label())
+	if err := needRunning(s); err != nil {
+		return err
 	}
 	args := []string{}
 	if tty {

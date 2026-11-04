@@ -39,7 +39,7 @@ func newForkCmd(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "", "a name for the fork, or the start of the names with --count")
 	cmd.Flags().IntVar(&count, "count", 1, fmt.Sprintf("how many forks to make, up to %d", maxForks))
 	cmd.Flags().StringVar(&size, "size", "", "standard-1 to standard-4 (default: the original's)")
-	cmd.Flags().DurationVar(&idle, "idle", 0, "stop after this long without activity (default: the original's)")
+	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop after this long without activity, such as 30m or 2h (default: the original's)")
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make the fork the current sandbox")
 	return cmd
 }
@@ -90,7 +90,8 @@ func runFork(cmd *cobra.Command, opts *options, from string, req api.ForkRequest
 	if req.Count > 1 {
 		what = fmt.Sprintf("%d forks", req.Count)
 	}
-	fmt.Fprintf(cmd.ErrOrStderr(), "Making %s of %s. A running sandbox is saved first and keeps running.\n", what, r)
+	shown := display(cmd.Context(), client, r)
+	fmt.Fprintf(cmd.ErrOrStderr(), "Making %s of %s. A running sandbox is saved first and keeps running.\n", what, shown)
 	ctx, cancel := context.WithTimeout(cmd.Context(), lifecycleTimeout)
 	defer cancel()
 	forks, err := client.Fork(ctx, r, req)
@@ -117,7 +118,7 @@ func runFork(cmd *cobra.Command, opts *options, from string, req api.ForkRequest
 		}
 	} else if len(forks) == 1 && failed == 0 {
 		f := forks[0]
-		fmt.Fprintf(out, "%s is running (%s), a fork of %s.\n", f.Label(), f.Size, r)
+		fmt.Fprintf(out, "%s is running (%s), a fork of %s.\n", f.Label(), f.Size, shown)
 		if !noUse {
 			fmt.Fprintln(out, "It is now the current sandbox. Connect with: cloudex ssh")
 		}

@@ -125,8 +125,8 @@ func newSSHCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if s.State != "running" {
-				return fmt.Errorf("%s is %s; start it with: cloudex resume %s", s.Label(), s.State, s.Label())
+			if err := needRunning(s); err != nil {
+				return err
 			}
 			return runSSH(cmd, s.ID, append([]string{"cloudex@" + s.ID + sshHostSuffix}, extra...))
 		},

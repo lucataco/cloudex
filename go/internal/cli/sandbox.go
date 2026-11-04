@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -15,9 +16,55 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Starting can include pulling the image onto a fresh host; saving a full disk
-// took about 3 minutes in the spikes.
-const lifecycleTimeout = 20 * time.Minute
+// How long the CLI waits for a start, stop or fork: the API allows a stop 15
+// minutes to save and 20 to back up, and a start can pull the image first.
+var lifecycleTimeout = 40 * time.Minute
+
+// durationFlag is a --flag duration that tells a bare number to take a unit.
+type durationFlag struct{ d *time.Duration }
+
+func (f durationFlag) Set(s string) error {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		if _, numErr := strconv.ParseFloat(s, 64); numErr == nil {
+			return fmt.Errorf("add a unit, such as %sm or %sh", s, s)
+		}
+		return err
+	}
+	*f.d = d
+	return nil
+}
+
+func (f durationFlag) String() string {
+	if f.d == nil || *f.d == 0 {
+		return "0"
+	}
+	return f.d.String()
+}
+
+func (durationFlag) Type() string { return "duration" }
+
+// display names the sandbox r in a message: by its name when r is an id and
+// the sandbox has one.
+func display(ctx context.Context, client *api.Client, r string) string {
+	if sandboxIDRE.MatchString(r) {
+		if s, err := client.Get(ctx, r); err == nil {
+			return s.Label()
+		}
+	}
+	return r
+}
+
+// needRunning is the error for a command that needs a running sandbox.
+func needRunning(s *api.Sandbox) error {
+	switch s.State {
+	case "running":
+		return nil
+	case "starting", "stopping":
+		return fmt.Errorf("%s is %s; try again in a moment", s.Label(), s.State)
+	}
+	return fmt.Errorf("%s is %s; start it with: cloudex resume %s", s.Label(), s.State, s.Label())
+}
 
 func optionalRef(args []string) string {
 	if len(args) > 0 {
@@ -29,7 +76,7 @@ func optionalRef(args []string) string {
 func newNewCmd(opts *options) *cobra.Command {
 	var name, size, from, repo string
 	var count int
-	var idle time.Duration
+	idle := 30 * time.Minute
 	var noUse bool
 	var envPairs, envFiles, files []string
 	cmd := &cobra.Command{
@@ -116,7 +163,7 @@ func newNewCmd(opts *options) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&name, "name", "", "a name to use instead of the id")
 	cmd.Flags().StringVar(&size, "size", "", "standard-1, standard-2 (default), standard-3 or standard-4")
-	cmd.Flags().DurationVar(&idle, "idle", 30*time.Minute, "stop after this long without activity; 0 waits for the 6-hour platform limit")
+	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop after this long without activity, such as 30m or 2h; 0 waits for the 6-hour platform limit")
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make it the current sandbox")
 	cmd.Flags().StringVar(&from, "from", "", "start from a copy of this sandbox's disk (a fork), or from this named save")
 	cmd.Flags().IntVar(&count, "count", 1, fmt.Sprintf("with --from, how many sandboxes to start, up to %d", maxForks))
@@ -248,7 +295,7 @@ func printSandbox(w io.Writer, s *api.Sandbox) {
 		fmt.Fprintf(tw, "Note\t%s\n", *s.Notice)
 	}
 	if s.Error != nil {
-		fmt.Fprintf(tw, "Note\t%s\n", *s.Error)
+		fmt.Fprintf(tw, "Error\t%s\n", *s.Error)
 	}
 	tw.Flush()
 }
@@ -271,14 +318,18 @@ func newUseCmd(opts *options) *cobra.Command {
 			if err := cfg.Save(); err != nil {
 				return err
 			}
+			if opts.json {
+				return writeJSON(cmd.OutOrStdout(), s)
+			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s is now the current sandbox.\n", s.Label())
 			return err
 		},
 	}
 }
 
-// lifecycleCmd builds stop and resume, which share their shape.
-func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client, context.Context, string) (*api.Sandbox, error), done string) *cobra.Command {
+// lifecycleCmd builds stop and resume, which share their shape. done says what
+// became of the sandbox, from the record the API answered with.
+func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client, context.Context, string) (*api.Sandbox, error), done func(*api.Sandbox) string) *cobra.Command {
 	return &cobra.Command{
 		Use:   use + " [sandbox]",
 		Short: short,
@@ -292,18 +343,25 @@ func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "%s %s...\n", doing, r)
+			shown := display(cmd.Context(), client, r)
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s %s...\n", doing, shown)
 			ctx, cancel := context.WithTimeout(cmd.Context(), lifecycleTimeout)
 			defer cancel()
 			s, err := call(client, ctx, r)
 			if err != nil {
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return fmt.Errorf("gave up waiting after %d minutes, but the work on %s goes on. Check on it with: cloudex info %s", int(lifecycleTimeout.Minutes()), shown, shown)
+				}
 				return err
 			}
 			if opts.json {
 				return writeJSON(cmd.OutOrStdout(), s)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s %s.\n", s.Label(), done)
-			if s.Notice != nil {
+			fmt.Fprintf(cmd.OutOrStdout(), "%s %s.\n", s.Label(), done(s))
+			if s.Error != nil {
+				fmt.Fprintln(cmd.OutOrStdout(), *s.Error)
+			}
+			if use == "resume" && s.Notice != nil {
 				fmt.Fprintln(cmd.OutOrStdout(), *s.Notice)
 			}
 			if use == "stop" && s.BackupError != nil {
@@ -316,7 +374,20 @@ func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client
 
 func newStopCmd(opts *options) *cobra.Command {
 	return lifecycleCmd(opts, "stop", "Save a sandbox's disk and stop it", "Saving and stopping",
-		(*api.Client).Stop, "is stopped; its disk is saved")
+		(*api.Client).Stop, func(s *api.Sandbox) string {
+			if s.State == "stopped" {
+				return "is stopped; its disk is saved"
+			}
+			return stateIs(s)
+		})
+}
+
+// stateIs finishes "<sandbox> ..." with the sandbox's state.
+func stateIs(s *api.Sandbox) string {
+	if s.State == "error" {
+		return "is in an error state"
+	}
+	return "is " + s.State
 }
 
 func newResumeCmd(opts *options) *cobra.Command {
@@ -330,7 +401,7 @@ func newResumeCmd(opts *options) *cobra.Command {
 				return nil, fmt.Errorf("%s is running, but on %s: this deployment can't change sizes yet; update it with cloudex deploy", s.Label(), s.Size)
 			}
 			return s, err
-		}, "is running")
+		}, stateIs)
 	cmd.Long = "Start a stopped sandbox from its saved disk. A save expires after 30 days without\n" +
 		"a resume; after that, resume restores /home from the newest backup onto a fresh\n" +
 		"image instead, and anything installed outside /home needs installing again.\n\n" +
@@ -408,7 +479,7 @@ func newSetCmd(opts *options) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "a new name")
-	cmd.Flags().DurationVar(&idle, "idle", 0, "stop after this long without activity, such as 30m or 2h; 0 waits for the 6-hour platform limit")
+	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop after this long without activity, such as 30m or 2h; 0 waits for the 6-hour platform limit")
 	return cmd
 }
 
