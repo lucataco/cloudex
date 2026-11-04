@@ -106,6 +106,12 @@ if want setup; then
 	ok S09 "update --check answers" [ "$CODE" = 0 ]
 	cx info nosuchsandbox-$P
 	ok S10 "a wrong sandbox name says so" has "$ERR" "no sandbox named"
+	code=$(curl -s -o "$work/b" -w '%{http_code}' -X POST "$API_URL/v1/sandboxes" -H "authorization: Bearer $(jq -r .apiKey "$CLOUDEX_CONFIG_DIR/config.json")" -d '{')
+	ok S13 "the API refuses malformed JSON on create with a 400" [ "$code" = 400 ]
+	code=$(curl -s -o "$work/b" -w '%{http_code}' "$API_URL/v1/no-such-route" -H "authorization: Bearer $(jq -r .apiKey "$CLOUDEX_CONFIG_DIR/config.json")")
+	ok S14 "an unknown route is a JSON 404 the clients can tell from a missing sandbox" [ "$code" = 404 -a "$(jq -r .error "$work/b")" = "not found" ]
+	cx info cx-zzzzzz
+	ok S15 "a missing sandbox id is named in the error" has "$ERR" "cx-zzzzzz"
 	cx --version
 	ok S11 "cloudex --version works" [ "$CODE" = 0 ]
 	if printf '%s\n' "$key" | CLOUDEX_CONFIG_DIR=$work/fourth "$CX" login --url "${API_URL#https://}" >/dev/null 2>&1; then
@@ -182,6 +188,14 @@ if want lifecycle; then
 	ok L25 "saves rm deletes the save" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 0 ]
 	cx new --from "$P-nosave" --name "$P-x"
 	ok L26 "new --from something missing fails clearly" [ "$CODE" != 0 ]
+	cx new --name "$P-cred" --repo "https://user:token@github.com/octocat/Hello-World"
+	ok L29 "new refuses a repo URL with a token in it and points to GH_TOKEN" [ "$CODE" != 0 -a "$(has "$ERR" GH_TOKEN && echo y)" = y ]
+	cx set "$P-f-1" --idle 1m
+	cx exec "$P-f-1" --timeout 5m -- 'sleep 150; echo alive'
+	out=$OUT
+	cx info "$P-f-1"
+	ok L30 "a quiet foreground exec keeps a sandbox from idling" [ "$out" = alive -a "$(field .state)" = running ]
+	cx set "$P-f-1" --idle 30m
 	echo f >"$work/ef"
 	cx env set "$P-f-1" --file ".vr-e=$work/ef"
 	cx env unset "$P-f-1" --file .vr-e
@@ -308,6 +322,8 @@ if want inside; then
 	ok I01 "cloudex inside a sandbox knows itself" [ "$(field .id)" = "$A_ID" ]
 	cx exec "$A" -- 'cloudex set --idle 45m --json'
 	ok I02 "cloudex set --idle inside" [ "$(field .idleMinutes)" = 45 ]
+	cx exec "$A" -- 'cloudex set --idle 7h'
+	ok I06 "cloudex set --idle over 6h inside says the limit" [ "$CODE" != 0 -a "$(has "$OUT$ERR" "6h" && echo y)" = y ]
 	cx exec "$A" -- 'cloudex list'
 	ok I03 "cloudex inside refuses other sandboxes clearly" [ "$CODE" != 0 -a -n "$ERR$OUT" ]
 	if [[ -n $ZONE ]]; then
