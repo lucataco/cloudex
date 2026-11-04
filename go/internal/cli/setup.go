@@ -1,10 +1,23 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
+	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/spf13/cobra"
 )
+
+// isUnauthorized is true when the API rejected the key.
+func isUnauthorized(err error) bool {
+	var apiErr *api.Error
+	return errors.As(err, &apiErr) && apiErr.Status == 401
+}
+
+// keyAdvice says what to do when the API rejects this computer's key.
+func keyAdvice(url string) string {
+	return fmt.Sprintf("Run cloudex login --url %s with the key from cloudex status --show-key on a computer where it works.", url)
+}
 
 func newVersionCmd(version string, opts *options) *cobra.Command {
 	return &cobra.Command{
@@ -36,6 +49,13 @@ func newStatusCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			sandboxes, err := client.List(cmd.Context())
+			if err != nil {
+				if isUnauthorized(err) {
+					return errors.New("the API rejected the key. " + keyAdvice(client.BaseURL))
+				}
+				return err
+			}
 			zone := ""
 			if h.PreviewZone != nil {
 				zone = *h.PreviewZone
@@ -49,6 +69,9 @@ func newStatusCmd(opts *options) *cobra.Command {
 			}
 			w := cmd.OutOrStdout()
 			fmt.Fprintf(w, "API      %s (version %s)\n", client.BaseURL, h.Version)
+			if deploymentIsOlder(opts.version, h) {
+				fmt.Fprintf(w, "Update   the deployment is older than this CLI (%s): run cloudex deploy to update it\n", opts.version)
+			}
 			if showKey {
 				fmt.Fprintf(w, "Key      %s\n", client.Key)
 			} else {
@@ -66,6 +89,14 @@ func newStatusCmd(opts *options) *cobra.Command {
 				fmt.Fprintln(w, "Backups  off (cloudex deploy turns them on once R2 is enabled for the account)")
 			}
 			current := cfg.Current
+			for _, s := range sandboxes {
+				if cfg.Current != "" && (s.ID == cfg.Current || (s.Name != nil && *s.Name == cfg.Current)) {
+					current = s.Label()
+					if s.Name != nil && *s.Name != "" {
+						current += " (" + s.ID + ")"
+					}
+				}
+			}
 			if current == "" {
 				current = "none"
 			}

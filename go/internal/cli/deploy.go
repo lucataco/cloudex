@@ -135,7 +135,11 @@ func newDoctorCmd(opts *options) *cobra.Command {
 			check(err == nil, "ssh is installed", "install an OpenSSH client; cloudex ssh, scp and prompt use it")
 
 			cfg, client, err := opts.load()
-			check(err == nil, "a deployment is configured", "run cloudex deploy")
+			notConfigured := ""
+			if err != nil {
+				notConfigured = err.Error()
+			}
+			check(err == nil, "a deployment is configured", notConfigured)
 			if err == nil {
 				version := "?"
 				h, err := client.Health(cmd.Context())
@@ -145,8 +149,15 @@ func newDoctorCmd(opts *options) *cobra.Command {
 				check(err == nil, fmt.Sprintf("the API at %s answers (version %s)", client.BaseURL, version),
 					fmt.Sprintf("the API at %s doesn't answer: %v", client.BaseURL, err))
 				if err == nil {
+					if deploymentIsOlder(opts.version, h) {
+						check(false, "", fmt.Sprintf("the deployment runs %s, older than this CLI (%s): run cloudex deploy to update it", h.Version, opts.version))
+					}
 					_, err := client.List(cmd.Context())
-					check(err == nil, "the API key works", fmt.Sprintf("the API rejected the key (%v); run cloudex deploy again", err))
+					bad := fmt.Sprintf("the API failed the key check: %v", err)
+					if isUnauthorized(err) {
+						bad = "the API rejected the key. " + keyAdvice(client.BaseURL)
+					}
+					check(err == nil, "the API key works", bad)
 				}
 			}
 			if token := os.Getenv("CLOUDFLARE_API_TOKEN"); token != "" && cfg != nil && cfg.AccountID != "" {

@@ -77,7 +77,7 @@ const sandboxJSON = `{"id":"cx-abc123","name":"web","size":"standard-2","state":
 "createdAt":1,"updatedAt":1,"startedAt":1,"stoppedAt":null,"savedAt":null,"savedBytes":null,"error":null}`
 
 func TestStatusShowsAPIVersion(t *testing.T) {
-	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`})
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`, "GET /v1/sandboxes": `[]`})
 	code, out, errOut := run(t, "status")
 	if code != 0 || !strings.Contains(out, "version 1.2.3") {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
@@ -196,7 +196,7 @@ func TestLoginRejectsAWrongKey(t *testing.T) {
 }
 
 func TestStatusHidesTheKeyUnlessAsked(t *testing.T) {
-	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`})
+	newFakeAPI(t, map[string]string{"GET /v1/health": `{"ok":true,"version":"1.2.3","previewZone":null}`, "GET /v1/sandboxes": `[]`})
 	_, out, _ := run(t, "status")
 	if strings.Contains(out, "test-key") {
 		t.Fatalf("status printed the key: %q", out)

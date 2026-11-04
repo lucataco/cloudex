@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/config"
 	"github.com/lucataco/cloudex/go/internal/update"
 	"github.com/spf13/cobra"
@@ -23,6 +24,12 @@ var executable = self
 // isRelease is false for builds from source, which report "dev".
 func isRelease(version string) bool {
 	return strings.HasPrefix(version, "v")
+}
+
+// deploymentIsOlder says whether the deployment h describes runs an older
+// release than the CLI. A build from source has no release to compare.
+func deploymentIsOlder(cliVersion string, h *api.Health) bool {
+	return isRelease(cliVersion) && update.Newer(cliVersion, h.Version)
 }
 
 func newUpdateCmd(version string, opts *options) *cobra.Command {
@@ -92,7 +99,7 @@ func updateDeployment(cmd *cobra.Command, opts *options, exe, version string, ch
 		fmt.Fprintf(cmd.ErrOrStderr(), "Couldn't check your deployment: %v\n", err)
 		return nil
 	}
-	if !isRelease(version) || !update.Newer(version, h.Version) {
+	if !deploymentIsOlder(version, h) {
 		fmt.Fprintf(out, "Your deployment runs %s.\n", h.Version)
 		return nil
 	}
