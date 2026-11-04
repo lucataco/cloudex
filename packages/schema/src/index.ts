@@ -43,7 +43,7 @@ export type Sandbox = z.infer<typeof Sandbox>;
 
 export const Name = z
   .string()
-  .regex(/^[a-z][a-z0-9-]{0,30}[a-z0-9]$/, "lowercase letters, digits and dashes; 2-32 characters")
+  .regex(/^[a-z][a-z0-9-]{0,30}[a-z0-9]$/, "2-32 lowercase letters, digits and dashes, starting with a letter and not ending with a dash")
   .refine((n) => !n.startsWith("cx-"), "names can't start with cx-, which marks sandbox ids");
 
 // Settings: environment variables and files the sandbox gets at every start,
@@ -68,9 +68,12 @@ export const FilePath = z
 const FileContent = z.string().max(262_144);
 
 const Branch = z.string().regex(/^[\w./-]{1,200}$/, "a branch or tag name");
+// The URL is kept and shown in the clear, unlike env.
+const noCredentials = (url: string) => !/^https:\/\/[^/?#]*@/.test(url);
+const CREDENTIALS = "a URL without a user name or token in it; for a private repo, set GH_TOKEN in env instead";
 export const Repo = z.object({
   // HTTPS only. For a private GitHub repo, set GH_TOKEN or GITHUB_TOKEN in env.
-  url: z.string().regex(/^https:\/\/[^\s#]+$/, "an https:// URL"),
+  url: z.string().regex(/^https:\/\/[^\s#]+$/, "an https:// URL").refine(noCredentials, CREDENTIALS),
   // Where to clone it, in the home directory; default the repo's name.
   dir: FilePath.optional(),
   branch: Branch.optional(),
@@ -89,7 +92,12 @@ export const CreateSandbox = z.object({
   files: z.record(FilePath, FileContent).refine(maxEntries(20), "at most 20 files").optional(),
   // An https:// URL, with #branch to pick one, or { url, dir, branch }. Cloned
   // once, when the sandbox is created.
-  repo: z.union([z.string().regex(/^https:\/\/[^\s#]+(#[\w./-]{1,200})?$/, "an https:// URL, with #branch if you like"), Repo]).optional(),
+  repo: z
+    .union([
+      z.string().regex(/^https:\/\/[^\s#]+(#[\w./-]{1,200})?$/, "an https:// URL, with #branch if you like").refine(noCredentials, CREDENTIALS),
+      Repo,
+    ])
+    .optional(),
 });
 export type CreateSandbox = z.input<typeof CreateSandbox>;
 
