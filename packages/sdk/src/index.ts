@@ -80,7 +80,7 @@ export interface ProviderKey {
 }
 
 export interface CreateOptions {
-  /** Lowercase letters, digits and dashes; 2-32 characters. */
+  /** 2-32 lowercase letters, digits and dashes, starting with a letter and not ending with a dash. Can't start with cx-, which marks sandbox ids. */
   name?: string;
   /** Default standard-2. */
   size?: SandboxSize;
