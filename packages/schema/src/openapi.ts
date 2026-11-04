@@ -77,8 +77,15 @@ const responses = {
   Error: ApiError,
 };
 
+// Responses stay open to fields added later, which a strict generated client
+// would otherwise reject.
 function jsonSchema(model: z.ZodType, io: "input" | "output") {
-  const { $schema: _, ...schema } = z.toJSONSchema(model, { io });
+  const { $schema: _, ...schema } = z.toJSONSchema(model, {
+    io,
+    override: ({ jsonSchema }) => {
+      if (io === "output" && jsonSchema.additionalProperties === false) delete jsonSchema.additionalProperties;
+    },
+  });
   return schema;
 }
 

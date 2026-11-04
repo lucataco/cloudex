@@ -17,8 +17,9 @@ export const DESKTOP_PORT = 6080;
 // over photo quality (text is sent losslessly anyway). Measured in spikes/RESULTS.md (S5).
 export const DESKTOP_VIEWER = "vnc.html?autoconnect=1&resize=scale&quality=3&compression=2&reconnect=1&path=websockify";
 
-// $1 is the screen size (WxH), $2 the desktop's name. Starts whatever isn't
-// running and resizes a running screen. Prints {"installed":bool,"started":bool}.
+// $1 is the screen size (WxH) or '', $2 the desktop's name. Starts whatever
+// isn't running, at 1280x720 without a size, and resizes a running screen to a
+// size given. Prints {"installed":bool,"started":bool,"size":"WxH"}.
 export const DESKTOP_SCRIPT = String.raw`
 set -euo pipefail
 size=$1 name=$2
@@ -135,6 +136,7 @@ chmod 755 /usr/local/bin/cloudex-desktop-keepalive
 
 started=false
 if ! up 5901; then
+  [ -n "$size" ] || size=1280x720
   note "starting Xtigervnc at $size"
   rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
   daemon Xtigervnc :1 -geometry "$size" -depth 24 -SecurityTypes None -localhost yes -rfbport 5901 \
@@ -144,6 +146,7 @@ if ! up 5901; then
 else
   # Already running: switch the screen to the size asked for, adding a mode if needed.
   current=$(as_user xrandr | sed -n 's/.*current \([0-9]*\) x \([0-9]*\).*/\1x\2/p')
+  [ -n "$size" ] || size=$current
   if [ "$current" != "$size" ]; then
     note "resizing from $current to $size"
     out=$(as_user xrandr | awk '/ connected/ { print $1; exit }')
@@ -169,7 +172,7 @@ up 6080 || daemon websockify --web /usr/share/novnc 6080 127.0.0.1:5901
 wait_up 6080 websockify
 pgrep -f '^/bin/bash /usr/local/bin/cloudex-desktop-keepalive' >/dev/null || setsid -f /usr/local/bin/cloudex-desktop-keepalive >/dev/null 2>&1 </dev/null 9>&-
 note "ready"
-printf '{"installed":%s,"started":%s}\n' "$installed" "$started"
+printf '{"installed":%s,"started":%s,"size":"%s"}\n' "$installed" "$started" "$size"
 `;
 
 // Stops the desktop and everything shown on it.

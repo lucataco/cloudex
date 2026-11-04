@@ -282,8 +282,8 @@ def minutes(text):
         die("bad duration %r: use one such as 30m, 2h or 1h30m" % text, 2)
     h, mi, s = (int(x or 0) for x in m.groups())
     seconds = h * 3600 + mi * 60 + s
-    if 0 < seconds < 60:
-        die("--idle must be 0 or at least 1m", 2)
+    if 0 < seconds < 60 or seconds > 6 * 3600:
+        die("--idle must be 0, or from 1m to 6h", 2)
     return seconds // 60
 
 

@@ -27,10 +27,10 @@ import { openapi } from "@cloudex/schema/openapi";
 import { isAgentId } from "./agents";
 import { isCommandId } from "./commands";
 import { backupBucket } from "./backup";
-import { idForName, listSandboxes, nameTaken } from "./db";
+import { deleteSandbox, idForName, listSandboxes, nameTaken } from "./db";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, listKeys, setKey } from "./keys";
-import type { ForkSource } from "./sandbox";
+import { NO_SUCH_SANDBOX, type ForkSource } from "./sandbox";
 import { type SaveManifest, deleteSave, getSave, listSaves, readManifest } from "./saves";
 import {
   LINK_HEADER,
@@ -53,7 +53,10 @@ export { Egress } from "./egress";
 type Ctx = { Bindings: Env };
 const app = new Hono<Ctx>();
 
-app.onError(onError);
+app.onError((e, c) => {
+  const ref = c.req.param("ref");
+  return onError(ref && e.message === `[404] ${NO_SUCH_SANDBOX}` ? new Error(`[404] no sandbox ${ref}`) : e, c);
+});
 
 app.get("/v1/health", (c) =>
   c.json({ ok: true, version: VERSION, previewZone: c.env.PREVIEW_ZONE || null, backups: Boolean(backupBucket(c.env)) } satisfies Health),
@@ -90,7 +93,8 @@ async function sandbox(env: Env, ref: string) {
 }
 
 app.post("/v1/sandboxes", async (c) => {
-  const input = CreateSandbox.parse(await c.req.json().catch(() => ({})));
+  const body = await c.req.text();
+  const input = CreateSandbox.parse(body ? JSON.parse(body) : {});
   if (input.name && (await nameTaken(c.env.DB, input.name))) {
     return c.json({ error: `the name ${input.name} is taken` }, 409);
   }
@@ -117,9 +121,17 @@ app.post("/v1/sandboxes/:ref/resume", async (c) => {
   return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.resume(fromBackup, size));
 });
 
-app.delete("/v1/sandboxes/:ref", async (c) =>
-  c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.remove()),
-);
+app.delete("/v1/sandboxes/:ref", async (c) => {
+  const { id, stub } = await sandbox(c.env, c.req.param("ref"));
+  try {
+    return c.json(await stub.remove());
+  } catch (e) {
+    // An index row left behind by a delete that failed partway goes too, so
+    // that it doesn't keep holding its name.
+    if (errorStatus(e).status === 404 && (await deleteSandbox(c.env.DB, id))) return c.json({ deleted: id });
+    throw e;
+  }
+});
 
 app.post("/v1/sandboxes/:ref/exec", async (c) => {
   const { stream, ...input } = ExecRequest.parse(await c.req.json());
@@ -216,8 +228,10 @@ app.put("/v1/sandboxes/:ref/files/content", async (c) => {
   const { path, root } = fileQuery(c);
   const mode = c.req.query("mode") || null;
   if (mode !== null && !/^[0-7]{3,4}$/.test(mode)) fail(400, `bad mode ${mode}: give it in octal, such as 644`);
+  const length = c.req.header("content-length");
+  const bytes = length && /^\d{1,15}$/.test(length) ? Number(length) : undefined;
   const ref = c.req.param("ref");
-  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.writeFile(path, root, mode, c.req.raw.body)));
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.writeFile(path, root, mode, c.req.raw.body, bytes)));
 });
 
 app.put("/v1/sandboxes/:ref/files/archive", async (c) => {
