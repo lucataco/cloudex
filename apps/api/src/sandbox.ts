@@ -1246,10 +1246,12 @@ export class Sandbox extends DurableObject<Env> {
     return JSON.parse(await this.fileOp("delete", [path, recursive ? "1" : "0"], root, undefined, 10 * 60_000));
   }
 
-  async writeFile(path: string, root: boolean, mode: string | null, body: ReadableStream | null): Promise<FileInfo> {
+  // With bytes, the upload must come to that many, or the file isn't replaced.
+  async writeFile(path: string, root: boolean, mode: string | null, body: ReadableStream | null, bytes?: number): Promise<FileInfo> {
     this.mustRun();
     try {
-      return JSON.parse(await this.fileOp("write", [path, mode ?? ""], root, body ?? new Response("").body!, FILE_TIMEOUT_MS));
+      const args = [path, mode ?? "", bytes === undefined ? "" : String(bytes)];
+      return JSON.parse(await this.fileOp("write", args, root, body ?? new Response("").body!, FILE_TIMEOUT_MS));
     } finally {
       this.touch();
     }

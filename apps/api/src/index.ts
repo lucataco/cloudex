@@ -228,8 +228,10 @@ app.put("/v1/sandboxes/:ref/files/content", async (c) => {
   const { path, root } = fileQuery(c);
   const mode = c.req.query("mode") || null;
   if (mode !== null && !/^[0-7]{3,4}$/.test(mode)) fail(400, `bad mode ${mode}: give it in octal, such as 644`);
+  const length = c.req.header("content-length");
+  const bytes = length && /^\d{1,15}$/.test(length) ? Number(length) : undefined;
   const ref = c.req.param("ref");
-  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.writeFile(path, root, mode, c.req.raw.body)));
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.writeFile(path, root, mode, c.req.raw.body, bytes)));
 });
 
 app.put("/v1/sandboxes/:ref/files/archive", async (c) => {
