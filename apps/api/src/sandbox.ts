@@ -209,6 +209,8 @@ export class Sandbox extends DurableObject<Env> {
   private queue: Promise<unknown> = Promise.resolve();
   private lastActivity = Date.now();
   private lastActivitySaved = 0;
+  // Foreground execs running now, which count as activity for as long as they run.
+  private execs = 0;
   private exitedAt = 0;
   // Guest ports that listen only on localhost, and the port of the relay for
   // each, in this run.
@@ -470,6 +472,7 @@ export class Sandbox extends DurableObject<Env> {
           "saving the disk",
         );
         console.log(`[${r.id}] saved ${snap.size} bytes for a fork in ${Date.now() - t0} ms`);
+        this.touch();
         return { sandbox: r.id, snapshot: { id: snap.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
       }
       if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
@@ -1045,23 +1048,26 @@ export class Sandbox extends DurableObject<Env> {
     this.touch();
   }
 
-  // The command line and options exec runs a command with. GNU timeout puts the
-  // command in a process group of its own and stops the whole group, so
-  // what it started in the background goes too; the abort is a backstop.
-  private execArgs(input: ExecInput, signal: AbortSignal): [string[], ContainerExecOptions] {
+  // GNU timeout puts the command in a process group of its own and stops the
+  // whole group, so what it started in the background goes too; the abort is
+  // a backstop.
+
+  private async startExec(input: ExecInput, signal: AbortSignal): Promise<ExecProcess> {
     const home = input.root ? "/root" : GUEST_HOME;
     // A relative directory, or one starting with ~, is in the home directory.
     const cwd = !input.cwd ? home : input.cwd.startsWith("/") ? input.cwd : `${home}/${input.cwd.replace(/^~(\/|$)/, "")}`;
-    return [
-      guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root),
-      {
-        cwd,
-        env: input.root
-          ? { HOME: "/root", USER: "root", LANG: "C.UTF-8", TERM: "dumb" }
-          : { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8", TERM: "dumb" },
-        signal,
-      },
-    ];
+    // The container runtime reports a missing directory as a missing command.
+    if (input.cwd) {
+      const check = await this.container.exec(["test", "-d", cwd], { cwd: "/" });
+      if ((await check.exitCode) !== 0) fail(400, `there's no directory ${cwd} in the sandbox`);
+    }
+    return this.container.exec(guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root), {
+      cwd,
+      env: input.root
+        ? { HOME: "/root", USER: "root", LANG: "C.UTF-8", TERM: "dumb" }
+        : { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8", TERM: "dumb" },
+      signal,
+    });
   }
 
   async exec(input: ExecInput): Promise<ExecResult> {
@@ -1069,12 +1075,14 @@ export class Sandbox extends DurableObject<Env> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), input.timeoutSec * 1000 + 30_000);
     const t0 = Date.now();
+    this.execs++;
     try {
-      const p = await this.container.exec(...this.execArgs(input, ctl.signal));
+      const p = await this.startExec(input, ctl.signal);
       const out = await readOutput(p);
       return { ...out, timedOut: timedOut(out.exitCode, t0, input.timeoutSec) || ctl.signal.aborted, ms: Date.now() - t0 };
     } finally {
       clearTimeout(timer);
+      this.execs--;
       this.touch();
     }
   }
@@ -1087,10 +1095,12 @@ export class Sandbox extends DurableObject<Env> {
     const timer = setTimeout(() => ctl.abort(), input.timeoutSec * 1000 + 30_000);
     const t0 = Date.now();
     let p: ExecProcess;
+    this.execs++;
     try {
-      p = await this.container.exec(...this.execArgs(input, ctl.signal));
+      p = await this.startExec(input, ctl.signal);
     } catch (e) {
       clearTimeout(timer);
+      this.execs--;
       throw e;
     }
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
@@ -1155,6 +1165,7 @@ export class Sandbox extends DurableObject<Env> {
         clearInterval(keepalive);
         stop();
         clearTimeout(timer);
+        this.execs--;
         this.touch();
         await writer.close().catch(() => {});
       }
@@ -1343,6 +1354,12 @@ export class Sandbox extends DurableObject<Env> {
     return { stopped: true };
   }
 
+  private idle() {
+    const r = this.record;
+    const idleMs = (r?.idleMinutes ?? 0) * 60_000;
+    return r?.state === "running" && idleMs > 0 && this.execs === 0 && Date.now() - this.lastActivity > idleMs;
+  }
+
   // Idle stop. The platform's own inactivity timer only sees incoming
   // connections, so this is what actually ends a quiet box. An open bridge
   // counts only while its client sends something (ssh keepalives every 30 s,
@@ -1371,14 +1388,19 @@ export class Sandbox extends DurableObject<Env> {
         if (this.record?.state === "running") await this.applyPlatform();
       }).catch((e) => console.error(`[${r.id}] ${message(e)}`));
     }
-    const idleMs = r.idleMinutes * 60_000;
-    if (idleMs > 0 && Date.now() - this.lastActivity > idleMs) {
+    if (this.idle()) {
       try {
-        await this.exclusive(async () => {
-          if (this.record?.state === "running") await this.saveAndDestroy();
+        // Asked again in the queue: what ran ahead of it, such as a long save,
+        // may have been activity.
+        const stopped = await this.exclusive(async () => {
+          if (!this.idle()) return false;
+          await this.saveAndDestroy();
+          return true;
         });
-        console.log(`[${r.id}] stopped after ${r.idleMinutes} idle minutes`);
-        return;
+        if (stopped) {
+          console.log(`[${r.id}] stopped after ${r.idleMinutes} idle minutes`);
+          return;
+        }
       } catch (e) {
         console.error(`[${r.id}] idle stop failed: ${message(e)}`);
       }
