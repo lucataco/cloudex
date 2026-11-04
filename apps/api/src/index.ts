@@ -9,6 +9,8 @@ import {
   DesktopRequest,
   ExecRequest,
   ForkRequest,
+  KillCommand,
+  StartCommand,
   HostRequest,
   Name,
   Provider,
@@ -23,6 +25,7 @@ import {
 import { z } from "zod";
 import { openapi } from "@cloudex/schema/openapi";
 import { isAgentId } from "./agents";
+import { isCommandId } from "./commands";
 import { backupBucket } from "./backup";
 import { idForName, listSandboxes, nameTaken } from "./db";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
@@ -36,6 +39,7 @@ import {
   fail,
   isSandboxId,
   newAgentId,
+  newCommandId,
   newSandboxId,
   newSaveId,
   previewToken,
@@ -64,6 +68,12 @@ app.use("/v1/*", async (c, next) => {
     return c.json({ error: "unauthorized" }, 401);
   }
   await next();
+});
+
+// after and wait for long polls: agent events and command output.
+const EventsQuery = z.object({
+  after: z.coerce.number().int().min(0).default(0),
+  wait: z.coerce.number().int().min(0).max(60).default(0),
 });
 
 // Sandboxes are addressed by id (cx-xxxxxx) or by name.
@@ -112,8 +122,108 @@ app.delete("/v1/sandboxes/:ref", async (c) =>
 );
 
 app.post("/v1/sandboxes/:ref/exec", async (c) => {
-  const input = ExecRequest.parse(await c.req.json());
-  return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.exec(input));
+  const { stream, ...input } = ExecRequest.parse(await c.req.json());
+  const ref = c.req.param("ref");
+  const { stub } = await sandbox(c.env, ref);
+  if (!stream) return c.json(await stub.exec(input));
+  const body = await newMethod(ref, stub.execStream(input));
+  return new Response(body, { headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" } });
+});
+
+// Background commands (commands.ts). Each call runs a script in the sandbox,
+// which keeps the commands and their output.
+async function commandOp(env: Env, ref: string, op: string, args: string[], stdin?: string, waitSec?: number) {
+  const { stub } = await sandbox(env, ref);
+  return newMethod(ref, stub.commandOp(op, args, stdin, waitSec));
+}
+
+function commandId(id: string) {
+  if (!isCommandId(id)) fail(404, `no command ${id}`);
+  return id;
+}
+
+app.post("/v1/sandboxes/:ref/commands", async (c) => {
+  const input = StartCommand.parse(await c.req.json());
+  const args = [newCommandId(), input.root ? "1" : "0", input.cwd ?? "", String(input.timeoutSec)];
+  return c.json(await commandOp(c.env, c.req.param("ref"), "start", args, input.cmd), 201);
+});
+
+app.get("/v1/sandboxes/:ref/commands", async (c) => c.json(await commandOp(c.env, c.req.param("ref"), "list", [])));
+
+app.get("/v1/sandboxes/:ref/commands/:cmd", async (c) =>
+  c.json(await commandOp(c.env, c.req.param("ref"), "get", [commandId(c.req.param("cmd"))])),
+);
+
+// Long polling: with wait, answers as soon as there's output after `after`,
+// the command ends, or the seconds pass.
+app.get("/v1/sandboxes/:ref/commands/:cmd/output", async (c) => {
+  const { after, wait } = EventsQuery.parse(c.req.query());
+  const args = [commandId(c.req.param("cmd")), String(after), String(wait)];
+  return c.json(await commandOp(c.env, c.req.param("ref"), "output", args, undefined, wait));
+});
+
+app.post("/v1/sandboxes/:ref/commands/:cmd/kill", async (c) => {
+  const body = await c.req.text();
+  const { signal } = KillCommand.parse(body ? JSON.parse(body) : {});
+  return c.json(await commandOp(c.env, c.req.param("ref"), "kill", [commandId(c.req.param("cmd")), signal]));
+});
+
+app.delete("/v1/sandboxes/:ref/commands/:cmd", async (c) =>
+  c.json(await commandOp(c.env, c.req.param("ref"), "forget", [commandId(c.req.param("cmd"))])),
+);
+
+// Files (files.ts), named by the path query parameter; root=true acts as root.
+const FileQuery = z.object({
+  path: z.string().min(1, "give a path").max(4096),
+  root: z.enum(["true", "false", "1", "0"]).default("false").transform((v) => v === "true" || v === "1"),
+});
+
+const fileQuery = (c: { req: { query(): Record<string, string> } }) => FileQuery.parse(c.req.query());
+
+app.get("/v1/sandboxes/:ref/files", async (c) => {
+  const { path, root } = fileQuery(c);
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.fileInfo(path, root)));
+});
+
+app.delete("/v1/sandboxes/:ref/files", async (c) => {
+  const { path, root } = fileQuery(c);
+  const recursive = ["true", "1"].includes(c.req.query("recursive") ?? "");
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.deleteFile(path, root, recursive)));
+});
+
+async function download(env: Env, ref: string, query: Record<string, string>, archive: boolean) {
+  const { path, root } = FileQuery.parse(query);
+  const { stub } = await sandbox(env, ref);
+  const { info, body } = await newMethod(ref, stub.readFile(path, root, archive));
+  const name = encodeURIComponent(info.path.split("/").pop() || "root") + (archive ? ".tar.gz" : "");
+  return new Response(body, {
+    headers: {
+      "content-type": archive ? "application/gzip" : "application/octet-stream",
+      "content-disposition": `attachment; filename*=UTF-8''${name}`,
+      "cache-control": "no-store",
+      "x-cloudex-path": encodeURIComponent(info.path),
+    },
+  });
+}
+
+app.get("/v1/sandboxes/:ref/files/content", (c) => download(c.env, c.req.param("ref"), c.req.query(), false));
+
+app.get("/v1/sandboxes/:ref/files/archive", (c) => download(c.env, c.req.param("ref"), c.req.query(), true));
+
+app.put("/v1/sandboxes/:ref/files/content", async (c) => {
+  const { path, root } = fileQuery(c);
+  const mode = c.req.query("mode") || null;
+  if (mode !== null && !/^[0-7]{3,4}$/.test(mode)) fail(400, `bad mode ${mode}: give it in octal, such as 644`);
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.writeFile(path, root, mode, c.req.raw.body)));
+});
+
+app.put("/v1/sandboxes/:ref/files/archive", async (c) => {
+  const { path, root } = fileQuery(c);
+  const ref = c.req.param("ref");
+  return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.writeArchive(path, root, c.req.raw.body)));
 });
 
 // The names ForkRequest asks for, checked before anything starts.
@@ -235,10 +345,6 @@ function agentId(id: string) {
   return id;
 }
 
-const EventsQuery = z.object({
-  after: z.coerce.number().int().min(0).default(0),
-  wait: z.coerce.number().int().min(0).max(60).default(0),
-});
 
 app.post("/v1/sandboxes/:ref/agents", async (c) => {
   const input = StartAgent.parse(await c.req.json());

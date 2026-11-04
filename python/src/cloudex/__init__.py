@@ -10,6 +10,9 @@ account, using only the standard library.
     print(box.exec("uname -a").stdout)
     forks = box.fork(count=3, name="try")
 
+    for event in box.exec_stream("npm test"):  # output as it comes
+        print(event.data, end="")
+
     agent = box.prompt("make the tests pass")  # Claude Code, with no terminal
     for event in agent.events():
         print(event["type"])
@@ -26,14 +29,20 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from typing import IO, Any, Dict, Iterator, List, Optional, Sequence, Union
 
 __all__ = [
     "Agent",
+    "ArchiveResult",
     "Cloudex",
     "CloudexError",
+    "Command",
+    "CommandOutput",
     "Desktop",
+    "ExecEvent",
     "ExecResult",
+    "FileEntry",
+    "FileInfo",
     "Health",
     "HostLink",
     "ProviderKey",
@@ -41,7 +50,7 @@ __all__ = [
     "Save",
     "Settings",
 ]
-__version__ = "0.1.15"
+__version__ = "0.1.16"
 
 
 class CloudexError(Exception):
@@ -60,6 +69,90 @@ class ExecResult:
     stderr: str
     timed_out: bool
     ms: int
+
+
+@dataclass(frozen=True)
+class ExecEvent:
+    """Part of a streamed exec: output as it comes (type "stdout" or "stderr",
+    in data), then "exit" with exit_code, timed_out and ms.
+
+    Output is UTF-8 text; bytes that aren't become U+FFFD, so read binary
+    files with read_file.
+    """
+
+    type: str
+    data: str = ""
+    exit_code: Optional[int] = None
+    timed_out: Optional[bool] = None
+    ms: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class Command:
+    """A background command. Times are milliseconds since the epoch.
+
+    state is running; exited, with exit_code; killed by a signal, which
+    includes a kill and a timeout (timed_out); or lost: the sandbox stopped,
+    or was forked or saved, while it ran.
+    """
+
+    id: str  # cm-xxxxxxxx
+    cmd: str
+    root: bool
+    cwd: str
+    state: str
+    exit_code: Optional[int]
+    signal: Optional[str]  # the signal that ended it, such as TERM or KILL
+    timed_out: bool
+    timeout_sec: int  # 0: none
+    started_at: int
+    ended_at: Optional[int]
+    output_bytes: int  # the size of its output so far
+
+
+@dataclass(frozen=True)
+class CommandOutput:
+    """Part of a command's output (stdout and stderr together), from byte offset
+    offset to next, as UTF-8 text. Pass next as after to read on."""
+
+    data: str
+    offset: int
+    next: int
+    command: Command  # the command as of this read
+
+
+@dataclass(frozen=True)
+class FileEntry:
+    """One entry in a directory."""
+
+    name: str
+    type: str  # file, dir, symlink or other
+    size: int
+    mode: str  # permission bits in octal, such as 644
+    mtime: int  # milliseconds since the epoch
+    target: Optional[str] = None  # a symlink's target
+
+
+@dataclass(frozen=True)
+class FileInfo:
+    """A path's details and, for a directory, what's in it."""
+
+    path: str  # absolute
+    type: str  # file, dir, symlink or other
+    size: int
+    mode: str  # permission bits in octal, such as 644
+    mtime: int  # milliseconds since the epoch
+    target: Optional[str] = None  # a symlink's target
+    entries: Optional[List[FileEntry]] = None  # a directory's, sorted by name, at most 10,000
+    truncated: bool = False  # the directory had more entries than these
+
+
+@dataclass(frozen=True)
+class ArchiveResult:
+    """What an archive upload unpacked, and where."""
+
+    path: str
+    entries: int
 
 
 @dataclass(frozen=True)
@@ -251,14 +344,24 @@ class Cloudex:
 
     def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
         data = None if body is None else json.dumps(body).encode()
+        with self._open(method, path, data, None if data is None else "application/json") as res:
+            text = res.read().decode()
+        return json.loads(text) if text else None
+
+    def _open(self, method: str, path: str, data: Any = None, content_type: Optional[str] = None) -> Any:
+        # A request, answered with the response unread; an error status raises.
         req = urllib.request.Request(self.api_url + path, data=data, method=method)
         req.add_header("Authorization", f"Bearer {self._key}")
         req.add_header("User-Agent", f"cloudex-python/{__version__}")
-        if data is not None:
-            req.add_header("Content-Type", "application/json")
+        if content_type:
+            req.add_header("Content-Type", content_type)
+        if data is not None and not isinstance(data, bytes):
+            # A file, sent from where it is to its end: give the length, or urllib sends chunks.
+            here = data.tell()
+            req.add_header("Content-Length", str(data.seek(0, os.SEEK_END) - here))
+            data.seek(here)
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as res:
-                text = res.read().decode()
+            return urllib.request.urlopen(req, timeout=self._timeout)
         except urllib.error.HTTPError as e:
             text = e.read().decode(errors="replace")
             try:
@@ -268,7 +371,6 @@ class Cloudex:
             raise CloudexError(e.code, str(message)) from None
         except urllib.error.URLError as e:
             raise CloudexError(0, f"can't reach {self.api_url}: {e.reason}") from None
-        return json.loads(text) if text else None
 
 
 def _provider_key(k: Dict[str, Any]) -> ProviderKey:
@@ -294,6 +396,50 @@ def _save(s: Dict[str, Any]) -> Save:
         ms=s["ms"],
         replaced=s.get("replaced"),
     )
+
+
+def _command(c: Dict[str, Any]) -> Command:
+    return Command(
+        id=c["id"],
+        cmd=c["cmd"],
+        root=c["root"],
+        cwd=c["cwd"],
+        state=c["state"],
+        exit_code=c.get("exitCode"),
+        signal=c.get("signal"),
+        timed_out=c["timedOut"],
+        timeout_sec=c["timeoutSec"],
+        started_at=c["startedAt"],
+        ended_at=c.get("endedAt"),
+        output_bytes=c["outputBytes"],
+    )
+
+
+def _file_info(f: Dict[str, Any]) -> FileInfo:
+    entries = f.get("entries")
+    return FileInfo(
+        path=f["path"],
+        type=f["type"],
+        size=f["size"],
+        mode=f["mode"],
+        mtime=f["mtime"],
+        target=f.get("target"),
+        entries=None if entries is None else [
+            FileEntry(name=e["name"], type=e["type"], size=e["size"], mode=e["mode"], mtime=e["mtime"], target=e.get("target"))
+            for e in entries
+        ],
+        truncated=bool(f.get("truncated")),
+    )
+
+
+def _upload(data: Union[bytes, bytearray, memoryview, str, IO[bytes]]) -> Any:
+    # Bytes, or a binary file that can seek, which is streamed; anything else is read whole.
+    if isinstance(data, str):
+        return data.encode()
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return bytes(data)
+    seekable = getattr(data, "seekable", None)
+    return data if seekable and seekable() else data.read()
 
 
 def _sandbox_path(ref: str) -> str:
@@ -348,6 +494,19 @@ class Sandbox:
     def _path(self, suffix: str = "") -> str:
         return _sandbox_path(self.id) + suffix
 
+    def _command_path(self, id: str) -> str:
+        return self._path("/commands/" + urllib.parse.quote(id, safe=""))
+
+    def _file_path(self, suffix: str, path: str, root: bool, recursive: bool = False, mode: Optional[str] = None) -> str:
+        q = "?path=" + urllib.parse.quote(path, safe="/~")
+        if root:
+            q += "&root=true"
+        if recursive:
+            q += "&recursive=true"
+        if mode:
+            q += "&mode=" + urllib.parse.quote(mode, safe="")
+        return self._path("/files" + suffix + q)
+
     def _update(self, method: str, suffix: str, body: Optional[Dict[str, Any]] = None) -> "Sandbox":
         self.info = self._client._call(method, self._path(suffix), body)
         return self
@@ -385,12 +544,170 @@ class Sandbox:
         """Runs a command with `bash -lc` and waits for it (default limit 600 s, at most 3600).
 
         A string is run as shell code; a list is quoted, one argument per
-        element. A failing command doesn't raise: check exit_code.
+        element. cwd defaults to the home directory; a relative path, or one
+        starting with ~, is in it. A failing command doesn't raise: check
+        exit_code.
         """
         cmd = command if isinstance(command, str) else shlex.join(command)
         body = _drop_none(cmd=cmd, root=root or None, cwd=cwd, timeoutSec=timeout_sec)
         r = self._client._call("POST", self._path("/exec"), body)
         return ExecResult(exit_code=r["exitCode"], stdout=r["stdout"], stderr=r["stderr"], timed_out=r["timedOut"], ms=r["ms"])
+
+    def exec_stream(
+        self,
+        command: Union[str, Sequence[str]],
+        root: bool = False,
+        cwd: Optional[str] = None,
+        timeout_sec: Optional[int] = None,
+    ) -> Iterator[ExecEvent]:
+        """Runs a command like exec, yielding its output as it comes.
+
+        Yields ExecEvents: "stdout" and "stderr" with data, then "exit" with
+        exit_code. Streamed output isn't cut. Closing the generator early, or
+        leaving its loop with break, stops the command. If the stream breaks
+        off it raises CloudexError (status 0); the command may still be
+        running. The API sends something every 15 seconds, so a client
+        timeout must be longer than that. An API before v0.1.16 answers once
+        the command ends, so all its output comes at once.
+        """
+        cmd = command if isinstance(command, str) else shlex.join(command)
+        body = _drop_none(cmd=cmd, root=root or None, cwd=cwd, timeoutSec=timeout_sec)
+        body["stream"] = True
+        with self._client._open("POST", self._path("/exec"), json.dumps(body).encode(), "application/json") as res:
+            if "ndjson" not in (res.headers.get("Content-Type") or ""):
+                r = json.loads(res.read().decode())
+                if r["stdout"]:
+                    yield ExecEvent("stdout", r["stdout"])
+                if r["stderr"]:
+                    yield ExecEvent("stderr", r["stderr"])
+                yield ExecEvent("exit", exit_code=r["exitCode"], timed_out=r["timedOut"], ms=r["ms"])
+                return
+            for line in res:
+                if not line.strip():
+                    continue
+                e = json.loads(line)
+                if e["type"] in ("stdout", "stderr"):
+                    yield ExecEvent(e["type"], e["data"])
+                elif e["type"] == "exit":
+                    yield ExecEvent("exit", exit_code=e["exitCode"], timed_out=e["timedOut"], ms=e["ms"])
+                    return
+                elif e["type"] == "error":
+                    raise CloudexError(0, e["error"])
+                # keepalive, and anything newer, is skipped
+        raise CloudexError(0, "the exec stream ended before the command did")
+
+    def start_command(
+        self,
+        command: Union[str, Sequence[str]],
+        root: bool = False,
+        cwd: Optional[str] = None,
+        timeout_sec: Optional[int] = None,
+    ) -> Command:
+        """Starts a command in the background and returns once it's running.
+
+        A string is run as shell code with `bash -lc`; a list is quoted.
+        timeout_sec stops it after that long; by default it runs until it ends,
+        is killed or the sandbox stops. Its output (stdout and stderr together)
+        is kept on the sandbox's disk: read it with command_output or
+        follow_command.
+        """
+        cmd = command if isinstance(command, str) else shlex.join(command)
+        body = _drop_none(cmd=cmd, root=root or None, cwd=cwd, timeoutSec=timeout_sec)
+        return _command(self._client._call("POST", self._path("/commands"), body))
+
+    def list_commands(self) -> List[Command]:
+        """The sandbox's background commands, newest first."""
+        return [_command(c) for c in self._client._call("GET", self._path("/commands"))]
+
+    def get_command(self, id: str) -> Command:
+        """A background command by id (cm-xxxxxxxx)."""
+        return _command(self._client._call("GET", self._command_path(id)))
+
+    def command_output(self, id: str, after: int = 0, wait: int = 0) -> CommandOutput:
+        """A command's output from byte offset after, up to 1 MiB.
+
+        With wait (seconds, at most 60), waits for output after that or for the
+        command to end. Pass next as after to read on.
+        """
+        o = self._client._call("GET", f"{self._command_path(id)}/output?after={after}&wait={wait}")
+        return CommandOutput(data=o["data"], offset=o["offset"], next=o["next"], command=_command(o["command"]))
+
+    def follow_command(self, id: str, after: int = 0) -> Iterator[CommandOutput]:
+        """Follows a command's output from after until it ends and all of it is read.
+
+        Each item is a piece of output; the last one's command tells how it
+        ended. Each request waits up to 25 seconds, so a client timeout must
+        be longer than that.
+        """
+        # Once the command has ended, read only what its log held then, so
+        # that something it left running can't keep this going.
+        end = -1
+        while True:
+            page = self.command_output(id, after=after, wait=25)
+            c = page.command
+            if c.state != "running" and end < 0:
+                end = c.output_bytes
+            ended = end >= 0 and (page.next >= end or page.next == after)
+            if page.data or ended:
+                yield page
+            if ended:
+                return
+            after = page.next
+
+    def kill_command(self, id: str, signal: Optional[str] = None) -> Command:
+        """Sends a running command, and everything it started, a signal: TERM (the default), INT, HUP or KILL."""
+        return _command(self._client._call("POST", self._command_path(id) + "/kill", _drop_none(signal=signal)))
+
+    def forget_command(self, id: str) -> Command:
+        """Deletes a finished command's record and output; a running one must be killed first."""
+        return _command(self._client._call("DELETE", self._command_path(id)))
+
+    def stat(self, path: str, root: bool = False) -> FileInfo:
+        """A path's details and, for a directory, what's in it (entries).
+
+        A relative path, or one starting with ~, is in the home directory.
+        With root, acts as root rather than the cloudex user; so do the other
+        file calls.
+        """
+        return _file_info(self._client._call("GET", self._file_path("", path, root)))
+
+    def read_file(self, path: str, root: bool = False) -> bytes:
+        """A file's contents."""
+        with self._client._open("GET", self._file_path("/content", path, root)) as res:
+            return res.read()
+
+    def write_file(
+        self,
+        path: str,
+        data: Union[bytes, str, IO[bytes]],
+        mode: Union[str, int, None] = None,
+        root: bool = False,
+    ) -> FileInfo:
+        """Writes a file whole, making its directory if need be.
+
+        data is bytes, a str (sent as UTF-8) or a binary file. The file keeps
+        its mode unless mode is given, in octal: "755" or 0o755. Cloudflare
+        limits a request to 100 MB on most plans.
+        """
+        mode_text = format(mode, "o") if isinstance(mode, int) else mode
+        url = self._file_path("/content", path, root, mode=mode_text)
+        with self._client._open("PUT", url, _upload(data), "application/octet-stream") as res:
+            return _file_info(json.loads(res.read().decode()))
+
+    def delete_file(self, path: str, recursive: bool = False, root: bool = False) -> FileInfo:
+        """Deletes a file, or with recursive, a directory and everything in it. Returns what was deleted."""
+        return _file_info(self._client._call("DELETE", self._file_path("", path, root, recursive=recursive)))
+
+    def download_archive(self, path: str, root: bool = False) -> bytes:
+        """A directory's contents, or one file, as a tar.gz. Files the user can't read are left out."""
+        with self._client._open("GET", self._file_path("/archive", path, root)) as res:
+            return res.read()
+
+    def upload_archive(self, path: str, data: Union[bytes, IO[bytes]], root: bool = False) -> ArchiveResult:
+        """Unpacks a tar.gz (bytes or a binary file) into a directory, making it if need be."""
+        with self._client._open("PUT", self._file_path("/archive", path, root), _upload(data), "application/gzip") as res:
+            r = json.loads(res.read().decode())
+        return ArchiveResult(path=r["path"], entries=r["entries"])
 
     def fork(
         self,

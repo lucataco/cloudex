@@ -156,7 +156,7 @@ export interface ForkOptions {
 export interface ExecOptions {
   /** Run as root instead of the cloudex user. */
   root?: boolean;
-  /** Default: the user's home directory. */
+  /** Default: the user's home directory. A relative path, or one starting with ~, is in it. */
   cwd?: string;
   /** 1 to 3600; default 600. */
   timeoutSec?: number;
@@ -169,6 +169,115 @@ export interface ExecResult {
   stderr: string;
   timedOut: boolean;
   ms: number;
+}
+
+/**
+ * One line of a streamed exec: output as it comes, then exit. Output is UTF-8
+ * text; bytes that aren't become U+FFFD, so read binary files with readFile.
+ * keepalive comes every 15 seconds while the command prints nothing; error
+ * ends a stream that broke off.
+ */
+export type ExecEvent =
+  | { type: "stdout"; data: string }
+  | { type: "stderr"; data: string }
+  | { type: "keepalive" }
+  | { type: "exit"; exitCode: number; timedOut: boolean; ms: number }
+  | { type: "error"; error: string };
+
+/** What Sandbox.execStream yields: keepalives are skipped, and an error is thrown. */
+export type ExecStreamEvent = Extract<ExecEvent, { type: "stdout" | "stderr" | "exit" }>;
+
+export interface CommandOptions {
+  /** Run as root instead of the cloudex user. */
+  root?: boolean;
+  /** Default: the user's home directory. A relative path, or one starting with ~, is in it. */
+  cwd?: string;
+  /** Stop it after this long; 0, the default, never. */
+  timeoutSec?: number;
+}
+
+/**
+ * running; exited with exitCode; killed by a signal, which includes a kill
+ * and a timeout; or lost: the sandbox stopped, or was forked or saved, while
+ * it ran.
+ */
+export type CommandState = "running" | "exited" | "killed" | "lost";
+export type CommandSignal = "TERM" | "INT" | "HUP" | "KILL";
+
+/** A background command. Times are milliseconds since the epoch. */
+export interface Command {
+  /** cm-xxxxxxxx */
+  id: string;
+  cmd: string;
+  root: boolean;
+  cwd: string;
+  state: CommandState;
+  exitCode: number | null;
+  /** The signal that ended it, such as TERM or KILL. */
+  signal: string | null;
+  timedOut: boolean;
+  timeoutSec: number;
+  startedAt: number;
+  endedAt: number | null;
+  /** The size of its output so far. */
+  outputBytes: number;
+}
+
+/**
+ * Part of a command's output (standard output and error together), from byte
+ * offset `offset` to `next`, as UTF-8 text. Pass next as after to read on.
+ */
+export interface CommandOutput {
+  data: string;
+  offset: number;
+  next: number;
+  /** The command as of this read. */
+  command: Command;
+}
+
+export type FileType = "file" | "dir" | "symlink" | "other";
+
+/** One entry in a directory. mtime is milliseconds since the epoch. */
+export interface FileEntry {
+  name: string;
+  type: FileType;
+  size: number;
+  /** Permission bits in octal, such as 644. */
+  mode: string;
+  mtime: number;
+  /** A symlink's target. */
+  target?: string;
+}
+
+/** A path's details and, for a directory, what's in it. */
+export interface FileInfo {
+  /** Absolute. */
+  path: string;
+  type: FileType;
+  size: number;
+  /** Permission bits in octal, such as 644. */
+  mode: string;
+  mtime: number;
+  /** A symlink's target. */
+  target?: string;
+  /** A directory's entries, sorted by name, at most 10,000. */
+  entries?: FileEntry[];
+  /** The directory had more entries than these. */
+  truncated?: boolean;
+}
+
+/** What an archive upload unpacked, and where. */
+export interface ArchiveResult {
+  path: string;
+  entries: number;
+}
+
+/** Bytes to upload. A string is sent as UTF-8. */
+export type FileData = string | Uint8Array | ArrayBuffer | Blob | ReadableStream<Uint8Array>;
+
+export interface FileOptions {
+  /** Act as root instead of the cloudex user. */
+  root?: boolean;
 }
 
 export interface Desktop {
@@ -268,7 +377,7 @@ export interface CloudexOptions {
   fetch?: (input: string, init: RequestInit) => Promise<Response>;
 }
 
-/** An error from the API, with its HTTP status (0 when there was no request). */
+/** An error from the API, with its HTTP status (0 when there was no request, or a stream broke off). */
 export class CloudexError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -279,6 +388,7 @@ export class CloudexError extends Error {
 }
 
 type Call = <T>(method: string, path: string, body?: unknown) => Promise<T>;
+type Send = (method: string, path: string, body?: FileData, contentType?: string) => Promise<Response>;
 
 export class Cloudex {
   #options: CloudexOptions;
@@ -357,31 +467,36 @@ export class Cloudex {
   }
 
   #wrap(info: SandboxInfo) {
-    return new Sandbox(info, (method, path, body) => this.#call(method, path, body));
+    return new Sandbox(info, this.#call, this.#send);
   }
 
   #call: Call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+    const json = body === undefined ? undefined : JSON.stringify(body);
+    return readJson<T>(await this.#send(method, path, json, json === undefined ? undefined : "application/json"));
+  };
+
+  // A request, answered with the response unread; an error status throws.
+  #send: Send = async (method, path, body, contentType) => {
     const { url, key } = await (this.#endpoint ??= this.#resolve());
-    const res = await this.#fetch(url + path, {
+    const init: RequestInit & { duplex?: "half" } = {
       method,
-      headers: {
-        authorization: `Bearer ${key}`,
-        ...(body === undefined ? {} : { "content-type": "application/json" }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const text = await res.text();
-    let data: unknown;
-    try {
-      data = text ? JSON.parse(text) : undefined;
-    } catch {
-      data = undefined;
-    }
+      headers: { authorization: `Bearer ${key}`, ...(contentType ? { "content-type": contentType } : {}) },
+      body: body as RequestInit["body"],
+    };
+    // Node and Deno send a stream only when told it's one-way.
+    if (typeof ReadableStream !== "undefined" && body instanceof ReadableStream) init.duplex = "half";
+    const res = await this.#fetch(url + path, init);
     if (!res.ok) {
-      const error = (data as { error?: unknown } | undefined)?.error;
+      const text = await res.text();
+      let error: unknown;
+      try {
+        error = (JSON.parse(text) as { error?: unknown }).error;
+      } catch {
+        error = undefined;
+      }
       throw new CloudexError(res.status, typeof error === "string" ? error : text.trim() || res.statusText);
     }
-    return data as T;
+    return res;
   };
 
   // The same order as the CLI: options, then the environment, then the
@@ -410,11 +525,13 @@ export class Cloudex {
 export class Sandbox {
   #info: SandboxInfo;
   #call: Call;
+  #send: Send;
 
   /** @internal Get sandboxes from Cloudex.create, get, list or fork. */
-  constructor(info: SandboxInfo, call: Call) {
+  constructor(info: SandboxInfo, call: Call, send: Send) {
     this.#info = info;
     this.#call = call;
+    this.#send = send;
   }
 
   get id(): string {
@@ -464,8 +581,137 @@ export class Sandbox {
    * doesn't throw: check exitCode.
    */
   exec(command: string | string[], options: ExecOptions = {}): Promise<ExecResult> {
-    const cmd = typeof command === "string" ? command : command.map(shellQuote).join(" ");
-    return this.#call("POST", this.#path("/exec"), { cmd, ...options });
+    return this.#call("POST", this.#path("/exec"), { cmd: commandLine(command), ...options });
+  }
+
+  /**
+   * Runs a command like exec, yielding its output as it comes: stdout and
+   * stderr events, then an exit event with the exit code. Streamed output
+   * isn't cut. Leaving the loop early stops the command. If the stream breaks
+   * off it throws CloudexError (status 0); the command may still be running.
+   * An API before v0.1.16 answers once the command ends, so all its output
+   * comes at once.
+   */
+  async *execStream(
+    command: string | string[],
+    options: ExecOptions = {},
+  ): AsyncGenerator<ExecStreamEvent, void, undefined> {
+    const body = JSON.stringify({ cmd: commandLine(command), ...options, stream: true });
+    const res = await this.#send("POST", this.#path("/exec"), body, "application/json");
+    if (!res.headers.get("content-type")?.includes("ndjson")) {
+      const r = await readJson<ExecResult>(res);
+      if (r.stdout) yield { type: "stdout", data: r.stdout };
+      if (r.stderr) yield { type: "stderr", data: r.stderr };
+      yield { type: "exit", exitCode: r.exitCode, timedOut: r.timedOut, ms: r.ms };
+      return;
+    }
+    for await (const line of lines(res)) {
+      const event = JSON.parse(line) as ExecEvent;
+      if (event.type === "error") throw new CloudexError(0, event.error);
+      if (event.type === "stdout" || event.type === "stderr" || event.type === "exit") yield event;
+      if (event.type === "exit") return;
+    }
+    throw new CloudexError(0, "the exec stream ended before the command did");
+  }
+
+  /**
+   * Starts a command in the background and answers once it's running. A string
+   * is run as shell code with `bash -lc`; an array is quoted. Its output
+   * (stdout and stderr together) is kept on the sandbox's disk: read it with
+   * commandOutput or followCommand. A stop ends it.
+   */
+  startCommand(command: string | string[], options: CommandOptions = {}): Promise<Command> {
+    return this.#call("POST", this.#path("/commands"), { cmd: commandLine(command), ...options });
+  }
+
+  /** The sandbox's background commands, newest first. */
+  listCommands(): Promise<Command[]> {
+    return this.#call("GET", this.#path("/commands"));
+  }
+
+  /** A background command by id (cm-xxxxxxxx). */
+  getCommand(id: string): Promise<Command> {
+    return this.#call("GET", this.#commandPath(id));
+  }
+
+  /**
+   * A command's output from byte offset after (default 0), up to 1 MiB. With
+   * wait (seconds, at most 60), it waits for output after that or for the
+   * command to end. Pass next as after to read on.
+   */
+  commandOutput(id: string, options: { after?: number; wait?: number } = {}): Promise<CommandOutput> {
+    return this.#call("GET", `${this.#commandPath(id)}/output?after=${options.after ?? 0}&wait=${options.wait ?? 0}`);
+  }
+
+  /**
+   * Follows a command's output from after (default 0) until it ends and all
+   * of it is read. Each item is a piece of output; the last one's command
+   * tells how it ended.
+   */
+  async *followCommand(id: string, options: { after?: number } = {}): AsyncGenerator<CommandOutput> {
+    let after = options.after ?? 0;
+    // Once the command has ended, read only what its log held then, so that
+    // something it left running can't keep this going.
+    let end = -1;
+    for (;;) {
+      const page = await this.commandOutput(id, { after, wait: 30 });
+      if (page.command.state !== "running" && end < 0) end = page.command.outputBytes;
+      const ended = end >= 0 && (page.next >= end || page.next === after);
+      if (page.data || ended) yield page;
+      if (ended) return;
+      after = page.next;
+    }
+  }
+
+  /** Sends a running command, and everything it started, a signal (default TERM). */
+  killCommand(id: string, signal?: CommandSignal): Promise<Command> {
+    return this.#call("POST", `${this.#commandPath(id)}/kill`, signal ? { signal } : {});
+  }
+
+  /** Deletes a finished command's record and output; a running one must be killed first. */
+  forgetCommand(id: string): Promise<Command> {
+    return this.#call("DELETE", this.#commandPath(id));
+  }
+
+  /**
+   * A path's details and, for a directory, what's in it. A relative path, or
+   * one starting with ~, is in the home directory.
+   */
+  stat(path: string, options: FileOptions = {}): Promise<FileInfo> {
+    return this.#call("GET", this.#filePath("", path, options));
+  }
+
+  /** A file's contents. */
+  async readFile(path: string, options: FileOptions = {}): Promise<Uint8Array> {
+    const res = await this.#send("GET", this.#filePath("/content", path, options));
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /**
+   * Writes a file whole, making its directory if need be. It keeps its mode
+   * unless mode is given, in octal: "755" or 0o755. Cloudflare limits a
+   * request to 100 MB on most plans.
+   */
+  async writeFile(path: string, data: FileData, options: FileOptions & { mode?: string | number } = {}): Promise<FileInfo> {
+    const mode = typeof options.mode === "number" ? options.mode.toString(8) : options.mode;
+    const res = await this.#send("PUT", this.#filePath("/content", path, { ...options, mode }), data, "application/octet-stream");
+    return readJson(res);
+  }
+
+  /** Deletes a file, or with recursive, a directory and everything in it. Returns what was deleted. */
+  deleteFile(path: string, options: FileOptions & { recursive?: boolean } = {}): Promise<FileInfo> {
+    return this.#call("DELETE", this.#filePath("", path, options));
+  }
+
+  /** A directory's contents, or one file, as a tar.gz. Files the user can't read are left out. */
+  async downloadArchive(path: string, options: FileOptions = {}): Promise<Uint8Array> {
+    const res = await this.#send("GET", this.#filePath("/archive", path, options));
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /** Unpacks a tar.gz into a directory, making it if need be. */
+  async uploadArchive(path: string, data: FileData, options: FileOptions = {}): Promise<ArchiveResult> {
+    return readJson(await this.#send("PUT", this.#filePath("/archive", path, options), data, "application/gzip"));
   }
 
   /**
@@ -475,7 +721,7 @@ export class Sandbox {
    */
   async fork(options: ForkOptions = {}): Promise<Sandbox[]> {
     const forks = await this.#call<SandboxInfo[]>("POST", this.#path("/fork"), options);
-    return forks.map((info) => new Sandbox(info, this.#call));
+    return forks.map((info) => new Sandbox(info, this.#call, this.#send));
   }
 
   /**
@@ -562,6 +808,18 @@ export class Sandbox {
 
   #path(suffix: string) {
     return sandboxPath(this.#info.id) + suffix;
+  }
+
+  #commandPath(id: string) {
+    return this.#path(`/commands/${encodeURIComponent(id)}`);
+  }
+
+  #filePath(suffix: string, path: string, options: { root?: boolean; recursive?: boolean; mode?: string }) {
+    let q = `?path=${encodeURIComponent(path).replaceAll("%2F", "/")}`;
+    if (options.root) q += "&root=true";
+    if (options.recursive) q += "&recursive=true";
+    if (options.mode) q += `&mode=${encodeURIComponent(options.mode)}`;
+    return this.#path(`/files${suffix}${q}`);
   }
 
   async #update(method: string, suffix: string, body?: unknown): Promise<this> {
@@ -656,6 +914,34 @@ export class Agent {
 
 const sandboxPath = (ref: string) => `/v1/sandboxes/${encodeURIComponent(ref)}`;
 const savePath = (name: string) => `/v1/saves/${encodeURIComponent(name)}`;
+
+const commandLine = (command: string | string[]) =>
+  typeof command === "string" ? command : command.map(shellQuote).join(" ");
+
+async function readJson<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+// The lines of a response, as they come. Stopping early cancels the response.
+async function* lines(res: Response): AsyncGenerator<string> {
+  if (!res.body) return;
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let rest = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      rest += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      const parts = rest.split("\n");
+      rest = done ? "" : parts.pop()!;
+      for (const line of parts) if (line.trim()) yield line;
+      if (done) return;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+}
 
 /** Quotes one argument for bash. */
 export function shellQuote(arg: string): string {

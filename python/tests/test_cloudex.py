@@ -1,12 +1,16 @@
+import io
 import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from cloudex import Cloudex, CloudexError, ExecResult, HostLink, ProviderKey, Settings
+from cloudex import (
+    ArchiveResult, Cloudex, CloudexError, ExecEvent, ExecResult, FileEntry, FileInfo, HostLink, ProviderKey, Settings,
+)
 
 
 def info(id, **extra):
@@ -20,20 +24,33 @@ def info(id, **extra):
 
 
 class FakeAPI(BaseHTTPRequestHandler):
-    """Answers by "METHOD /path" from routes and records what it was sent."""
+    """Answers by "METHOD /path" from routes and records what it was sent.
+
+    A body that isn't JSON is kept as bytes, with its type. An answer in bytes
+    is sent as is; a route can also be a function that answers by itself.
+    """
 
     routes = {}
     seen = []
 
     def _handle(self):
         length = int(self.headers.get("Content-Length") or 0)
-        body = json.loads(self.rfile.read(length)) if length else None
+        raw = self.rfile.read(length) if length else b""
+        kind = self.headers.get("Content-Type")
         route = f"{self.command} {self.path}"
-        FakeAPI.seen.append({"route": route, "auth": self.headers.get("Authorization"), "body": body})
-        status, answer = FakeAPI.routes.get(route, (404, {"error": f"no route {route}"}))
-        data = json.dumps(answer).encode()
+        seen = {"route": route, "auth": self.headers.get("Authorization"), "body": None}
+        if raw and kind == "application/json":
+            seen["body"] = json.loads(raw)
+        elif raw:
+            seen.update(body=raw, type=kind)
+        FakeAPI.seen.append(seen)
+        answer = FakeAPI.routes.get(route, (404, {"error": f"no route {route}"}))
+        if callable(answer):
+            return answer(self)
+        status, body = answer
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/octet-stream" if isinstance(body, bytes) else "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -245,6 +262,176 @@ class CloudexTest(unittest.TestCase):
         self.assertEqual(box.settings(), Settings(env=["A"], files=["~/.npmrc"], repo=None))
         self.assertEqual(box.update_settings(env={"A": None}).env, [])
         self.assertEqual(FakeAPI.seen[-1]["body"], {"env": {"A": None}})
+
+    def test_exec_stream_yields_output_as_it_comes_skipping_keepalives(self):
+        def stream(h):
+            h.send_response(200)
+            h.send_header("Content-Type", "application/x-ndjson")
+            h.end_headers()
+            text = ('{"type":"stdout","data":"hi\\n"}\n{"type":"keepalive"}\n'
+                    '{"type":"stderr","data":"\u00e9"}\n{"type":"exit","exitCode":3,"timedOut":false,"ms":9}\n')
+            data = text.encode()
+            for part in (data[:10], data[10:40], data[40:]):
+                h.wfile.write(part)
+                h.wfile.flush()
+                time.sleep(0.01)
+
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/exec"] = stream
+        events = list(self.cx.get("web").exec_stream(["npm", "test"], cwd="~/app"))
+        self.assertEqual(events, [
+            ExecEvent("stdout", "hi\n"),
+            ExecEvent("stderr", "\u00e9"),
+            ExecEvent("exit", exit_code=3, timed_out=False, ms=9),
+        ])
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"cmd": "npm test", "cwd": "~/app", "stream": True})
+
+    def test_exec_stream_on_an_api_without_streaming(self):
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/exec"] = (
+            200, {"exitCode": 0, "stdout": "out", "stderr": "", "timedOut": False, "ms": 4},
+        )
+        events = list(self.cx.get("web").exec_stream("echo out"))
+        self.assertEqual(events, [ExecEvent("stdout", "out"), ExecEvent("exit", exit_code=0, timed_out=False, ms=4)])
+
+    def test_exec_stream_raises_when_it_breaks_off_and_hangs_up_when_left(self):
+        def broken(h):
+            h.send_response(200)
+            h.send_header("Content-Type", "application/x-ndjson")
+            h.end_headers()
+            h.wfile.write(b'{"type":"stdout","data":"a"}\n{"type":"error","error":"the sandbox stopped"}\n')
+
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/exec"] = broken
+        box = self.cx.get("web")
+        got = []
+        with self.assertRaises(CloudexError) as caught:
+            for e in box.exec_stream("sleep 1"):
+                got.append(e.data)
+        self.assertEqual((caught.exception.status, str(caught.exception)), (0, "the sandbox stopped"))
+        self.assertEqual(got, ["a"])
+
+        hung_up = threading.Event()
+
+        def endless(h):
+            h.send_response(200)
+            h.send_header("Content-Type", "application/x-ndjson")
+            h.end_headers()
+            try:
+                for _ in range(500):
+                    h.wfile.write(b'{"type":"stdout","data":"tick"}\n')
+                    h.wfile.flush()
+                    time.sleep(0.01)
+            except OSError:
+                hung_up.set()
+
+        FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/exec"] = endless
+        for e in box.exec_stream("yes tick"):
+            self.assertEqual(e.type, "stdout")
+            break
+        self.assertTrue(hung_up.wait(5))
+
+    def test_commands(self):
+        def command(**extra):
+            base = {"id": "cm-aaaa1111", "cmd": "npm run build", "root": False, "cwd": "/home/cloudex/app",
+                    "state": "running", "exitCode": None, "signal": None, "timedOut": False, "timeoutSec": 0,
+                    "startedAt": 1, "endedAt": None, "outputBytes": 0}
+            base.update(extra)
+            return base
+
+        def page(data, offset, nxt, **extra):
+            return {"data": data, "offset": offset, "next": nxt, "command": command(**extra)}
+
+        path = "/v1/sandboxes/cx-aaa111/commands/cm-aaaa1111"
+        later = [page("", 4, 4, outputBytes=4), page("two\n", 4, 8, state="exited", exitCode=0, endedAt=2, outputBytes=8)]
+
+        def answer_later(h):
+            data = json.dumps(later.pop(0)).encode()
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(data)))
+            h.end_headers()
+            h.wfile.write(data)
+
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/commands"] = (201, command())
+        FakeAPI.routes["GET /v1/sandboxes/cx-aaa111/commands"] = (200, [command()])
+        FakeAPI.routes[f"GET {path}"] = (200, command(outputBytes=6))
+        FakeAPI.routes[f"GET {path}/output?after=2&wait=0"] = (200, page("e\n", 2, 4, outputBytes=4))
+        FakeAPI.routes[f"GET {path}/output?after=0&wait=25"] = (200, page("one\n", 0, 4, outputBytes=4))
+        FakeAPI.routes[f"GET {path}/output?after=4&wait=25"] = answer_later
+        FakeAPI.routes[f"POST {path}/kill"] = (200, command(state="killed", signal="INT", endedAt=5))
+        FakeAPI.routes[f"DELETE {path}"] = (200, command(state="killed", signal="INT", endedAt=5))
+
+        box = self.cx.get("web")
+        cmd = box.start_command(["npm", "run", "build"], cwd="app", timeout_sec=60)
+        self.assertEqual((cmd.id, cmd.state, cmd.exit_code), ("cm-aaaa1111", "running", None))
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"cmd": "npm run build", "cwd": "app", "timeoutSec": 60})
+        self.assertEqual([c.id for c in box.list_commands()], ["cm-aaaa1111"])
+        self.assertEqual(box.get_command(cmd.id).output_bytes, 6)
+        self.assertEqual(box.command_output(cmd.id, after=2).data, "e\n")
+
+        pages = list(box.follow_command(cmd.id))
+        self.assertEqual([p.data for p in pages], ["one\n", "two\n"])
+        self.assertEqual((pages[-1].command.state, pages[-1].command.exit_code), ("exited", 0))
+
+        self.assertEqual(box.kill_command(cmd.id, "INT").signal, "INT")
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"signal": "INT"})
+        box.kill_command(cmd.id)
+        self.assertEqual(FakeAPI.seen[-1]["body"], {})
+        self.assertEqual(box.forget_command(cmd.id).state, "killed")
+        self.assertEqual(FakeAPI.seen[-1]["route"], f"DELETE {path}")
+
+    def test_files(self):
+        data = bytes(range(256))
+        files = "/v1/sandboxes/cx-aaa111/files"
+
+        def file_info(path, **extra):
+            base = {"path": path, "type": "file", "size": 256, "mode": "644", "mtime": 1}
+            base.update(extra)
+            return base
+
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes[f"PUT {files}/content?path=bin/my%20tool&mode=755"] = (200, file_info("/home/cloudex/bin/my tool", mode="755"))
+        FakeAPI.routes[f"PUT {files}/content?path=~/.npmrc"] = (200, file_info("/home/cloudex/.npmrc", size=3))
+        FakeAPI.routes[f"GET {files}/content?path=bin/my%20tool"] = (200, data)
+        FakeAPI.routes[f"GET {files}?path=/etc&root=true"] = (200, file_info(
+            "/etc", type="dir", size=4096, mode="755", entries=[{"name": "hosts", "type": "file", "size": 9, "mode": "644", "mtime": 1}],
+        ))
+        FakeAPI.routes[f"DELETE {files}?path=build&recursive=true"] = (200, file_info("/home/cloudex/build", type="dir"))
+        FakeAPI.routes[f"GET {files}?path=gone"] = (404, {"error": "no such file: /home/cloudex/gone"})
+        box = self.cx.get("web")
+
+        self.assertEqual(box.write_file("bin/my tool", data, mode=0o755).mode, "755")
+        self.assertEqual((FakeAPI.seen[-1]["body"], FakeAPI.seen[-1]["type"]), (data, "application/octet-stream"))
+        box.write_file("bin/my tool", data, mode="755")
+        self.assertEqual(FakeAPI.seen[-1]["route"], f"PUT {files}/content?path=bin/my%20tool&mode=755")
+        box.write_file("~/.npmrc", "h\u00e9\n")
+        self.assertEqual(FakeAPI.seen[-1]["body"], "h\u00e9\n".encode())
+        f = io.BytesIO(b"skip" + data)
+        f.seek(4)
+        box.write_file("~/.npmrc", f)
+        self.assertEqual(FakeAPI.seen[-1]["body"], data)
+        self.assertEqual(box.read_file("bin/my tool"), data)
+
+        etc = box.stat("/etc", root=True)
+        self.assertEqual((etc.type, etc.truncated), ("dir", False))
+        self.assertEqual(etc.entries, [FileEntry(name="hosts", type="file", size=9, mode="644", mtime=1)])
+        self.assertEqual(box.delete_file("build", recursive=True), FileInfo(path="/home/cloudex/build", type="dir", size=256, mode="644", mtime=1))
+        with self.assertRaises(CloudexError) as caught:
+            box.stat("gone")
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_archives(self):
+        tgz = bytes([0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3, 0xFF])
+        files = "/v1/sandboxes/cx-aaa111/files"
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes[f"PUT {files}/archive?path=app"] = (200, {"path": "/home/cloudex/app", "entries": 12})
+        FakeAPI.routes[f"GET {files}/archive?path=app"] = (200, tgz)
+        box = self.cx.get("web")
+        self.assertEqual(box.upload_archive("app", tgz), ArchiveResult(path="/home/cloudex/app", entries=12))
+        self.assertEqual((FakeAPI.seen[-1]["body"], FakeAPI.seen[-1]["type"]), (tgz, "application/gzip"))
+        self.assertEqual(box.download_archive("app"), tgz)
 
     def test_unreachable_api(self):
         with self.assertRaises(CloudexError) as caught:

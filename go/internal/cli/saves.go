@@ -252,8 +252,11 @@ func printStarted(w io.Writer, list []api.Sandbox) {
 }
 
 func plural(n int64, word string) string {
-	if n == 1 {
+	switch {
+	case n == 1:
 		return "1 " + word
+	case strings.HasSuffix(word, "y"):
+		return fmt.Sprintf("%d %sies", n, strings.TrimSuffix(word, "y"))
 	}
 	return fmt.Sprintf("%d %ss", n, word)
 }

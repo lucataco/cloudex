@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,18 +23,27 @@ const info = (id: string, extra: object = {}) => ({
   ...extra,
 });
 
-// A fake API: answers by "METHOD /path" and records what it was sent.
-type Seen = { route: string; auth?: string; body?: unknown };
+// A fake API: answers by "METHOD /path" and records what it was sent. A body
+// that isn't JSON is kept as bytes, with its type. A route can also be a
+// function that answers by itself.
+type Seen = { route: string; auth?: string; body?: unknown; type?: string };
 let seen: Seen[] = [];
-let routes: Record<string, [number, unknown]> = {};
+let routes: Record<string, [number, unknown] | ((res: ServerResponse) => void)> = {};
 let url = "";
 const server = createServer(async (req: IncomingMessage, res) => {
-  let text = "";
-  for await (const chunk of req) text += chunk;
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  const raw = Buffer.concat(chunks);
   const route = `${req.method} ${req.url}`;
-  seen.push({ route, auth: req.headers.authorization, body: text ? JSON.parse(text) : undefined });
-  const [status, body] = routes[route] ?? [404, { error: `no route ${route}` }];
-  res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+  const type = req.headers["content-type"];
+  if (!raw.length) seen.push({ route, auth: req.headers.authorization, body: undefined });
+  else if (type === "application/json") seen.push({ route, auth: req.headers.authorization, body: JSON.parse(raw.toString()) });
+  else seen.push({ route, auth: req.headers.authorization, body: new Uint8Array(raw), type });
+  const answer = routes[route] ?? [404, { error: `no route ${route}` }];
+  if (typeof answer === "function") return answer(res);
+  const [status, body] = answer;
+  if (body instanceof Uint8Array) res.writeHead(status, { "content-type": "application/octet-stream" }).end(body);
+  else res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
 });
 
 before(async () => {
@@ -314,4 +323,181 @@ test("update, resume on another size, and links: list and revoke", async () => {
       ["DELETE /v1/sandboxes/cx-aaa111/hosts", undefined],
     ],
   );
+});
+
+test("execStream yields output as it comes and ends with exit, skipping keepalives", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["POST /v1/sandboxes/cx-aaa111/exec"] = (res) => {
+    res.writeHead(200, { "content-type": "application/x-ndjson" });
+    // A line split across writes, and a character split across them too.
+    const text = '{"type":"stdout","data":"hi\\n"}\n{"type":"keepalive"}\n{"type":"stderr","data":"é"}\n{"type":"exit","exitCode":3,"timedOut":false,"ms":9}\n';
+    const bytes = Buffer.from(text);
+    const cut = bytes.indexOf(Buffer.from("é")) + 1;
+    res.write(bytes.subarray(0, 10));
+    res.write(bytes.subarray(10, cut));
+    setTimeout(() => res.end(bytes.subarray(cut)), 10);
+  };
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  const events = [];
+  for await (const e of box.execStream(["npm", "test"], { cwd: "~/app" })) events.push(e);
+  assert.deepEqual(events, [
+    { type: "stdout", data: "hi\n" },
+    { type: "stderr", data: "é" },
+    { type: "exit", exitCode: 3, timedOut: false, ms: 9 },
+  ]);
+  assert.deepEqual(seen.at(-1)?.body, { cmd: "npm test", cwd: "~/app", stream: true });
+});
+
+test("execStream on an API without streaming turns its one answer into events", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["POST /v1/sandboxes/cx-aaa111/exec"] = [200, { exitCode: 0, stdout: "out", stderr: "", timedOut: false, ms: 4 }];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  const events = [];
+  for await (const e of box.execStream("echo out")) events.push(e);
+  assert.deepEqual(events, [
+    { type: "stdout", data: "out" },
+    { type: "exit", exitCode: 0, timedOut: false, ms: 4 },
+  ]);
+});
+
+test("execStream throws when the stream breaks off, and leaving early hangs up", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["POST /v1/sandboxes/cx-aaa111/exec"] = (res) => {
+    res.writeHead(200, { "content-type": "application/x-ndjson" });
+    res.end('{"type":"stdout","data":"a"}\n{"type":"error","error":"the sandbox stopped"}\n');
+  };
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  const got: string[] = [];
+  await assert.rejects(
+    (async () => {
+      for await (const e of box.execStream("sleep 1")) if (e.type === "stdout") got.push(e.data);
+    })(),
+    (e: unknown) => e instanceof CloudexError && e.status === 0 && e.message === "the sandbox stopped",
+  );
+  assert.deepEqual(got, ["a"]);
+
+  let hungUp!: () => void;
+  const closed = new Promise<void>((resolve) => (hungUp = resolve));
+  routes["POST /v1/sandboxes/cx-aaa111/exec"] = (res) => {
+    res.on("close", hungUp);
+    res.writeHead(200, { "content-type": "application/x-ndjson" }).write('{"type":"stdout","data":"tick"}\n');
+  };
+  for await (const e of box.execStream("yes tick")) {
+    assert.equal(e.type, "stdout");
+    break;
+  }
+  await closed;
+});
+
+const command = (extra: object = {}) => ({
+  id: "cm-aaaa1111",
+  cmd: "npm run build",
+  root: false,
+  cwd: "/home/cloudex/app",
+  state: "running",
+  exitCode: null,
+  signal: null,
+  timedOut: false,
+  timeoutSec: 0,
+  startedAt: 1,
+  endedAt: null,
+  outputBytes: 0,
+  ...extra,
+});
+
+test("commands: start, follow the output to the end, kill, forget", async () => {
+  const path = "/v1/sandboxes/cx-aaa111/commands/cm-aaaa1111";
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["POST /v1/sandboxes/cx-aaa111/commands"] = [201, command()];
+  routes["GET /v1/sandboxes/cx-aaa111/commands"] = [200, [command()]];
+  routes[`GET ${path}`] = [200, command({ outputBytes: 6 })];
+  routes[`GET ${path}/output?after=0&wait=30`] = [200, { data: "one\n", offset: 0, next: 4, command: command({ outputBytes: 4 }) }];
+  routes[`GET ${path}/output?after=4&wait=30`] = [200, { data: "", offset: 4, next: 4, command: command({ outputBytes: 4 }) }];
+  routes[`GET ${path}/output?after=2&wait=0`] = [200, { data: "e\n", offset: 2, next: 4, command: command({ outputBytes: 4 }) }];
+  routes[`POST ${path}/kill`] = [200, command({ state: "killed", signal: "INT", endedAt: 5 })];
+  routes[`DELETE ${path}`] = [200, command({ state: "killed", signal: "INT", endedAt: 5 })];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  const cmd = await box.startCommand(["npm", "run", "build"], { cwd: "app", timeoutSec: 60 });
+  assert.equal(cmd.id, "cm-aaaa1111");
+  assert.deepEqual(seen.at(-1)?.body, { cmd: "npm run build", cwd: "app", timeoutSec: 60 });
+  assert.equal((await box.listCommands()).length, 1);
+  assert.equal((await box.getCommand(cmd.id)).outputBytes, 6);
+  assert.equal((await box.commandOutput(cmd.id, { after: 2 })).data, "e\n");
+
+  // A wait that ends with no output isn't yielded; the command ending is.
+  const answers = [
+    { data: "", offset: 4, next: 4, command: command({ outputBytes: 4 }) },
+    { data: "two\n", offset: 4, next: 8, command: command({ state: "exited", exitCode: 0, endedAt: 2, outputBytes: 8 }) },
+  ];
+  routes[`GET ${path}/output?after=4&wait=30`] = (res) =>
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(answers.shift()));
+  const pages = [];
+  for await (const page of box.followCommand(cmd.id)) pages.push(page);
+  assert.deepEqual(pages.map((p) => p.data), ["one\n", "two\n"]);
+  assert.equal(pages.at(-1)?.command.exitCode, 0);
+
+  assert.equal((await box.killCommand(cmd.id, "INT")).signal, "INT");
+  assert.deepEqual(seen.at(-1)?.body, { signal: "INT" });
+  await box.killCommand(cmd.id);
+  assert.deepEqual(seen.at(-1)?.body, {});
+  assert.equal((await box.forgetCommand(cmd.id)).state, "killed");
+  assert.equal(seen.at(-1)?.route, `DELETE ${path}`);
+});
+
+test("commands: following an ended command with no output gives one empty piece", async () => {
+  const path = "/v1/sandboxes/cx-aaa111/commands/cm-aa%2F1";
+  routes["GET /v1/sandboxes/cx-aaa111"] = [200, info("cx-aaa111")];
+  routes[`GET ${path}/output?after=0&wait=30`] = [200, { data: "", offset: 0, next: 0, command: command({ state: "lost" }) }];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("cx-aaa111");
+  const pages = [];
+  for await (const page of box.followCommand("cm-aa/1")) pages.push(page);
+  assert.deepEqual(pages.map((p) => [p.data, p.command.state]), [["", "lost"]]);
+});
+
+const fileInfo = (path: string, extra: object = {}) => ({ path, type: "file", size: 256, mode: "644", mtime: 1, ...extra });
+
+test("files: write and read back binary bytes, stat, delete", async () => {
+  const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
+  const files = "/v1/sandboxes/cx-aaa111/files";
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes[`PUT ${files}/content?path=bin/my%20tool&mode=755`] = [200, fileInfo("/home/cloudex/bin/my tool", { mode: "755" })];
+  routes[`PUT ${files}/content?path=~/.npmrc`] = [200, fileInfo("/home/cloudex/.npmrc", { size: 3 })];
+  routes[`GET ${files}/content?path=bin/my%20tool`] = [200, bytes];
+  routes[`GET ${files}?path=/etc&root=true`] = [
+    200,
+    fileInfo("/etc", { type: "dir", size: 4096, mode: "755", entries: [{ name: "hosts", type: "file", size: 9, mode: "644", mtime: 1 }] }),
+  ];
+  routes[`DELETE ${files}?path=build&recursive=true`] = [200, fileInfo("/home/cloudex/build", { type: "dir" })];
+  routes[`GET ${files}?path=gone`] = [404, { error: "no such file: /home/cloudex/gone" }];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+
+  assert.equal((await box.writeFile("bin/my tool", bytes, { mode: 0o755 })).mode, "755");
+  assert.deepEqual(seen.at(-1)?.body, bytes);
+  assert.equal(seen.at(-1)?.type, "application/octet-stream");
+  await box.writeFile("~/.npmrc", "hé\n");
+  assert.deepEqual(seen.at(-1)?.body, new TextEncoder().encode("hé\n"));
+  await box.writeFile("~/.npmrc", new Blob([bytes]));
+  assert.deepEqual(seen.at(-1)?.body, bytes);
+  await box.writeFile("~/.npmrc", new Blob([bytes]).stream());
+  assert.deepEqual(seen.at(-1)?.body, bytes);
+  assert.deepEqual(await box.readFile("bin/my tool"), bytes);
+
+  const etc = await box.stat("/etc", { root: true });
+  assert.equal(etc.type, "dir");
+  assert.equal(etc.entries?.[0]?.name, "hosts");
+  assert.equal((await box.deleteFile("build", { recursive: true })).type, "dir");
+  await assert.rejects(box.stat("gone"), (e: CloudexError) => e.status === 404 && /no such file/.test(e.message));
+});
+
+test("files: upload and download an archive", async () => {
+  const tgz = Uint8Array.from([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0xff]);
+  const files = "/v1/sandboxes/cx-aaa111/files";
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes[`PUT ${files}/archive?path=app`] = [200, { path: "/home/cloudex/app", entries: 12 }];
+  routes[`GET ${files}/archive?path=app`] = [200, tgz];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  assert.deepEqual(await box.uploadArchive("app", tgz), { path: "/home/cloudex/app", entries: 12 });
+  assert.deepEqual(seen.at(-1)?.body, tgz);
+  assert.equal(seen.at(-1)?.type, "application/gzip");
+  assert.deepEqual(await box.downloadArchive("app"), tgz);
 });

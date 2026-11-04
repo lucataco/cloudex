@@ -28,10 +28,16 @@
 //   R2. A sandbox started from one boots held, so that the save is restored
 //   before anything in it runs, and keeps the save to restore again until it
 //   has a save of its own.
+// - Background commands (commands.ts) and file operations (files.ts) run
+//   scripts in the guest too; file contents and streamed exec output pass
+//   through as streams.
 import { DurableObject } from "cloudflare:workers";
 import type {
+  ArchiveResult,
   Desktop,
+  ExecEvent,
   ExecResult,
+  FileInfo,
   Repo,
   Save,
   Sandbox as SandboxRecord,
@@ -52,8 +58,10 @@ import {
   writeManifest,
 } from "./backup";
 import { AGENT_BAD_REQUEST, AGENT_BOOT, AGENT_NOT_FOUND, AGENT_SCRIPT } from "./agents";
+import { COMMAND_BAD_REQUEST, COMMAND_BOOT, COMMAND_CONFLICT, COMMAND_NOT_FOUND, COMMAND_SCRIPT } from "./commands";
 import { deleteSandbox, renameSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } from "./desktop";
+import { ARCHIVE_SCRIPT, FILE_BAD_REQUEST, FILE_FORBIDDEN, FILE_NOT_FOUND, FILE_SCRIPT, UNPACK_SCRIPT } from "./files";
 import { PLATFORM_FILES, PLATFORM_SCRIPT, PLATFORM_VERSION, RELAY_NOTHING, RELAY_SCRIPT, START_SCRIPT } from "./guest";
 import { KEYS_SCRIPT, PROVIDERS, listKeys } from "./keys";
 import {
@@ -99,8 +107,15 @@ const SAVE_LIFETIME_MS = 29 * 24 * 3600_000;
 const PLATFORM_MAX_INACTIVITY_MS = 6 * 3600_000;
 const ALARM_EVERY_MS = 60_000;
 const GUEST_USER = "1000:1000"; // the image's cloudex user
+// Runs the rest of a command line as the cloudex user, as an ssh login would.
+// exec's own user option keeps every capability root has (as ambient ones) and
+// drops the user's groups (sudo, docker), so commands start as root and switch.
+const AS_GUEST = ["setpriv", "--reuid=1000", "--regid=1000", "--init-groups", "--inh-caps=-all", "--"];
+const guestArgv = (argv: string[], root = false) => (root ? argv : [...AS_GUEST, ...argv]);
 const GUEST_HOME = "/home/cloudex";
 const OUTPUT_LIMIT = 1 << 20;
+const FILE_TIMEOUT_MS = 30 * 60_000; // an upload or unpack of up to 100 MB
+const KEEPALIVE_MS = 15_000; // the longest a streamed exec stays quiet
 const SSH_KEY = /^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^\n]*)?$/;
 
 type CreateInput = {
@@ -173,6 +188,11 @@ async function readOutput(p: ExecProcess) {
     stop();
   }
 }
+
+// Whether a command ended because exec's timeout stopped it: GNU timeout exits
+// 124, or 137 when it had to kill.
+const timedOut = (code: number, t0: number, timeoutSec: number) =>
+  (code === 124 || code === 137) && Date.now() - t0 >= timeoutSec * 1000 - 1000;
 
 export class Sandbox extends DurableObject<Env> {
   private record: SandboxRecord | undefined;
@@ -962,28 +982,238 @@ export class Sandbox extends DurableObject<Env> {
     this.touch();
   }
 
-  async exec(input: ExecInput): Promise<ExecResult> {
-    this.mustRun();
-    const ctl = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      ctl.abort();
-    }, input.timeoutSec * 1000);
-    const t0 = Date.now();
-    try {
-      const p = await this.container.exec(["bash", "-lc", input.cmd], {
-        cwd: input.cwd ?? (input.root ? "/root" : GUEST_HOME),
+  // The command line and options exec runs a command with. GNU timeout puts the
+  // command in a process group of its own and stops the whole group, so
+  // what it started in the background goes too; the abort is a backstop.
+  private execArgs(input: ExecInput, signal: AbortSignal): [string[], ContainerExecOptions] {
+    const home = input.root ? "/root" : GUEST_HOME;
+    // A relative directory, or one starting with ~, is in the home directory.
+    const cwd = !input.cwd ? home : input.cwd.startsWith("/") ? input.cwd : `${home}/${input.cwd.replace(/^~(\/|$)/, "")}`;
+    return [
+      guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root),
+      {
+        cwd,
         env: input.root
           ? { HOME: "/root", USER: "root", LANG: "C.UTF-8", TERM: "dumb" }
           : { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8", TERM: "dumb" },
-        ...(input.root ? {} : { user: GUEST_USER }),
-        signal: ctl.signal,
-      });
+        signal,
+      },
+    ];
+  }
+
+  async exec(input: ExecInput): Promise<ExecResult> {
+    this.mustRun();
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), input.timeoutSec * 1000 + 30_000);
+    const t0 = Date.now();
+    try {
+      const p = await this.container.exec(...this.execArgs(input, ctl.signal));
       const out = await readOutput(p);
-      return { ...out, timedOut, ms: Date.now() - t0 };
+      return { ...out, timedOut: timedOut(out.exitCode, t0, input.timeoutSec) || ctl.signal.aborted, ms: Date.now() - t0 };
     } finally {
       clearTimeout(timer);
+      this.touch();
+    }
+  }
+
+  // exec, answering with its output as it comes (ExecEvent lines). Output
+  // isn't cut. A client that goes away stops the command.
+  async execStream(input: ExecInput): Promise<ReadableStream<Uint8Array>> {
+    this.mustRun();
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), input.timeoutSec * 1000 + 30_000);
+    const t0 = Date.now();
+    let p: ExecProcess;
+    try {
+      p = await this.container.exec(...this.execArgs(input, ctl.signal));
+    } catch (e) {
+      clearTimeout(timer);
+      throw e;
+    }
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = writable.getWriter();
+    const enc = new TextEncoder();
+    let gone = false;
+    const hangUp = () => {
+      if (gone) return;
+      gone = true;
+      try {
+        p.kill(15); // timeout passes it on to the command's whole process group
+      } catch {
+        // already ended
+      }
+    };
+    // The client going away cancels the stream, even while the command is quiet.
+    writer.closed.catch(hangUp);
+    let lastSent = Date.now();
+    const send = async (ev: ExecEvent) => {
+      if (gone) return;
+      lastSent = Date.now();
+      await writer.write(enc.encode(`${JSON.stringify(ev)}\n`)).catch(hangUp);
+    };
+    // Something between the client and Cloudflare can drop a connection that
+    // has been quiet for a few minutes, so a quiet command sends keepalives.
+    const keepalive = setInterval(() => {
+      if (Date.now() - lastSent >= KEEPALIVE_MS) void send({ type: "keepalive" });
+    }, KEEPALIVE_MS / 3);
+    let stop!: () => void;
+    const stopped = new Promise<void>((resolve) => (stop = resolve));
+    const pump = async (stream: ReadableStream | null, type: "stdout" | "stderr") => {
+      if (!stream) return;
+      const reader = stream.getReader();
+      void stopped.then(() => reader.cancel().catch(() => {}));
+      const dec = new TextDecoder();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const data = dec.decode(value instanceof Uint8Array ? value : new Uint8Array(value as ArrayBuffer), { stream: true });
+          if (data) await send({ type, data });
+          this.touch();
+        }
+      } catch {
+        // cancelled after the grace period
+      }
+      const rest = dec.decode();
+      if (rest) await send({ type, data: rest });
+    };
+    const pumps = Promise.all([pump(p.stdout, "stdout"), pump(p.stderr, "stderr")]);
+    const done = (async () => {
+      let grace: ReturnType<typeof setTimeout> | null = null;
+      try {
+        const exitCode = await p.exitCode;
+        grace = setTimeout(stop, EXIT_GRACE_MS);
+        await pumps;
+        await send({ type: "exit", exitCode, timedOut: timedOut(exitCode, t0, input.timeoutSec) || ctl.signal.aborted, ms: Date.now() - t0 });
+      } catch (e) {
+        await send({ type: "error", error: message(e) });
+      } finally {
+        if (grace) clearTimeout(grace);
+        clearInterval(keepalive);
+        stop();
+        clearTimeout(timer);
+        this.touch();
+        await writer.close().catch(() => {});
+      }
+    })();
+    this.ctx.waitUntil(done);
+    return readable;
+  }
+
+  // Runs a guest program as the cloudex user or root, the way exec runs
+  // commands, and answers its standard output. Exit codes in `codes` become
+  // HTTP statuses with the last line of standard error as the message.
+  private async guest(
+    argv: string[],
+    o: { root?: boolean; what: string; timeoutMs: number; stdin?: ReadableStream | string; codes: Record<number, number> },
+  ): Promise<string> {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), o.timeoutMs);
+    try {
+      const p = await this.container.exec(guestArgv(argv, o.root), {
+        cwd: o.root ? "/root" : GUEST_HOME,
+        env: o.root
+          ? { HOME: "/root", USER: "root", LANG: "C.UTF-8" }
+          : { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8" },
+        ...(o.stdin === undefined ? {} : { stdin: typeof o.stdin === "string" ? new Response(o.stdin).body! : o.stdin }),
+        signal: ctl.signal,
+      });
+      const out = await p.output();
+      if (out.exitCode !== 0) {
+        const why = clip(out.stderr).trim().split("\n").pop() ?? "";
+        const status = o.codes[out.exitCode];
+        if (status) fail(status, why);
+        throw new Error(`${o.what} failed (exit ${out.exitCode}): ${why}`);
+      }
+      return new TextDecoder().decode(out.stdout);
+    } catch (e) {
+      if (ctl.signal.aborted) throw new Error(`${o.what} took longer than ${Math.round(o.timeoutMs / 1000)} s`);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // One operation of the background command script (commands.ts), as root.
+  async commandOp(op: string, args: string[], stdin?: string, waitSec = 0): Promise<unknown> {
+    this.mustRun();
+    try {
+      const out = await this.guest(["bash", "-c", COMMAND_BOOT, "cloudex", COMMAND_SCRIPT, op, ...args], {
+        root: true,
+        what: `command ${op}`,
+        timeoutMs: (waitSec + 60) * 1000,
+        stdin,
+        codes: { [COMMAND_NOT_FOUND]: 404, [COMMAND_BAD_REQUEST]: 400, [COMMAND_CONFLICT]: 409 },
+      });
+      return JSON.parse(out);
+    } finally {
+      this.touch();
+    }
+  }
+
+  private fileOp(op: string, args: string[], root: boolean, stdin?: ReadableStream, timeoutMs = 60_000) {
+    return this.guest(["python3", "-I", "-c", FILE_SCRIPT, op, ...args], {
+      root,
+      what: `file ${op}`,
+      timeoutMs,
+      stdin,
+      codes: { [FILE_NOT_FOUND]: 404, [FILE_BAD_REQUEST]: 400, [FILE_FORBIDDEN]: 403 },
+    });
+  }
+
+  async fileInfo(path: string, root: boolean): Promise<FileInfo> {
+    this.mustRun();
+    return JSON.parse(await this.fileOp("stat", [path], root));
+  }
+
+  async deleteFile(path: string, root: boolean, recursive: boolean): Promise<FileInfo> {
+    this.mustRun();
+    return JSON.parse(await this.fileOp("delete", [path, recursive ? "1" : "0"], root, undefined, 10 * 60_000));
+  }
+
+  async writeFile(path: string, root: boolean, mode: string | null, body: ReadableStream | null): Promise<FileInfo> {
+    this.mustRun();
+    try {
+      return JSON.parse(await this.fileOp("write", [path, mode ?? ""], root, body ?? new Response("").body!, FILE_TIMEOUT_MS));
+    } finally {
+      this.touch();
+    }
+  }
+
+  // A file's contents, or with archive a tar.gz of a directory or file, as it
+  // streams out of the sandbox.
+  async readFile(path: string, root: boolean, archive: boolean): Promise<{ info: FileInfo; body: ReadableStream }> {
+    this.mustRun();
+    const info = JSON.parse(await this.fileOp("check", [path, archive ? "any" : "file"], root)) as FileInfo;
+    const argv = archive ? ["bash", "-c", ARCHIVE_SCRIPT, "cloudex", info.path] : ["cat", "--", info.path];
+    // A deadline, in case the file was swapped for a pipe that never ends.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), FILE_TIMEOUT_MS);
+    const p = await this.container.exec(guestArgv(argv, root), {
+      cwd: "/",
+      env: { HOME: root ? "/root" : GUEST_HOME, LANG: "C.UTF-8" },
+      stderr: "ignore",
+      signal: ctl.signal,
+    });
+    this.ctx.waitUntil(p.exitCode.then(() => this.touch(), () => {}).finally(() => clearTimeout(timer)));
+    return { info, body: p.stdout! };
+  }
+
+  // Unpacks a tar.gz into a directory, making it first if need be.
+  async writeArchive(path: string, root: boolean, body: ReadableStream | null): Promise<ArchiveResult> {
+    this.mustRun();
+    if (!body) fail(400, "send a tar.gz archive as the request body");
+    try {
+      const dir = JSON.parse(await this.fileOp("mkdir", [path], root)) as FileInfo;
+      const out = await this.guest(["bash", "-c", UNPACK_SCRIPT, "cloudex", dir.path], {
+        root,
+        what: "unpacking the archive",
+        timeoutMs: FILE_TIMEOUT_MS,
+        stdin: body,
+        codes: {},
+      }).catch((e: unknown) => fail(400, `couldn't unpack the archive: ${message(e).replace(/^unpacking the archive failed \(exit \d+\): /, "")}`));
+      return { path: dir.path, entries: Number(out.trim()) || 0 };
+    } finally {
       this.touch();
     }
   }
@@ -1012,10 +1242,9 @@ export class Sandbox extends DurableObject<Env> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
-      const p = await this.container.exec(["bash", "-lc", argv[0]!, "cloudex", ...argv.slice(1)], {
+      const p = await this.container.exec(guestArgv(["bash", "-lc", argv[0]!, "cloudex", ...argv.slice(1)]), {
         cwd: GUEST_HOME,
         env: { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8" },
-        user: GUEST_USER,
         ...(stdin === undefined ? {} : { stdin: new Response(stdin).body! }),
         signal: ctl.signal,
       });

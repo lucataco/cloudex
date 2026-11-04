@@ -171,14 +171,20 @@ export const UpdateSandbox = z
   .refine((u) => u.name !== undefined || u.idleMinutes !== undefined, "give a name or idleMinutes");
 export type UpdateSandbox = z.input<typeof UpdateSandbox>;
 
+// A command runs with bash -lc, as the cloudex user in its home directory, or
+// as root. A timeout stops it and everything it started.
 export const ExecRequest = z.object({
   cmd: z.string().min(1),
   root: z.boolean().default(false),
   cwd: z.string().optional(),
   timeoutSec: z.number().int().min(1).max(3600).default(600),
+  // Answer with application/x-ndjson, one ExecEvent per line as the output
+  // comes, instead of one ExecResult at the end. Streamed output isn't cut.
+  stream: z.boolean().default(false),
 });
 export type ExecRequest = z.input<typeof ExecRequest>;
 
+// Output beyond 1 MiB per stream is cut, with a note at the end.
 export const ExecResult = z.object({
   exitCode: z.number().int(),
   stdout: z.string(),
@@ -187,6 +193,96 @@ export const ExecResult = z.object({
   ms: z.number().int(),
 });
 export type ExecResult = z.infer<typeof ExecResult>;
+
+// One line of a streamed exec: output as it comes (UTF-8 text; bytes that
+// aren't become U+FFFD, so read binary files through the files API), then
+// exit. error ends a stream that broke off; the command may still be running.
+// keepalive comes every 15 seconds while the command prints nothing; skip it.
+export const ExecEvent = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("stdout"), data: z.string() }),
+  z.object({ type: z.literal("stderr"), data: z.string() }),
+  z.object({ type: z.literal("keepalive") }),
+  z.object({ type: z.literal("exit"), exitCode: z.number().int(), timedOut: z.boolean(), ms: z.number().int() }),
+  z.object({ type: z.literal("error"), error: z.string() }),
+]);
+export type ExecEvent = z.infer<typeof ExecEvent>;
+
+// Background commands: started, then left running in the sandbox with their
+// output kept on its disk, for scripts, CI jobs and servers. Standard output
+// and standard error go to one log. A stop ends them with everything else
+// running; the record and the log stay.
+export const StartCommand = z.object({
+  cmd: z.string().min(1).max(1_000_000),
+  root: z.boolean().default(false),
+  cwd: z.string().min(1).max(4096).optional(),
+  // Stop it after this long; 0, the default, never.
+  timeoutSec: z.number().int().min(0).max(30 * 24 * 3600).default(0),
+});
+export type StartCommand = z.input<typeof StartCommand>;
+
+// running; exited with exitCode; killed by a signal (signal), which includes
+// a kill through the API and a timeout (timedOut); or lost: the sandbox
+// stopped, or was forked or saved, while it ran.
+export const CommandState = z.enum(["running", "exited", "killed", "lost"]);
+export type CommandState = z.infer<typeof CommandState>;
+
+export const Command = z.object({
+  id: z.string(), // cm-xxxxxxxx
+  cmd: z.string(),
+  root: z.boolean(),
+  cwd: z.string(),
+  state: CommandState,
+  exitCode: z.number().int().nullable(),
+  signal: z.string().nullable(), // such as TERM or KILL
+  timedOut: z.boolean(),
+  timeoutSec: z.number().int(),
+  startedAt: z.number().int(),
+  endedAt: z.number().int().nullable(),
+  outputBytes: z.number().int(), // the log's size so far
+});
+export type Command = z.infer<typeof Command>;
+
+// Part of a command's log, from byte offset `offset` to `next`, as UTF-8 text
+// (a character split at the end waits for the next read). Pass next as after
+// to read on; with wait, the call holds until there's more or the command ends.
+export const CommandOutput = z.object({
+  data: z.string(),
+  offset: z.number().int(),
+  next: z.number().int(),
+  command: Command,
+});
+export type CommandOutput = z.infer<typeof CommandOutput>;
+
+export const KillCommand = z.object({ signal: z.enum(["TERM", "INT", "HUP", "KILL"]).default("TERM") });
+export type KillCommand = z.input<typeof KillCommand>;
+
+// Files: read, written and listed as the cloudex user unless root is set.
+// Relative paths start in the home directory; answers carry absolute ones.
+export const FileType = z.enum(["file", "dir", "symlink", "other"]);
+export type FileType = z.infer<typeof FileType>;
+
+export const FileEntry = z.object({
+  name: z.string(),
+  type: FileType,
+  size: z.number().int(),
+  mode: z.string(), // permission bits in octal, such as 644
+  mtime: z.number().int(), // ms
+  target: z.string().optional(), // a symlink's target
+});
+export type FileEntry = z.infer<typeof FileEntry>;
+
+// A path's details and, for a directory, what's in it (at most 10,000 entries,
+// sorted by name; truncated says there were more).
+export const FileInfo = FileEntry.omit({ name: true }).extend({
+  path: z.string(),
+  entries: z.array(FileEntry).optional(),
+  truncated: z.boolean().optional(),
+});
+export type FileInfo = z.infer<typeof FileInfo>;
+
+// What an archive upload unpacked.
+export const ArchiveResult = z.object({ path: z.string(), entries: z.number().int() });
+export type ArchiveResult = z.infer<typeof ArchiveResult>;
 
 // AI providers whose keys the deployment can hold for sandboxes. A sandbox
 // started while a provider has a key gets a placeholder, and the real key is

@@ -6,7 +6,8 @@
 // The image lists its own files (images/base/bin/cloudex-files), so a save
 // holds only what a sandbox changed: new and changed files anywhere on the
 // disk, including installed packages and Docker's data, and the list of the
-// image's files it deleted. The guest streams it to R2 the way backups go
+// image's files it deleted. Background commands' records (commands.ts) stay
+// with the sandbox that ran them. The guest streams it to R2 the way backups go
 // (backup.ts), through http://cloudex.internal/saves/<id>/... (egress.ts),
 // which only the sandbox making or restoring that save may use, and only then.
 //
@@ -172,6 +173,10 @@ trap 'rm -rf "$dir"' EXIT
 cd /
 if [ -x /usr/local/bin/cloudex-files ] && [ -s /usr/share/cloudex/image-files.gz ]; then
   summary=$(/usr/local/bin/cloudex-files diff "$dir")
+  # Background commands belong to the sandbox that ran them (commands.ts).
+  # LC_ALL=C and -a, so that names that aren't UTF-8 pass through.
+  { LC_ALL=C grep -azv '^var/lib/cloudex/commands\(/\|$\)' "$dir/changed" || true; } >"$dir/changed.kept"
+  mv "$dir/changed.kept" "$dir/changed"
   kind=disk
   recursion=--no-recursion
 else

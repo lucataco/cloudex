@@ -4,8 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -14,16 +19,26 @@ import (
 )
 
 func newExecCmd(opts *options) *cobra.Command {
-	var root bool
+	var root, detach bool
 	var cwd string
 	var timeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "exec [sandbox] -- <command>",
-		Short: "Run a command in a sandbox and print its output",
-		Long: "Run a command with bash in a sandbox, as the cloudex user in its home directory.\n" +
-			"Without --, every argument is the command and the current sandbox runs it.",
-		Example: "  cloudex exec -- npm test\n  cloudex exec my-box -- 'cd app && git status'",
-		Args:    cobra.MinimumNArgs(1),
+		Short: "Run a command in a sandbox, or start one in the background",
+		Long: "Run a command with bash in a sandbox, as the cloudex user in its home directory,\n" +
+			"printing its output as it comes and ending with its exit code. One argument is\n" +
+			"a shell command line; several are one command and its arguments, quoted for you.\n" +
+			"Without --, every argument is the command and the current sandbox runs it.\n\n" +
+			"--timeout (at most 1h) stops the command and everything it started. Ctrl-C stops\n" +
+			"it too. For longer jobs, and servers, use --detach: the command keeps running in\n" +
+			"the sandbox, and cloudex commands shows it and its output.\n\n" +
+			"With --json, prints the result as JSON once the command ends, output cut at\n" +
+			"1 MiB per stream; with --detach, the background command.",
+		Example: "  cloudex exec -- npm test\n" +
+			"  cloudex exec my-box -- 'cd app && git status'\n" +
+			"  cloudex exec -- python3 -c 'print(42)'\n" +
+			"  cloudex exec -d -- npm run dev",
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			named, command := splitAtDash(cmd, args)
 			if command == nil {
@@ -43,35 +58,105 @@ func newExecCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ctx, cancel := context.WithTimeout(cmd.Context(), timeout+time.Minute)
-			defer cancel()
-			res, err := client.Exec(ctx, r, api.ExecRequest{
-				Cmd: strings.Join(command, " "), Root: root, Cwd: cwd, TimeoutSec: int(timeout.Seconds()),
-			})
-			if err != nil {
-				return err
+			line := commandLine(command)
+			if detach {
+				secs := 0
+				if cmd.Flags().Changed("timeout") {
+					if timeout < time.Second {
+						return errors.New("--timeout must be at least 1s")
+					}
+					secs = int(timeout.Seconds())
+				}
+				c, err := client.StartCommand(cmd.Context(), r, api.StartCommandRequest{Cmd: line, Root: root, Cwd: cwd, TimeoutSec: secs})
+				if err != nil {
+					return err
+				}
+				if opts.json {
+					return writeJSON(cmd.OutOrStdout(), c)
+				}
+				where := c.ID
+				if len(named) > 0 {
+					where = named[0] + " " + c.ID
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Started %s in the background in %s.\n", c.ID, r)
+				fmt.Fprintf(cmd.OutOrStdout(), "Follow its output with: cloudex commands logs -f %s\nStop it with: cloudex commands kill %s\n", where, where)
+				return nil
 			}
-			if opts.json {
+			if timeout < time.Second || timeout > time.Hour {
+				return errors.New("--timeout must be from 1s to 1h; for longer, use --detach")
+			}
+			req := api.ExecRequest{Cmd: line, Root: root, Cwd: cwd, TimeoutSec: int(timeout.Seconds())}
+			ctx, cancel := context.WithTimeout(cmd.Context(), timeout+2*time.Minute)
+			defer cancel()
+			if opts.json && cmd.Flag("json").Changed {
+				res, err := client.Exec(ctx, r, req)
+				if err != nil {
+					return err
+				}
 				if err := writeJSON(cmd.OutOrStdout(), res); err != nil {
 					return err
 				}
-			} else {
-				fmt.Fprint(cmd.OutOrStdout(), res.Stdout)
-				fmt.Fprint(cmd.ErrOrStderr(), res.Stderr)
-				if res.TimedOut {
-					fmt.Fprintf(cmd.ErrOrStderr(), "cloudex: stopped the command after %s\n", timeout)
+				if res.ExitCode != 0 {
+					return exitError{res.ExitCode}
 				}
+				return nil
 			}
-			if res.ExitCode != 0 {
-				return exitError{res.ExitCode}
+			// Ctrl-C ends the stream, which stops the command.
+			ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
+			end, err := client.ExecStream(ctx, r, req, func(ev api.ExecEvent) error {
+				w := out
+				if ev.Type == "stderr" {
+					w = errOut
+				}
+				_, err := io.WriteString(w, ev.Data)
+				return err
+			})
+			if err != nil {
+				if errors.Is(err, context.Canceled) && cmd.Context().Err() == nil {
+					fmt.Fprintln(errOut, "\ncloudex: stopped the command")
+					return exitError{130}
+				}
+				return err
+			}
+			if end.TimedOut {
+				fmt.Fprintf(errOut, "cloudex: stopped the command after %s\n", timeout)
+			}
+			if end.ExitCode != 0 {
+				return exitError{end.ExitCode}
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&root, "root", false, "run as root")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory (default: the user's home)")
-	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "stop the command after this long (at most 1h)")
+	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "stop the command after this long (at most 1h; with --detach, any, and none by default)")
+	cmd.Flags().BoolVarP(&detach, "detach", "d", false, "start the command in the background and print its id")
 	return cmd
+}
+
+// commandLine makes exec's arguments one bash command line: a single argument
+// as it is, several quoted so that each stays one word.
+func commandLine(args []string) string {
+	if len(args) == 1 {
+		return args[0]
+	}
+	words := make([]string, len(args))
+	for i, a := range args {
+		words[i] = shellWord(a)
+	}
+	return strings.Join(words, " ")
+}
+
+var plainWord = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./-]+$`)
+
+// shellWord quotes s for a POSIX shell when it needs it.
+func shellWord(s string) string {
+	if plainWord.MatchString(s) {
+		return s
+	}
+	return shellQuote(s)
 }
 
 func newHostCmd(opts *options) *cobra.Command {

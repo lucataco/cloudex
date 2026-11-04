@@ -44,6 +44,56 @@ agent.wait()
 `events()` waits up to 25 seconds per request, so give `Cloudex(timeout=)` more
 than that if you set one.
 
+## Commands
+
+`box.exec()` waits for a command and returns its output, cut at 1 MiB.
+`box.exec_stream()` gives the output as it comes, uncut, and ends with the exit
+code. Leaving the loop early stops the command.
+
+```python
+for e in box.exec_stream("pytest", cwd="~/app"):
+    if e.type == "exit":
+        print("exit code", e.exit_code)
+    else:
+        print(e.data, end="")  # e.type is stdout or stderr
+```
+
+For servers and long jobs, start a command in the background. It keeps
+running after your program ends, with its output kept in the sandbox, until it
+ends, you kill it or the sandbox stops.
+
+```python
+cmd = box.start_command("make build", cwd="app")
+for part in box.follow_command(cmd.id):
+    print(part.data, end="")
+print(part.command.state, part.command.exit_code)
+
+server = box.start_command("python -m http.server 8000")
+print(box.host(8000))
+box.kill_command(server.id)  # TERM; or "INT", "HUP", "KILL"
+```
+
+`exec_stream()` hears from the API at least every 15 seconds and
+`follow_command()` waits up to 25 seconds per request, so give
+`Cloudex(timeout=)` more than that if you set one.
+
+## Files
+
+Paths are in the home directory unless they start with `/`. `root=True`
+reads and writes as root.
+
+```python
+box.write_file("app/.env", "PORT=8000\n")
+box.write_file("bin/tool", data, mode=0o755)  # bytes, str or a binary file
+text = box.read_file("app/setup.cfg").decode()
+listing = box.stat("app").entries
+box.delete_file("app/build", recursive=True)
+
+with open("app.tar.gz", "rb") as f:
+    box.upload_archive("app", f)  # unpacks into ~/app
+tgz = box.download_archive("app/dist")
+```
+
 ## Connecting
 
 `Cloudex(api_url, api_key)` takes the API URL and key that `cloudex deploy`
@@ -58,6 +108,14 @@ The key gives full control of your sandboxes.
 | `cx.create(name=, size=, idle_minutes=, env=, files=, repo=)` | Create a sandbox; returns once it's running (and the repo is cloned) |
 | `cx.get(ref)`, `cx.list()`, `cx.health()` | Look up by id or name, list, check the deployment |
 | `box.exec(cmd, root=, cwd=, timeout_sec=)` | Run shell code, or an argument list, and wait; check `exit_code` |
+| `box.exec_stream(cmd, root=, cwd=, timeout_sec=)` | The same, as a generator of `ExecEvent`s that ends with `exit` |
+| `box.start_command(cmd, root=, cwd=, timeout_sec=)` | Start a command in the background; returns a `Command` at once |
+| `box.list_commands()`, `box.get_command(id)` | The sandbox's commands, newest first; one by id |
+| `box.command_output(id, after=, wait=)`, `box.follow_command(id, after=)` | Read a command's output from a byte offset; follow it to the end |
+| `box.kill_command(id, signal=)`, `box.forget_command(id)` | Signal a running command; delete a finished one's record and output |
+| `box.read_file(path, root=)`, `box.write_file(path, data, mode=, root=)` | Download a file as bytes; upload one whole |
+| `box.stat(path, root=)`, `box.delete_file(path, recursive=, root=)` | A path's details, with a directory's entries; delete one |
+| `box.download_archive(path, root=)`, `box.upload_archive(path, data, root=)` | A directory as a tar.gz; unpack one into a directory |
 | `box.fork(count=, name=, size=, idle_minutes=)` | Up to 10 sandboxes starting from a copy of the disk |
 | `box.host(port)` | HTTPS link to a port on your preview domain; servers on localhost work too |
 | `box.links()`, `box.revoke_links(port=None)` | The links that work; make one port's link, or all of them, stop working |

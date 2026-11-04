@@ -23,6 +23,7 @@ function randomString(n: number) {
 
 export const newSandboxId = () => `cx-${randomString(6)}`;
 export const newAgentId = () => `ag-${randomString(8)}`;
+export const newCommandId = () => `cm-${randomString(8)}`;
 
 export const newSaveId = () => `sv-${randomString(10)}`;
 

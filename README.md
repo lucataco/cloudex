@@ -53,7 +53,10 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex set [sandbox] [--name] [--idle 2h]` | Rename a sandbox, or change how long it may sit idle |
 | `cloudex ssh [sandbox] [-- ssh args]` | Shell in over SSH, through your API (no public IP) |
 | `cloudex desktop [sandbox] [--size 1280x720] [--link] [--quality 0-9]` | Open the sandbox's desktop, with Chrome and a terminal, in your browser |
-| `cloudex exec [sandbox] -- <command>` | Run a command and print its output and exit code |
+| `cloudex exec [sandbox] -- <command>` | Run a command, printing its output as it comes and ending with its exit code; `-d` leaves it running in the background |
+| `cloudex commands [sandbox]`, `commands logs -f <id>`, `commands kill <id>` | List background commands, follow their output, stop them |
+| `cloudex cp <from> <to>` | Copy files and directories into or out of a sandbox (`web:path`, or `:path` for the current one) |
+| `cloudex run [--from <save>] -- <command>` | Run a command in a fresh sandbox with this directory's files, copy back `--out` paths, and delete it; for CI |
 | `cloudex ssh-config >> ~/.ssh/config` | Lets `scp`, `rsync` and editors reach `<sandbox>.cloudex` |
 | `cloudex prompt [sandbox] "task"` | Start Claude Code or Codex on a task in tmux and watch it |
 | `cloudex attach [sandbox]` | Reattach to the newest agent session |
@@ -117,6 +120,15 @@ the image it was made on; after a `cloudex deploy` that brings a new image,
 only `/home` comes back, and the new sandbox's notice says so. Saving under a
 taken name replaces that save. `cloudex saves` lists them, and `saves rm`
 deletes one. Named saves need R2, like backups.
+
+**Commands, files and CI.** `cloudex exec` streams a command's output as it's
+printed, and `exec -d` leaves a long job or a server running in the background,
+with its output kept on the sandbox's disk for `cloudex commands logs -f`.
+`cloudex cp` copies files and directories in and out. `cloudex run -- npm test`
+starts a sandbox (or one from a named save, with `--from`), copies in the files
+git would commit, runs the command, copies back what `--out` names, deletes the
+sandbox and exits with the command's code, so a CI step can run its tests in
+your Cloudflare account.
 
 **Desktop.** `cloudex desktop` starts a desktop in the sandbox (TigerVNC,
 openbox, Chrome and a terminal) and opens it in your browser through noVNC. The

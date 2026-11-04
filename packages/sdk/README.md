@@ -43,6 +43,51 @@ await agent.send("stop, fix the build first", { interrupt: true });
 await agent.wait();
 ```
 
+## Commands
+
+`box.exec()` waits for a command and returns its output, cut at 1 MiB.
+`box.execStream()` gives the output as it comes, uncut, and ends with the exit
+code. Leaving the loop early stops the command.
+
+```ts
+for await (const e of box.execStream("npm test", { cwd: "~/app" })) {
+  if (e.type === "exit") console.log("exit code", e.exitCode);
+  else process.stdout.write(e.data); // e.type is stdout or stderr
+}
+```
+
+For servers and long jobs, start a command in the background. It keeps
+running after your program ends, with its output kept in the sandbox, until it
+ends, you kill it or the sandbox stops.
+
+```ts
+const cmd = await box.startCommand("npm run build", { cwd: "app" });
+for await (const part of box.followCommand(cmd.id)) {
+  process.stdout.write(part.data);
+  if (part.command.state !== "running") console.log(part.command.state, part.command.exitCode);
+}
+
+const server = await box.startCommand("npm start", { cwd: "app" });
+console.log(await box.host(3000));
+await box.killCommand(server.id); // TERM; or "INT", "HUP", "KILL"
+```
+
+## Files
+
+Paths are in the home directory unless they start with `/`. `{ root: true }`
+reads and writes as root.
+
+```ts
+await box.writeFile("app/.env", "PORT=3000\n");
+await box.writeFile("bin/tool", bytes, { mode: "755" }); // a Uint8Array, Blob or stream works too
+const text = new TextDecoder().decode(await box.readFile("app/package.json"));
+const dir = await box.stat("app"); // dir.entries lists what's in it
+await box.deleteFile("app/dist", { recursive: true });
+
+await box.uploadArchive("app", await fs.readFile("app.tar.gz")); // fs from node:fs/promises; unpacks into ~/app
+const tgz = await box.downloadArchive("app/dist");
+```
+
 ## Connecting
 
 `new Cloudex({ apiUrl, apiKey })` takes the API URL and key that `cloudex
@@ -58,6 +103,14 @@ gives full control of your sandboxes; keep it on a server.
 | `cx.create({ name?, size?, idleMinutes?, env?, files?, repo? })` | Create a sandbox; resolves once it's running (and the repo is cloned) |
 | `cx.get(ref)`, `cx.list()`, `cx.health()` | Look up by id or name, list, check the deployment |
 | `box.exec(cmd, { root?, cwd?, timeoutSec? })` | Run shell code, or an argument list, and wait; check `exitCode` |
+| `box.execStream(cmd, { root?, cwd?, timeoutSec? })` | The same, as an async iterator over output events that ends with `exit` |
+| `box.startCommand(cmd, { root?, cwd?, timeoutSec? })` | Start a command in the background; returns a `Command` at once |
+| `box.listCommands()`, `box.getCommand(id)` | The sandbox's commands, newest first; one by id |
+| `box.commandOutput(id, { after?, wait? })`, `box.followCommand(id, { after? })` | Read a command's output from a byte offset; follow it to the end |
+| `box.killCommand(id, signal?)`, `box.forgetCommand(id)` | Signal a running command; delete a finished one's record and output |
+| `box.readFile(path, { root? })`, `box.writeFile(path, data, { mode?, root? })` | Download a file as a `Uint8Array`; upload one whole |
+| `box.stat(path, { root? })`, `box.deleteFile(path, { recursive?, root? })` | A path's details, with a directory's entries; delete one |
+| `box.downloadArchive(path, { root? })`, `box.uploadArchive(path, tarGz, { root? })` | A directory as a tar.gz; unpack one into a directory |
 | `box.fork({ count?, name?, size?, idleMinutes? })` | Up to 10 sandboxes starting from a copy of the disk |
 | `box.host(port)` | HTTPS link to a port on your preview domain; servers on localhost work too |
 | `box.links()`, `box.revokeLinks(port?)` | The links that work; make one port's link, or all of them, stop working |

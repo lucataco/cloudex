@@ -7,17 +7,23 @@ import {
   AgentEvents,
   AgentMessage,
   ApiError,
+  ArchiveResult,
+  Command,
+  CommandOutput,
   CreateSandbox,
   CreateSave,
   Desktop,
   DesktopRequest,
+  ExecEvent,
   ExecRequest,
   ExecResult,
+  FileInfo,
   ForkRequest,
   Health,
   HostLink,
   HostRequest,
   HostResult,
+  KillCommand,
   Provider,
   ProviderKey,
   ResumeRequest,
@@ -27,6 +33,7 @@ import {
   Save,
   SetProviderKey,
   StartAgent,
+  StartCommand,
   UpdateSandbox,
   UpdateSettings,
 } from "./index.ts";
@@ -39,6 +46,8 @@ const requests = {
   ForkRequest,
   ResumeRequest,
   ExecRequest,
+  StartCommand,
+  KillCommand,
   HostRequest,
   DesktopRequest,
   SetProviderKey,
@@ -52,6 +61,11 @@ const responses = {
   SandboxSettings,
   Save,
   ExecResult,
+  ExecEvent,
+  Command,
+  CommandOutput,
+  FileInfo,
+  ArchiveResult,
   HostResult,
   HostLink,
   RevokedLinks,
@@ -96,6 +110,29 @@ const agentRef = {
   required: true,
   description: "The agent's id (ag-xxxxxxxx)",
   schema: { type: "string" },
+};
+
+const commandRef = {
+  name: "cmd",
+  in: "path",
+  required: true,
+  description: "The command's id (cm-xxxxxxxx)",
+  schema: { type: "string" },
+};
+
+const pathParam = {
+  name: "path",
+  in: "query",
+  required: true,
+  description: "The file's path; a relative one starts in the user's home directory",
+  schema: { type: "string" },
+};
+
+const rootParam = {
+  name: "root",
+  in: "query",
+  description: "Act as root rather than the cloudex user",
+  schema: { type: "boolean", default: false },
 };
 
 function op(operationId: string, summary: string, rest: object) {
@@ -224,9 +261,114 @@ export function openapi(version: string) {
       "/v1/sandboxes/{ref}/exec": {
         parameters: [sandboxRef],
         post: op("exec", "Run a command with bash -lc and wait for it", {
-          description: "Output is cut at 1 MiB per stream. Counts as activity for idle stop.",
+          description:
+            "Output is cut at 1 MiB per stream. With stream, the answer is application/x-ndjson: one ExecEvent " +
+            "per line as the output comes, uncut, ending with exit. A timeout stops the command and everything it " +
+            "started; so does closing a stream. Counts as activity for idle stop.",
           requestBody: body("ExecRequest"),
-          responses: { 200: ok("How the command ended", ref("ExecResult")) },
+          responses: {
+            200: {
+              description: "How the command ended, or with stream its output as it comes",
+              content: {
+                "application/json": { schema: ref("ExecResult") },
+                "application/x-ndjson": { schema: ref("ExecEvent") },
+              },
+            },
+          },
+        }),
+      },
+      "/v1/sandboxes/{ref}/commands": {
+        parameters: [sandboxRef],
+        get: op("listCommands", "List the sandbox's background commands, newest first", {
+          responses: { 200: ok("The commands", { type: "array", items: ref("Command") }) },
+        }),
+        post: op("startCommand", "Start a command in the background", {
+          description:
+            "Answers once it's running. Its output (standard output and error together) is kept on the sandbox's " +
+            "disk; read it with the output call. While it writes output it counts as activity for idle stop. A stop " +
+            "ends it.",
+          requestBody: body("StartCommand"),
+          responses: { 201: ok("The command", ref("Command")) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/commands/{cmd}": {
+        parameters: [sandboxRef, commandRef],
+        get: op("getCommand", "Get a background command", { responses: { 200: ok("The command", ref("Command")) } }),
+        delete: op("forgetCommand", "Delete a finished command's record and output", {
+          responses: { 200: ok("The command, as it was", ref("Command")) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/commands/{cmd}/output": {
+        parameters: [
+          sandboxRef,
+          commandRef,
+          {
+            name: "after",
+            in: "query",
+            description: "Return the output from this byte offset; next in the answer is the one to pass next time",
+            schema: { type: "integer", minimum: 0, default: 0 },
+          },
+          {
+            name: "wait",
+            in: "query",
+            description: "Seconds to wait for output after `after`, or for the command to end, before answering",
+            schema: { type: "integer", minimum: 0, maximum: 60, default: 0 },
+          },
+        ],
+        get: op("commandOutput", "Read a command's output, waiting for more if asked", {
+          description: "Returns up to 1 MiB at a time; ask again from next for the rest.",
+          responses: { 200: ok("The output and the command", ref("CommandOutput")) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/commands/{cmd}/kill": {
+        parameters: [sandboxRef, commandRef],
+        post: op("killCommand", "Send a running command, and everything it started, a signal", {
+          requestBody: body("KillCommand", false),
+          responses: { 200: ok("The command", ref("Command")) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/files": {
+        parameters: [sandboxRef, pathParam, rootParam],
+        get: op("getFile", "A path's details and, for a directory, what's in it", {
+          responses: { 200: ok("The path", ref("FileInfo")) },
+        }),
+        delete: op("deleteFile", "Delete a file, or with recursive a directory and everything in it", {
+          parameters: [
+            { name: "recursive", in: "query", description: "Delete a directory and everything in it", schema: { type: "boolean", default: false } },
+          ],
+          responses: { 200: ok("What was deleted", ref("FileInfo")) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/files/content": {
+        parameters: [sandboxRef, pathParam, rootParam],
+        get: op("readFile", "Download a file", {
+          responses: {
+            200: { description: "The file's contents", content: { "application/octet-stream": { schema: { type: "string", format: "binary" } } } },
+          },
+        }),
+        put: op("writeFile", "Upload a file, making its directory if need be", {
+          description:
+            "Replaces the file whole, keeping its mode unless mode is given; writes through a symlink to its target. " +
+            "Cloudflare limits a request body to 100 MB on most plans.",
+          parameters: [{ name: "mode", in: "query", description: "Permission bits in octal, such as 755", schema: { type: "string" } }],
+          requestBody: {
+            required: true,
+            content: { "application/octet-stream": { schema: { type: "string", format: "binary" } } },
+          },
+          responses: { 200: ok("The file", ref("FileInfo")) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/files/archive": {
+        parameters: [sandboxRef, pathParam, rootParam],
+        get: op("downloadArchive", "Download a directory's contents, or a file, as a tar.gz", {
+          description: "Files the user can't read are left out.",
+          responses: { 200: { description: "A tar.gz", content: { "application/gzip": { schema: { type: "string", format: "binary" } } } } },
+        }),
+        put: op("uploadArchive", "Unpack a tar.gz into a directory, making it if need be", {
+          description:
+            "The files are owned by the cloudex user, or by root with root. Cloudflare limits a request body to 100 MB on most plans.",
+          requestBody: { required: true, content: { "application/gzip": { schema: { type: "string", format: "binary" } } } },
+          responses: { 200: ok("Where it went and how many entries it held", ref("ArchiveResult")) },
         }),
       },
       "/v1/sandboxes/{ref}/hosts": {
