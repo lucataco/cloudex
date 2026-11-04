@@ -33,14 +33,22 @@ selfApi.post("/v1/sandboxes/:ref/stop", async (c) => {
   return c.json(await newMethod(id, stub.requestStop()), 202);
 });
 
+function needPreviewZone(env: Env) {
+  if (!env.PREVIEW_ZONE) {
+    fail(400, "preview links need a domain, and this deployment has none. Ask the person who deployed Cloudex to run, on their own computer: cloudex deploy --preview-domain <domain>");
+  }
+}
+
 selfApi.post("/v1/sandboxes/:ref/hosts", async (c) => {
   const { port } = HostRequest.parse(await c.req.json());
   const { id, stub } = own(c);
+  needPreviewZone(c.env.env);
   return c.json(await hostLink(c.env.env, id, stub, port));
 });
 
 selfApi.get("/v1/sandboxes/:ref/hosts", async (c) => {
   const { id, stub } = own(c);
+  needPreviewZone(c.env.env);
   return c.json(await hostLinks(c.env.env, id, stub));
 });
 
