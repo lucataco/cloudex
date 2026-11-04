@@ -621,6 +621,11 @@ export class Sandbox extends DurableObject<Env> {
       this.removing = true;
       try {
         return await this.removeAll(r);
+      } catch (e) {
+        // Undo the stopping mark so it can be deleted again. A container
+        // already destroyed shows up as an exit at the next alarm.
+        this.record = r;
+        throw e;
       } finally {
         this.removing = false;
       }
@@ -629,6 +634,10 @@ export class Sandbox extends DurableObject<Env> {
 
   private async removeAll(r: SandboxRecord): Promise<{ deleted: string }> {
     if (this.ctx.container?.running) await withTimeout(this.container.destroy(), 60_000, "destroy");
+    // Before its storage, so that a later failure leaves a sandbox to delete
+    // again, not an index row holding its name.
+
+    await deleteSandbox(this.env.DB, r.id);
     const bucket = backupBucket(this.env);
     if (bucket) {
       try {
@@ -639,7 +648,6 @@ export class Sandbox extends DurableObject<Env> {
     }
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
-    await deleteSandbox(this.env.DB, r.id);
     this.record = undefined;
     // Its backups are gone. The last save can't be deleted from a Worker; it
     // expires on its own 30 days after it was made or last restored.

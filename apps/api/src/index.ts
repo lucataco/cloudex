@@ -27,7 +27,7 @@ import { openapi } from "@cloudex/schema/openapi";
 import { isAgentId } from "./agents";
 import { isCommandId } from "./commands";
 import { backupBucket } from "./backup";
-import { idForName, listSandboxes, nameTaken } from "./db";
+import { deleteSandbox, idForName, listSandboxes, nameTaken } from "./db";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, listKeys, setKey } from "./keys";
 import type { ForkSource } from "./sandbox";
@@ -117,9 +117,17 @@ app.post("/v1/sandboxes/:ref/resume", async (c) => {
   return c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.resume(fromBackup, size));
 });
 
-app.delete("/v1/sandboxes/:ref", async (c) =>
-  c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.remove()),
-);
+app.delete("/v1/sandboxes/:ref", async (c) => {
+  const { id, stub } = await sandbox(c.env, c.req.param("ref"));
+  try {
+    return c.json(await stub.remove());
+  } catch (e) {
+    // An index row left behind by a delete that failed partway goes too, so
+    // that it doesn't keep holding its name.
+    if (errorStatus(e).status === 404 && (await deleteSandbox(c.env.DB, id))) return c.json({ deleted: id });
+    throw e;
+  }
+});
 
 app.post("/v1/sandboxes/:ref/exec", async (c) => {
   const { stream, ...input } = ExecRequest.parse(await c.req.json());

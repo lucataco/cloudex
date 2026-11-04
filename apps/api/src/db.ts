@@ -111,9 +111,11 @@ export async function renameSandbox(db: D1Database, id: string, name: string): P
   }
 }
 
-export async function deleteSandbox(db: D1Database, id: string) {
+// False if it had no row.
+export async function deleteSandbox(db: D1Database, id: string): Promise<boolean> {
   await ensureSchema(db);
-  await db.prepare("DELETE FROM sandboxes WHERE id = ?").bind(id).run();
+  const { meta } = await db.prepare("DELETE FROM sandboxes WHERE id = ?").bind(id).run();
+  return meta.changes > 0;
 }
 
 export async function listSandboxes(db: D1Database): Promise<Sandbox[]> {
