@@ -163,6 +163,12 @@ func shellWord(s string) string {
 	return shellQuote(s)
 }
 
+// isNumber is for telling a port from a sandbox, whose name starts with a letter.
+func isNumber(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
 func newHostCmd(opts *options) *cobra.Command {
 	var list, revoke, revokeAll bool
 	cmd := &cobra.Command{
@@ -184,7 +190,7 @@ func newHostCmd(opts *options) *cobra.Command {
 				if revoke || (list && revokeAll) {
 					return errors.New("use one of --list, --revoke and --revoke-all")
 				}
-				if len(args) > 1 {
+				if len(args) > 1 || len(args) == 1 && isNumber(args[0]) {
 					return errors.New("--list and --revoke-all take a sandbox, not a port")
 				}
 				cfg, client, err := opts.load()

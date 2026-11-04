@@ -96,6 +96,11 @@ func TestHostRevokeAndList(t *testing.T) {
 			t.Fatalf("%v should fail", args)
 		}
 	}
+	for _, flag := range []string{"--list", "--revoke-all"} {
+		if code, _, errOut := run(t, "host", "3000", flag); code != 1 || !strings.Contains(errOut, "take a sandbox, not a port") {
+			t.Fatalf("host 3000 %s: code %d, stderr %q", flag, code, errOut)
+		}
+	}
 }
 
 func TestStopSaysWhatBecameOfTheSandbox(t *testing.T) {

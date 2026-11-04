@@ -391,3 +391,31 @@ func TestCpSaysWhatItDidOnStandardErrorWhenPiped(t *testing.T) {
 		t.Fatalf("stdout %q, stderr %q", out.String(), errOut.String())
 	}
 }
+
+func TestCommandsLogsFollowExitsLikeBashForAnySignal(t *testing.T) {
+	for sig, want := range map[string]int{"SEGV": 139, "ABRT": 134, "KILL": 137, "34": 162, "TERM": 143} {
+		ended := strings.Replace(command("killed", "null", "5"), `"signal":null`, `"signal":"`+sig+`"`, 1)
+		newFakeAPI(t, map[string]string{
+			"GET /v1/sandboxes/web/commands/cm-1a2b3c4d/output": `{"data":"","offset":0,"next":6,"command":` + ended + `}`,
+		})
+		if code, _, errOut := run(t, "commands", "logs", "-f", "web", "cm-1a2b3c4d"); code != want {
+			t.Errorf("%s: exit %d, want %d (%s)", sig, code, want, errOut)
+		}
+	}
+}
+
+func TestCommandsKillHintNamesTheSandbox(t *testing.T) {
+	newFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes/web/commands/cm-1a2b3c4d/kill":       command("running", "null", "null"),
+		"POST /v1/sandboxes/cx-abc123/commands/cm-1a2b3c4d/kill": command("running", "null", "null"),
+	})
+	(&config.Config{Current: "cx-abc123"}).Save()
+	_, out, _ := run(t, "commands", "kill", "web", "cm-1a2b3c4d")
+	if !strings.Contains(out, "cloudex commands kill --signal KILL web cm-1a2b3c4d") {
+		t.Fatalf("stdout %q", out)
+	}
+	_, out, _ = run(t, "commands", "kill", "cm-1a2b3c4d")
+	if !strings.Contains(out, "cloudex commands kill --signal KILL cm-1a2b3c4d\n") {
+		t.Fatalf("stdout %q", out)
+	}
+}

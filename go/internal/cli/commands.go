@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -199,7 +200,11 @@ func commandExit(c *api.Command) error {
 	case c.State == "exited" && c.ExitCode != nil && *c.ExitCode != 0:
 		return exitError{*c.ExitCode}
 	case c.State == "killed":
-		if n, ok := signalNumbers[deref(c.Signal)]; ok {
+		sig := deref(c.Signal)
+		if n, ok := signalNumbers[sig]; ok {
+			return exitError{128 + n}
+		}
+		if n, err := strconv.Atoi(sig); err == nil { // a real-time signal
 			return exitError{128 + n}
 		}
 		return exitError{137}
@@ -209,7 +214,13 @@ func commandExit(c *api.Command) error {
 	return nil
 }
 
-var signalNumbers = map[string]int{"HUP": 1, "INT": 2, "KILL": 9, "TERM": 15}
+// Linux signal numbers by the names the sandbox reports, as bash adds 128 to them.
+var signalNumbers = map[string]int{
+	"HUP": 1, "INT": 2, "QUIT": 3, "ILL": 4, "TRAP": 5, "ABRT": 6, "BUS": 7, "FPE": 8, "KILL": 9,
+	"USR1": 10, "SEGV": 11, "USR2": 12, "PIPE": 13, "ALRM": 14, "TERM": 15, "STKFLT": 16, "CHLD": 17,
+	"CONT": 18, "STOP": 19, "TSTP": 20, "TTIN": 21, "TTOU": 22, "URG": 23, "XCPU": 24, "XFSZ": 25,
+	"VTALRM": 26, "PROF": 27, "WINCH": 28, "IO": 29, "POLL": 29, "PWR": 30, "SYS": 31,
+}
 
 func deref(s *string) string {
 	if s == nil {
@@ -237,7 +248,11 @@ func newCommandsKillCmd(opts *options) *cobra.Command {
 				return writeJSON(cmd.OutOrStdout(), c)
 			}
 			if c.State == "running" {
-				fmt.Fprintf(cmd.OutOrStdout(), "Sent %s to %s; it's still running. Stop it for sure with: cloudex commands kill --signal KILL %s\n", sig, c.ID, c.ID)
+				where := c.ID
+				if len(args) > 1 {
+					where = args[0] + " " + c.ID
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Sent %s to %s; it's still running. Stop it for sure with: cloudex commands kill --signal KILL %s\n", sig, c.ID, where)
 				return nil
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s has ended: %s.\n", c.ID, commandState(c))
