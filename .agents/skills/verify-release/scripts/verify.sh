@@ -337,13 +337,15 @@ if want agents; then
 			cx exec "$P-ag" -- "env | grep -E '^(ANTHROPIC|OPENAI)_API_KEY=' | grep -cE '=(sk-ant-api|sk-proj-)[A-Za-z0-9_-]{40,}'"
 			ok "A2-$2" "the real $1 key is not in the sandbox" is "$OUT" 0
 			cx agents start "$P-ag" --agent "$2" "Reply with exactly the word VERIFYOK and nothing else. Do not run any tools."
-			ok "A3-$2" "agents start $2 finishes a turn" [ "$CODE" = 0 -a "$(has "$OUT$ERR" VERIFYOK && echo y)" = y ]
-			cx agents send "$P-ag" "Reply with exactly the word SECONDOK and nothing else."
-			ok "A4-$2" "agents send continues the conversation" has "$OUT$ERR" SECONDOK
+			code=$CODE
 			cx agents "$P-ag"
-			ok "A5-$2" "agents lists it" has "$OUT" "$2"
+			ok "A3-$2" "agents start $2 finishes a turn with the answer" [ "$code" = 0 -a "$(field 'max_by(.updatedAt).lastMessage')" = VERIFYOK ]
+			cx agents send "$P-ag" "Now reply with exactly the word you replied with before, then the word SECONDOK, separated by a space."
+			cx agents "$P-ag"
+			ok "A4-$2" "agents send continues the same conversation" [ "$(field 'max_by(.updatedAt).lastMessage')" = "VERIFYOK SECONDOK" ]
+			ok "A5-$2" "agents lists it" [ "$(field 'max_by(.updatedAt).agent')" = "$2" ]
 			cx agents logs "$P-ag"
-			ok "A6-$2" "agents logs prints the conversation" has "$OUT$ERR" SECONDOK
+			ok "A6-$2" "agents logs prints both turns" [ "$(grep -c '"type":"end"' <<<"$OUT")" -ge 2 ]
 			cx agents start "$P-ag" --agent "$2" -d "Count from 1 to 100000 in a bash loop, printing each number, then summarize."
 			sleep 15
 			cx agents interrupt "$P-ag"
