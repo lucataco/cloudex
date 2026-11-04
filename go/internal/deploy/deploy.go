@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -678,6 +679,13 @@ func waitHealthy(ctx context.Context, client *api.Client) error {
 	}
 }
 
+// testSandboxName matches the names checkSandbox gives its sandboxes. Each
+// lives through one start of up to 12 minutes, so one older than
+// leftoverTestSandbox was left by a deploy that was stopped, not one running now.
+var testSandboxName = regexp.MustCompile(`^deploy-check-[0-9a-f]{4}$`)
+
+const leftoverTestSandbox = 40 * time.Minute
+
 // checkSandbox starts, uses and deletes a throwaway sandbox. A newly pushed
 // image can take up to 20 minutes to become startable, so it keeps trying.
 func checkSandbox(ctx context.Context, client *api.Client, log func(string, ...any)) error {
@@ -687,7 +695,10 @@ func checkSandbox(ctx context.Context, client *api.Client, log func(string, ...a
 	idle := 5
 	if left, err := client.List(ctx); err == nil {
 		for _, s := range left {
-			if s.Name != nil && strings.HasPrefix(*s.Name, "deploy-check-") && client.Delete(ctx, s.ID) == nil {
+			if s.Name == nil || !testSandboxName.MatchString(*s.Name) || time.Since(time.UnixMilli(s.CreatedAt)) < leftoverTestSandbox {
+				continue
+			}
+			if client.Delete(ctx, s.ID) == nil {
 				log("Deleted %s, left over from an earlier deploy", *s.Name)
 			}
 		}
