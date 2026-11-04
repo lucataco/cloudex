@@ -75,3 +75,22 @@ func TestACancelledCallIsNotAConnectionProblem(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestAnHTMLErrorPageNamesTheStatusOnce(t *testing.T) {
+	for page, want := range map[string]string{
+		"<html><head><title>502 Bad Gateway</title></head></html>":       "502 Bad Gateway",
+		"<html><head><title>\n 502   Bad Gateway </title></head></html>": "502 Bad Gateway",
+		"<html><head><title>Just a moment...</title></head></html>":      "502 Bad Gateway Just a moment...",
+		"<html><body>no title</body></html>":                             "502 Bad Gateway",
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			w.Write([]byte(page))
+		}))
+		_, err := New(srv.URL, "key").List(context.Background())
+		srv.Close()
+		if err == nil || err.Error() != want {
+			t.Errorf("page %q: got %v, want %q", page, err, want)
+		}
+	}
+}
