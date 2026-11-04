@@ -27,7 +27,7 @@ case "${1:-}" in
     echo "$name"
     ;;
   attach)
-    name=${2:-$(tmux list-sessions -F '#{session_created} #{session_name}' 2>/dev/null | awk '$2 ~ /^agent-/' | sort -n | tail -1 | cut -d' ' -f2)}
+    name=${2:-$(tmux list-sessions -F '#{session_created} #{session_name}' 2>/dev/null | awk '$2 ~ /^agent-/' | sort -n | tail -1 | cut -d' ' -f2 || true)}
     [ -n "$name" ] || { echo "no agent sessions; start one with cloudex prompt" >&2; exit 1; }
     exec tmux attach -t "$name"
     ;;
