@@ -223,7 +223,30 @@ export class Sandbox extends DurableObject<Env> {
       this.lastActivity = (await ctx.storage.get<number>("lastActivity")) ?? Date.now();
       // After an eviction or deploy, reattach the exit watcher to a running box.
       if (ctx.container?.running) this.watch();
+      if (this.record?.state === "starting" || this.record?.state === "stopping") await this.repair(this.record);
     });
+  }
+
+  // A start or stop that an eviction or a deploy cut off has nobody left to
+  // finish it. A box still running carries on; otherwise it counts as stopped,
+  // or as a failed start if it never made a save.
+  private async repair(r: SandboxRecord) {
+    if (this.ctx.container?.running) {
+      await this.update({ state: "running", ...(r.state === "starting" ? { startedAt: Date.now() } : {}) });
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+    } else {
+      const savedThisRun = r.state === "stopping" && (r.savedAt ?? 0) >= (r.startedAt ?? 0);
+      await this.update({
+        state: r.savedAt ? "stopped" : "error",
+        stoppedAt: Date.now(),
+        error: savedThisRun
+          ? null
+          : r.state === "starting"
+            ? "start failed: it was cut off partway by an update or restart of the deployment"
+            : "stopped before it could save; resume starts from the previous save",
+      });
+    }
+    console.log(`[${r.id}] was ${r.state} after a restart; now ${this.record?.state}`);
   }
 
   private get container() {
@@ -915,10 +938,17 @@ export class Sandbox extends DurableObject<Env> {
       await this.save();
     } catch (e) {
       await this.update({ state: "running", error: `save failed: ${message(e)}` });
-      fail(500, `couldn't save ${r.id}, so it is still running: ${message(e)}`);
+      // An alarm that came while it was stopping didn't set the next one.
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+      fail(500, `couldn't save ${r.name ?? r.id}, so it is still running: ${message(e)}`);
     }
     await this.backup();
-    await withTimeout(this.container.destroy(), 60_000, "destroy");
+    try {
+      await withTimeout(this.container.destroy(), 60_000, "destroy");
+    } catch (e) {
+      // The save and the backup are done, so it counts as stopped either way.
+      console.error(`[${r.id}] ${message(e)}`);
+    }
     await this.ctx.storage.deleteAlarm();
     await this.update({ state: "stopped", stoppedAt: Date.now(), error: null });
   }
