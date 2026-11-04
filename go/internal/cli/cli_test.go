@@ -252,6 +252,9 @@ func TestSavedKeyGoesOnlyToTheSavedDeployment(t *testing.T) {
 	if code, _, errOut := run(t, "--api-url", savedSrv.URL+"/", "list"); code != 0 {
 		t.Fatalf("saved deployment: code %d, stderr %q", code, errOut)
 	}
+	if code, _, errOut := run(t, "--api-url", "HTTP"+strings.TrimPrefix(savedSrv.URL, "http"), "list"); code != 0 {
+		t.Fatalf("saved deployment with its scheme in capitals: code %d, stderr %q", code, errOut)
+	}
 	code, _, errOut := run(t, "--api-url", otherSrv.URL, "list")
 	if code != 1 || !strings.Contains(errOut, "CLOUDEX_API_KEY") || len(other.requests) != 0 {
 		t.Fatalf("other deployment: code %d, stderr %q, it saw %v", code, errOut, other.requests)

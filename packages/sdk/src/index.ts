@@ -518,8 +518,9 @@ export class Cloudex {
     if (!url || !key) {
       const saved = await savedDeployment(env.CLOUDEX_CONFIG_DIR);
       url ||= saved?.apiUrl;
-      if (!key && url && saved?.apiUrl && trimSlashes(url) === trimSlashes(saved.apiUrl)) key = saved.apiKey;
+      if (!key && url && saved?.apiUrl && normalizeUrl(url) === normalizeUrl(saved.apiUrl)) key = saved.apiKey;
     }
+    url = normalizeUrl(url ?? "");
     // Let a later call find a deployment or key set up since.
     if (!url) {
       this.#endpoint = undefined;
@@ -535,7 +536,7 @@ export class Cloudex {
         `no API key for ${url}: pass apiKey or set CLOUDEX_API_KEY. The CLI's saved key is used only with the deployment it was saved for`,
       );
     }
-    return { url: trimSlashes(url), key };
+    return { url, key };
   }
 }
 
@@ -951,7 +952,20 @@ const commandLine = (command: string | string[]) =>
 
 const OLDER_DEPLOYMENT = "this deployment is older than the SDK and doesn't have that call; update it with: cloudex deploy";
 
-const trimSlashes = (url: string) => url.replace(/\/+$/, "");
+// As the CLI's NormalizeURL: no trailing slashes, https:// when there's no
+// scheme, the scheme and host in lowercase, and no :443 on https, so that the
+// saved key matches its deployment however either URL is written.
+function normalizeUrl(url: string) {
+  let u = url.trim().replace(/\/+$/, "");
+  if (!u) return u;
+  if (!u.includes("://")) u = `https://${u}`;
+  const at = u.indexOf("://");
+  const scheme = u.slice(0, at).toLowerCase();
+  const rest = u.slice(at + 3);
+  const slash = rest.includes("/") ? rest.indexOf("/") : rest.length;
+  const host = rest.slice(0, slash).toLowerCase();
+  return `${scheme}://${scheme === "https" ? host.replace(/:443$/, "") : host}${rest.slice(slash)}`;
+}
 
 // A failed fetch or a body that broke off. Node's fetch says only "fetch failed"
 // or "terminated"; the reason is in cause.

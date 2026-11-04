@@ -251,6 +251,23 @@ def _saved_deployment(config_dir: Optional[str]) -> Dict[str, Any]:
         return {}
 
 
+def _normalize_url(url: str) -> str:
+    # As the CLI's NormalizeURL: no trailing slashes, https:// when there's no
+    # scheme, the scheme and host in lowercase, and no :443 on https, so that
+    # the saved key matches its deployment however either URL is written.
+    u = url.strip().rstrip("/")
+    if not u:
+        return u
+    if "://" not in u:
+        u = "https://" + u
+    scheme, rest = u.split("://", 1)
+    host, slash, path = rest.partition("/")
+    scheme, host = scheme.lower(), host.lower()
+    if scheme == "https" and host.endswith(":443"):
+        host = host[: -len(":443")]
+    return f"{scheme}://{host}{slash}{path}"
+
+
 class Cloudex:
     """A Cloudex deployment.
 
@@ -270,8 +287,9 @@ class Cloudex:
             saved = _saved_deployment(os.environ.get("CLOUDEX_CONFIG_DIR"))
             url = url or saved.get("apiUrl")
             # The saved key goes only to the saved URL, so a URL passed in can't be sent the admin key.
-            if not key and url and saved.get("apiUrl") and url.rstrip("/") == saved["apiUrl"].rstrip("/"):
+            if not key and url and saved.get("apiUrl") and _normalize_url(url) == _normalize_url(saved["apiUrl"]):
                 key = saved.get("apiKey")
+        url = _normalize_url(url or "")
         if not url:
             raise CloudexError(
                 0,
@@ -283,7 +301,7 @@ class Cloudex:
                 f"no API key for {url}: pass api_key or set CLOUDEX_API_KEY. "
                 "The CLI's saved key is used only with the deployment it was saved for",
             )
-        self.api_url = url.rstrip("/")
+        self.api_url = url
         self._key = key
         self._timeout = timeout
 

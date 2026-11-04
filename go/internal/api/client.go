@@ -120,14 +120,28 @@ func New(baseURL, key string) *Client {
 	return &Client{BaseURL: NormalizeURL(baseURL), Key: key, HTTP: &http.Client{}}
 }
 
-// NormalizeURL drops trailing slashes and assumes https:// for an address
-// given without a scheme.
+// NormalizeURL drops trailing slashes, assumes https:// for an address given
+// without a scheme, lowercases the scheme and host, and drops https's own
+// port, so that the saved key matches its deployment however the URL is
+// written. The SDKs do the same.
 func NormalizeURL(u string) string {
 	u = strings.TrimRight(strings.TrimSpace(u), "/")
-	if u != "" && !strings.Contains(u, "://") {
-		return "https://" + u
+	if u == "" {
+		return ""
 	}
-	return u
+	if !strings.Contains(u, "://") {
+		u = "https://" + u
+	}
+	scheme, rest, _ := strings.Cut(u, "://")
+	host, path := rest, ""
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		host, path = rest[:i], rest[i:]
+	}
+	scheme, host = strings.ToLower(scheme), strings.ToLower(host)
+	if scheme == "https" {
+		host = strings.TrimSuffix(host, ":443")
+	}
+	return scheme + "://" + host + path
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
