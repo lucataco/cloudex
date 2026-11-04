@@ -46,21 +46,20 @@ func newDeployCmd(opts *options) *cobra.Command {
 				PreviewDomain: previewDomain, PreviewDomainSet: cmd.Flags().Changed("preview-domain"),
 				RememberedPreviewDomain: cfg.PreviewZone, Image: image,
 				ExistingURL: cfg.APIURL, ExistingKey: cfg.APIKey, ExistingAccountID: cfg.AccountID,
-				Confirm:   func(q string) bool { return yes || confirm(cmd, q) },
+				Confirm: func(q string) bool { return yes || confirm(cmd, q) },
+				// Save the key as soon as the Worker holds it, so an interrupted
+				// deploy, or a failed check, doesn't lose it.
+				OnInstalled: func(res deploy.Result) error {
+					// Another deployment's sandboxes aren't this one's; the same one at a
+					// new workers.dev address keeps them.
+					if res.APIURL != cfg.APIURL && res.AccountID != cfg.AccountID {
+						cfg.Current = ""
+					}
+					cfg.APIURL, cfg.APIKey, cfg.AccountID, cfg.PreviewZone = res.APIURL, res.APIKey, res.AccountID, res.PreviewZone
+					return cfg.Save()
+				},
 				SkipCheck: skipCheck, Log: cmd.ErrOrStderr(),
 			})
-			if res != nil {
-				// Save even after a failed check, so status and doctor can see the deployment.
-				// Another deployment's sandboxes aren't this one's; the same one at a
-				// new workers.dev address keeps them.
-				if res.APIURL != cfg.APIURL && res.AccountID != cfg.AccountID {
-					cfg.Current = ""
-				}
-				cfg.APIURL, cfg.APIKey, cfg.AccountID, cfg.PreviewZone = res.APIURL, res.APIKey, res.AccountID, res.PreviewZone
-				if saveErr := cfg.Save(); saveErr != nil {
-					return saveErr
-				}
-			}
 			if err != nil {
 				return err
 			}
