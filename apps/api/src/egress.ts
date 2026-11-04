@@ -80,18 +80,20 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
     const spec = PROVIDERS[name];
     const headers = new Headers(req.headers);
     const sent = spec.sent(headers);
+    // Anthropic's error shape, whose error.message OpenAI's clients read too.
+    // Not a 401: Claude Code retries one whose message it doesn't know.
+    const refuse = (message: string) => Response.json({ type: "error", error: { type: "permission_error", message } }, { status: 403 });
     if (!sent || sent === spec.placeholder) {
       let key: string | null;
       try {
         key = await providerKey(this.env, name);
       } catch (e) {
         if (!(e instanceof UnreadableKey)) throw e;
-        // Anthropic's error shape, whose error.message OpenAI's clients read too.
-        // Not a 401: Claude Code retries one whose message it doesn't know.
-        const message = `Cloudex can't read its stored ${name} key: the deployment's admin key changed after it was set. Set it again with: cloudex keys set ${name}`;
-        return Response.json({ type: "error", error: { type: "permission_error", message } }, { status: 403 });
+        return refuse(`Cloudex can't read its stored ${name} key: the deployment's admin key changed after it was set. Set it again with: cloudex keys set ${name}`);
       }
       if (key) spec.set(headers, key);
+      // A placeholder with no key behind it: the key was removed after this run started.
+      else if (sent) return refuse(`no ${name} key is set in Cloudex. Set one with: cloudex keys set ${name}`);
     }
     // An agent working counts as activity, at most twice a minute.
     const id = this.ctx.props.id;
