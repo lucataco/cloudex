@@ -24,8 +24,9 @@ func newKeysCmd(opts *options) *cobra.Command {
 			"the provider as they leave, so it never enters a sandbox, its saves, backups or\n" +
 			"forks. Claude Code, Codex, the providers' SDKs and curl work as if the key were\n" +
 			"there. A key a sandbox brings itself, or a subscription login, is used as is.\n\n" +
-			"A new provider reaches a running sandbox when it next starts; a changed key\n" +
-			"reaches it within a minute. With no subcommand, lists the keys.",
+			"A new provider reaches a running sandbox when it next starts (stop it, then\n" +
+			"resume it, to start it now); a changed key reaches it within a minute. With no\n" +
+			"subcommand, lists the keys.",
 		Example: "  cloudex keys set anthropic\n  cloudex keys set openai --from-env\n  cloudex keys\n  cloudex keys rm openai",
 		Args:    cobra.NoArgs,
 		RunE:    func(cmd *cobra.Command, _ []string) error { return listKeys(cmd, opts) },
@@ -46,6 +47,9 @@ func newKeysCmd(opts *options) *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			provider := args[0]
+			if _, ok := providerEnv[provider]; !ok {
+				return fmt.Errorf("unknown provider %s: use anthropic or openai", provider)
+			}
 			key, err := providerKey(cmd, provider, fromEnv)
 			if err != nil {
 				return err
@@ -61,8 +65,9 @@ func newKeysCmd(opts *options) *cobra.Command {
 			if opts.json {
 				return writeJSON(cmd.OutOrStdout(), k)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Stored the %s key (%s). Sandboxes started from now on use it; running ones\n"+
-				"get it when they next start, or within a minute if they already use a %s key.\n", k.Provider, k.Hint, k.Provider)
+			fmt.Fprintf(cmd.OutOrStdout(), "Stored the %s key (%s). Sandboxes started from now on use it.\n"+
+				"A running sandbox that already uses an %s key gets this one within a minute; any other\n"+
+				"gets it when it next starts. To use it now: cloudex stop <sandbox>, then cloudex resume <sandbox>.\n", k.Provider, k.Hint, k.Provider)
 			return nil
 		},
 	}
@@ -124,10 +129,7 @@ func listKeys(cmd *cobra.Command, opts *options) error {
 // input or a hidden prompt.
 func providerKey(cmd *cobra.Command, provider string, fromEnv bool) (string, error) {
 	if fromEnv {
-		name, ok := providerEnv[provider]
-		if !ok {
-			return "", fmt.Errorf("unknown provider %s: use anthropic or openai", provider)
-		}
+		name := providerEnv[provider]
 		if k := strings.TrimSpace(os.Getenv(name)); k != "" {
 			return k, nil
 		}

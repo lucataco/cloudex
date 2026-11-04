@@ -20,6 +20,12 @@ import (
 // How long each read of a followed command's output waits for more.
 const commandWaitSec = 30
 
+// How long, and how often, a followed command's output is asked for again when the connection breaks.
+var (
+	commandRetryFor   = 2 * time.Minute
+	commandRetryEvery = 3 * time.Second
+)
+
 func newCommandsCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "commands [sandbox]",
@@ -128,6 +134,9 @@ func newCommandsLogsCmd(opts *options) *cobra.Command {
 					fmt.Fprintf(cmd.ErrOrStderr(), "\nStopped following %s; it keeps running.\n", id)
 					return nil
 				}
+				if follow && lostTouch(err) {
+					fmt.Fprintf(cmd.ErrOrStderr(), "Follow %s again with: cloudex commands logs -f %s %s\n", id, r, id)
+				}
 				return err
 			}
 			if follow {
@@ -162,13 +171,13 @@ func followCommand(ctx context.Context, client *api.Client, r, id string, after 
 			if failingSince.IsZero() {
 				failingSince = time.Now()
 				fmt.Fprintf(errw, "cloudex: lost touch with the sandbox (%v); trying again\n", err)
-			} else if time.Since(failingSince) > 2*time.Minute {
+			} else if time.Since(failingSince) > commandRetryFor {
 				return nil, err
 			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(3 * time.Second):
+			case <-time.After(commandRetryEvery):
 			}
 			continue
 		}

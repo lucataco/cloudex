@@ -293,7 +293,7 @@ func newPromptCmd(opts *options) *cobra.Command {
 			"sandbox's disk. Agents run without their own permission prompts; the sandbox\n" +
 			"is the boundary.",
 		Example: "  cloudex prompt \"make the tests pass\"\n  cloudex prompt my-box --agent codex \"add a dark mode\"",
-		Args:    cobra.RangeArgs(1, 2),
+		Args:    taskArgs(2, "task"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !agentKinds[agent] {
 				return fmt.Errorf("unknown agent %q: use claude or codex", agent)
@@ -303,12 +303,17 @@ func newPromptCmd(opts *options) *cobra.Command {
 				named = args[0]
 			}
 			task := args[len(args)-1]
-			start := fmt.Sprintf("cloudex-agent start %s %s", agent, shellQuote(task))
-			remote := fmt.Sprintf(`name=$(%s) && echo "Started $name. Detach with Ctrl-b d; reattach with cloudex attach." && sleep 1 && exec cloudex-agent attach "$name"`, start)
-			if detach {
-				remote = fmt.Sprintf(`name=$(%s) && echo "Started $name. Watch it with: cloudex attach"`, start)
+			// The hint goes inside double quotes in the remote shell, so only a name that is safe there is put in it.
+			attach := "cloudex attach"
+			if sandboxRefRE.MatchString(named) {
+				attach += " " + named
 			}
-			return sshRun(cmd, opts, named, !detach, remote)
+			start := fmt.Sprintf("cloudex-agent start %s %s", agent, shellQuote(task))
+			remote := fmt.Sprintf(`name=$(%s) && echo "Started $name. Detach with Ctrl-b d; reattach with %s." && sleep 1 && exec cloudex-agent attach "$name"`, start, attach)
+			if detach {
+				remote = fmt.Sprintf(`name=$(%s) && echo "Started $name. Watch it with: %s"`, start, attach)
+			}
+			return unquoted(sshRun(cmd, opts, named, !detach, remote), args)
 		},
 	}
 	cmd.Flags().StringVar(&agent, "agent", "claude", "claude or codex")
@@ -320,18 +325,33 @@ func newAttachCmd(opts *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "attach [sandbox] [session]",
 		Short: "Reattach to an agent session (the newest by default)",
-		Args:  cobra.MaximumNArgs(2),
+		Long: "Reattach to a session that cloudex prompt started, the newest by default. A\n" +
+			"session is named like agent-1104-153012; cloudex prompt prints its name.",
+		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			named, session := "", ""
-			if len(args) > 0 {
-				named = args[0]
-			}
-			if len(args) > 1 {
-				session = shellQuote(args[1])
+			named, session := attachTarget(args)
+			if session != "" {
+				session = shellQuote(session)
 			}
 			return sshRun(cmd, opts, named, true, "cloudex-agent attach "+session)
 		},
 	}
+}
+
+var sessionRE = regexp.MustCompile(`^agent-\d{4}-\d{6}(-\d+)?$`)
+
+// attachTarget reads [sandbox] [session]. A lone argument that looks like a
+// session's name is one; sandboxes can be named agent-1 and so on, but not like that.
+func attachTarget(args []string) (named, session string) {
+	switch {
+	case len(args) == 2:
+		return args[0], args[1]
+	case len(args) == 1 && sessionRE.MatchString(args[0]):
+		return "", args[0]
+	case len(args) == 1:
+		return args[0], ""
+	}
+	return "", ""
 }
 
 // sshRun runs a remote command over SSH, with a terminal when tty is set.
