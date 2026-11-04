@@ -1334,16 +1334,17 @@ export class Sandbox extends DurableObject<Env> {
     }
   }
 
-  // Starts the desktop, installing it the first time, or resizes a running one.
-  async desktop(size: string): Promise<Desktop> {
+  // Starts the desktop, installing it the first time; with a size, resizes a running one.
+
+  async desktop(size?: string): Promise<Desktop> {
     const r = this.mustRun();
     const t0 = Date.now();
     try {
-      const out = await this.runScript(DESKTOP_SCRIPT, [size, r.name ?? r.id], "starting the desktop", DESKTOP_TIMEOUT_MS);
+      const out = await this.runScript(DESKTOP_SCRIPT, [size ?? "", r.name ?? r.id], "starting the desktop", DESKTOP_TIMEOUT_MS);
       const last = out.trim().split("\n").pop() ?? "";
-      const { installed, started } = JSON.parse(last) as { installed: boolean; started: boolean };
-      console.log(`[${r.id}] desktop ${started ? "started" : "running"} at ${size}${installed ? ", installed" : ""} in ${Date.now() - t0} ms`);
-      return { port: DESKTOP_PORT, path: DESKTOP_VIEWER, size, installed, started };
+      const { installed, started, size: shown } = JSON.parse(last) as { installed: boolean; started: boolean; size: string };
+      console.log(`[${r.id}] desktop ${started ? "started" : "running"} at ${shown}${installed ? ", installed" : ""} in ${Date.now() - t0} ms`);
+      return { port: DESKTOP_PORT, path: DESKTOP_VIEWER, size: shown, installed, started };
     } finally {
       this.touch();
     }

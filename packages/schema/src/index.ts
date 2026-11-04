@@ -402,7 +402,10 @@ export const RevokedLinks = z.object({
 });
 export type RevokedLinks = z.infer<typeof RevokedLinks>;
 
-// The desktop's screen, from 640x480 up to 3840x2160. A running desktop is resized.
+// The desktop's screen, from 640x480 up to 3840x2160. With a size, a running
+// desktop is resized to it. Without one, a running desktop keeps its size and a
+// new one starts at 1280x720.
+
 const ScreenSize = z
   .string()
   .regex(/^\d{3,4}x\d{3,4}$/, "a size such as 1280x720")
@@ -411,7 +414,7 @@ const ScreenSize = z
     return w >= 640 && w <= 3840 && h >= 480 && h <= 2160;
   }, "between 640x480 and 3840x2160");
 
-export const DesktopRequest = z.object({ size: ScreenSize.default("1280x720") });
+export const DesktopRequest = z.object({ size: ScreenSize.optional() });
 export type DesktopRequest = z.input<typeof DesktopRequest>;
 
 // Where the desktop is served: the viewer page is <path> on guest <port>, which

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CreateSandbox, Name, UpdateSettings } from "../src/index.ts";
+import { CreateSandbox, DesktopRequest, Name, UpdateSettings } from "../src/index.ts";
 
 const issue = (r: { success: boolean; error?: { issues: { message: string }[] } }) => r.error?.issues[0]?.message;
 
@@ -23,4 +23,9 @@ test("a repo URL with a user name or token in it is refused, pointing at GH_TOKE
     assert.ok(CreateSandbox.safeParse({ repo }).success, JSON.stringify(repo));
   }
   assert.ok(UpdateSettings.safeParse({ env: { GH_TOKEN: "ghp_abc" } }).success);
+});
+
+test("a desktop request without a size leaves the screen as it is", () => {
+  assert.equal(DesktopRequest.parse({}).size, undefined);
+  assert.equal(DesktopRequest.parse({ size: "1920x1080" }).size, "1920x1080");
 });
