@@ -498,7 +498,8 @@ export function openapi(version: string) {
         put: op("setKey", "Set a provider's key", {
           description:
             "Sandboxes started from then on get a placeholder key, and the real one is added to their " +
-            "HTTPS calls to the provider on the way out. A changed key reaches running sandboxes within a minute.",
+            "HTTPS calls to the provider on the way out. A changed key reaches running sandboxes within a minute. " +
+            "The key is tried with the provider first: a 400 says what the provider answered when it rejects the key.",
           requestBody: body("SetProviderKey"),
           responses: { 200: ok("The stored key", ref("ProviderKey")) },
         }),

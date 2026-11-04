@@ -10,18 +10,22 @@ import { ensureSchema } from "./db";
 import { open, seal } from "./seal";
 
 interface ProviderSpec {
+  label: string;
   host: string;
   placeholder: string;
   // The key a request carries, if any.
   sent(h: Headers): string | null;
   // Puts the real key in place of the placeholder or no key.
   set(h: Headers, key: string): void;
+  // Headers besides the key that a request to /v1/models needs.
+  probeHeaders?: Record<string, string>;
 }
 
 const bearer = (h: Headers) => h.get("authorization")?.replace(/^Bearer\s+/i, "") || null;
 
 export const PROVIDERS: Record<Provider, ProviderSpec> = {
   anthropic: {
+    label: "Anthropic",
     host: "api.anthropic.com",
     placeholder: "sk-ant-cloudex-placeholder-the-real-key-is-added-on-the-way-out",
     sent: (h) => h.get("x-api-key") || bearer(h),
@@ -29,8 +33,10 @@ export const PROVIDERS: Record<Provider, ProviderSpec> = {
       h.delete("authorization");
       h.set("x-api-key", key);
     },
+    probeHeaders: { "anthropic-version": "2023-06-01" },
   },
   openai: {
+    label: "OpenAI",
     host: "api.openai.com",
     placeholder: "sk-cloudex-placeholder-the-real-key-is-added-on-the-way-out",
     sent: bearer,
@@ -40,6 +46,32 @@ export const PROVIDERS: Record<Provider, ProviderSpec> = {
 
 export const providerForHost = (host: string) =>
   (Object.keys(PROVIDERS) as Provider[]).find((p) => PROVIDERS[p].host === host);
+
+// Asks the provider whether it accepts a key, and returns what to tell the
+// user if it refuses. A provider that can't be reached or answers with anything
+// but a 401 or 403 doesn't count against the key: it may just be down.
+export async function keyRefusal(provider: Provider, key: string): Promise<string | null> {
+  const spec = PROVIDERS[provider];
+  const headers = new Headers(spec.probeHeaders);
+  spec.set(headers, key);
+  let res: Response;
+  try {
+    res = await fetch(`https://${spec.host}/v1/models`, { headers, signal: AbortSignal.timeout(8_000) });
+  } catch {
+    return null;
+  }
+  if (res.status !== 401 && res.status !== 403) {
+    await res.body?.cancel();
+    return null;
+  }
+  const body = await res.json<{ error?: { message?: unknown } }>().catch(() => null);
+  const said = typeof body?.error?.message === "string" ? `${res.status}: ${body.error.message.slice(0, 300)}` : `HTTP ${res.status}`;
+  const next =
+    provider === "anthropic" && key.startsWith("sk-ant-oat")
+      ? "A key starting with sk-ant-oat is a Claude subscription token, which can't be used this way. Make an API key in the Anthropic Console instead."
+      : "Check the key and try again.";
+  return `${spec.label} rejected that key (${said}), so it wasn't stored. ${next}`;
+}
 
 // Sealed with the admin key (seal.ts), so a copy of the D1 database alone
 // doesn't reveal the provider keys.

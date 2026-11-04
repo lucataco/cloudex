@@ -602,6 +602,16 @@ func TestKeysSetFromEnvSendsTheKey(t *testing.T) {
 	}
 }
 
+func TestKeysSetShowsWhyTheProviderRejectedTheKey(t *testing.T) {
+	const why = "Anthropic rejected that key (401: invalid x-api-key), so it wasn't stored. Check the key and try again."
+	withFakeAPI(t, map[string]string{"PUT /v1/keys/anthropic": `!400 {"error":"` + why + `"}`})
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-oat01-test")
+	code, out, errOut := run(t, "keys", "set", "anthropic", "--from-env")
+	if code != 1 || !strings.Contains(errOut, why) || strings.Contains(out, "Stored") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
 func TestKeysSetFromEnvNeedsTheVariable(t *testing.T) {
 	withFakeAPI(t, nil)
 	t.Setenv("OPENAI_API_KEY", "")

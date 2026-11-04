@@ -338,7 +338,9 @@ class Cloudex:
         Sandboxes started from then on get a placeholder, and the real key is
         added to their HTTPS calls to the provider on the way out, so it never
         enters a sandbox, its saves, backups or forks. A changed key reaches
-        running sandboxes within a minute.
+        running sandboxes within a minute. The key is tried with the provider
+        first; if the provider rejects it, this raises a CloudexError (status
+        400) with what the provider said.
         """
         return _provider_key(self._call("PUT", "/v1/keys/" + urllib.parse.quote(provider, safe=""), {"key": key}))
 
