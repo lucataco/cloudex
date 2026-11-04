@@ -291,8 +291,6 @@ http.server.HTTPServer((\"127.0.0.1\", 8127), H).serve_forever()"'
 		cx desktop "$A" --link --size 1024x768
 		cx desktop "$A" --link
 		ok C22b "desktop again without --size keeps the size" is "$(field .size)" 1024x768
-		cx exec "$A" -- 'stat -c %u /'
-		ok C22c "/ is owned by root, so tools that check it work" is "$OUT" 0
 		cx desktop "$A" --stop
 		ok C23 "desktop --stop" [ "$(field .stopped)" = true ]
 	else
@@ -323,6 +321,8 @@ fi
 # ---------------------------------------------------------------- inside
 if want inside; then
 	need_a
+	cx exec "$A" -- 'stat -c %u /'
+	ok I07 "/ is owned by root, so tools that check it work" is "$OUT" 0
 	cx exec "$A" -- 'cloudex info --json'
 	ok I01 "cloudex inside a sandbox knows itself" [ "$(field .id)" = "$A_ID" ]
 	cx exec "$A" -- 'cloudex set --idle 45m --json'
