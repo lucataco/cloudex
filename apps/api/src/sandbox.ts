@@ -254,7 +254,7 @@ export class Sandbox extends DurableObject<Env> {
           ? null
           : r.state === "starting"
             ? "start failed: it was cut off partway by an update or restart of the deployment"
-            : "stopped before it could save; resume starts from the previous save",
+            : "stopped before it could save; resume starts from its last save or backup",
       });
     }
     console.log(`[${r.id}] was ${r.state} after a restart; now ${this.record?.state}`);
@@ -324,7 +324,7 @@ export class Sandbox extends DurableObject<Env> {
     await this.update({
       state: "stopped",
       stoppedAt: Date.now(),
-      error: savedThisRun ? null : "stopped by the platform before it could save; resume starts from the previous save",
+      error: savedThisRun ? null : "stopped by the platform before it could save; resume starts from its last save or backup",
     });
   }
 
