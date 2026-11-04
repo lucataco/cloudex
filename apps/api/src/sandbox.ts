@@ -361,7 +361,13 @@ export class Sandbox extends DurableObject<Env> {
       }
       // The same for a named save, which is restored again until then.
       if (save) await this.ctx.storage.put("fromSave", save);
-      await this.boot(from?.snapshot, undefined, save);
+      try {
+        await this.boot(from?.snapshot, undefined, save);
+      } catch (e) {
+        const { status, message: why } = errorStatus(e);
+        const r = this.mustRecord();
+        fail(status, `${why.replace(/\.$/, "")}. ${r.name ?? r.id} is kept, in state ${r.state}: resume it to try again, or delete it`);
+      }
       if (settings?.repo && !from && !save) await this.clone(settings.repo);
       await this.startHook();
       return this.mustRecord();
@@ -370,15 +376,22 @@ export class Sandbox extends DurableObject<Env> {
 
   private async clone(repo: NonNullable<StoredSettings["repo"]>) {
     const t0 = Date.now();
-    const out = await this.asGuest([CLONE_SCRIPT, repo.url, repo.dir, repo.branch ?? ""], "cloning", 10 * 60_000);
-    const why = new TextDecoder().decode(out.stderr).trim().split("\n").slice(-2).join(" ");
-    if (out.exitCode === 0) {
-      console.log(`[${this.mustRecord().id}] cloned ${repo.url} in ${Date.now() - t0} ms${why ? `: ${why}` : ""}`);
-      return;
+    let why: string;
+    let hint = "";
+    try {
+      const out = await this.asGuest([CLONE_SCRIPT, repo.url, repo.dir, repo.branch ?? ""], "cloning", 10 * 60_000);
+      const err = new TextDecoder().decode(out.stderr).trim().split("\n").slice(-2).join(" ");
+      if (out.exitCode === 0) {
+        console.log(`[${this.mustRecord().id}] cloned ${repo.url} in ${Date.now() - t0} ms${err ? `: ${err}` : ""}`);
+        return;
+      }
+      why = err || `git exited with code ${out.exitCode}`;
+      // GitHub asks for a login for a private repo, and for one that isn't there.
+      if (/could not read Username/.test(err)) hint = " If it's private, set GH_TOKEN in the sandbox's env.";
+    } catch (e) {
+      why = message(e);
     }
-    // GitHub asks for a login for a private repo, and for one that isn't there.
-    const hint = /could not read Username/.test(why) ? " If it's private, set GH_TOKEN in the sandbox's env." : "";
-    const notice = `Couldn't clone ${repo.url} into ~/${repo.dir}: ${why || `git exited with code ${out.exitCode}`}.${hint}`;
+    const notice = `Couldn't clone ${repo.url} into ~/${repo.dir}: ${why}.${hint}`;
     await this.update({ notice: [this.mustRecord().notice, notice].filter(Boolean).join(" ") });
   }
 
@@ -763,7 +776,7 @@ export class Sandbox extends DurableObject<Env> {
       } catch {}
       const why = message(e);
       await this.update({ state: r.savedAt ? "stopped" : "error", error: `start failed: ${why}` });
-      fail(503, `${r.id} didn't start: ${why}`);
+      fail(503, `${r.name ?? r.id} didn't start: ${why}`);
     }
     try {
       await withTimeout(c.setInactivityTimeout(PLATFORM_MAX_INACTIVITY_MS), 30_000, "setInactivityTimeout");
