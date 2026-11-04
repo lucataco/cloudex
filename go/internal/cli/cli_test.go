@@ -23,6 +23,15 @@ import (
 	"github.com/lucataco/cloudex/go/internal/update/updatetest"
 )
 
+// git sets these for the commands that rebase --exec and hooks run, and the
+// tests that run git in a temporary repository would commit into that repo.
+func TestMain(m *testing.M) {
+	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"} {
+		os.Unsetenv(k)
+	}
+	os.Exit(m.Run())
+}
+
 // fakeAPI records requests and answers with canned JSON per "METHOD /path".
 type fakeAPI struct {
 	t        *testing.T
