@@ -209,7 +209,9 @@ run_turn() { # turn
 
 case $op in
   start)
-    id=$1 agent=$2 cwd=$3 model=$4
+    id=$1 agent=$2 model=$4
+    # ~ and ~/dir are in the home directory, as for exec.
+    cwd=$(sed 's|^~$||; s|^~/||' <<<"$3")
     command -v "$agent" >/dev/null || fail 4 "$agent isn't installed in this sandbox"
     cd "$HOME" && cwd=$(cd "$cwd" 2>/dev/null && pwd) || fail 4 "there's no directory $3 in the sandbox"
     d=$root/$id
