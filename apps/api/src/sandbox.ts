@@ -116,6 +116,7 @@ const GUEST_HOME = "/home/cloudex";
 const OUTPUT_LIMIT = 1 << 20;
 const FILE_TIMEOUT_MS = 30 * 60_000; // an upload or unpack of up to 100 MB
 const KEEPALIVE_MS = 15_000; // the longest a streamed exec stays quiet
+const REPLAY_LIMIT = 1 << 20; // the biggest preview request body held to send again
 const SSH_KEY = /^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^\n]*)?$/;
 
 type CreateInput = {
@@ -1467,11 +1468,18 @@ export class Sandbox extends DurableObject<Env> {
   // A preview request for a guest port. A server listening only on localhost
   // doesn't answer at the sandbox's address, so then a relay (guest.ts) starts
   // for it, and requests for the port go through the relay while it runs. A
-  // request is sent again after a miss only without a body, which can't be.
+  // body with a content-length up to REPLAY_LIMIT is held here, so that the
+  // request can be sent again after a miss; any other goes only once.
+
   private async preview(port: number, target: string, req: Request): Promise<Response> {
     const r = this.mustRecord();
+    const length = req.headers.get("content-length");
+    const held = req.body && length !== null && Number(length) <= REPLAY_LIMIT ? await req.arrayBuffer() : null;
+    const once = held === null && req.body !== null;
     const send = (to: number) => {
-      const fwd = new Request(target, req);
+      const fwd = held
+        ? new Request(target, { method: req.method, headers: req.headers, body: held, redirect: req.redirect })
+        : new Request(target, req);
       fwd.headers.delete(LINK_HEADER);
       return this.container.getTcpPort(to).fetch(fwd);
     };
@@ -1483,7 +1491,7 @@ export class Sandbox extends DurableObject<Env> {
       } catch (e) {
         why = message(e);
         if (to !== port) this.relayed.delete(port);
-        if (req.body) break;
+        if (once) break;
       }
     }
     const addr = /not listening in the TCP address (\d{1,3}(?:\.\d{1,3}){3}):\d+/.exec(why)?.[1];
@@ -1494,7 +1502,7 @@ export class Sandbox extends DurableObject<Env> {
       }
       if (through) {
         if (through !== port) this.relayed.set(port, through);
-        if (req.body) {
+        if (once) {
           return new Response(`port ${port} in ${r.name ?? r.id} only just started answering; send that again\n`, {
             status: 503,
             headers: { "retry-after": "1" },
