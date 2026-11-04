@@ -30,7 +30,7 @@ import { backupBucket } from "./backup";
 import { deleteSandbox, idForName, listSandboxes, nameTaken } from "./db";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, listKeys, setKey } from "./keys";
-import type { ForkSource } from "./sandbox";
+import { NO_SUCH_SANDBOX, type ForkSource } from "./sandbox";
 import { type SaveManifest, deleteSave, getSave, listSaves, readManifest } from "./saves";
 import {
   LINK_HEADER,
@@ -53,7 +53,10 @@ export { Egress } from "./egress";
 type Ctx = { Bindings: Env };
 const app = new Hono<Ctx>();
 
-app.onError(onError);
+app.onError((e, c) => {
+  const ref = c.req.param("ref");
+  return onError(ref && e.message === `[404] ${NO_SUCH_SANDBOX}` ? new Error(`[404] no sandbox ${ref}`) : e, c);
+});
 
 app.get("/v1/health", (c) =>
   c.json({ ok: true, version: VERSION, previewZone: c.env.PREVIEW_ZONE || null, backups: Boolean(backupBucket(c.env)) } satisfies Health),

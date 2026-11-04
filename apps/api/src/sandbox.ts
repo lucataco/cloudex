@@ -133,6 +133,8 @@ export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?:
 type Links = { epoch: number; ports: Record<string, { gen: number; at: number | null }> };
 type ExecInput = { cmd: string; root: boolean; cwd?: string; timeoutSec: number };
 
+export const NO_SUCH_SANDBOX = "no such sandbox";
+
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
 
 function clip(buf: ArrayBuffer) {
@@ -231,7 +233,7 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   private mustRecord(): SandboxRecord {
-    if (!this.record || this.removing) fail(404, "no such sandbox");
+    if (!this.record || this.removing) fail(404, NO_SUCH_SANDBOX);
     return this.record;
   }
 
