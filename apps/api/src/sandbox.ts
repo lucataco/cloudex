@@ -491,22 +491,23 @@ export class Sandbox extends DurableObject<Env> {
   private async resumeFrom(fromBackup: boolean): Promise<SandboxRecord> {
     const r = this.mustRecord();
     const snapshot = await this.ctx.storage.get("snapshot");
+    const fromSave = snapshot ? undefined : await this.ctx.storage.get<SaveManifest>("fromSave");
     const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
     const expired = Boolean(snapshot) && Date.now() - touched > SAVE_LIFETIME_MS;
-    if (fromBackup || expired) {
+    const homeOnlyInBackup = !snapshot && !fromSave && r.savedAt !== null;
+    if (fromBackup || expired || homeOnlyInBackup) {
       const bucket = backupBucket(this.env);
       const backup = bucket ? await latestBackup(bucket, r.id) : null;
       if (backup) {
-        await this.bootFromBackup(backup, fromBackup ? "as asked" : "its save had expired");
+        await this.bootFromBackup(backup, fromBackup ? "as asked" : expired ? "its save had expired" : "it stopped before it could save");
         await this.startHook();
         return this.mustRecord();
       }
-      if (fromBackup) fail(404, bucket ? `${r.id} has no backup yet` : "backups are off: this deployment has no R2 bucket");
+      if (fromBackup) fail(404, bucket ? `${r.name ?? r.id} has no backup yet` : "backups are off: this deployment has no R2 bucket");
     }
     // Started from a named save, and stopped before it made a save of its own:
     // it starts from that save again, or from the newest save of its name if
     // it has been saved over, or from the image if it's gone.
-    const fromSave = snapshot ? undefined : await this.ctx.storage.get<SaveManifest>("fromSave");
     if (fromSave) {
       const m = await this.currentSave(fromSave);
       let note = "";
