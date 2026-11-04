@@ -587,11 +587,8 @@ const (
 	permZone       = "Zone Read"
 )
 
-// keyReplacedEffects is what a new API key costs besides the other
-// computers: what the old key sealed or signed stops working.
 const keyReplacedEffects = "Sandboxes' environment variables and files, the provider keys set with cloudex keys, and preview links stop working too."
 
-// denied is true when Cloudflare refused the token, as opposed to failing.
 func denied(err error) bool {
 	var cfErr *cloudflare.Error
 	return errors.As(err, &cfErr) && (cfErr.Status == http.StatusForbidden || cfErr.Code == 10000)
@@ -601,8 +598,6 @@ func tokenNeeds(step, permission string, err error) error {
 	return fmt.Errorf("%s: this API token isn't allowed to do that. It needs the %s permission. Add it to the token, or make a new token with the link in cloudex deploy --help, then run cloudex deploy again (%w)", step, permission, err)
 }
 
-// stepError says what failed, and when Cloudflare refused the token, which
-// permission the step needs.
 func stepError(step, permission string, err error) error {
 	if denied(err) {
 		return tokenNeeds(step, permission, err)
@@ -618,9 +613,6 @@ func lookupZone(ctx context.Context, cf *cloudflare.Client, account, zone string
 	return id, err
 }
 
-// retirePreviews takes preview links off zone: the Worker route, so its
-// other subdomains stop reaching the Worker, and the wildcard record Cloudex
-// added. A zone the token can't see is left alone.
 func retirePreviews(ctx context.Context, cf *cloudflare.Client, account, zone string, log func(string, ...any)) error {
 	zoneID, err := lookupZone(ctx, cf, account, zone)
 	var noZone *cloudflare.NoZoneError

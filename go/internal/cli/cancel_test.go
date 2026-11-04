@@ -13,8 +13,6 @@ import (
 	"testing"
 )
 
-// Ctrl-C while the first desktop install is under way ends the command
-// without blaming the connection.
 func TestCtrlCDuringAnAPICallEndsQuietly(t *testing.T) {
 	started := make(chan struct{})
 	var once sync.Once

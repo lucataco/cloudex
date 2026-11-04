@@ -26,8 +26,6 @@ func isRelease(version string) bool {
 	return strings.HasPrefix(version, "v")
 }
 
-// deploymentIsOlder says whether the deployment h describes runs an older
-// release than the CLI. A build from source has no release to compare.
 func deploymentIsOlder(cliVersion string, h *api.Health) bool {
 	return isRelease(cliVersion) && update.Newer(cliVersion, h.Version)
 }
@@ -144,8 +142,6 @@ func saveLatest(latest string) {
 	os.WriteFile(p, data, 0o600)
 }
 
-// updateCheckOff is true when $CLOUDEX_NO_UPDATE_CHECK turns the check off;
-// 0 and false leave it on.
 func updateCheckOff() bool {
 	switch strings.ToLower(os.Getenv("CLOUDEX_NO_UPDATE_CHECK")) {
 	case "", "0", "false":

@@ -405,7 +405,6 @@ export type RevokedLinks = z.infer<typeof RevokedLinks>;
 // The desktop's screen, from 640x480 up to 3840x2160. With a size, a running
 // desktop is resized to it. Without one, a running desktop keeps its size and a
 // new one starts at 1280x720.
-
 const ScreenSize = z
   .string()
   .regex(/^\d{3,4}x\d{3,4}$/, "a size such as 1280x720")

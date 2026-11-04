@@ -284,7 +284,6 @@ func writeFileAtomic(path string, data []byte, mode fs.FileMode) error {
 	return err
 }
 
-// trackSSHName drops name's host keys unless name already pointed at id.
 func trackSSHName(dir, name, id string) error {
 	names := readSSHNames(dir)
 	if names[name] == id {
@@ -297,8 +296,8 @@ func trackSSHName(dir, name, id string) error {
 	return writeSSHNames(dir, names)
 }
 
-// forgetSSHName drops a deleted or renamed name's host keys. It is tidying: the
-// proxy forgets a stale name when it next sees it, so a failure is let go.
+// Tidying only: the proxy forgets a stale name when it next sees it, so a
+// failure is let go.
 func forgetSSHName(name string) {
 	dir, err := config.Dir()
 	if err != nil {

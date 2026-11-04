@@ -11,8 +11,6 @@ import (
 	"github.com/lucataco/cloudex/go/internal/config"
 )
 
-// newKeyedAPI answers like the real API: /v1/health is open and the rest needs
-// the key "test-key". The caller's key comes from $CLOUDEX_API_KEY.
 func newKeyedAPI(t *testing.T, version string, routes map[string]string) *httptest.Server {
 	t.Helper()
 	routes["GET /v1/health"] = `{"ok":true,"version":"` + version + `","previewZone":null,"backups":true}`

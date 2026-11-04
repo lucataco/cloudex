@@ -30,23 +30,16 @@ const (
 	sourceRepo = "ghcr.io/lucataco/cloudex-base"
 )
 
-// world stands in for everything Run talks to: the Cloudflare API, the
-// registries, and the deployed API. Requests never leave the process; they go
-// to handlers by host name.
 type world struct {
-	t *testing.T
-	// cf answers Cloudflare calls by "METHOD /path"; a call it doesn't know fails the test.
-	cf    map[string]func(r *http.Request) (int, any)
-	calls []string
-	// The deployed API. Until deployed, its host answers 404.
-	deployed  bool
-	key       string
-	zone      string
-	sandboxes []map[string]any
-	apiCalls  []string
-	// source serves the public image.
-	source http.Handler
-	// apiDeletes are the DELETE calls the API got, in order.
+	t          *testing.T
+	cf         map[string]func(r *http.Request) (int, any)
+	calls      []string
+	deployed   bool
+	key        string
+	zone       string
+	sandboxes  []map[string]any
+	apiCalls   []string
+	source     http.Handler
 	apiDeletes []string
 }
 
@@ -293,8 +286,6 @@ func TestReplacingTheKeySaysWhatStopsWorking(t *testing.T) {
 	}
 }
 
-// previewsOn sets up a deployment whose previews are on old.dev, with a
-// Cloudex route and record there and some of the user's own.
 func previewsOn(t *testing.T) (w *world, deleted *[]string) {
 	w = newWorld(t)
 	w.deployed, w.key, w.zone = true, oldKey, "old.dev"
@@ -375,8 +366,6 @@ func TestSwitchingPreviewDomainRemovesTheOldRoute(t *testing.T) {
 	}
 }
 
-// A zone only this computer remembers may have been set up since by another
-// deployment that relies on the route or the record.
 func TestSwitchingPreviewDomainLeavesAZoneOnlyRemembered(t *testing.T) {
 	w, deleted := previewsOn(t)
 	w.zone = ""
@@ -460,8 +449,6 @@ func TestR2ProblemNamesThePermission(t *testing.T) {
 	}
 }
 
-// Another deploy may be using a recent test sandbox, and a user's sandbox may
-// have a name that only looks like one.
 func TestCheckSandboxDeletesOnlyOldTestSandboxes(t *testing.T) {
 	w := newWorld(t)
 	w.deployed, w.key = true, oldKey

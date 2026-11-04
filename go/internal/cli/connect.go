@@ -163,7 +163,6 @@ func shellWord(s string) string {
 	return shellQuote(s)
 }
 
-// isNumber is for telling a port from a sandbox, whose name starts with a letter.
 func isNumber(s string) bool {
 	_, err := strconv.Atoi(s)
 	return err == nil
@@ -340,8 +339,6 @@ func newAttachCmd(opts *options) *cobra.Command {
 
 var sessionRE = regexp.MustCompile(`^agent-\d{4}-\d{6}(-\d+)?$`)
 
-// attachTarget reads [sandbox] [session]. A lone argument that looks like a
-// session's name is one; sandboxes can be named agent-1 and so on, but not like that.
 func attachTarget(args []string) (named, session string) {
 	switch {
 	case len(args) == 2:

@@ -81,9 +81,8 @@ show() {
 }
 
 # Under q.lock. A turn whose runner is gone without ending it was cut off by a
-# stop or a fork; queued messages go with it, and the next turn resumes the
-# conversation it started. Messages queued without a runner (one that failed
-# to start) get one.
+# stop or a fork; queued messages go with it. Messages queued without a runner
+# (one that failed to start) get one.
 reconcile() {
   running "$d" && return 0
   local cur sid
@@ -210,7 +209,6 @@ run_turn() { # turn
 case $op in
   start)
     id=$1 agent=$2 model=$4
-    # ~ and ~/dir are in the home directory, as for exec.
     cwd=$(sed 's|^~$||; s|^~/||' <<<"$3")
     command -v "$agent" >/dev/null || fail 4 "$agent isn't installed in this sandbox"
     cd "$HOME" && cwd=$(cd "$cwd" 2>/dev/null && pwd) || fail 4 "there's no directory $3 in the sandbox"

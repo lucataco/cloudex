@@ -8,13 +8,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// isUnauthorized is true when the API rejected the key.
 func isUnauthorized(err error) bool {
 	var apiErr *api.Error
 	return errors.As(err, &apiErr) && apiErr.Status == 401
 }
 
-// keyAdvice says what to do when the API rejects this computer's key.
 func keyAdvice(url string) string {
 	return fmt.Sprintf("Run cloudex login --url %s with the key from cloudex status --show-key on a computer where it works.", url)
 }

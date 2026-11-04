@@ -10,7 +10,6 @@ import (
 	"time"
 )
 
-// releasesFailing serves a GitHub that errors, and counts what it's asked.
 func releasesFailing(t *testing.T) *atomic.Int32 {
 	var asked atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

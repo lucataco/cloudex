@@ -952,9 +952,8 @@ const commandLine = (command: string | string[]) =>
 
 const OLDER_DEPLOYMENT = "this deployment is older than the SDK and doesn't have that call; update it with: cloudex deploy";
 
-// As the CLI's NormalizeURL: no trailing slashes, https:// when there's no
-// scheme, the scheme and host in lowercase, and no :443 on https, so that the
-// saved key matches its deployment however either URL is written.
+// Must agree with the CLI's NormalizeURL, so that the saved key matches its
+// deployment however either URL is written.
 function normalizeUrl(url: string) {
   let u = url.trim().replace(/\/+$/, "");
   if (!u) return u;
@@ -975,7 +974,6 @@ function unreachable(url: string, e: unknown): CloudexError {
   return new CloudexError(0, `can't reach ${url}: ${reason || "no answer"}`);
 }
 
-// Where a response came from, for errors while reading it.
 const origin = (res: Response) => (res.url ? new URL(res.url).origin : "the API");
 
 async function readBody<T>(res: Response, read: () => Promise<T>): Promise<T> {
@@ -1010,7 +1008,6 @@ async function readJson<T>(res: Response): Promise<T> {
 
 const isStream = (res: Response) => Boolean(res.headers.get("content-type")?.includes("ndjson"));
 
-// The events of a streamed exec, until its exit. A stream that breaks off throws.
 async function* execEvents(res: Response): AsyncGenerator<ExecStreamEvent> {
   for await (const line of lines(res)) {
     const event = JSON.parse(line) as ExecEvent;

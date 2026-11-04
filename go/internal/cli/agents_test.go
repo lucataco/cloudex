@@ -362,7 +362,6 @@ func TestAttachTreatsASessionNameAsASession(t *testing.T) {
 	}
 }
 
-// fakeSSH puts an ssh on PATH that writes the arguments it got to a file.
 func fakeSSH(t *testing.T) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {

@@ -16,11 +16,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// How long the CLI waits for a start, stop or fork: the API allows a stop 15
-// minutes to save and 20 to back up, and a start can pull the image first.
+// The API allows a stop 15 minutes to save and 20 to back up, and a start can
+// pull the image first.
 var lifecycleTimeout = 40 * time.Minute
 
-// durationFlag is a --flag duration that tells a bare number to take a unit.
 type durationFlag struct{ d *time.Duration }
 
 func (f durationFlag) Set(s string) error {
@@ -44,8 +43,6 @@ func (f durationFlag) String() string {
 
 func (durationFlag) Type() string { return "duration" }
 
-// display names the sandbox r in a message: by its name when r is an id and
-// the sandbox has one.
 func display(ctx context.Context, client *api.Client, r string) string {
 	if sandboxIDRE.MatchString(r) {
 		if s, err := client.Get(ctx, r); err == nil {
@@ -55,7 +52,6 @@ func display(ctx context.Context, client *api.Client, r string) string {
 	return r
 }
 
-// needRunning is the error for a command that needs a running sandbox.
 func needRunning(s *api.Sandbox) error {
 	switch s.State {
 	case "running":
@@ -327,8 +323,7 @@ func newUseCmd(opts *options) *cobra.Command {
 	}
 }
 
-// lifecycleCmd builds stop and resume, which share their shape. done says what
-// became of the sandbox, from the record the API answered with.
+// lifecycleCmd builds stop and resume, which share their shape.
 func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client, context.Context, string) (*api.Sandbox, error), done func(*api.Sandbox) string) *cobra.Command {
 	return &cobra.Command{
 		Use:   use + " [sandbox]",
@@ -382,7 +377,6 @@ func newStopCmd(opts *options) *cobra.Command {
 		})
 }
 
-// stateIs finishes "<sandbox> ..." with the sandbox's state.
 func stateIs(s *api.Sandbox) string {
 	if s.State == "error" {
 		return "is in an error state"

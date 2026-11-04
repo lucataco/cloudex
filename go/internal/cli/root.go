@@ -99,8 +99,7 @@ func New(version string) *cobra.Command {
 	return root
 }
 
-// load returns the config and a client for the configured deployment. The
-// saved key goes only to the saved deployment; any other needs $CLOUDEX_API_KEY.
+// load returns the config and a client for the configured deployment.
 func (o *options) load() (*config.Config, *api.Client, error) {
 	cfg, err := config.Load()
 	if err != nil {

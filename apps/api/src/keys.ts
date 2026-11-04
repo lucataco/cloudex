@@ -17,7 +17,6 @@ interface ProviderSpec {
   sent(h: Headers): string | null;
   // Puts the real key in place of the placeholder or no key.
   set(h: Headers, key: string): void;
-  // Headers besides the key that a request to /v1/models needs.
   probeHeaders?: Record<string, string>;
 }
 
@@ -47,9 +46,8 @@ export const PROVIDERS: Record<Provider, ProviderSpec> = {
 export const providerForHost = (host: string) =>
   (Object.keys(PROVIDERS) as Provider[]).find((p) => PROVIDERS[p].host === host);
 
-// Asks the provider whether it accepts a key, and returns what to tell the
-// user if it refuses. A provider that can't be reached or answers with anything
-// but a 401 or 403 doesn't count against the key: it may just be down.
+// A provider that can't be reached, or answers with anything but a 401 or 403,
+// may just be down, so that doesn't count against the key.
 export async function keyRefusal(provider: Provider, key: string): Promise<string | null> {
   const spec = PROVIDERS[provider];
   const headers = new Headers(spec.probeHeaders);

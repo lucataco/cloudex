@@ -97,7 +97,6 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
         spec.set(headers, key);
         added = true;
       } else if (sent) {
-        // A placeholder with no key behind it: the key was removed after this run started.
         return refuse(`no ${name} key is set in Cloudex. Set one with: cloudex keys set ${name}`);
       }
     }

@@ -20,7 +20,6 @@ import (
 // How long each read of a followed command's output waits for more.
 const commandWaitSec = 30
 
-// How long, and how often, a followed command's output is asked for again when the connection breaks.
 var (
 	commandRetryFor   = 2 * time.Minute
 	commandRetryEvery = 3 * time.Second

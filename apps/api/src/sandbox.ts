@@ -116,7 +116,7 @@ const GUEST_HOME = "/home/cloudex";
 const OUTPUT_LIMIT = 1 << 20;
 const FILE_TIMEOUT_MS = 30 * 60_000; // an upload or unpack of up to 100 MB
 const KEEPALIVE_MS = 15_000; // the longest a streamed exec stays quiet
-const REPLAY_LIMIT = 1 << 20; // the biggest preview request body held to send again
+const REPLAY_LIMIT = 1 << 20;
 const SSH_KEY = /^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^\n]*)?$/;
 
 type CreateInput = {
@@ -138,7 +138,6 @@ export const NO_SUCH_SANDBOX = "no such sandbox";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
 
-// The 409 message for a call the sandbox's state won't allow, saying what to do instead.
 function wrongState(r: SandboxRecord) {
   const name = r.name ?? r.id;
   if (r.state === "starting" || r.state === "stopping") return `${name} is ${r.state}; try again in a moment`;
@@ -146,7 +145,6 @@ function wrongState(r: SandboxRecord) {
   return `${name} is ${r.state}; resume it first`;
 }
 
-// The error of a sandbox that stopped before it could save, saying what resume starts it from.
 const unsavedStop = (r: SandboxRecord, how: string) =>
   r.savedAt
     ? `${how} before it could save; resume starts from its last save or backup`
@@ -216,10 +214,8 @@ export class Sandbox extends DurableObject<Env> {
   private queue: Promise<unknown> = Promise.resolve();
   private lastActivity = Date.now();
   private lastActivitySaved = 0;
-  // Foreground execs running now, which count as activity for as long as they run.
   private execs = 0;
   private exitedAt = 0;
-  // The exit watcher of the container started last (see watch).
   private exited: Promise<void> = Promise.resolve();
   // Guest ports that listen only on localhost, and the port of the relay for
   // each, in this run.
@@ -702,7 +698,6 @@ export class Sandbox extends DurableObject<Env> {
     if (this.ctx.container?.running) await withTimeout(this.container.destroy(), 60_000, "destroy");
     // Before its storage, so that a later failure leaves a sandbox to delete
     // again, not an index row holding its name.
-
     await deleteSandbox(this.env.DB, r.id);
     const bucket = backupBucket(this.env);
     if (bucket) {
@@ -992,8 +987,7 @@ export class Sandbox extends DurableObject<Env> {
     await this.update({ state: "stopped", stoppedAt: Date.now(), error: null });
   }
 
-  // Destroys the container and waits until its exit is seen. One that doesn't
-  // go keeps billing, so the alarm tries again.
+  // A container that doesn't go keeps billing, so the alarm tries again.
   private async destroyContainer(id: string) {
     try {
       await withTimeout(Promise.all([this.container.destroy(), this.exited]), 60_000, "destroy");
@@ -1003,7 +997,6 @@ export class Sandbox extends DurableObject<Env> {
     }
   }
 
-  // A container still up after its sandbox stopped or failed to start.
   private leftOver() {
     const state = this.record?.state;
     return (state === "stopped" || state === "error") && Boolean(this.ctx.container?.running);
@@ -1078,9 +1071,6 @@ export class Sandbox extends DurableObject<Env> {
     this.touch();
   }
 
-  // GNU timeout puts the command in a process group of its own and stops the
-  // whole group, so what it started in the background goes too; the abort is
-  // a backstop.
   private async startExec(input: ExecInput, signal: AbortSignal): Promise<ExecProcess> {
     const home = input.root ? "/root" : GUEST_HOME;
     // A relative directory, or one starting with ~, is in the home directory.
@@ -1090,6 +1080,9 @@ export class Sandbox extends DurableObject<Env> {
       const found = this.container.exec(["test", "-d", cwd], { cwd: "/", signal }).then((p) => p.exitCode);
       if ((await withTimeout(found, 30_000, "checking the directory")) !== 0) fail(400, `there's no directory ${cwd} in the sandbox`);
     }
+    // GNU timeout puts the command in a process group of its own and stops the
+    // whole group, so what it started in the background goes too; the abort is
+    // a backstop.
     return this.container.exec(guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root), {
       cwd,
       env: input.root
@@ -1279,7 +1272,6 @@ export class Sandbox extends DurableObject<Env> {
     return JSON.parse(await this.fileOp("delete", [path, recursive ? "1" : "0"], root, undefined, 10 * 60_000));
   }
 
-  // With bytes, the upload must come to that many, or the file isn't replaced.
   async writeFile(path: string, root: boolean, mode: string | null, body: ReadableStream | null, bytes?: number): Promise<FileInfo> {
     this.mustRun();
     try {
@@ -1366,8 +1358,6 @@ export class Sandbox extends DurableObject<Env> {
       clearTimeout(timer);
     }
   }
-
-  // Starts the desktop, installing it the first time; with a size, resizes a running one.
 
   async desktop(size?: string): Promise<Desktop> {
     const r = this.mustRun();
@@ -1514,7 +1504,6 @@ export class Sandbox extends DurableObject<Env> {
   // for it, and requests for the port go through the relay while it runs. A
   // body with a content-length up to REPLAY_LIMIT is held here, so that the
   // request can be sent again after a miss; any other goes only once.
-
   private async preview(port: number, target: string, req: Request): Promise<Response> {
     const r = this.mustRecord();
     const length = req.headers.get("content-length");

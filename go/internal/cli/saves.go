@@ -113,7 +113,6 @@ func newSavesCmd(opts *options) *cobra.Command {
 	return cmd
 }
 
-// printSaves lists saves; names turns the ids of the sandboxes they came from into names.
 func printSaves(w io.Writer, saves []api.Save, names map[string]string) {
 	if len(saves) == 0 {
 		fmt.Fprintln(w, "No saves. Make one with: cloudex save [sandbox] <name>")

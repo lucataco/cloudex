@@ -218,7 +218,6 @@ func (c *Client) ZoneID(ctx context.Context, account, name string) (string, erro
 	return "", &NoZoneError{Name: name}
 }
 
-// NoZoneError is ZoneID's error when the account has no zone by that name.
 type NoZoneError struct{ Name string }
 
 func (e *NoZoneError) Error() string {

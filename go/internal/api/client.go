@@ -109,10 +109,9 @@ type Error struct {
 func (e *Error) Error() string { return e.Message }
 
 type Client struct {
-	BaseURL string
-	Key     string
-	HTTP    *http.Client
-	// CLIVersion is named in the error for a route this deployment doesn't have.
+	BaseURL    string
+	Key        string
+	HTTP       *http.Client
 	CLIVersion string
 }
 
@@ -120,10 +119,9 @@ func New(baseURL, key string) *Client {
 	return &Client{BaseURL: NormalizeURL(baseURL), Key: key, HTTP: &http.Client{}}
 }
 
-// NormalizeURL drops trailing slashes, assumes https:// for an address given
-// without a scheme, lowercases the scheme and host, and drops https's own
-// port, so that the saved key matches its deployment however the URL is
-// written. The SDKs do the same.
+// NormalizeURL gives every way of writing a deployment's URL one form, so that
+// the saved key matches its deployment. The SDKs' normalizeUrl and
+// _normalize_url must agree with it.
 func NormalizeURL(u string) string {
 	u = strings.TrimRight(strings.TrimSpace(u), "/")
 	if u == "" {
@@ -184,10 +182,10 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	return json.Unmarshal(data, out)
 }
 
-// failure turns an error answer into an *Error. The API answers a route it
-// doesn't have with {"error":"not found"}, and every real 404 says what is
-// missing, so that answer means the deployment is older than the CLI. The
-// health route has existed from the start, so it never means that.
+// The API answers a route it doesn't have with {"error":"not found"}, and
+// every real 404 says what is missing, so that answer means the deployment is
+// older than the CLI. The health route has existed from the start, so it never
+// means that.
 func (c *Client) failure(ctx context.Context, res *http.Response, data []byte) *Error {
 	var e struct {
 		Error string `json:"error"`

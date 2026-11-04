@@ -285,8 +285,6 @@ func followAgent(cmd *cobra.Command, opts *options, client *api.Client, r string
 	return err
 }
 
-// lostTouch is true for an error from the network or from the API being down,
-// as opposed to an answer to what was asked.
 func lostTouch(err error) bool {
 	var apiErr *api.Error
 	var netErr net.Error
@@ -299,8 +297,6 @@ func lostTouch(err error) bool {
 	return errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
-// taskArgs allows one to max arguments for [sandbox] <task> and the like, and
-// says what to do about the usual way to exceed them: a task left unquoted.
 func taskArgs(max int, what string) cobra.PositionalArgs {
 	return func(_ *cobra.Command, args []string) error {
 		switch {
@@ -313,8 +309,6 @@ func taskArgs(max int, what string) cobra.PositionalArgs {
 	}
 }
 
-// unquoted adds to a "no sandbox named" answer when the first of two
-// arguments may have been the start of a task that wasn't quoted.
 func unquoted(err error, args []string) error {
 	var apiErr *api.Error
 	if len(args) == 2 && errors.As(err, &apiErr) && apiErr.Status == 404 && strings.HasPrefix(apiErr.Message, "no sandbox named ") {

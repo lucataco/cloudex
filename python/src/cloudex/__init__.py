@@ -252,9 +252,8 @@ def _saved_deployment(config_dir: Optional[str]) -> Dict[str, Any]:
 
 
 def _normalize_url(url: str) -> str:
-    # As the CLI's NormalizeURL: no trailing slashes, https:// when there's no
-    # scheme, the scheme and host in lowercase, and no :443 on https, so that
-    # the saved key matches its deployment however either URL is written.
+    # Must agree with the CLI's NormalizeURL, so that the saved key matches its
+    # deployment however either URL is written.
     u = url.strip().rstrip("/")
     if not u:
         return u
@@ -419,7 +418,7 @@ class Cloudex:
         # A request, answered with the response unread; an error status raises.
         try:
             req = urllib.request.Request(self.api_url + path, data=data, method=method)
-        except ValueError as e:  # no scheme, say
+        except ValueError as e:
             raise self._unreachable(e) from None
         req.add_header("Authorization", f"Bearer {self._key}")
         req.add_header("User-Agent", f"cloudex-python/{__version__}")
