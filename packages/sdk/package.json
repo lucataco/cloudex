@@ -1,6 +1,6 @@
 {
   "name": "cloudex",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "SDK for Cloudex: agent sandboxes in your own Cloudflare account",
   "license": "MIT",
   "repository": {
@@ -18,6 +18,8 @@
     "codex"
   ],
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
