@@ -296,7 +296,11 @@ class Cloudex:
         return Health(ok=h["ok"], version=h["version"], preview_zone=h.get("previewZone"), backups=bool(h.get("backups")))
 
     def list(self) -> List["Sandbox"]:
-        """All sandboxes, newest first."""
+        """All sandboxes, newest first, as a summary.
+
+        get() or refresh() has every field: notice, forkedFrom, fromSave,
+        providerKeys and the backup* ones.
+        """
         return [Sandbox(self, info) for info in self._call("GET", "/v1/sandboxes")]
 
     def get(self, ref: str) -> "Sandbox":

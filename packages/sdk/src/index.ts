@@ -407,7 +407,7 @@ export class Cloudex {
     return this.#call("GET", "/v1/health");
   }
 
-  /** All sandboxes, newest first. */
+  /** All sandboxes, newest first, as a summary: get() or refresh() has every field (notice, forkedFrom, fromSave, providerKeys, backup*). */
   async list(): Promise<Sandbox[]> {
     const list = await this.#call<SandboxInfo[]>("GET", "/v1/sandboxes");
     return list.map((info) => this.#wrap(info));

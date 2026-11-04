@@ -96,10 +96,11 @@ tgz = box.download_archive("app/dist")
 
 ## Connecting
 
-`Cloudex(api_url, api_key)` takes the API URL and key that `cloudex deploy`
-printed (`cloudex status --show-key` shows them again). Without them it reads
+`Cloudex(api_url, api_key)` takes the API URL that `cloudex deploy` printed and
+the key that `cloudex status --show-key` shows. Without them it reads
 `$CLOUDEX_API_URL` and `$CLOUDEX_API_KEY`, then the deployment the CLI saved.
-The key gives full control of your sandboxes.
+The saved key is used only with the saved URL: for any other URL, pass `api_key`
+or set `$CLOUDEX_API_KEY`. The key gives full control of your sandboxes.
 
 ## API
 
@@ -117,6 +118,9 @@ The key gives full control of your sandboxes.
 | `box.stat(path, root=)`, `box.delete_file(path, recursive=, root=)` | A path's details, with a directory's entries; delete one |
 | `box.download_archive(path, root=)`, `box.upload_archive(path, data, root=)` | A directory as a tar.gz; unpack one into a directory |
 | `box.fork(count=, name=, size=, idle_minutes=)` | Up to 10 sandboxes starting from a copy of the disk |
+| `box.save(name)` | Keep a copy of the running sandbox's disk under a name until it's deleted; a taken name's save is replaced (needs R2) |
+| `cx.start_from_save(name, count=, name=, size=, idle_minutes=)` | Up to 10 sandboxes starting from a named save |
+| `cx.list_saves()`, `cx.get_save(name)`, `cx.delete_save(name)` | The named saves, newest first; one by name; delete one |
 | `box.host(port)` | HTTPS link to a port on your preview domain; servers on localhost work too |
 | `box.links()`, `box.revoke_links(port=None)` | The links that work; make one port's link, or all of them, stop working |
 | `box.update(name=, idle_minutes=)` | Rename, or change the idle time |
@@ -130,8 +134,15 @@ The key gives full control of your sandboxes.
 | `agent.events(after=, follow=)` | Iterate over its events (dicts); follows until the agent is idle |
 | `agent.send(prompt, interrupt=)`, `agent.interrupt()`, `agent.wait()` | Continue, stop the running turn, wait until idle |
 
+`cx.list()` returns a summary of each sandbox. `cx.get()` and `box.refresh()`
+return every field, including `info["notice"]`, `info["backupAt"]` and the other
+`backup*` keys, `forked_from`, `from_save` and `provider_keys`. On a sandbox from
+`list()` those are empty until you call `box.refresh()`.
+
 Errors from the API raise `CloudexError`, with `status` and the API's message.
-The full API is described at `<your API URL>/v1/openapi.json`.
+When there was no answer (the API can't be reached, a request timed out, a
+response broke off), `status` is 0 and the message starts with `can't reach` and
+the API URL. The full API is described at `<your API URL>/v1/openapi.json`.
 
 Fetching a preview link with `urllib` needs a `User-Agent` header: Cloudflare's
 Browser Integrity Check, on by default for your domain, answers urllib's default
