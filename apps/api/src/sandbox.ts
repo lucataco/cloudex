@@ -478,10 +478,10 @@ export class Sandbox extends DurableObject<Env> {
       }
       if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
       const snapshot = await this.ctx.storage.get<{ id: string }>("snapshot");
-      if (!snapshot) fail(409, `${r.id} has no saved disk to fork; resume it, then fork it`);
+      if (!snapshot) fail(409, `${r.name ?? r.id} has no saved disk to fork; resume it, then fork it`);
       const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
       if (Date.now() - touched > SAVE_LIFETIME_MS) {
-        fail(409, `${r.id}'s save has expired; resume it (which restores its backup), then fork it`);
+        fail(409, `${r.name ?? r.id}'s save has expired; resume it (which restores its backup), then fork it`);
       }
       return { sandbox: r.id, snapshot: { id: snapshot.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
     });
