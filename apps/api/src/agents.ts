@@ -256,8 +256,9 @@ case $op in
       busy "$d" || break
       sleep 0.25
     done
-    LC_ALL=C awk -v after="$after" -v max=524288 \
-      'NR > after { if (n && bytes + length($0) > max) exit; print; bytes += length($0) + 1; n++ }' "$d/events.jsonl" |
+    # Whole lines only: the runner may be partway through writing the last one.
+    LC_ALL=C awk -v after="$after" -v total="$(wc -l <"$d/events.jsonl")" -v max=524288 \
+      'NR > total { exit } NR > after { if (n && bytes + length($0) > max) exit; print; bytes += length($0) + 1; n++ }' "$d/events.jsonl" |
       jq -cs --argjson after "$after" --argjson agent "$(show "$d")" \
         '{events: [to_entries[] | {seq: (.key + $after + 1)} + .value], next: ($after + length), agent: $agent}'
     ;;
