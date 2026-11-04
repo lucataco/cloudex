@@ -137,6 +137,14 @@ export const NO_SUCH_SANDBOX = "no such sandbox";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
 
+// The 409 message for a call the sandbox's state won't allow, saying what to do instead.
+function wrongState(r: SandboxRecord) {
+  const name = r.name ?? r.id;
+  if (r.state === "starting" || r.state === "stopping") return `${name} is ${r.state}; try again in a moment`;
+  if (r.state === "error") return `${name} didn't start; resume it to try again, or delete it`;
+  return `${name} is ${r.state}; resume it first`;
+}
+
 function clip(buf: ArrayBuffer) {
   const text = new TextDecoder().decode(buf.byteLength > OUTPUT_LIMIT ? buf.slice(0, OUTPUT_LIMIT) : buf);
   return buf.byteLength > OUTPUT_LIMIT ? `${text}\n[cloudex: output cut at 1 MiB of ${buf.byteLength} bytes]` : text;
@@ -263,7 +271,7 @@ export class Sandbox extends DurableObject<Env> {
   // The record of a running sandbox, for work inside it, which counts as activity.
   private mustRun(): SandboxRecord {
     const r = this.mustRecord();
-    if (r.state !== "running") fail(409, `${r.name ?? r.id} is ${r.state}; resume it first`);
+    if (r.state !== "running") fail(409, wrongState(r));
     this.touch();
     return r;
   }
@@ -464,7 +472,7 @@ export class Sandbox extends DurableObject<Env> {
         console.log(`[${r.id}] saved ${snap.size} bytes for a fork in ${Date.now() - t0} ms`);
         return { sandbox: r.id, snapshot: { id: snap.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
       }
-      if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}; try again when it has finished`);
+      if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
       const snapshot = await this.ctx.storage.get<{ id: string }>("snapshot");
       if (!snapshot) fail(409, `${r.id} has no saved disk to fork; resume it, then fork it`);
       const touched = (await this.ctx.storage.get<number>("saveTouchedAt")) ?? r.savedAt ?? 0;
@@ -484,10 +492,11 @@ export class Sandbox extends DurableObject<Env> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
       if (r.state === "running") {
+        if (fromBackup) fail(409, `${r.name ?? r.id} is running; stop it, then resume it from its backup`);
         if (size && size !== r.size) fail(409, `${r.name ?? r.id} is running on ${r.size}; stop it, then resume it on ${size}`);
         return r;
       }
-      if (r.state !== "stopped" && r.state !== "error") fail(409, `${r.id} is ${r.state}`);
+      if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
       if (!size || size === r.size) return this.resumeFrom(fromBackup);
       await this.update({ size });
       try {
@@ -561,7 +570,7 @@ export class Sandbox extends DurableObject<Env> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
       if (r.state === "stopped" || r.state === "error") return r;
-      if (r.state !== "running") fail(409, `${r.id} is ${r.state}`);
+      if (r.state !== "running") fail(409, wrongState(r));
       await this.saveAndDestroy();
       return this.mustRecord();
     });
@@ -571,7 +580,7 @@ export class Sandbox extends DurableObject<Env> {
   // before the container goes, so the alarm does it a moment later.
   async requestStop(): Promise<SandboxRecord> {
     const r = this.mustRecord();
-    if (r.state !== "running") fail(409, `${r.name ?? r.id} is ${r.state}`);
+    if (r.state !== "running") fail(409, wrongState(r));
     await this.ctx.storage.put("stopRequested", true);
     await this.ctx.storage.setAlarm(Date.now() + 1000);
     return r;
@@ -1404,7 +1413,7 @@ export class Sandbox extends DurableObject<Env> {
       return new Response("not found", { status: 404 });
     }
     if (r.state !== "running") {
-      return new Response(`${r.id} is ${r.state}. Run: cloudex resume ${r.name ?? r.id}\n`, { status: 409 });
+      return new Response(`${wrongState(r)}\n`, { status: 409 });
     }
     this.touch();
     if (m[1] === "http") {
