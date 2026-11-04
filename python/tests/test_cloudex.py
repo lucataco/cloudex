@@ -179,6 +179,7 @@ class CloudexTest(unittest.TestCase):
 
     def test_desktop_links_to_the_viewer(self):
         FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes["GET /v1/health"] = (200, {"ok": True, "version": "v0", "previewZone": "example.com"})
         FakeAPI.routes["POST /v1/sandboxes/cx-aaa111/desktop"] = (
             200, {"port": 6080, "path": "vnc.html?autoconnect=1", "size": "1280x720", "installed": False, "started": True},
         )
@@ -434,9 +435,114 @@ class CloudexTest(unittest.TestCase):
         self.assertEqual(box.download_archive("app"), tgz)
 
     def test_unreachable_api(self):
+        for url in ("http://127.0.0.1:9", "no-scheme.example"):
+            with self.assertRaises(CloudexError) as caught:
+                Cloudex(url, "k").list()
+            self.assertEqual(caught.exception.status, 0)
+            self.assertTrue(str(caught.exception).startswith(f"can't reach {url}: "), str(caught.exception))
+
+    def test_a_timeout_is_an_error_with_the_url(self):
+        FakeAPI.routes["GET /v1/sandboxes"] = lambda handler: time.sleep(0.5)
         with self.assertRaises(CloudexError) as caught:
-            Cloudex("http://127.0.0.1:9", "k").list()
+            Cloudex(self.url, "k", timeout=0.1).list()
         self.assertEqual(caught.exception.status, 0)
+        self.assertTrue(str(caught.exception).startswith(f"can't reach {self.url}: "), str(caught.exception))
+
+    def test_a_body_that_breaks_off_is_an_error_with_the_url(self):
+        def cut_off(handler):
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", "100")
+            handler.end_headers()
+            handler.wfile.write(b"[{")
+
+        FakeAPI.routes["GET /v1/sandboxes"] = cut_off
+        with self.assertRaises(CloudexError) as caught:
+            self.cx.list()
+        self.assertEqual(caught.exception.status, 0)
+        self.assertTrue(str(caught.exception).startswith(f"can't reach {self.url}: "), str(caught.exception))
+
+    def test_an_html_error_page_becomes_its_status_and_title(self):
+        def page(status, body, kind="text/html"):
+            def answer(handler):
+                data = body.encode()
+                handler.send_response(status)
+                handler.send_header("Content-Type", kind)
+                handler.send_header("Content-Length", str(len(data)))
+                handler.end_headers()
+                handler.wfile.write(data)
+
+            return answer
+
+        FakeAPI.routes["GET /v1/sandboxes"] = page(502, "<html>\n<head><title>502 Bad Gateway</title></head>\n<body>nginx</body></html>")
+        FakeAPI.routes["GET /v1/saves"] = page(503, "<html><title>\n Just a  moment </title></html>")
+        FakeAPI.routes["GET /v1/keys"] = page(500, "x" * 600, "text/plain")
+        with self.assertRaises(CloudexError) as caught:
+            self.cx.list()
+        self.assertEqual((caught.exception.status, str(caught.exception)), (502, "502 Bad Gateway"))
+        with self.assertRaises(CloudexError) as caught:
+            self.cx.list_saves()
+        self.assertEqual(str(caught.exception), "503 Just a moment")
+        with self.assertRaises(CloudexError) as caught:
+            self.cx.list_keys()
+        self.assertEqual(str(caught.exception), "x" * 500 + "\u2026")
+
+    def test_an_unknown_route_says_the_deployment_is_older(self):
+        FakeAPI.routes["GET /v1/saves"] = (404, {"error": "not found"})
+        FakeAPI.routes["GET /v1/saves/gone"] = (404, {"error": "no save named gone"})
+        with self.assertRaises(CloudexError) as caught:
+            self.cx.list_saves()
+        self.assertEqual(caught.exception.status, 404)
+        self.assertRegex(str(caught.exception), r"older than the SDK.*cloudex deploy")
+        with self.assertRaises(CloudexError) as caught:
+            self.cx.get_save("gone")
+        self.assertEqual(str(caught.exception), "no save named gone")
+
+    def test_the_saved_key_goes_only_to_the_saved_deployment(self):
+        FakeAPI.routes["GET /v1/health"] = (200, {"ok": True, "version": "v0", "previewZone": None})
+        other = self.url.replace("127.0.0.1", "localhost")
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w") as f:
+                json.dump({"apiUrl": self.url + "/", "apiKey": "saved"}, f)
+            os.environ["CLOUDEX_CONFIG_DIR"] = d
+
+            Cloudex(self.url).health()
+            self.assertEqual(FakeAPI.seen[-1]["auth"], "Bearer saved")
+
+            FakeAPI.seen.clear()
+            with self.assertRaisesRegex(CloudexError, r"no API key for http://localhost:\d+: pass api_key or set CLOUDEX_API_KEY") as caught:
+                Cloudex(other)
+            self.assertEqual(caught.exception.status, 0)
+            os.environ["CLOUDEX_API_URL"] = other
+            with self.assertRaisesRegex(CloudexError, "no API key"):
+                Cloudex()
+            self.assertEqual(FakeAPI.seen, [])
+
+            Cloudex(other, "mine").health()
+            self.assertEqual(FakeAPI.seen[-1]["auth"], "Bearer mine")
+            os.environ["CLOUDEX_API_KEY"] = "from-env"
+            Cloudex().health()
+            self.assertEqual(FakeAPI.seen[-1]["auth"], "Bearer from-env")
+
+    def test_desktop_without_a_preview_domain_fails_before_starting_anything(self):
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        FakeAPI.routes["GET /v1/health"] = (200, {"ok": True, "version": "v0", "previewZone": None})
+        box = self.cx.get("web")
+        with self.assertRaisesRegex(CloudexError, "preview links need a domain") as caught:
+            box.desktop()
+        self.assertEqual(caught.exception.status, 400)
+        self.assertFalse(any("/desktop" in seen["route"] for seen in FakeAPI.seen))
+
+    def test_a_file_mode_below_0o100_is_sent_with_three_digits(self):
+        files = "/v1/sandboxes/cx-aaa111/files"
+        FakeAPI.routes["GET /v1/sandboxes/web"] = (200, info("cx-aaa111"))
+        for mode in ("077", "007"):
+            FakeAPI.routes[f"PUT {files}/content?path=f&mode={mode}"] = (
+                200, {"path": "/home/cloudex/f", "type": "file", "size": 1, "mode": mode, "mtime": 1},
+            )
+        box = self.cx.get("web")
+        self.assertEqual(box.write_file("f", "x", mode=0o77).mode, "077")
+        self.assertEqual(box.write_file("f", "x", mode=7).mode, "007")
 
 
 if __name__ == "__main__":

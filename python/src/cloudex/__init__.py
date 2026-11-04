@@ -21,8 +21,10 @@ account, using only the standard library.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import re
 import shlex
 import urllib.error
 import urllib.parse
@@ -50,7 +52,7 @@ __all__ = [
     "Save",
     "Settings",
 ]
-__version__ = "0.1.16"
+__version__ = "0.1.17"
 
 
 class CloudexError(Exception):
@@ -225,6 +227,21 @@ def _drop_none(**fields: Any) -> Dict[str, Any]:
     return {k: v for k, v in fields.items() if v is not None}
 
 
+_OLDER_DEPLOYMENT = "this deployment is older than the SDK and doesn't have that call; update it with: cloudex deploy"
+_HTML_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _plain_error(status: int, body: str) -> str:
+    # An answer that isn't the API's JSON, such as Cloudflare's HTML error page,
+    # becomes its status and title; other text is cut at 500 characters.
+    body = body.strip()
+    if body.startswith("<"):
+        m = _HTML_TITLE.search(body)
+        title = " ".join(m.group(1).split()) if m else ""
+        return title if title.startswith(str(status)) else f"{status} {title}".strip()
+    return body[:500] + "\u2026" if len(body) > 500 else body
+
+
 def _saved_deployment(config_dir: Optional[str]) -> Dict[str, Any]:
     # The CLI keeps its deployment in ~/.config/cloudex/config.json.
     path = Path(config_dir) if config_dir else Path.home() / ".config" / "cloudex"
@@ -239,7 +256,9 @@ class Cloudex:
 
     The URL and key come from the arguments, then $CLOUDEX_API_URL and
     $CLOUDEX_API_KEY, then the deployment saved by `cloudex deploy` or
-    `cloudex login`, the same order as the CLI. timeout is in seconds per
+    `cloudex login`, the same order as the CLI. The saved key is used only
+    with the saved URL: for any other URL, pass api_key or set
+    $CLOUDEX_API_KEY. timeout is in seconds per
     request; by default there's none, since starting or forking can take
     minutes the first time on a host.
     """
@@ -250,14 +269,22 @@ class Cloudex:
         if not url or not key:
             saved = _saved_deployment(os.environ.get("CLOUDEX_CONFIG_DIR"))
             url = url or saved.get("apiUrl")
-            key = key or saved.get("apiKey")
+            # The saved key goes only to the saved URL, so a URL passed in can't be sent the admin key.
+            if not key and url and saved.get("apiUrl") and url.rstrip("/") == saved["apiUrl"].rstrip("/"):
+                key = saved.get("apiKey")
         if not url:
             raise CloudexError(
                 0,
                 "no Cloudex deployment: pass api_url and api_key, set CLOUDEX_API_URL and CLOUDEX_API_KEY, or run cloudex login",
             )
+        if not key:
+            raise CloudexError(
+                0,
+                f"no API key for {url}: pass api_key or set CLOUDEX_API_KEY. "
+                "The CLI's saved key is used only with the deployment it was saved for",
+            )
         self.api_url = url.rstrip("/")
-        self._key = key or ""
+        self._key = key
         self._timeout = timeout
 
     def __repr__(self) -> str:
@@ -269,7 +296,11 @@ class Cloudex:
         return Health(ok=h["ok"], version=h["version"], preview_zone=h.get("previewZone"), backups=bool(h.get("backups")))
 
     def list(self) -> List["Sandbox"]:
-        """All sandboxes, newest first."""
+        """All sandboxes, newest first, as a summary.
+
+        get() or refresh() has every field: notice, forkedFrom, fromSave,
+        providerKeys and the backup* ones.
+        """
         return [Sandbox(self, info) for info in self._call("GET", "/v1/sandboxes")]
 
     def get(self, ref: str) -> "Sandbox":
@@ -345,12 +376,31 @@ class Cloudex:
     def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
         data = None if body is None else json.dumps(body).encode()
         with self._open(method, path, data, None if data is None else "application/json") as res:
-            text = res.read().decode()
+            text = self._read(res).decode()
         return json.loads(text) if text else None
+
+    def _unreachable(self, e: Exception) -> CloudexError:
+        reason = e.reason if isinstance(e, urllib.error.URLError) else e
+        return CloudexError(0, f"can't reach {self.api_url}: {reason}")
+
+    def _read(self, res: Any) -> bytes:
+        try:
+            return res.read()
+        except (OSError, http.client.HTTPException) as e:
+            raise self._unreachable(e) from None
+
+    def _lines(self, res: Any) -> Iterator[bytes]:
+        try:
+            yield from res
+        except (OSError, http.client.HTTPException) as e:
+            raise self._unreachable(e) from None
 
     def _open(self, method: str, path: str, data: Any = None, content_type: Optional[str] = None) -> Any:
         # A request, answered with the response unread; an error status raises.
-        req = urllib.request.Request(self.api_url + path, data=data, method=method)
+        try:
+            req = urllib.request.Request(self.api_url + path, data=data, method=method)
+        except ValueError as e:  # no scheme, say
+            raise self._unreachable(e) from None
         req.add_header("Authorization", f"Bearer {self._key}")
         req.add_header("User-Agent", f"cloudex-python/{__version__}")
         if content_type:
@@ -363,14 +413,16 @@ class Cloudex:
         try:
             return urllib.request.urlopen(req, timeout=self._timeout)
         except urllib.error.HTTPError as e:
-            text = e.read().decode(errors="replace")
+            text = self._read(e).decode(errors="replace")
             try:
                 message = json.loads(text)["error"]
             except (ValueError, KeyError, TypeError):
-                message = text.strip() or e.reason
+                message = _plain_error(e.code, text) or e.reason
+            if e.code == 404 and message == "not found":
+                message = _OLDER_DEPLOYMENT
             raise CloudexError(e.code, str(message)) from None
-        except urllib.error.URLError as e:
-            raise CloudexError(0, f"can't reach {self.api_url}: {e.reason}") from None
+        except (OSError, http.client.HTTPException) as e:  # URLError, a timeout, a reset
+            raise self._unreachable(e) from None
 
 
 def _provider_key(k: Dict[str, Any]) -> ProviderKey:
@@ -575,14 +627,14 @@ class Sandbox:
         body["stream"] = True
         with self._client._open("POST", self._path("/exec"), json.dumps(body).encode(), "application/json") as res:
             if "ndjson" not in (res.headers.get("Content-Type") or ""):
-                r = json.loads(res.read().decode())
+                r = json.loads(self._client._read(res).decode())
                 if r["stdout"]:
                     yield ExecEvent("stdout", r["stdout"])
                 if r["stderr"]:
                     yield ExecEvent("stderr", r["stderr"])
                 yield ExecEvent("exit", exit_code=r["exitCode"], timed_out=r["timedOut"], ms=r["ms"])
                 return
-            for line in res:
+            for line in self._client._lines(res):
                 if not line.strip():
                     continue
                 e = json.loads(line)
@@ -674,7 +726,7 @@ class Sandbox:
     def read_file(self, path: str, root: bool = False) -> bytes:
         """A file's contents."""
         with self._client._open("GET", self._file_path("/content", path, root)) as res:
-            return res.read()
+            return self._client._read(res)
 
     def write_file(
         self,
@@ -689,10 +741,11 @@ class Sandbox:
         its mode unless mode is given, in octal: "755" or 0o755. Cloudflare
         limits a request to 100 MB on most plans.
         """
-        mode_text = format(mode, "o") if isinstance(mode, int) else mode
+        # The API wants 3 or 4 octal digits.
+        mode_text = format(mode, "03o") if isinstance(mode, int) else mode
         url = self._file_path("/content", path, root, mode=mode_text)
         with self._client._open("PUT", url, _upload(data), "application/octet-stream") as res:
-            return _file_info(json.loads(res.read().decode()))
+            return _file_info(json.loads(self._client._read(res).decode()))
 
     def delete_file(self, path: str, recursive: bool = False, root: bool = False) -> FileInfo:
         """Deletes a file, or with recursive, a directory and everything in it. Returns what was deleted."""
@@ -701,12 +754,12 @@ class Sandbox:
     def download_archive(self, path: str, root: bool = False) -> bytes:
         """A directory's contents, or one file, as a tar.gz. Files the user can't read are left out."""
         with self._client._open("GET", self._file_path("/archive", path, root)) as res:
-            return res.read()
+            return self._client._read(res)
 
     def upload_archive(self, path: str, data: Union[bytes, IO[bytes]], root: bool = False) -> ArchiveResult:
         """Unpacks a tar.gz (bytes or a binary file) into a directory, making it if need be."""
         with self._client._open("PUT", self._file_path("/archive", path, root), _upload(data), "application/gzip") as res:
-            r = json.loads(res.read().decode())
+            r = json.loads(self._client._read(res).decode())
         return ArchiveResult(path=r["path"], entries=r["entries"])
 
     def fork(
@@ -757,8 +810,12 @@ class Sandbox:
     def desktop(self, size: Optional[str] = None) -> Desktop:
         """Starts the desktop (Chrome and a terminal), or resizes a running one, and links to its viewer.
 
-        The first start installs it, which takes a minute or two.
+        The link is on the preview domain, so the deployment needs one. The
+        first start installs it, which takes a minute or two.
         """
+        # Checked first: starting the desktop without a way to link to it would only fail afterwards.
+        if not self._client.health().preview_zone:
+            raise CloudexError(400, "preview links need a domain: run cloudex deploy --preview-domain <your domain>")
         d = self._client._call("POST", self._path("/desktop"), _drop_none(size=size))
         return Desktop(
             url=f"{self.host(d['port'])}/{d['path']}",

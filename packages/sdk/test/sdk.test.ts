@@ -106,9 +106,56 @@ test("exec quotes an argument list and passes options", async () => {
   routes["POST /v1/sandboxes/cx-aaa111/exec"] = [200, result];
   const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
   assert.deepEqual(await box.exec(["echo", "it's", "a b", "--x=1"], { root: true }), result);
-  assert.deepEqual(seen.at(-1)?.body, { cmd: `echo 'it'\\''s' 'a b' --x=1`, root: true });
+  assert.deepEqual(seen.at(-1)?.body, { cmd: `echo 'it'\\''s' 'a b' --x=1`, root: true, stream: true });
   await box.exec("ls ~ | wc -l");
-  assert.deepEqual(seen.at(-1)?.body, { cmd: "ls ~ | wc -l" });
+  assert.deepEqual(seen.at(-1)?.body, { cmd: "ls ~ | wc -l", stream: true });
+});
+
+const ndjson = (lines: object[]) => (res: ServerResponse) =>
+  res.writeHead(200, { "content-type": "application/x-ndjson" }).end(lines.map((l) => JSON.stringify(l) + "\n").join(""));
+const MiB = 1024 * 1024;
+
+test("exec collects the API's stream into one result", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["POST /v1/sandboxes/cx-aaa111/exec"] = ndjson([
+    { type: "stdout", data: "hi\n" },
+    { type: "keepalive" },
+    { type: "stderr", data: "err\n" },
+    { type: "stdout", data: "there\n" },
+    { type: "exit", exitCode: 3, timedOut: false, ms: 9 },
+  ]);
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  assert.deepEqual(await box.exec("echo hi"), { exitCode: 3, stdout: "hi\nthere\n", stderr: "err\n", timedOut: false, ms: 9 });
+  assert.deepEqual(seen.at(-1)?.body, { cmd: "echo hi", stream: true });
+});
+
+test("exec cuts each stream at 1 MiB with the API's note, and throws if the stream breaks off", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  const chunk = { type: "stdout", data: "a".repeat(400_000) };
+  routes["POST /v1/sandboxes/cx-aaa111/exec"] = ndjson([
+    chunk,
+    chunk,
+    chunk,
+    { type: "stderr", data: "a" + "é".repeat(MiB / 2) },
+    { type: "exit", exitCode: 0, timedOut: false, ms: 1 },
+  ]);
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  const r = await box.exec("yes");
+  assert.equal(r.stdout, `${"a".repeat(MiB)}\n[cloudex: output cut at 1 MiB of 1200000 bytes]`);
+  // The cut falls between the two bytes of the last é.
+  assert.equal(r.stderr, `a${"é".repeat(MiB / 2 - 1)}\uFFFD\n[cloudex: output cut at 1 MiB of ${MiB + 1} bytes]`);
+
+  routes["POST /v1/sandboxes/cx-aaa111/exec"] = ndjson([{ type: "stdout", data: "a" }]);
+  await assert.rejects(box.exec("sleep 1"), (e: unknown) => e instanceof CloudexError && e.status === 0);
+});
+
+test("exec on an API without streaming returns its answer as it is", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  const stdout = `${"a".repeat(MiB)}\n[cloudex: output cut at 1 MiB of 3000000 bytes]`;
+  const result = { exitCode: 0, stdout, stderr: "", timedOut: false, ms: 4 };
+  routes["POST /v1/sandboxes/cx-aaa111/exec"] = [200, result];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  assert.deepEqual(await box.exec("yes"), result);
 });
 
 test("fork returns working sandboxes", async () => {
@@ -161,6 +208,7 @@ test("named saves: save, list, start from and delete", async () => {
 
 test("desktop returns a link to the viewer", async () => {
   routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["GET /v1/health"] = [200, { ok: true, version: "v0", previewZone: "example.com" }];
   routes["POST /v1/sandboxes/cx-aaa111/desktop"] = [
     200,
     { port: 6080, path: "vnc.html?autoconnect=1", size: "1920x1080", installed: true, started: true },
@@ -500,4 +548,107 @@ test("files: upload and download an archive", async () => {
   assert.deepEqual(seen.at(-1)?.body, tgz);
   assert.equal(seen.at(-1)?.type, "application/gzip");
   assert.deepEqual(await box.downloadArchive("app"), tgz);
+});
+
+test("a failed connection is a CloudexError with the URL", async () => {
+  const closed = createServer();
+  await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", resolve));
+  const gone = `http://127.0.0.1:${(closed.address() as AddressInfo).port}`;
+  await new Promise((resolve) => closed.close(resolve));
+  for (const apiUrl of [gone, "no-scheme.example"]) {
+    await assert.rejects(new Cloudex({ apiUrl, apiKey: "k" }).list(), (e: unknown) => {
+      assert.ok(e instanceof CloudexError);
+      assert.equal(e.status, 0);
+      assert.ok(e.message.startsWith(`can't reach ${apiUrl}: `), e.message);
+      return true;
+    });
+  }
+});
+
+test("a body that breaks off is a CloudexError with the URL", async () => {
+  routes["GET /v1/sandboxes"] = (res) => {
+    res.writeHead(200, { "content-type": "application/json", "content-length": "100" });
+    res.write("[{");
+    setTimeout(() => res.destroy(), 10);
+  };
+  await assert.rejects(new Cloudex({ apiUrl: url, apiKey: "k" }).list(), (e: unknown) => {
+    assert.ok(e instanceof CloudexError);
+    assert.equal(e.status, 0);
+    assert.ok(e.message.startsWith(`can't reach ${url}: `), e.message);
+    return true;
+  });
+});
+
+test("an HTML error page becomes its status and title", async () => {
+  const page = "<html>\n<head><title>502 Bad Gateway</title></head>\n<body>nginx</body></html>";
+  routes["GET /v1/sandboxes"] = (res) => res.writeHead(502, { "content-type": "text/html" }).end(page);
+  routes["GET /v1/saves"] = (res) => res.writeHead(503, { "content-type": "text/html" }).end("<html><title>\n Just a  moment </title></html>");
+  routes["GET /v1/keys"] = (res) => res.writeHead(500, { "content-type": "text/plain" }).end("x".repeat(600));
+  const cx = new Cloudex({ apiUrl: url, apiKey: "k" });
+  await assert.rejects(cx.list(), (e: unknown) => e instanceof CloudexError && e.status === 502 && e.message === "502 Bad Gateway");
+  await assert.rejects(cx.listSaves(), (e: unknown) => e instanceof CloudexError && e.message === "503 Just a moment");
+  await assert.rejects(cx.listKeys(), (e: unknown) => e instanceof CloudexError && e.message === `${"x".repeat(500)}…`);
+});
+
+test("an unknown route says the deployment is older; a missing thing keeps its own message", async () => {
+  routes["GET /v1/saves"] = [404, { error: "not found" }];
+  routes["GET /v1/saves/gone"] = [404, { error: "no save named gone" }];
+  const cx = new Cloudex({ apiUrl: url, apiKey: "k" });
+  await assert.rejects(cx.listSaves(), (e: unknown) => {
+    assert.ok(e instanceof CloudexError);
+    assert.equal(e.status, 404);
+    assert.match(e.message, /older than the SDK.*cloudex deploy/);
+    return true;
+  });
+  await assert.rejects(cx.getSave("gone"), (e: unknown) => e instanceof CloudexError && e.message === "no save named gone");
+});
+
+test("the CLI's saved key goes only to the saved deployment", async () => {
+  routes["GET /v1/health"] = [200, { ok: true, version: "v0", previewZone: null }];
+  const dir = await mkdtemp(join(tmpdir(), "cloudex-sdk-"));
+  await writeFile(join(dir, "config.json"), JSON.stringify({ apiUrl: url + "/", apiKey: "saved" }));
+  process.env.CLOUDEX_CONFIG_DIR = dir;
+
+  await new Cloudex({ apiUrl: url }).health();
+  assert.equal(seen.at(-1)?.auth, "Bearer saved");
+
+  seen.length = 0;
+  const other = url.replace("127.0.0.1", "localhost");
+  await assert.rejects(new Cloudex({ apiUrl: other }).health(), (e: unknown) => {
+    assert.ok(e instanceof CloudexError);
+    assert.equal(e.status, 0);
+    assert.match(e.message, /no API key for http:\/\/localhost:\d+: pass apiKey or set CLOUDEX_API_KEY/);
+    return true;
+  });
+  process.env.CLOUDEX_API_URL = other;
+  await assert.rejects(new Cloudex().health(), /no API key/);
+  assert.equal(seen.length, 0);
+
+  await new Cloudex({ apiUrl: other, apiKey: "mine" }).health();
+  assert.equal(seen.at(-1)?.auth, "Bearer mine");
+  process.env.CLOUDEX_API_KEY = "from-env";
+  await new Cloudex().health();
+  assert.equal(seen.at(-1)?.auth, "Bearer from-env");
+});
+
+test("desktop on a deployment with no preview domain fails before starting anything", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["GET /v1/health"] = [200, { ok: true, version: "v0", previewZone: null }];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  await assert.rejects(box.desktop(), (e: unknown) => {
+    assert.ok(e instanceof CloudexError);
+    assert.equal(e.status, 400);
+    assert.match(e.message, /preview links need a domain/);
+    return true;
+  });
+  assert.ok(!seen.some((s) => s.route.includes("/desktop")));
+});
+
+test("a file mode below 0o100 is sent with three digits", async () => {
+  routes["GET /v1/sandboxes/web"] = [200, info("cx-aaa111")];
+  routes["PUT /v1/sandboxes/cx-aaa111/files/content?path=f&mode=077"] = [200, fileInfo("/home/cloudex/f", { mode: "077" })];
+  routes["PUT /v1/sandboxes/cx-aaa111/files/content?path=g&mode=007"] = [200, fileInfo("/home/cloudex/g", { mode: "007" })];
+  const box = await new Cloudex({ apiUrl: url, apiKey: "k" }).get("web");
+  assert.equal((await box.writeFile("f", "x", { mode: 0o77 })).mode, "077");
+  assert.equal((await box.writeFile("g", "x", { mode: 7 })).mode, "007");
 });

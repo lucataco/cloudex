@@ -2,7 +2,8 @@
 
 Create, fork and drive [Cloudex](https://cloudex.build) sandboxes: agent
 computers in your own Cloudflare account. It runs anywhere `fetch` does (Node
-18+, Bun, Deno, Workers, browsers) and has no dependencies.
+18+, Bun, Deno, Workers) and has no dependencies. Use it from a server or a
+script: the API sends no CORS headers, so a browser page can't call it.
 
 ```sh
 npm install cloudex
@@ -90,11 +91,12 @@ const tgz = await box.downloadArchive("app/dist");
 
 ## Connecting
 
-`new Cloudex({ apiUrl, apiKey })` takes the API URL and key that `cloudex
-deploy` printed (`cloudex status --show-key` shows them again). Without them it
+`new Cloudex({ apiUrl, apiKey })` takes the API URL that `cloudex deploy`
+printed and the key that `cloudex status --show-key` shows. Without them it
 reads `$CLOUDEX_API_URL` and `$CLOUDEX_API_KEY`, then, in Node, Bun and Deno,
-the deployment the CLI saved. In Workers and browsers, pass them in. The key
-gives full control of your sandboxes; keep it on a server.
+the deployment the CLI saved. The saved key is used only with the saved URL: for
+any other URL, pass `apiKey` or set `$CLOUDEX_API_KEY`. In Workers, pass them
+in. The key gives full control of your sandboxes; keep it on a server.
 
 ## API
 
@@ -112,6 +114,9 @@ gives full control of your sandboxes; keep it on a server.
 | `box.stat(path, { root? })`, `box.deleteFile(path, { recursive?, root? })` | A path's details, with a directory's entries; delete one |
 | `box.downloadArchive(path, { root? })`, `box.uploadArchive(path, tarGz, { root? })` | A directory as a tar.gz; unpack one into a directory |
 | `box.fork({ count?, name?, size?, idleMinutes? })` | Up to 10 sandboxes starting from a copy of the disk |
+| `box.save(name)` | Keep a copy of the running sandbox's disk under a name until it's deleted; a taken name's save is replaced (needs R2) |
+| `cx.startFromSave(name, { count?, name?, size?, idleMinutes? })` | Up to 10 sandboxes starting from a named save |
+| `cx.listSaves()`, `cx.getSave(name)`, `cx.deleteSave(name)` | The named saves, newest first; one by name; delete one |
 | `box.host(port)` | HTTPS link to a port on your preview domain; servers on localhost work too |
 | `box.links()`, `box.revokeLinks(port?)` | The links that work; make one port's link, or all of them, stop working |
 | `box.update({ name?, idleMinutes? })` | Rename, or change the idle time |
@@ -125,5 +130,12 @@ gives full control of your sandboxes; keep it on a server.
 | `agent.events({ after?, follow? })` | Async iterator over its events; follows until the agent is idle |
 | `agent.send(prompt, { interrupt? })`, `agent.interrupt()`, `agent.wait()` | Continue, stop the running turn, wait until idle |
 
+`cx.list()` returns a summary of each sandbox. `cx.get()` and `box.refresh()`
+return every field, including `info.notice`, `info.forkedFrom`, `info.fromSave`,
+`info.providerKeys` and the `info.backup*` fields. On a sandbox from `list()`
+those are missing until you call `box.refresh()`.
+
 Errors from the API throw `CloudexError`, with `status` and the API's message.
-The full API is described at `<your API URL>/v1/openapi.json`.
+When there was no answer (the API can't be reached, a request timed out, a
+response broke off), `status` is 0 and the message starts with `can't reach` and
+the API URL. The full API is described at `<your API URL>/v1/openapi.json`.
