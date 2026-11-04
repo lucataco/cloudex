@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,8 +18,9 @@ import (
 )
 
 type options struct {
-	apiURL string
-	json   bool
+	apiURL  string
+	json    bool
+	version string
 }
 
 // exitError ends the process with a remote command's exit code, without a message.
@@ -49,6 +51,8 @@ func Run(version string, args []string, stdout, stderr io.Writer) (code int) {
 		return 0
 	case errors.As(err, &exit):
 		return exit.code
+	case errors.Is(err, context.Canceled):
+		return 130
 	default:
 		fmt.Fprintln(stderr, "error:", err)
 		if ran == nil || ran.Name() != "feedback" {
@@ -63,14 +67,16 @@ func Run(version string, args []string, stdout, stderr io.Writer) (code int) {
 
 // New returns the root command. version is the build's release version.
 func New(version string) *cobra.Command {
-	opts := &options{}
+	opts := &options{version: version}
 	root := &cobra.Command{
 		Use:           "cloudex",
 		Short:         "Agent computers in your own Cloudflare account",
+		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.PersistentFlags().StringVar(&opts.apiURL, "api-url", "", "Cloudex API URL (default from cloudex deploy, or $CLOUDEX_API_URL)")
+	root.SetVersionTemplate("cloudex {{.Version}}\n")
+	root.PersistentFlags().StringVar(&opts.apiURL, "api-url", "", "Cloudex API URL (default: the one saved by cloudex deploy or login, or $CLOUDEX_API_URL)")
 	root.PersistentFlags().BoolVar(&opts.json, "json", !isTerminal(os.Stdout), "print JSON (the default when stdout is not a terminal)")
 	root.AddGroup(
 		&cobra.Group{ID: "sandbox", Title: "Sandboxes:"},
@@ -93,18 +99,27 @@ func New(version string) *cobra.Command {
 	return root
 }
 
-// load returns the config and a client for the configured deployment.
+// load returns the config and a client for the configured deployment. The
+// saved key goes only to the saved deployment; any other needs $CLOUDEX_API_KEY.
 func (o *options) load() (*config.Config, *api.Client, error) {
 	cfg, err := config.Load()
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading config: %w", err)
+		return nil, nil, err
 	}
-	url := firstNonEmpty(o.apiURL, os.Getenv("CLOUDEX_API_URL"), cfg.APIURL)
-	key := firstNonEmpty(os.Getenv("CLOUDEX_API_KEY"), cfg.APIKey)
+	url := api.NormalizeURL(firstNonEmpty(o.apiURL, os.Getenv("CLOUDEX_API_URL"), cfg.APIURL))
 	if url == "" {
 		return nil, nil, errors.New("no Cloudex deployment is set up: run cloudex deploy (or set CLOUDEX_API_URL and CLOUDEX_API_KEY)")
 	}
-	return cfg, api.New(url, key), nil
+	key := os.Getenv("CLOUDEX_API_KEY")
+	if key == "" && url == api.NormalizeURL(cfg.APIURL) {
+		key = cfg.APIKey
+	}
+	if key == "" {
+		return nil, nil, fmt.Errorf("no API key for %s: set CLOUDEX_API_KEY (the key saved by cloudex deploy or login is only used for the deployment it came from)", url)
+	}
+	client := api.New(url, key)
+	client.CLIVersion = o.version
+	return cfg, client, nil
 }
 
 // ref picks the sandbox a command acts on: the one named, else the current one.

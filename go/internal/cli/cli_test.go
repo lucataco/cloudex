@@ -207,6 +207,67 @@ func TestStatusHidesTheKeyUnlessAsked(t *testing.T) {
 	}
 }
 
+func TestVersionFlag(t *testing.T) {
+	for _, flag := range []string{"--version", "-v"} {
+		code, out, errOut := runVersion(t, "v0.1.17", flag)
+		if code != 0 || out != "cloudex v0.1.17\n" {
+			t.Fatalf("%s: code %d, stdout %q, stderr %q", flag, code, out, errOut)
+		}
+	}
+}
+
+func TestLoginAssumesHTTPSWithoutAScheme(t *testing.T) {
+	srv := newFakeAPI(t, nil)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	code, _, errOut := run(t, "login", "--url", host+"/")
+	// The fake API speaks plain HTTP, so the call fails, but at https://.
+	if code != 1 || !strings.Contains(errOut, "can't reach the Cloudex API at https://"+host+":") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestSavedKeyGoesOnlyToTheSavedDeployment(t *testing.T) {
+	saved := &fakeAPI{t: t, routes: map[string]string{"GET /v1/sandboxes": `[]`}}
+	savedSrv := httptest.NewServer(saved)
+	defer savedSrv.Close()
+	other := &fakeAPI{t: t, routes: map[string]string{"GET /v1/sandboxes": `[]`}}
+	otherSrv := httptest.NewServer(other)
+	defer otherSrv.Close()
+	t.Setenv("CLOUDEX_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLOUDEX_API_URL", "")
+	t.Setenv("CLOUDEX_API_KEY", "")
+	if err := (&config.Config{APIURL: savedSrv.URL, APIKey: "test-key"}).Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if code, _, errOut := run(t, "--api-url", savedSrv.URL+"/", "list"); code != 0 {
+		t.Fatalf("saved deployment: code %d, stderr %q", code, errOut)
+	}
+	code, _, errOut := run(t, "--api-url", otherSrv.URL, "list")
+	if code != 1 || !strings.Contains(errOut, "CLOUDEX_API_KEY") || len(other.requests) != 0 {
+		t.Fatalf("other deployment: code %d, stderr %q, it saw %v", code, errOut, other.requests)
+	}
+	t.Setenv("CLOUDEX_API_KEY", "test-key")
+	if code, _, errOut := run(t, "--api-url", otherSrv.URL, "list"); code != 0 {
+		t.Fatalf("with a key: code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestACorruptConfigNamesTheFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLOUDEX_CONFIG_DIR", dir)
+	t.Setenv("CLOUDEX_API_URL", "")
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range []string{"status", "deploy"} {
+		code, _, errOut := run(t, cmd)
+		if code != 1 || !strings.Contains(errOut, filepath.Join(dir, "config.json")) {
+			t.Fatalf("%s: code %d, stderr %q", cmd, code, errOut)
+		}
+	}
+}
+
 func TestResumeFromBackupAsksForIt(t *testing.T) {
 	restored := strings.Replace(sandboxJSON, `"error":null`, `"notice":"Restored /home from the backup of 2026-10-29 03:12 UTC (as asked).","error":null`, 1)
 	f := &fakeAPI{t: t, routes: map[string]string{"POST /v1/sandboxes/web/resume": restored}}
