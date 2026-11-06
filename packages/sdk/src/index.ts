@@ -79,6 +79,53 @@ export interface ProviderKey {
   updatedAt: number;
 }
 
+/**
+ * An access token's role: admin (everything), user (sandboxes and saves, not
+ * tokens or provider keys) or read (lists, info, agent events, command output
+ * and file reads).
+ */
+export type Role = "admin" | "user" | "read";
+
+/** An access token: an API key other than the admin key. */
+export interface Token {
+  /** tk-xxxxxxxx; the secret starts cx_xxxxxxxx_. */
+  id: string;
+  name: string;
+  /** session: a dashboard sign-in. */
+  kind: "token" | "session";
+  role: Role;
+  /** Only the sandboxes this token made, and their forks. */
+  ownOnly: boolean;
+  createdAt: number;
+  /** "admin", or the id of the token that made it. */
+  createdBy: string;
+  expiresAt: number | null;
+  /** To the minute. */
+  lastUsedAt: number | null;
+}
+
+/** A token as made, with its secret, which nothing shows again. */
+export interface NewToken extends Token {
+  secret: string;
+}
+
+export interface TokenOptions {
+  name: string;
+  /** Default user. */
+  role?: Role;
+  /** Only the sandboxes this token makes; default false. */
+  ownOnly?: boolean;
+  /** Default: it doesn't expire. */
+  expiresInSec?: number;
+}
+
+/** Who the caller is: token is null for the admin key. */
+export interface Me {
+  role: Role;
+  ownOnly: boolean;
+  token: Token | null;
+}
+
 export interface CreateOptions {
   /** 2-32 lowercase letters, digits and dashes, starting with a letter and not ending with a dash. Can't start with cx-, which marks sandbox ids. */
   name?: string;
@@ -442,6 +489,29 @@ export class Cloudex {
 
   async deleteKey(provider: Provider): Promise<void> {
     await this.#call("DELETE", `/v1/keys/${provider}`);
+  }
+
+  /** Who this client is signed in as: the admin key, or a token and its role. */
+  me(): Promise<Me> {
+    return this.#call("GET", "/v1/me");
+  }
+
+  /**
+   * Makes an access token, for CI, an agent or another computer. Needs the
+   * admin key or an admin token. The answer's secret is shown only here.
+   */
+  createToken(options: TokenOptions): Promise<NewToken> {
+    return this.#call("POST", "/v1/tokens", options);
+  }
+
+  /** The access tokens and dashboard sessions, newest first. Admins only. */
+  listTokens(): Promise<Token[]> {
+    return this.#call("GET", "/v1/tokens");
+  }
+
+  /** Revokes a token by its id; it stops working at once. Admins only. */
+  async revokeToken(id: string): Promise<void> {
+    await this.#call("DELETE", `/v1/tokens/${encodeURIComponent(id)}`);
   }
 
   /** The named saves, newest first. Make one with Sandbox.save. */

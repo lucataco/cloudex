@@ -283,6 +283,21 @@ test("provider keys: set, list, delete", async () => {
   assert.equal(seen.at(-1)?.route, "DELETE /v1/keys/openai");
 });
 
+test("tokens: create, list, revoke and me", async () => {
+  const t = { id: "tk-aaaa2222", name: "ci", kind: "token", role: "user", ownOnly: true, createdAt: 1, createdBy: "admin", expiresAt: null, lastUsedAt: null };
+  routes["POST /v1/tokens"] = [201, { ...t, secret: "cx_aaaa2222_s" }];
+  routes["GET /v1/tokens"] = [200, [t]];
+  routes["DELETE /v1/tokens/tk-aaaa2222"] = [200, { revoked: "tk-aaaa2222" }];
+  routes["GET /v1/me"] = [200, { role: "user", ownOnly: true, token: t }];
+  const cx = new Cloudex({ apiUrl: url, apiKey: "k" });
+  assert.equal((await cx.createToken({ name: "ci", ownOnly: true, expiresInSec: 3600 })).secret, "cx_aaaa2222_s");
+  assert.deepEqual(seen.at(-1)?.body, { name: "ci", ownOnly: true, expiresInSec: 3600 });
+  assert.equal((await cx.listTokens())[0]?.id, "tk-aaaa2222");
+  assert.equal((await cx.me()).token?.name, "ci");
+  await cx.revokeToken("tk-aaaa2222");
+  assert.equal(seen.at(-1)?.route, "DELETE /v1/tokens/tk-aaaa2222");
+});
+
 const agentInfo = (extra: object = {}) => ({
   id: "ag-aaaa1111",
   agent: "claude",

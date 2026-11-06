@@ -47,10 +47,12 @@ __all__ = [
     "FileInfo",
     "Health",
     "HostLink",
+    "Me",
     "ProviderKey",
     "Sandbox",
     "Save",
     "Settings",
+    "Token",
 ]
 __version__ = "0.1.18"
 
@@ -172,6 +174,37 @@ class ProviderKey:
     provider: str  # anthropic, openai, openrouter, google, groq, mistral, xai or deepseek
     hint: str  # the key's last 4 characters; the key itself is never returned
     updated_at: int  # milliseconds since the epoch
+
+
+@dataclass(frozen=True)
+class Token:
+    """An access token: an API key other than the admin key.
+
+    role is admin (everything), user (sandboxes and saves, not tokens or
+    provider keys) or read (lists, info, agent events, command output and file
+    reads). own_only limits it to the sandboxes it made, and their forks.
+    secret is set only on the token create_token returns.
+    """
+
+    id: str  # tk-xxxxxxxx
+    name: str
+    kind: str  # token, or session for a dashboard sign-in
+    role: str
+    own_only: bool
+    created_at: int
+    created_by: str  # "admin", or the id of the token that made it
+    expires_at: Optional[int]
+    last_used_at: Optional[int]  # to the minute
+    secret: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Me:
+    """Who the client is signed in as: token is None for the admin key."""
+
+    role: str
+    own_only: bool
+    token: Optional[Token]
 
 
 @dataclass(frozen=True)
@@ -364,6 +397,32 @@ class Cloudex:
     def delete_key(self, provider: str) -> None:
         self._call("DELETE", "/v1/keys/" + urllib.parse.quote(provider, safe=""))
 
+    def me(self) -> Me:
+        """Who this client is signed in as: the admin key, or a token and its role."""
+        m = self._call("GET", "/v1/me")
+        return Me(role=m["role"], own_only=m["ownOnly"], token=_token(m["token"]) if m.get("token") else None)
+
+    def create_token(
+        self, name: str, role: str = "user", own_only: bool = False, expires_in_sec: Optional[int] = None
+    ) -> Token:
+        """Makes an access token, for CI, an agent or another computer.
+
+        Needs the admin key or an admin token. The token's secret is set only
+        on the answer to this call; nothing shows it again.
+        """
+        body: Dict[str, Any] = {"name": name, "role": role, "ownOnly": own_only}
+        if expires_in_sec is not None:
+            body["expiresInSec"] = expires_in_sec
+        return _token(self._call("POST", "/v1/tokens", body))
+
+    def list_tokens(self) -> List[Token]:
+        """The access tokens and dashboard sessions, newest first. Admins only."""
+        return [_token(t) for t in self._call("GET", "/v1/tokens")]
+
+    def revoke_token(self, id: str) -> None:
+        """Revokes a token by its id; it stops working at once. Admins only."""
+        self._call("DELETE", "/v1/tokens/" + urllib.parse.quote(id, safe=""))
+
     def list_saves(self) -> List[Save]:
         """The named saves, newest first. Make one with Sandbox.save."""
         return [_save(s) for s in self._call("GET", "/v1/saves")]
@@ -446,6 +505,21 @@ class Cloudex:
 
 def _provider_key(k: Dict[str, Any]) -> ProviderKey:
     return ProviderKey(provider=k["provider"], hint=k["hint"], updated_at=k["updatedAt"])
+
+
+def _token(t: Dict[str, Any]) -> Token:
+    return Token(
+        id=t["id"],
+        name=t["name"],
+        kind=t["kind"],
+        role=t["role"],
+        own_only=t["ownOnly"],
+        created_at=t["createdAt"],
+        created_by=t["createdBy"],
+        expires_at=t.get("expiresAt"),
+        last_used_at=t.get("lastUsedAt"),
+        secret=t.get("secret"),
+    )
 
 
 def _settings(s: Dict[str, Any]) -> Settings:

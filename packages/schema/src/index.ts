@@ -438,3 +438,106 @@ export type Health = z.infer<typeof Health>;
 
 export const ApiError = z.object({ error: z.string() });
 export type ApiError = z.infer<typeof ApiError>;
+
+// Access tokens: API keys other than the admin key, for CI, agents, other
+// computers and the dashboard. Each has a role and may be limited to the
+// sandboxes it creates (ownOnly); it can expire, and be revoked at once.
+//   admin  everything, including tokens and provider keys
+//   user   everything to sandboxes and saves, but not tokens or provider keys
+//   read   lists, info, agent events, command output and file reads; no exec,
+//          ssh, preview links or changes
+// An ownOnly token sees and uses only the sandboxes it created (forks of them
+// included), and can start from any named save but not make, replace or
+// delete one. The admin key stays the root credential.
+export const Role = z.enum(["admin", "user", "read"]);
+export type Role = z.infer<typeof Role>;
+
+// Up to 10 years; leave it out for a token that doesn't expire.
+const ExpiresIn = z.number().int().min(60).max(10 * 365 * 86_400);
+
+export const CreateToken = z.object({
+  name: z.string().min(1).max(100),
+  role: Role.default("user"),
+  ownOnly: z.boolean().default(false),
+  expiresInSec: ExpiresIn.optional(),
+});
+export type CreateToken = z.input<typeof CreateToken>;
+
+export const Token = z.object({
+  id: z.string(), // tk-xxxxxxxx; the secret starts cx_xxxxxxxx_
+  name: z.string(),
+  kind: z.enum(["token", "session"]), // a session is the dashboard's sign-in
+  role: Role,
+  ownOnly: z.boolean(),
+  createdAt: z.number().int(),
+  createdBy: z.string(), // "admin", or the id of the token that made it
+  expiresAt: z.number().int().nullable(),
+  lastUsedAt: z.number().int().nullable(), // to the minute
+});
+export type Token = z.infer<typeof Token>;
+
+// Only when a token is made: its secret, which nothing shows again.
+export const NewToken = Token.extend({ secret: z.string() });
+export type NewToken = z.infer<typeof NewToken>;
+
+// GET /v1/me: who the caller is. token is null for the admin key.
+export const Me = z.object({
+  role: Role,
+  ownOnly: z.boolean(),
+  token: Token.nullable(),
+});
+export type Me = z.infer<typeof Me>;
+
+// Device login (RFC 8628): a computer without a key asks for one, someone
+// signed in approves its code, and the computer collects its token.
+export const DeviceStart = z.object({
+  name: z.string().min(1).max(100), // what the token will be called, such as the computer's name
+  role: Role.optional(), // the role asked for; the approver decides
+});
+export type DeviceStart = z.input<typeof DeviceStart>;
+
+export const DeviceCode = z.object({
+  device_code: z.string(),
+  user_code: z.string(), // ABCD-EFGH
+  verification_uri: z.string(),
+  verification_uri_complete: z.string(),
+  expires_in: z.number().int(),
+  interval: z.number().int(),
+});
+export type DeviceCode = z.infer<typeof DeviceCode>;
+
+export const DevicePoll = z.object({ device_code: z.string().min(1).max(200) });
+export type DevicePoll = z.input<typeof DevicePoll>;
+
+// The answer once approved; until then a 400 with error authorization_pending,
+// slow_down, access_denied or expired_token, as RFC 8628 has it.
+export const DeviceToken = z.object({
+  access_token: z.string(),
+  token_type: z.literal("Bearer"),
+  token: Token,
+});
+export type DeviceToken = z.infer<typeof DeviceToken>;
+
+// A request waiting for approval, as the approver sees it.
+export const DeviceRequest = z.object({
+  userCode: z.string(),
+  name: z.string(),
+  role: Role.nullable(), // asked for
+  ip: z.string().nullable(),
+  country: z.string().nullable(),
+  userAgent: z.string().nullable(),
+  createdAt: z.number().int(),
+  expiresAt: z.number().int(),
+});
+export type DeviceRequest = z.infer<typeof DeviceRequest>;
+
+export const DeviceApprove = z.object({
+  user_code: z.string().min(1).max(20),
+  role: Role.optional(), // default: the role asked for, or user
+  ownOnly: z.boolean().default(false),
+  expiresInSec: ExpiresIn.optional(), // default 90 days
+});
+export type DeviceApprove = z.input<typeof DeviceApprove>;
+
+export const DeviceDeny = z.object({ user_code: z.string().min(1).max(20) });
+export type DeviceDeny = z.input<typeof DeviceDeny>;

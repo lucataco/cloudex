@@ -222,6 +222,22 @@ class CloudexTest(unittest.TestCase):
         self.cx.delete_key("anthropic")
         self.assertEqual(FakeAPI.seen[-1]["route"], "DELETE /v1/keys/anthropic")
 
+    def test_tokens(self):
+        t = {"id": "tk-aaaa2222", "name": "ci", "kind": "token", "role": "user", "ownOnly": True, "createdAt": 1,
+             "createdBy": "admin", "expiresAt": None, "lastUsedAt": None}
+        FakeAPI.routes["POST /v1/tokens"] = (201, dict(t, secret="cx_aaaa2222_s"))
+        FakeAPI.routes["GET /v1/tokens"] = (200, [t])
+        FakeAPI.routes["DELETE /v1/tokens/tk-aaaa2222"] = (200, {"revoked": "tk-aaaa2222"})
+        FakeAPI.routes["GET /v1/me"] = (200, {"role": "user", "ownOnly": True, "token": t})
+        made = self.cx.create_token("ci", own_only=True, expires_in_sec=3600)
+        self.assertEqual((made.id, made.own_only, made.secret), ("tk-aaaa2222", True, "cx_aaaa2222_s"))
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"name": "ci", "role": "user", "ownOnly": True, "expiresInSec": 3600})
+        self.assertEqual([x.secret for x in self.cx.list_tokens()], [None])
+        me = self.cx.me()
+        self.assertEqual((me.role, me.own_only, me.token.id), ("user", True, "tk-aaaa2222"))
+        self.cx.revoke_token("tk-aaaa2222")
+        self.assertEqual(FakeAPI.seen[-1]["route"], "DELETE /v1/tokens/tk-aaaa2222")
+
     def test_agents(self):
         def agent(**extra):
             base = {"id": "ag-aaaa1111", "agent": "claude", "state": "running", "cwd": "/home/cloudex", "model": None,

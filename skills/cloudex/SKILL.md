@@ -34,6 +34,11 @@ description: Run code, servers and coding agents in Cloudex sandboxes, Ubuntu ma
 - If an agent fails to sign in or authenticate, ask the user to run `cloudex keys set anthropic` (or `openai`). The key is stored outside the sandbox, and sandboxes started afterwards use it; one that is already running needs `cloudex stop` and `cloudex resume` to pick up a first key for that provider.
 - Inside a sandbox, `cloudex` manages only that sandbox: `cloudex host <port>`, `cloudex info`, `cloudex set --idle <time>` and `cloudex stop`.
 
+## Signing in
+
+- `cloudex status` fails with "no deployment" when this computer has none. Don't run `cloudex deploy` for a deployment that exists elsewhere: it replaces the admin key. Ask the user for its URL, then run `cloudex login --url <URL> --json`: its first line holds a code (`userCode`) and the command that approves it (`approveWith`, `cloudex tokens approve <code>`). Show both to the user and keep waiting; the user runs it on a computer that already uses the deployment, and login finishes by itself. Never approve a code yourself.
+- A `403` means the token's role doesn't allow the call; a "no sandbox named" error from a token made with `--own` can mean the sandbox isn't one it made. Tell the user rather than looking for another key.
+
 ## When something breaks
 
 If `cloudex` fails in a way that looks like a bug in Cloudex (it suggests `cloudex feedback`, the API answers with a 5xx error, or the CLI crashes), tell the user what happened. With their OK, run `cloudex feedback --last-error "what you were doing"`: without a terminal it sends nothing, and prints the report and a `cloudex feedback --send <id>` command. Show the user that report, and run the `--send` command only if they agree; it sends exactly that report. Reports are public GitHub issues, filed under the user's GitHub account when `gh` is signed in, so never put keys or private details in the message. Security problems go to https://github.com/lucataco/cloudex/security/advisories/new instead.

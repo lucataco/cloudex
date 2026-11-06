@@ -12,7 +12,15 @@ import {
   CommandOutput,
   CreateSandbox,
   CreateSave,
+  CreateToken,
   Desktop,
+  DeviceApprove,
+  DeviceCode,
+  DeviceDeny,
+  DevicePoll,
+  DeviceRequest,
+  DeviceStart,
+  DeviceToken,
   DesktopRequest,
   ExecEvent,
   ExecRequest,
@@ -24,6 +32,8 @@ import {
   HostRequest,
   HostResult,
   KillCommand,
+  Me,
+  NewToken,
   Provider,
   ProviderKey,
   ResumeRequest,
@@ -34,6 +44,7 @@ import {
   SetProviderKey,
   StartAgent,
   StartCommand,
+  Token,
   UpdateSandbox,
   UpdateSettings,
 } from "./index.ts";
@@ -55,6 +66,11 @@ const requests = {
   AgentMessage,
   UpdateSandbox,
   UpdateSettings,
+  CreateToken,
+  DeviceStart,
+  DevicePoll,
+  DeviceApprove,
+  DeviceDeny,
 };
 const responses = {
   Sandbox,
@@ -74,6 +90,12 @@ const responses = {
   ProviderKey,
   Agent,
   AgentEvents,
+  Me,
+  Token,
+  NewToken,
+  DeviceCode,
+  DeviceToken,
+  DeviceRequest,
   Error: ApiError,
 };
 
@@ -160,14 +182,17 @@ export function openapi(version: string) {
       version,
       description:
         "Agent sandboxes in your own Cloudflare account. `cloudex deploy` sets up this API " +
-        "and its admin key; `cloudex status --show-key` prints both.",
+        "and its admin key; `cloudex status --show-key` prints both. Access tokens (`cloudex tokens`) " +
+        "work in place of the admin key, limited by their role.",
       license: { name: "MIT", identifier: "MIT" },
     },
     servers: [{ url: "/" }],
     security: [{ bearer: [] }],
     components: {
       schemas,
-      securitySchemes: { bearer: { type: "http", scheme: "bearer", description: "The deployment's admin key" } },
+      securitySchemes: {
+        bearer: { type: "http", scheme: "bearer", description: "The deployment's admin key, or an access token (cx_...)" },
+      },
     },
     paths: {
       "/v1/health": {
@@ -523,6 +548,68 @@ export function openapi(version: string) {
         get: op("connectTcp", "A WebSocket carrying a TCP connection to a port in the sandbox", {
           description: "Binary messages each way. cloudex ssh uses port 22.",
           responses: { 101: { description: "Switching to the WebSocket" } },
+        }),
+      },
+      "/v1/me": {
+        get: op("getMe", "Who the caller is: the admin key, or a token with its role", {
+          responses: { 200: ok("The caller", ref("Me")) },
+        }),
+      },
+      "/v1/tokens": {
+        post: op("createToken", "Make an access token (admins only)", {
+          description:
+            "Roles: admin (everything), user (sandboxes and saves, not tokens or provider keys) and read " +
+            "(lists, info, agent events, command output, file reads). ownOnly limits it to the sandboxes it makes. " +
+            "The answer holds the secret, which nothing shows again.",
+          requestBody: body("CreateToken"),
+          responses: { 201: ok("The token, with its secret", ref("NewToken")) },
+        }),
+        get: op("listTokens", "List the access tokens and dashboard sessions (admins only)", {
+          responses: { 200: ok("The tokens", { type: "array", items: ref("Token") }) },
+        }),
+      },
+      "/v1/tokens/{id}": {
+        parameters: [{ name: "id", in: "path", required: true, description: "The token's id (tk-xxxxxxxx)", schema: { type: "string" } }],
+        delete: op("revokeToken", "Revoke a token; it stops working at once (admins only)", {
+          responses: {
+            200: ok("Revoked", { type: "object", properties: { revoked: { type: "string" } }, required: ["revoked"] }),
+          },
+        }),
+      },
+      "/v1/auth/device": {
+        post: op("startDeviceLogin", "Ask for a token for a computer without one (RFC 8628); needs no key", {
+          security: [],
+          description:
+            "Show user_code to someone signed in, who approves it with cloudex tokens approve or in the dashboard, " +
+            "then poll /v1/auth/token every interval seconds with device_code. Codes last 10 minutes.",
+          requestBody: body("DeviceStart"),
+          responses: { 200: ok("The codes", ref("DeviceCode")) },
+        }),
+        get: op("listDeviceLogins", "List the device logins waiting for approval (admins only)", {
+          responses: { 200: ok("The requests", { type: "array", items: ref("DeviceRequest") }) },
+        }),
+      },
+      "/v1/auth/token": {
+        post: op("pollDeviceLogin", "Collect a device login's token once it's approved; needs no key", {
+          security: [],
+          description:
+            "Until then a 400 with error authorization_pending, or slow_down when asked sooner than the interval; " +
+            "access_denied or expired_token end it. The token comes once.",
+          requestBody: body("DevicePoll"),
+          responses: { 200: ok("The token", ref("DeviceToken")) },
+        }),
+      },
+      "/v1/auth/device/approve": {
+        post: op("approveDeviceLogin", "Approve a device login by its user code (admins only)", {
+          description: "The role is the one asked for, or user, unless given; the token expires in 90 days unless expiresInSec says otherwise.",
+          requestBody: body("DeviceApprove"),
+          responses: { 200: ok("The approved request", ref("DeviceRequest")) },
+        }),
+      },
+      "/v1/auth/device/deny": {
+        post: op("denyDeviceLogin", "Refuse a device login by its user code (admins only)", {
+          requestBody: body("DeviceDeny"),
+          responses: { 200: ok("The refused request", ref("DeviceRequest")) },
         }),
       },
     },

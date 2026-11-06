@@ -1,6 +1,7 @@
 // D1 is only the index behind `cloudex list` and name lookups. Each Sandbox
 // Durable Object owns its own state and writes its row here when it changes.
-// It also holds the names of named saves (saves.ts) and the provider keys.
+// It also holds the names of named saves (saves.ts), the provider keys, and
+// access tokens with the sandboxes each one made (tokens.ts).
 import type { Sandbox } from "@cloudex/schema";
 
 const SCHEMA = [
@@ -38,6 +39,45 @@ const SCHEMA = [
     value TEXT NOT NULL,
     hint TEXT NOT NULL,
     updated_at INTEGER NOT NULL
+  )`,
+  // Access tokens (tokens.ts): the SHA-256 of each secret, never the secret.
+  `CREATE TABLE IF NOT EXISTS tokens (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    role TEXT NOT NULL,
+    own_only INTEGER NOT NULL,
+    hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    expires_at INTEGER,
+    last_used_at INTEGER
+  )`,
+  // The token that made each sandbox, for ownOnly tokens. Apart from the
+  // index, which a Sandbox object rewrites, so that its owner never goes with
+  // a rewrite.
+  `CREATE TABLE IF NOT EXISTS sandbox_owners (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL
+  )`,
+  // Device logins waiting for approval: the device code's SHA-256, and the
+  // user code, which only signed-in callers see.
+  `CREATE TABLE IF NOT EXISTS device_requests (
+    device_hash TEXT PRIMARY KEY,
+    user_code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    role TEXT,
+    ip TEXT,
+    country TEXT,
+    user_agent TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    last_poll_at INTEGER,
+    status TEXT NOT NULL,
+    grant_role TEXT,
+    grant_own_only INTEGER,
+    grant_expires_in INTEGER,
+    granted_by TEXT
   )`,
 ];
 
@@ -113,13 +153,22 @@ export async function renameSandbox(db: D1Database, id: string, name: string): P
 
 export async function deleteSandbox(db: D1Database, id: string): Promise<boolean> {
   await ensureSchema(db);
-  const { meta } = await db.prepare("DELETE FROM sandboxes WHERE id = ?").bind(id).run();
-  return meta.changes > 0;
+  const [row] = await db.batch([
+    db.prepare("DELETE FROM sandboxes WHERE id = ?").bind(id),
+    db.prepare("DELETE FROM sandbox_owners WHERE id = ?").bind(id),
+  ]);
+  return (row?.meta.changes ?? 0) > 0;
 }
 
-export async function listSandboxes(db: D1Database): Promise<Sandbox[]> {
+// owner: only the sandboxes that token made.
+export async function listSandboxes(db: D1Database, owner?: string): Promise<Sandbox[]> {
   await ensureSchema(db);
-  const { results } = await db.prepare("SELECT * FROM sandboxes ORDER BY created_at DESC").all<Row>();
+  const { results } = await (owner
+    ? db
+        .prepare("SELECT s.* FROM sandboxes s JOIN sandbox_owners o ON o.id = s.id WHERE o.owner = ? ORDER BY s.created_at DESC")
+        .bind(owner)
+    : db.prepare("SELECT * FROM sandboxes ORDER BY created_at DESC")
+  ).all<Row>();
   return results.map(fromRow);
 }
 

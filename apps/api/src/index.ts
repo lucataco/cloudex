@@ -1,11 +1,16 @@
 // cloudex-api: the /v1 control plane, plus preview links when a zone is set.
-// v0.1 authenticates with one admin key that `cloudex deploy` mints and stores
-// as a Worker secret.
+// Callers authenticate with the admin key that `cloudex deploy` mints and
+// stores as a Worker secret, or with an access token (tokens.ts).
 import { Hono } from "hono";
 import {
   AgentMessage,
   CreateSandbox,
   CreateSave,
+  CreateToken,
+  DeviceApprove,
+  DeviceDeny,
+  DevicePoll,
+  DeviceStart,
   DesktopRequest,
   ExecRequest,
   ForkRequest,
@@ -28,6 +33,21 @@ import { isAgentId } from "./agents";
 import { isCommandId } from "./commands";
 import { backupBucket } from "./backup";
 import { deleteSandbox, idForName, listSandboxes, nameTaken } from "./db";
+import {
+  DEVICE_INTERVAL,
+  type Who,
+  authenticate,
+  authorize,
+  createToken,
+  decideDevice,
+  listTokens,
+  me,
+  pollDevice,
+  revokeToken,
+  setOwner,
+  startDevice,
+  waitingDevices,
+} from "./tokens";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, keyRefusal, listKeys, setKey } from "./keys";
 import { NO_SUCH_SANDBOX, type ForkSource } from "./sandbox";
@@ -50,7 +70,7 @@ export { Sandbox } from "./sandbox";
 export { Egress } from "./egress";
 
 
-type Ctx = { Bindings: Env };
+type Ctx = { Bindings: Env; Variables: { who: Who } };
 const app = new Hono<Ctx>();
 
 app.onError((e, c) => {
@@ -65,12 +85,83 @@ app.get("/v1/health", (c) =>
 let spec: object | undefined;
 app.get("/v1/openapi.json", (c) => c.json((spec ??= openapi(VERSION))));
 
+// Device login (RFC 8628), for a computer without a key: these two take none.
+// The form-encoded bodies of the RFC work as well as JSON.
+async function body(c: { req: { header(n: string): string | undefined; text(): Promise<string> } }) {
+  const text = await c.req.text();
+  if (/application\/x-www-form-urlencoded/.test(c.req.header("content-type") ?? "")) return Object.fromEntries(new URLSearchParams(text));
+  return text ? JSON.parse(text) : {};
+}
+
+app.post("/v1/auth/device", async (c) => {
+  const input = DeviceStart.parse(await body(c));
+  const cf = (c.req.raw as { cf?: { country?: string } }).cf;
+  const d = await startDevice(c.env.DB, {
+    ...input,
+    ip: c.req.header("cf-connecting-ip") ?? null,
+    country: cf?.country ?? null,
+    userAgent: c.req.header("user-agent") ?? null,
+  });
+  const origin = new URL(c.req.url).origin;
+  return c.json({
+    device_code: d.deviceCode,
+    user_code: d.userCode,
+    verification_uri: `${origin}/login`,
+    verification_uri_complete: `${origin}/login?code=${d.userCode}`,
+    expires_in: d.expiresIn,
+    interval: DEVICE_INTERVAL,
+  });
+});
+
+app.post("/v1/auth/token", async (c) => {
+  const { device_code } = DevicePoll.parse(await body(c));
+  const r = await pollDevice(c.env.DB, device_code);
+  if ("error" in r) return c.json({ error: r.error }, 400);
+  const { secret, ...token } = r.token;
+  return c.json({ access_token: secret, token_type: "Bearer", token });
+});
+
 app.use("/v1/*", async (c, next) => {
-  const key = c.env.ADMIN_KEY;
-  if (!key || !(await sameSecret(c.req.header("authorization") ?? "", `Bearer ${key}`))) {
-    return c.json({ error: "unauthorized" }, 401);
+  const who = await authenticate(c.env, c.req.header("authorization") ?? "", c.executionCtx);
+  if (!who) {
+    const why = c.req.header("authorization")
+      ? "the key isn't this deployment's admin key or a working token (a token may have been revoked, or have expired)"
+      : "no key: send Authorization: Bearer <the admin key or a token>";
+    return c.json({ error: `unauthorized: ${why}` }, 401);
   }
+  await authorize(c.env, who, c.req.method, new URL(c.req.url).pathname, async (ref) => (await resolve(c.env, ref))?.id ?? null);
+  c.set("who", who);
   await next();
+});
+
+app.get("/v1/me", (c) => c.json(me(c.get("who"))));
+
+// Tokens: for admins (tokens.ts RULES).
+app.post("/v1/tokens", async (c) => {
+  const input = CreateToken.parse(await c.req.json());
+  const who = c.get("who");
+  return c.json(await createToken(c.env.DB, { ...input, createdBy: who.kind === "admin" ? "admin" : who.token.id }), 201);
+});
+
+app.get("/v1/tokens", async (c) => c.json(await listTokens(c.env.DB)));
+
+app.delete("/v1/tokens/:id", async (c) => {
+  const id = c.req.param("id");
+  const t = await revokeToken(c.env.DB, id);
+  if (!t) fail(404, `no token ${id}`);
+  return c.json({ revoked: id });
+});
+
+app.get("/v1/auth/device", async (c) => c.json(await waitingDevices(c.env.DB)));
+
+app.post("/v1/auth/device/approve", async (c) => {
+  const { user_code, ...grant } = DeviceApprove.parse(await c.req.json());
+  return c.json(await decideDevice(c.env.DB, c.get("who"), user_code, { approve: true, ...grant }));
+});
+
+app.post("/v1/auth/device/deny", async (c) => {
+  const { user_code } = DeviceDeny.parse(await c.req.json());
+  return c.json(await decideDevice(c.env.DB, c.get("who"), user_code, { approve: false }));
 });
 
 // after and wait for long polls: agent events and command output.
@@ -99,11 +190,15 @@ app.post("/v1/sandboxes", async (c) => {
     return c.json({ error: `the name ${input.name} is taken` }, 409);
   }
   const id = newSandboxId();
+  await setOwner(c.env.DB, id, c.get("who"));
   const s = await c.env.SANDBOX.getByName(id).create(id, { ...input, name: input.name ?? null });
   return c.json(s, 201);
 });
 
-app.get("/v1/sandboxes", async (c) => c.json(await listSandboxes(c.env.DB)));
+app.get("/v1/sandboxes", async (c) => {
+  const who = c.get("who");
+  return c.json(await listSandboxes(c.env.DB, who.kind === "token" && who.token.ownOnly ? who.token.id : undefined));
+});
 
 app.get("/v1/sandboxes/:ref", async (c) => c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.get()));
 
@@ -259,6 +354,7 @@ async function copyNames(env: Env, input: z.output<typeof ForkRequest>): Promise
 // and resuming it tries again.
 function startCopies(
   env: Env,
+  who: Who,
   names: (string | null)[],
   opts: { size: SandboxSize; idleMinutes: number },
   of: string,
@@ -269,6 +365,7 @@ function startCopies(
     names.map(async (name) => {
       const id = newSandboxId();
       const copy = env.SANDBOX.getByName(id);
+      await setOwner(env.DB, id, who);
       try {
         return await copy.create(id, { name, ...opts }, from, save);
       } catch (e) {
@@ -289,7 +386,7 @@ app.post("/v1/sandboxes/:ref/fork", async (c) => {
   const original = await stub.get();
   const from = await newMethod(ref, stub.forkPoint());
   const opts = { size: input.size ?? original.size, idleMinutes: input.idleMinutes ?? original.idleMinutes };
-  return c.json(await startCopies(c.env, names, opts, original.id, from), 201);
+  return c.json(await startCopies(c.env, c.get("who"), names, opts, original.id, from), 201);
 });
 
 // Named saves (saves.ts): made from a running sandbox, which keeps running;
@@ -331,7 +428,7 @@ app.post("/v1/saves/:name/sandboxes", async (c) => {
   if (!manifest) fail(409, `the save ${save.name} was saved over or deleted just now; try again`);
   const names = await copyNames(c.env, input);
   const opts = { size: input.size ?? save.size, idleMinutes: input.idleMinutes ?? save.idleMinutes };
-  return c.json(await startCopies(c.env, names, opts, `the save ${save.name}`, undefined, manifest), 201);
+  return c.json(await startCopies(c.env, c.get("who"), names, opts, `the save ${save.name}`, undefined, manifest), 201);
 });
 
 // The desktop: POST starts it (installing it the first time) or resizes it; DELETE stops it.

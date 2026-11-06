@@ -33,9 +33,15 @@ API key and preview domain stay. Leave out `--preview-domain` if you don't want
 preview links.
 
 **On another computer**, don't deploy again: that would give the deployment a new
-API key and lock out the first computer. Instead run `cloudex status --show-key`
-on the first one, then `cloudex login --url <API URL>` on the new one and paste
-the key. `cloudex deploy` asks before replacing a key it doesn't have.
+API key and lock out the first computer. Instead run `cloudex login --url <API URL>`
+on the new one, which shows a code, and approve it on the first one with
+`cloudex tokens approve <code>`. The new computer gets a token of its own.
+`cloudex deploy` asks before replacing a key it doesn't have.
+
+**Tokens.** `cloudex tokens create ci --own --expires 90d` makes an API key for CI,
+an agent or a teammate: with a role (`admin`, `user` or `read`), limited to the
+sandboxes it makes with `--own`, expiring, and revocable at once with
+`cloudex tokens revoke`.
 
 **Updating.** `cloudex update` replaces the CLI with the latest release, after
 checking it against the release's checksums, then offers to run `cloudex deploy`
@@ -65,8 +71,9 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex agents start [sandbox] "task"`, `agents`, `logs -f`, `send`, `interrupt` | Run an agent with no terminal and follow it; send follow-ups or steer it |
 | `cloudex host [sandbox] <port>`, `--revoke`, `--list`, `--revoke-all` | HTTPS link to a port, on your preview domain (servers on localhost work too); revoke links |
 | `cloudex stop`, `resume [--from-backup] [--size]`, `delete` | Save, back up and stop; resume from the save or the backup, on another size if you like; or delete |
-| `cloudex login --url <api url>` | Use an existing deployment from another computer |
-| `cloudex keys set <anthropic\|openai>`, `keys`, `keys rm` | Let sandboxes use an AI provider key that never enters them |
+| `cloudex login --url <api url>` | Use an existing deployment from another computer, signing in with a code |
+| `cloudex tokens create <name>`, `tokens`, `tokens approve <code>`, `tokens revoke <id>` | API keys of their own for CI, agents and other computers, with a role |
+| `cloudex keys set <provider>`, `keys`, `keys rm` | Let sandboxes use an AI provider key that never enters them |
 | `cloudex doctor`, `status [--show-key]` | Check this computer and the deployment |
 | `cloudex update [--check]` | Update the CLI to the latest release, then offer to update the deployment |
 | `cloudex feedback "message"`, `--last-error` | Report a bug or an idea as a GitHub issue; keys and addresses are removed, and you see it first |

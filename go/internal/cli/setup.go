@@ -58,8 +58,13 @@ func newStatusCmd(opts *options) *cobra.Command {
 			if h.PreviewZone != nil {
 				zone = *h.PreviewZone
 			}
+			// Deployments from before tokens have no /v1/me: the key is the admin key.
+			who, _ := client.Me(cmd.Context())
 			if opts.json {
 				out := map[string]any{"apiUrl": client.BaseURL, "apiVersion": h.Version, "previewZone": zone, "backups": h.Backups, "current": cfg.Current}
+				if who != nil && who.Role != "" {
+					out["me"] = who
+				}
 				if showKey {
 					out["apiKey"] = client.Key
 				}
@@ -70,10 +75,16 @@ func newStatusCmd(opts *options) *cobra.Command {
 			if deploymentIsOlder(opts.version, h) {
 				fmt.Fprintf(w, "Update   the deployment is older than this CLI (%s): run cloudex deploy to update it\n", opts.version)
 			}
+			switch {
+			case who != nil && who.Token != nil:
+				fmt.Fprintf(w, "Signed   in with the token %s (%s), %s\n", who.Token.ID, who.Token.Name, describeToken(*who.Token))
+			case who != nil && who.Role != "":
+				fmt.Fprintln(w, "Signed   in with the admin key")
+			}
 			if showKey {
 				fmt.Fprintf(w, "Key      %s\n", client.Key)
 			} else {
-				fmt.Fprintln(w, "Key      hidden (--show-key prints it, for cloudex login on another computer)")
+				fmt.Fprintln(w, "Key      hidden (--show-key prints it; for another computer, cloudex login there and approve its code with cloudex tokens approve)")
 			}
 			if zone == "" {
 				zone = "off (cloudex deploy --preview-domain <domain> turns them on)"

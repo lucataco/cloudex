@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Checks what Cloudex ships against a live deployment, the way a user runs it.
-#   verify.sh [area...]    areas: setup lifecycle connect inside agents sdk (default: all)
+#   verify.sh [area...]    areas: setup lifecycle connect inside agents tokens sdk (default: all)
 # Env: CLOUDEX_BIN (default: cloudex on PATH), CLOUDEX_CONFIG_DIR (the deployment to use,
 # default ~/.config/cloudex), VERIFY_OUT (results directory), VERIFY_KEEP=1 keeps sandboxes.
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
@@ -58,13 +58,16 @@ cleanup() {
 	for s in $("$CX" saves --json 2>/dev/null | jq -r --arg p "$P-" '.[] | select(.name | startswith($p)) | .name'); do
 		"$CX" saves rm "$s" --yes >/dev/null 2>&1
 	done
+	for t in $("$CX" tokens --json 2>/dev/null | jq -r --arg p "$P-" '.[]? | select(.name | startswith($p)) | .id'); do
+		"$CX" tokens revoke "$t" >/dev/null 2>&1
+	done
 	echo "results: $results"
 }
 trap cleanup EXIT
 
 want() { [[ $# -eq 0 || " ${areas[*]} " == *" $1 "* ]]; }
 areas=("$@")
-[[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents sdk)
+[[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents tokens sdk)
 echo "Cloudex verify: $("$CX" version 2>&1 | head -1) against $API_URL, prefix $P, areas: ${areas[*]}"
 
 A=$P-a
@@ -387,6 +390,66 @@ if want agents; then
 			cx agents interrupt "$P-ag"
 			ok "A7-$2" "agents interrupt stops a running turn" [ "$CODE" = 0 ]
 		done
+	fi
+fi
+
+# ---------------------------------------------------------------- tokens
+if want tokens; then
+	# as SECRET CMD...: the CLI with a token instead of the deployment's key, in a config dir of its own.
+	as() {
+		local secret=$1
+		shift
+		CLOUDEX_CONFIG_DIR=$work/tok-$RANDOM CLOUDEX_API_URL=$API_URL CLOUDEX_API_KEY=$secret "$CX" "$@" >"$work/o" 2>"$work/e" </dev/null
+		CODE=$? OUT=$(cat "$work/o") ERR=$(cat "$work/e")
+	}
+	cx status
+	if [[ $(field '.me.role // empty') != admin ]]; then
+		skip K00 "tokens" "the deployment has no tokens yet, or this config doesn't hold the admin key"
+	else
+		need_a
+		cx tokens create "$P-own" --own --expires 1h
+		own=$(field .secret)
+		ok K01 "tokens create prints a secret once" has "$own" "cx_"
+		cx tokens create "$P-ro" --role read --expires 1h
+		ro=$(field .secret)
+		as "$own" new --name "$P-own1" --no-use
+		ok K02 "an own-only token makes a sandbox" [ "$CODE" = 0 ]
+		as "$own" list
+		ok K03 "an own-only token lists only its own sandboxes" is "$(field 'map(.name) | join(" ")')" "$P-own1"
+		as "$own" info "$A"
+		ok K04 "an own-only token can't see another sandbox" has "$ERR" "no sandbox named"
+		as "$own" exec "$P-own1" -- echo own-ok
+		ok K05 "an own-only token runs commands in its own sandbox" is "$OUT" own-ok
+		as "$own" save "$P-own1" "$P-own-save"
+		ok K06 "an own-only token can't make a named save" has "$ERR" "named saves"
+		as "$own" keys
+		ok K07 "a user token can't read provider keys" has "$ERR" "admin"
+		as "$ro" info "$A"
+		ok K08 "a read token shows a sandbox" is "$(field .name)" "$A"
+		as "$ro" exec "$A" -- echo no
+		ok K09 "a read token can't run commands" has "$ERR" "only reads"
+		as "$own" delete "$P-own1" --yes
+		ok K10 "an own-only token deletes its own sandbox" [ "$CODE" = 0 ]
+		cx tokens
+		id=$(jq -r --arg n "$P-ro" '.[] | select(.name == $n) | .id' <<<"$OUT")
+		cx tokens revoke "$id"
+		as "$ro" list
+		ok K11 "a revoked token stops working at once" has "$ERR" "unauthorized"
+		# Device sign-in: a second computer asks, this one approves.
+		dev=$work/dev
+		mkdir -p "$dev"
+		(CLOUDEX_CONFIG_DIR=$dev CLOUDEX_API_KEY= "$CX" login --url "$API_URL" --name "$P-device" --json </dev/null >"$dev/out" 2>"$dev/err"; echo "rc=$?" >>"$dev/out") &
+		code=""
+		for _ in $(seq 20); do
+			code=$(head -1 "$dev/out" 2>/dev/null | jq -r '.userCode // empty' 2>/dev/null)
+			[[ -n $code ]] && break
+			sleep 0.5
+		done
+		cx tokens approve "$code" --yes --role read --expires 1h
+		ok K12 "tokens approve approves a device sign-in" [ "$CODE" = 0 ]
+		for _ in $(seq 30); do grep -q '^rc=' "$dev/out" && break; sleep 0.5; done
+		OUT=$(CLOUDEX_CONFIG_DIR=$dev CLOUDEX_API_KEY= CLOUDEX_API_URL= "$CX" status --json 2>/dev/null)
+		ok K13 "the device signed in with a read token of its own" [ "$(field .me.token.name)" = "$P-device" -a "$(field .me.role)" = read ]
 	fi
 fi
 
