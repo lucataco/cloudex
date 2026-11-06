@@ -296,7 +296,7 @@ export type ArchiveResult = z.infer<typeof ArchiveResult>;
 // started while a provider has a key gets a placeholder, and the real key is
 // added to its requests to that provider on the way out, so it never enters the
 // sandbox, its saves, backups or forks.
-export const Provider = z.enum(["anthropic", "openai"]);
+export const Provider = z.enum(["anthropic", "openai", "openrouter", "google", "groq", "mistral", "xai", "deepseek"]);
 export type Provider = z.infer<typeof Provider>;
 
 export const SetProviderKey = z.object({
@@ -312,11 +312,11 @@ export const ProviderKey = z.object({
 });
 export type ProviderKey = z.infer<typeof ProviderKey>;
 
-// Agents: Claude Code or Codex working on a task in a sandbox, without a
+// Agents: Claude Code, Codex or OpenCode working on a task in a sandbox, without a
 // terminal. Each message is one turn of the agent's own conversation; a message
 // sent while a turn runs waits for it, or with interrupt, cuts it short. The
 // conversation lives on the sandbox's disk, so saves, resumes and forks keep it.
-export const AgentKind = z.enum(["claude", "codex"]);
+export const AgentKind = z.enum(["claude", "codex", "opencode"]);
 export type AgentKind = z.infer<typeof AgentKind>;
 
 // Up to 1 MB: prompts reach the sandbox on standard input, not the command line.
@@ -327,8 +327,9 @@ export const StartAgent = z.object({
   agent: AgentKind.default("claude"),
   // The directory to work in, default the home directory.
   cwd: z.string().min(1).max(4096).optional(),
-  // The agent's model, such as opus or gpt-5; default the agent's own default.
-  model: z.string().regex(/^[\w.:/@[\]-]{1,100}$/, "a model name").optional(),
+  // The agent's model, such as opus or gpt-5, or provider/model for OpenCode;
+  // default the agent's own default.
+  model: z.string().regex(/^[\w.:/@[\]#-]{1,100}$/, "a model name").optional(),
 });
 export type StartAgent = z.input<typeof StartAgent>;
 
@@ -352,7 +353,7 @@ export const Agent = z.object({
   turns: z.number().int(), // turns started so far
   queued: z.number().int(), // messages waiting for the running turn
   events: z.number().int(), // events so far; the next one's seq is this plus 1
-  // The agent's own conversation id: Claude Code's session or Codex's thread.
+  // The agent's own conversation id: Claude Code's or OpenCode's session, or Codex's thread.
   sessionId: z.string().nullable(),
   // The agent's final message in the last finished turn, and how that turn ended.
   lastMessage: z.string().nullable(),

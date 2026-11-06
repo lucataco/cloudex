@@ -70,7 +70,7 @@ export interface SaveInfo {
 }
 
 /** An AI provider whose key the deployment can hold for sandboxes. */
-export type Provider = "anthropic" | "openai";
+export type Provider = "anthropic" | "openai" | "openrouter" | "google" | "groq" | "mistral" | "xai" | "deepseek";
 
 /** A stored provider key. The key itself is never returned; hint is its last 4 characters. */
 export interface ProviderKey {
@@ -293,7 +293,7 @@ export interface Desktop {
   started: boolean;
 }
 
-export type AgentKind = "claude" | "codex";
+export type AgentKind = "claude" | "codex" | "opencode";
 export type AgentState = "running" | "idle";
 
 export interface PromptOptions {
@@ -319,7 +319,7 @@ export interface AgentInfo {
   queued: number;
   /** Events so far. */
   events: number;
-  /** The agent's own conversation id: Claude Code's session or Codex's thread. */
+  /** The agent's own conversation id: Claude Code's or OpenCode's session, or Codex's thread. */
   sessionId: string | null;
   /** The agent's final message in the last finished turn. */
   lastMessage: string | null;
@@ -332,7 +332,7 @@ export interface AgentInfo {
 
 /**
  * One line of an agent's log. A turn is a prompt, then the agent's own JSON
- * events (Claude Code's stream-json or Codex's exec --json) and any other
+ * events (Claude Code's stream-json, Codex's exec --json or OpenCode's run --format json) and any other
  * output lines, then an end.
  */
 export interface AgentEvent {
@@ -817,7 +817,7 @@ export class Sandbox {
   }
 
   /**
-   * Starts Claude Code (or Codex) on a task, with no terminal, and answers at
+   * Starts Claude Code (or Codex or OpenCode) on a task, with no terminal, and answers at
    * once. Follow it with agent.events() or agent.wait(), and continue the
    * conversation with agent.send(). With provider keys set, it needs no sign-in.
    */
@@ -861,7 +861,7 @@ export class Sandbox {
 }
 
 /**
- * Claude Code or Codex working on a task in a sandbox. Its fields are as of the
+ * Claude Code, Codex or OpenCode working on a task in a sandbox. Its fields are as of the
  * last call that returned it; refresh(), events() and wait() update them.
  */
 export class Agent {

@@ -362,14 +362,17 @@ if want agents; then
 	else
 		need_a
 		cx new --name "$P-ag" --no-use
-		for pair in "anthropic claude" "openai codex"; do
+		# OpenCode gets a small model: on its own it picks one, often the dearest.
+		for pair in "anthropic claude" "openai codex" "anthropic opencode anthropic/claude-haiku-4-5"; do
 			set -- $pair
+			model=()
+			[[ -z ${3:-} ]] || model=(--model "$3")
 			[[ " $providers " == *" $1 "* ]] || { skip "A-$2" "$2" "no $1 key"; continue; }
 			cx exec "$P-ag" -- "case $1 in anthropic) curl -s -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models -H \"x-api-key: \$ANTHROPIC_API_KEY\" -H 'anthropic-version: 2023-06-01';; openai) curl -s -o /dev/null -w '%{http_code}' https://api.openai.com/v1/models -H \"Authorization: Bearer \$OPENAI_API_KEY\";; esac"
 			ok "A1-$2" "$1 key works from a sandbox through the placeholder" is "$OUT" 200
 			cx exec "$P-ag" -- "env | grep -E '^(ANTHROPIC|OPENAI)_API_KEY=' | grep -cE '=(sk-ant-api|sk-proj-)[A-Za-z0-9_-]{40,}'"
 			ok "A2-$2" "the real $1 key is not in the sandbox" is "$OUT" 0
-			cx agents start "$P-ag" --agent "$2" "Reply with exactly the word VERIFYOK and nothing else. Do not run any tools."
+			cx agents start "$P-ag" --agent "$2" ${model[@]+"${model[@]}"} "Reply with exactly the word VERIFYOK and nothing else. Do not run any tools."
 			code=$CODE
 			cx agents "$P-ag"
 			ok "A3-$2" "agents start $2 finishes a turn with the answer" [ "$code" = 0 -a "$(field 'max_by(.updatedAt).lastMessage')" = VERIFYOK ]
@@ -379,7 +382,7 @@ if want agents; then
 			ok "A5-$2" "agents lists it" [ "$(field 'max_by(.updatedAt).agent')" = "$2" ]
 			cx agents logs "$P-ag"
 			ok "A6-$2" "agents logs prints both turns" [ "$(grep -c '"type":"end"' <<<"$OUT")" -ge 2 ]
-			cx agents start "$P-ag" --agent "$2" -d "Count from 1 to 100000 in a bash loop, printing each number, then summarize."
+			cx agents start "$P-ag" --agent "$2" ${model[@]+"${model[@]}"} -d "Count from 1 to 100000 in a bash loop, printing each number, then summarize."
 			sleep 15
 			cx agents interrupt "$P-ag"
 			ok "A7-$2" "agents interrupt stops a running turn" [ "$CODE" = 0 ]

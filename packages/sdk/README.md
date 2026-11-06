@@ -27,7 +27,7 @@ await box.stop(); // saves the disk; box.resume() picks up where it left off
 
 ## Agents
 
-`box.prompt()` starts Claude Code, or Codex, on a task with no terminal. Each
+`box.prompt()` starts Claude Code, Codex or OpenCode on a task with no terminal. Each
 message is one turn of the agent's own conversation, which lives on the
 sandbox's disk.
 
@@ -124,8 +124,8 @@ in. The key gives full control of your sandboxes; keep it on a server.
 | `box.stop()`, `box.resume({ fromBackup?, size? })`, `box.delete()` | Save and stop, start again (on another size with `size`), delete |
 | `box.refresh()` | Fetch the latest state; `box.id`, `box.name`, `box.state` and `box.info` hold it |
 | `box.settings()`, `box.updateSettings({ env?, files? })` | Environment variables and files the sandbox gets at every start; `null` removes one |
-| `cx.setKey(provider, key)`, `cx.listKeys()`, `cx.deleteKey(provider)` | AI provider keys sandboxes use without holding them (`"anthropic"`, `"openai"`) |
-| `box.prompt(prompt, { agent?, cwd?, model? })` | Start Claude Code (default) or Codex on a task; returns an `Agent` at once |
+| `cx.setKey(provider, key)`, `cx.listKeys()`, `cx.deleteKey(provider)` | AI provider keys sandboxes use without holding them (`"anthropic"`, `"openai"`, `"openrouter"`, `"google"`, `"groq"`, `"mistral"`, `"xai"`, `"deepseek"`) |
+| `box.prompt(prompt, { agent?, cwd?, model? })` | Start Claude Code (default), Codex or OpenCode on a task; returns an `Agent` at once |
 | `box.agents()`, `box.agent(id)` | The sandbox's agents, newest first; one by id |
 | `agent.events({ after?, follow? })` | Async iterator over its events; follows until the agent is idle |
 | `agent.send(prompt, { interrupt? })`, `agent.interrupt()`, `agent.wait()` | Continue, stop the running turn, wait until idle |

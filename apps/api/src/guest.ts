@@ -651,7 +651,8 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 `;
 
-// What Claude Code (as managed memory) and Codex (in ~/.codex/AGENTS.md) read
+// What Claude Code (as managed memory), Codex (in ~/.codex/AGENTS.md) and
+// OpenCode (in ~/.config/opencode/AGENTS.md) read
 // at the start of every conversation in a sandbox. @ZONE@ is the preview domain.
 const agentNote = (previews: boolean) =>
   [
@@ -704,13 +705,20 @@ fi
 note=$(jq -j --arg k "$([ -n "$zone" ] && echo note || echo noteNoPreviews)" '.[$k]' <<<"$in" | sed "s/@ZONE@/$zone/g")
 printf '%s' "$note" >/etc/claude-code/CLAUDE.md.new && chmod 644 /etc/claude-code/CLAUDE.md.new && mv /etc/claude-code/CLAUDE.md.new /etc/claude-code/CLAUDE.md
 
-# Codex's notes for every project; only the block between the marks is ours.
+# Codex's and OpenCode's notes for every project; only the block between the
+# marks is ours. OpenCode, with no settings of its own yet, gets some that
+# leave out its own free models (opencode/...): without them it picks one of
+# those, not a provider whose key the deployment holds, and runs out of free use.
 runuser -u cloudex -- env HOME=/home/cloudex NOTE="$note" bash -c '
-  f=$HOME/.codex/AGENTS.md
   begin="<!-- Cloudex: about this sandbox, rewritten at each start -->" end="<!-- Cloudex: end -->"
-  mkdir -p "$HOME/.codex" && touch "$f"
-  sed -i --follow-symlinks "/^$begin\$/,/^$end\$/d" "$f"
-  { [ -n "$(tail -c1 "$f")" ] && echo; echo "$begin"; printf "%s\n" "$NOTE"; echo "$end"; } >>"$f"' || true
+  for f in "$HOME/.codex/AGENTS.md" "$HOME/.config/opencode/AGENTS.md"; do
+    mkdir -p "$(dirname "$f")" && touch "$f"
+    sed -i --follow-symlinks "/^$begin\$/,/^$end\$/d" "$f"
+    { [ -n "$(tail -c1 "$f")" ] && echo; echo "$begin"; printf "%s\n" "$NOTE"; echo "$end"; } >>"$f"
+  done
+  c=$HOME/.config/opencode
+  [ -e "$c/opencode.json" ] || [ -e "$c/opencode.jsonc" ] || [ -e "$c/config.json" ] ||
+    printf "%s\n" "{\"\$schema\": \"https://opencode.ai/config.json\", \"disabled_providers\": [\"opencode\"]}" >"$c/opencode.json"' || true
 
 # cloudex prompt runs Claude Code with --dangerously-skip-permissions, the
 # sandbox being the boundary, so its warning about that is accepted ahead of

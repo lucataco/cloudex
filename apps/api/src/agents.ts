@@ -1,8 +1,9 @@
-// Agents through the API: Claude Code or Codex working on a task with no
-// terminal (see Agent and AgentEvent in @cloudex/schema). Each message is one
-// turn, run headless (claude -p --output-format stream-json, codex exec --json);
-// later turns resume the agent's own session. Everything lives in the sandbox,
-// in ~/.cloudex/agents/<id>, so saves, resumes and forks keep it:
+// Agents through the API: Claude Code, Codex or OpenCode working on a task with
+// no terminal (see Agent and AgentEvent in @cloudex/schema). Each message is one
+// turn, run headless (claude -p --output-format stream-json, codex exec --json,
+// opencode run --format json); later turns resume the agent's own session.
+// Everything lives in the sandbox, in ~/.cloudex/agents/<id>, so saves, resumes
+// and forks keep it:
 //
 //   meta.json     id, agent, cwd, model, createdAt
 //   state.json    turns, sessionId, lastMessage, lastExitCode, error, updatedAt,
@@ -36,7 +37,7 @@ exec bash "$f" "$@"
 
 // Run as the cloudex user from a login shell, so agents see the provider key
 // placeholders. Operations print JSON on stdout:
-//   start <id> <claude|codex> <cwd or ''> <model or ''>   prompt on stdin
+//   start <id> <claude|codex|opencode> <cwd or ''> <model or ''>   prompt on stdin
 //   send <id> <interrupt 0|1>                              prompt on stdin
 //   interrupt <id> | get <id> | list
 //   events <id> <after> <seconds to wait for one>
@@ -94,7 +95,7 @@ reconcile() {
     [ -z "$(tail -c 1 "$d/events.jsonl")" ] ||
       { head -n "$(wc -l <"$d/events.jsonl")" "$d/events.jsonl" >"$d/events.new" && mv "$d/events.new" "$d/events.jsonl"; }
     sid=$(jq -nrR --argjson turn "$cur" '[inputs | fromjson? | select(.turn == $turn and .type == "event")
-      | .event | .session_id // .thread_id // empty] | last // empty' "$d/events.jsonl")
+      | .event | .session_id // .thread_id // .sessionID // empty | select(. != "")] | last // empty' "$d/events.jsonl")
     end_turn "$cur" null true "$err"
     set_state --arg err "$err" --arg sid "$sid" --argjson at "$(now)" \
       '.sessionId = (if $sid == "" then .sessionId else $sid end) | .current = null | .lastMessage = null
@@ -140,14 +141,16 @@ wrap='select(length > 0)
 # The agent's conversation id, its final message, and its own account of a
 # failure, from one turn's events.
 summary='map(select(.type == "event") | .event) as $ev
-  | {sessionId: ([$ev[] | .session_id // .thread_id // empty] | last),
+  | {sessionId: ([$ev[] | .session_id // .thread_id // .sessionID // empty | select(. != "")] | last),
      lastMessage: ([$ev[] | if .type == "result" and .is_error != true then .result
                             elif .type == "item.completed" and .item.type == "agent_message" then .item.text
+                            elif .type == "text" then .part.text
                             else empty end] | last),
      failure: ([$ev[] | if .type == "result" and .is_error == true then (.result // .subtype)
                         elif .type == "turn.failed" then .error.message
+                        elif .type == "error" and (.error | type) == "object" then .error.message
                         else empty end] | last),
-     lastError: ([$ev[] | select(.type == "error") | .message] | last)}'
+     lastError: ([$ev[] | select(.type == "error") | .message // .error.message] | last)}'
 
 # Counts as activity for idle stop while the turn writes events.
 pinger() {
@@ -174,6 +177,14 @@ run_turn() { # turn
       [ -z "$model" ] || set -- "$@" -m "$model"
       [ -z "$sid" ] || set -- "$@" resume "$sid"
       set -- "$@" -
+      ;;
+    opencode)
+      # --standalone: its server is a child of this turn, not the shared
+      # background service, so an interrupt ends the tools it runs too. It
+      # makes the session the first turn names; ids start with ses_.
+      [ -n "$sid" ] || sid=ses_cloudex_$(jq -r '.id | gsub("-"; "_")' meta.json)
+      set -- opencode run --standalone --format json --auto --session "$sid"
+      [ -z "$model" ] || set -- "$@" --model "$model"
       ;;
   esac
   : >turn.err

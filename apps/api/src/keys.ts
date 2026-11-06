@@ -13,20 +13,40 @@ interface ProviderSpec {
   label: string;
   host: string;
   placeholder: string;
+  // Where clients look for the key in the sandbox; each gets the placeholder.
+  env: string[];
+  // A URL on the host that answers 401 (or one of badKey) to a key it refuses.
+  probe: string;
+  badKey?: number[];
   // The key a request carries, if any.
-  sent(h: Headers): string | null;
+  sent(h: Headers, url: URL): string | null;
   // Puts the real key in place of the placeholder or no key.
-  set(h: Headers, key: string): void;
+  set(h: Headers, key: string, url: URL): void;
   probeHeaders?: Record<string, string>;
 }
 
 const bearer = (h: Headers) => h.get("authorization")?.replace(/^Bearer\s+/i, "") || null;
+const setBearer = (h: Headers, key: string) => h.set("authorization", `Bearer ${key}`);
+
+// An OpenAI-style provider: the key as a bearer token.
+const openaiLike = (label: string, host: string, placeholder: string, env: string[], probe: string, badKey?: number[]): ProviderSpec => ({
+  label,
+  host,
+  placeholder,
+  env,
+  probe,
+  badKey,
+  sent: bearer,
+  set: setBearer,
+});
 
 export const PROVIDERS: Record<Provider, ProviderSpec> = {
   anthropic: {
     label: "Anthropic",
     host: "api.anthropic.com",
     placeholder: "sk-ant-cloudex-placeholder-the-real-key-is-added-on-the-way-out",
+    env: ["ANTHROPIC_API_KEY"],
+    probe: "/v1/models",
     sent: (h) => h.get("x-api-key") || bearer(h),
     set(h, key) {
       h.delete("authorization");
@@ -34,41 +54,92 @@ export const PROVIDERS: Record<Provider, ProviderSpec> = {
     },
     probeHeaders: { "anthropic-version": "2023-06-01" },
   },
-  openai: {
-    label: "OpenAI",
-    host: "api.openai.com",
-    placeholder: "sk-cloudex-placeholder-the-real-key-is-added-on-the-way-out",
-    sent: bearer,
-    set: (h, key) => h.set("authorization", `Bearer ${key}`),
+  // Codex reads CODEX_API_KEY, not OPENAI_API_KEY.
+  openai: openaiLike(
+    "OpenAI",
+    "api.openai.com",
+    "sk-cloudex-placeholder-the-real-key-is-added-on-the-way-out",
+    ["OPENAI_API_KEY", "CODEX_API_KEY"],
+    "/v1/models",
+  ),
+  // /api/v1/models answers without a key; /api/v1/key describes the key.
+  openrouter: openaiLike(
+    "OpenRouter",
+    "openrouter.ai",
+    "sk-or-cloudex-placeholder-the-real-key-is-added-on-the-way-out",
+    ["OPENROUTER_API_KEY"],
+    "/api/v1/key",
+  ),
+  // Google's clients send the key in x-goog-api-key, or the older ones as
+  // ?key=; a key it refuses gets a 400.
+  google: {
+    label: "Google",
+    host: "generativelanguage.googleapis.com",
+    placeholder: "AIza-cloudex-placeholder-the-real-key-is-added-on-the-way-out",
+    env: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
+    probe: "/v1beta/models",
+    badKey: [400, 401, 403],
+    sent: (h, url) => h.get("x-goog-api-key") || url.searchParams.get("key") || bearer(h),
+    set(h, key, url) {
+      url.searchParams.delete("key");
+      h.delete("authorization");
+      h.set("x-goog-api-key", key);
+    },
   },
+  groq: openaiLike("Groq", "api.groq.com", "gsk_cloudex_placeholder_the_real_key_is_added_on_the_way_out", ["GROQ_API_KEY"], "/openai/v1/models"),
+  mistral: openaiLike("Mistral", "api.mistral.ai", "cloudex-mistral-placeholder-the-real-key-is-added-on-the-way-out", ["MISTRAL_API_KEY"], "/v1/models"),
+  xai: openaiLike("xAI", "api.x.ai", "xai-cloudex-placeholder-the-real-key-is-added-on-the-way-out", ["XAI_API_KEY"], "/v1/models", [400, 401, 403]),
+  deepseek: openaiLike(
+    "DeepSeek",
+    "api.deepseek.com",
+    "sk-cloudex-deepseek-placeholder-the-real-key-is-added-on-the-way-out",
+    ["DEEPSEEK_API_KEY"],
+    "/models",
+  ),
 };
 
 export const providerForHost = (host: string) =>
   (Object.keys(PROVIDERS) as Provider[]).find((p) => PROVIDERS[p].host === host);
 
-// A provider that can't be reached, or answers with anything but a 401 or 403,
-// may just be down, so that doesn't count against the key.
+// NAME=placeholder for each variable of the given providers, for KEYS_SCRIPT.
+export const placeholderVars = (providers: Provider[]) =>
+  providers.flatMap((p) => PROVIDERS[p].env.map((v) => `${v}=${PROVIDERS[p].placeholder}`));
+
+// What a provider said when it refused a key: error.message, error or detail.
+function refusalText(body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const b = body as { error?: unknown; detail?: unknown; message?: unknown };
+  const e = b.error as { message?: unknown } | string | undefined;
+  for (const v of [typeof e === "object" ? e?.message : e, b.detail, b.message]) {
+    if (typeof v === "string" && v) return v;
+  }
+  return null;
+}
+
+// A provider that can't be reached, or answers with anything but one of its
+// bad-key statuses, may just be down, so that doesn't count against the key.
 export async function keyRefusal(provider: Provider, key: string): Promise<string | null> {
   const spec = PROVIDERS[provider];
+  const url = new URL(`https://${spec.host}${spec.probe}`);
   const headers = new Headers(spec.probeHeaders);
-  spec.set(headers, key);
+  spec.set(headers, key, url);
   let res: Response;
   try {
-    res = await fetch(`https://${spec.host}/v1/models`, { headers, signal: AbortSignal.timeout(8_000) });
+    res = await fetch(url, { headers, signal: AbortSignal.timeout(8_000) });
   } catch {
     return null;
   }
-  if (res.status !== 401 && res.status !== 403) {
+  if (!(spec.badKey ?? [401, 403]).includes(res.status)) {
     await res.body?.cancel();
     return null;
   }
-  const body = await res.json<{ error?: { message?: unknown } }>().catch(() => null);
-  const said = typeof body?.error?.message === "string" ? `${res.status}: ${body.error.message.slice(0, 300)}` : `HTTP ${res.status}`;
+  const said = refusalText(await res.json().catch(() => null));
+  const why = said ? `${res.status}: ${said.slice(0, 300)}` : `HTTP ${res.status}`;
   const next =
     provider === "anthropic" && key.startsWith("sk-ant-oat")
       ? "A key starting with sk-ant-oat is a Claude subscription token, which can't be used this way. Make an API key in the Anthropic Console instead."
       : "Check the key and try again.";
-  return `${spec.label} rejected that key (${said}), so it wasn't stored. ${next}`;
+  return `${spec.label} rejected that key (${why}), so it wasn't stored. ${next}`;
 }
 
 // Sealed with the admin key (seal.ts), so a copy of the D1 database alone
@@ -123,9 +194,11 @@ export async function providerKey(env: Env, provider: Provider): Promise<string 
 
 
 // Run as root after each start. $1 is the providers with keys, space-separated
-// (possibly none); $2 and $3 the Anthropic and OpenAI placeholders. Trusts the
-// platform's interception certificate, which appears once interception is on,
-// and writes the placeholders where login shells (ssh, exec, agents) see them.
+// (possibly none); $2 the Anthropic and $3 the OpenAI placeholder; the rest
+// NAME=placeholder for every variable of those providers (placeholderVars).
+// Trusts the platform's interception certificate, which appears once
+// interception is on, and writes the placeholders where login shells (ssh,
+// exec, agents) see them.
 export const KEYS_SCRIPT = String.raw`
 set -euo pipefail
 providers=" $1 "
@@ -158,8 +231,8 @@ update-ca-certificates >/dev/null 2>&1
 bundle=/etc/ssl/certs/ca-certificates.crt
 # NAME=value pairs; none has a space.
 vars="NODE_EXTRA_CA_CERTS=$bundle SSL_CERT_FILE=$bundle REQUESTS_CA_BUNDLE=$bundle"
-case $providers in *" anthropic "*) vars="$vars ANTHROPIC_API_KEY=$2" ;; esac
-case $providers in *" openai "*) vars="$vars OPENAI_API_KEY=$3 CODEX_API_KEY=$3" ;; esac
+shift 3
+vars="$vars $*"
 {
   echo "# Written by Cloudex at each start. These keys are placeholders: the real"
   echo "# ones stay outside the sandbox and are added to requests on the way out."

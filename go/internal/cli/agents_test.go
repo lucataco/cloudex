@@ -75,6 +75,21 @@ The command ran.
 	}
 }
 
+// A real log of OpenCode through the API, with Claude Haiku: a write, a shell
+// command, and a reply.
+func TestAgentPrinterReadsOpenCode(t *testing.T) {
+	want := `> Create a file hello.txt containing the word hi, run 'cat hello.txt' with your shell tool, then reply with just: done
+Write hello.txt
+$ cat hello.txt
+  hi
+done
+-- turn 1 done in 6s, $0.01
+`
+	if got := printEvents(t, "opencode", "testdata/opencode-events.jsonl"); got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestAgentPrinterDetails(t *testing.T) {
 	var out bytes.Buffer
 	p := newAgentPrinter(&out, "claude")
@@ -285,8 +300,8 @@ func TestOneLine(t *testing.T) {
 
 func TestKeysSetChecksTheProviderBeforeAskingForAKey(t *testing.T) {
 	f := withFakeAPI(t, nil)
-	code, _, errOut := run(t, "keys", "set", "gemini")
-	if code != 1 || !strings.Contains(errOut, "unknown provider gemini: use anthropic or openai") || strings.Contains(errOut, "no key") {
+	code, _, errOut := run(t, "keys", "set", "bedrock")
+	if code != 1 || !strings.Contains(errOut, "unknown provider bedrock: use anthropic, openai, openrouter, google,") || strings.Contains(errOut, "no key") {
 		t.Fatalf("code %d, stderr %q", code, errOut)
 	}
 	if len(f.requests) != 0 {

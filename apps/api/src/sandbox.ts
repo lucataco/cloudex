@@ -63,7 +63,7 @@ import { deleteSandbox, renameSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } from "./desktop";
 import { ARCHIVE_SCRIPT, FILE_BAD_REQUEST, FILE_FORBIDDEN, FILE_NOT_FOUND, FILE_SCRIPT, UNPACK_SCRIPT } from "./files";
 import { PLATFORM_FILES, PLATFORM_SCRIPT, PLATFORM_VERSION, RELAY_NOTHING, RELAY_SCRIPT, START_SCRIPT } from "./guest";
-import { KEYS_SCRIPT, PROVIDERS, listKeys } from "./keys";
+import { KEYS_SCRIPT, PROVIDERS, listKeys, placeholderVars } from "./keys";
 import {
   RESTORE_SAVE_SCRIPT,
   SAVE_SCRIPT,
@@ -782,7 +782,7 @@ export class Sandbox extends DurableObject<Env> {
       try {
         await this.runScript(
           KEYS_SCRIPT,
-          [providers.join(" "), PROVIDERS.anthropic.placeholder, PROVIDERS.openai.placeholder],
+          [providers.join(" "), PROVIDERS.anthropic.placeholder, PROVIDERS.openai.placeholder, ...placeholderVars(providers)],
           "setting up provider keys",
           60_000,
         );

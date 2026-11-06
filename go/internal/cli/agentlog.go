@@ -13,12 +13,13 @@ import (
 
 // agentPrinter turns an agent's events into lines for a person: the prompts,
 // the agent's messages, the commands it ran, the files it changed, and how
-// each turn ended. It reads Claude Code's stream-json and Codex's exec --json.
+// each turn ended. It reads Claude Code's stream-json, Codex's exec --json and
+// OpenCode's run --format json.
 type agentPrinter struct {
 	w       io.Writer
 	agent   string
 	started map[int]int64   // turn -> when its prompt was sent
-	cost    map[int]float64 // turn -> Claude Code's reported cost
+	cost    map[int]float64 // turn -> the cost Claude Code or OpenCode reported
 	shells  map[string]bool // ids of Claude Code's Bash calls, whose output is shown
 	err     error
 }
@@ -81,9 +82,12 @@ func (p *agentPrinter) print(e api.AgentEvent) error {
 	case "event":
 		var ev map[string]any
 		if json.Unmarshal(e.Event, &ev) == nil {
-			if p.agent == "codex" {
+			switch p.agent {
+			case "codex":
 				p.codex(ev)
-			} else {
+			case "opencode":
+				p.opencode(e.Turn, ev)
+			default:
 				p.claude(e.Turn, ev)
 			}
 		}
@@ -215,6 +219,51 @@ func (p *agentPrinter) codex(ev map[string]any) {
 	case kind == "error":
 		p.line("error: %s", oneLine(str(item, "message"), 200))
 	}
+}
+
+// opencode reads OpenCode's run --format json: text parts, tool calls once
+// they finish (with their input, state and output), the cost of each step, and
+// errors.
+func (p *agentPrinter) opencode(turn int, ev map[string]any) {
+	part := obj(ev, "part")
+	switch str(ev, "type") {
+	case "text":
+		if t := strings.TrimSpace(str(part, "text")); t != "" {
+			p.block("", "", t)
+		}
+	case "tool_use":
+		state := obj(part, "state")
+		in := obj(state, "input")
+		switch tool := str(part, "tool"); tool {
+		case "shell", "bash":
+			p.block("$ ", "  ", str(in, "command"))
+			p.output(str(state, "output"))
+			if code, ok := obj(obj(state, "metadata"), "metadata")["exit"].(float64); ok && code != 0 {
+				p.line("  exit %d", int(code))
+			}
+		case "todowrite", "todoread":
+		default:
+			arg := firstNonEmpty(str(in, "path"), str(in, "filePath"), str(in, "file_path"), str(in, "pattern"),
+				str(in, "url"), str(in, "query"), str(in, "description"), str(in, "prompt"))
+			p.line("%s", strings.TrimSpace(capitalize(tool)+" "+oneLine(arg, 120)))
+		}
+		if str(state, "status") == "error" {
+			p.line("  error: %s", oneLine(firstNonEmpty(str(state, "error"), str(state, "output")), 200))
+		}
+	case "step_finish":
+		if c, ok := part["cost"].(float64); ok {
+			p.cost[turn] += c
+		}
+	case "error":
+		p.line("error: %s", oneLine(firstNonEmpty(str(obj(ev, "error"), "message"), str(obj(ev, "error"), "type")), 200))
+	}
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func str(m map[string]any, key string) string {

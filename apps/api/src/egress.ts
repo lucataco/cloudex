@@ -79,7 +79,7 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
     }
     const spec = PROVIDERS[name];
     const headers = new Headers(req.headers);
-    const sent = spec.sent(headers);
+    const sent = spec.sent(headers, url);
     // Anthropic's error shape, whose error.message OpenAI's clients read too.
     // Cloudex's own refusals aren't a 401: Claude Code retries one whose message it doesn't know.
     const answer = (status: number, type: string, message: string) => Response.json({ type: "error", error: { type, message } }, { status });
@@ -94,7 +94,7 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
         return refuse(`Cloudex can't read its stored ${name} key: the deployment's admin key changed after it was set. Set it again with: cloudex keys set ${name}`);
       }
       if (key) {
-        spec.set(headers, key);
+        spec.set(headers, key, url);
         added = true;
       } else if (sent) {
         return refuse(`no ${name} key is set in Cloudex. Set one with: cloudex keys set ${name}`);

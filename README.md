@@ -60,7 +60,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex cp <from> <to>` | Copy files and directories into or out of a sandbox (`web:path`, or `:path` for the current one) |
 | `cloudex run [--from <save>] -- <command>` | Run a command in a fresh sandbox with this directory's files, copy back `--out` paths, and delete it; for CI |
 | `cloudex ssh-config >> ~/.ssh/config` | Lets `scp`, `rsync` and editors reach `<sandbox>.cloudex` |
-| `cloudex prompt [sandbox] "task"` | Start Claude Code or Codex on a task in tmux and watch it |
+| `cloudex prompt [sandbox] "task"` | Start Claude Code, Codex or OpenCode on a task in tmux and watch it |
 | `cloudex attach [sandbox]` | Reattach to the newest agent session |
 | `cloudex agents start [sandbox] "task"`, `agents`, `logs -f`, `send`, `interrupt` | Run an agent with no terminal and follow it; send follow-ups or steer it |
 | `cloudex host [sandbox] <port>`, `--revoke`, `--list`, `--revoke-all` | HTTPS link to a port, on your preview domain (servers on localhost work too); revoke links |
@@ -80,14 +80,15 @@ does that on request, and `delete` removes the backups. Backups need R2 turned
 on for the account (the free tier is enough); `cloudex deploy` says when it
 isn't, and `cloudex status` shows whether they're on.
 
-**Provider keys.** `cloudex keys set anthropic` (or `openai`) stores an API key
-in your deployment, encrypted. Sandboxes started after that get a placeholder
+**Provider keys.** `cloudex keys set anthropic` (or `openai`, `openrouter`,
+`google`, `groq`, `mistral`, `xai`, `deepseek`) stores an API key in your
+deployment, encrypted. Sandboxes started after that get a placeholder
 key, and the real one is added to their HTTPS calls to the provider as they
 leave, so it never enters a sandbox, its saves, backups or forks. Claude Code,
-Codex, the providers' SDKs and curl work as if the key were there, with no
-sign-in. `cloudex keys set` tries the key with the provider first and refuses one
+Codex, OpenCode, the providers' SDKs and curl work as if the key were there,
+with no sign-in. `cloudex keys set` tries the key with the provider first and refuses one
 it rejects. A key a sandbox brings itself is used as is. While the deployment
-holds a provider's key, Claude Code and Codex in a sandbox use it even if someone
+holds a provider's key, the agents in a sandbox use it even if someone
 signs in there with a subscription; to use a subscription instead, remove the
 key with `cloudex keys rm`. A new provider reaches a running sandbox when it next
 starts; a changed or removed key reaches it within a minute. `cloudex info`
@@ -154,7 +155,7 @@ ends the desktop and its programs.
 
 **Inside a sandbox**, `cloudex` manages that sandbox and nothing else, with no
 key: `cloudex host 3000` prints a preview link, and `info`, `set --idle` and
-`stop` work too. Claude Code and Codex in the sandbox are told about it, so an
+`stop` work too. Claude Code, Codex and OpenCode in the sandbox are told about it, so an
 agent that starts a server can hand you its link. Commands in
 `~/.cloudex/start` run at every start, to bring servers back after a resume.
 For coding agents on your own computer, [skills/cloudex](skills/cloudex/SKILL.md)
@@ -165,7 +166,7 @@ activity (30 minutes by default), and in any case within Cloudflare's 6-hour
 limit. An open `cloudex ssh` session counts, since it sends a keepalive every
 30 seconds; a connection that has gone silent doesn't. With provider keys, an
 agent's calls to its provider count too. Without them, agents need signing in
-once inside the sandbox (`cloudex ssh`, then run `claude` or `codex`); the login
+once inside the sandbox (`cloudex ssh`, then run `claude`, `codex` or `opencode`); the login
 is saved with the disk, and copied into forks.
 
 ## SDKs
@@ -173,7 +174,7 @@ is saved with the disk, and copied into forks.
 The [TypeScript SDK](packages/sdk) and the [Python SDK](python) do what the CLI
 does from code: create, fork, exec, host links, desktop, stop and resume, and
 named saves (`box.save`, `cx.startFromSave`). They also drive agents, like
-`cloudex agents`: start Claude Code or Codex on a task with no terminal, follow
+`cloudex agents`: start Claude Code, Codex or OpenCode on a task with no terminal, follow
 its events, send it follow-ups, and interrupt or steer it. The agent and its
 conversation live on the sandbox's disk, so a fork can take the same
 conversation somewhere else. The SDKs use the deployment the CLI saved, or an
@@ -193,7 +194,7 @@ const box = await new Cloudex().create({ name: "web" });
 const forks = await box.fork({ count: 10 });
 await Promise.all(forks.map((f) => f.exec("npm test")));
 
-const agent = await box.prompt("make the tests pass"); // Claude Code; { agent: "codex" } for Codex
+const agent = await box.prompt("make the tests pass"); // Claude Code; { agent: "codex" } or "opencode"
 for await (const event of agent.events()) console.log(event.type, event.event ?? event.text ?? "");
 console.log(agent.lastMessage);
 await (await agent.send("now update the docs")).wait();
@@ -213,7 +214,7 @@ sandbox names it knows of, and showing it to you. Agents get the report and a
 | Path | What |
 |---|---|
 | `apps/api` | Control plane Worker: the `/v1` API and one `Sandbox` Durable Object per sandbox, each owning one container |
-| `images/base` | The sandbox image: Ubuntu 24.04, Node, Python, Docker, sshd, tmux, Claude Code and Codex |
+| `images/base` | The sandbox image: Ubuntu 24.04, Node, Python, Docker, sshd, tmux, Claude Code, Codex and OpenCode |
 | `go/cmd/cloudex` | The `cloudex` CLI |
 | `packages/schema` | Zod models shared by the API and the SDKs, and the OpenAPI document built from them |
 | `packages/sdk` | The TypeScript SDK, [`cloudex` on npm](https://www.npmjs.com/package/cloudex) |

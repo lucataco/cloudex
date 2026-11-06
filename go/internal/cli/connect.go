@@ -276,7 +276,7 @@ func newHostCmd(opts *options) *cobra.Command {
 	return cmd
 }
 
-var agentKinds = map[string]bool{"claude": true, "codex": true}
+var agentKinds = map[string]bool{"claude": true, "codex": true, "opencode": true}
 
 func newPromptCmd(opts *options) *cobra.Command {
 	var agent string
@@ -284,18 +284,18 @@ func newPromptCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "prompt [sandbox] <task>",
 		Short: "Give a coding agent a task in a sandbox and watch it work",
-		Long: "Start Claude Code or Codex on a task in a tmux session inside the\n" +
+		Long: "Start Claude Code, Codex or OpenCode on a task in a tmux session inside the\n" +
 			"sandbox, then attach to it. Detach with Ctrl-b d; the agent keeps working and\n" +
 			"the sandbox stays up while it does. Reattach with cloudex attach.\n\n" +
 			"The agent needs a key or a login: store an API key with cloudex keys set, or\n" +
-			"sign in once (cloudex ssh, then run claude or codex), which is saved with the\n" +
+			"sign in once (cloudex ssh, then run claude, codex or opencode), which is saved with the\n" +
 			"sandbox's disk. Agents run without their own permission prompts; the sandbox\n" +
 			"is the boundary.",
 		Example: "  cloudex prompt \"make the tests pass\"\n  cloudex prompt my-box --agent codex \"add a dark mode\"",
 		Args:    taskArgs(2, "task"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !agentKinds[agent] {
-				return fmt.Errorf("unknown agent %q: use claude or codex", agent)
+				return fmt.Errorf("unknown agent %q: use claude, codex or opencode", agent)
 			}
 			named := ""
 			if len(args) == 2 {
@@ -315,7 +315,7 @@ func newPromptCmd(opts *options) *cobra.Command {
 			return unquoted(sshRun(cmd, opts, named, !detach, remote), args)
 		},
 	}
-	cmd.Flags().StringVar(&agent, "agent", "claude", "claude or codex")
+	cmd.Flags().StringVar(&agent, "agent", "claude", "claude, codex or opencode")
 	cmd.Flags().BoolVarP(&detach, "detach", "d", false, "start the agent without attaching")
 	return cmd
 }

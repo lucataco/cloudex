@@ -27,8 +27,8 @@ func newAgentsCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agents [sandbox]",
 		Short: "Run coding agents in a sandbox without a terminal, and follow them",
-		Long: "Agents that work without a terminal, as the SDKs start them: Claude Code or\n" +
-			"Codex takes a task, then any follow-up messages, one turn each. Their logs\n" +
+		Long: "Agents that work without a terminal, as the SDKs start them: Claude Code,\n" +
+			"Codex or OpenCode takes a task, then any follow-up messages, one turn each. Their logs\n" +
 			"live in the sandbox, so they survive stops, resumes and forks. With no\n" +
 			"subcommand, lists a sandbox's agents.\n\n" +
 			"Commands that take an agent use the most recently active one when it's left out.\n" +
@@ -86,18 +86,20 @@ func newAgentsStartCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "start [sandbox] <task>",
 		Short: "Start an agent on a task and follow it",
-		Long: "Start Claude Code or Codex on a task, then print what it does until it\n" +
+		Long: "Start Claude Code, Codex or OpenCode on a task, then print what it does until it\n" +
 			"finishes. Ctrl-C stops following; the agent keeps working. A task of -\n" +
 			"is read from standard input.\n\n" +
 			"The agent needs a key or a login: store an API key with cloudex keys set, or\n" +
 			"sign in once in the sandbox. Agents run without their own permission prompts;\n" +
 			"the sandbox is the boundary.",
 		Example: "  cloudex agents start \"make the tests pass\"\n" +
-			"  cloudex agents start web --agent codex --cwd app \"add a dark mode\"\n  cloudex agents start -d - < task.md",
+			"  cloudex agents start web --agent codex --cwd app \"add a dark mode\"\n" +
+			"  cloudex agents start --agent opencode --model anthropic/claude-sonnet-5-5 \"fix the flaky test\"\n" +
+			"  cloudex agents start -d - < task.md",
 		Args: taskArgs(2, "task"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !agentKinds[agent] {
-				return fmt.Errorf("unknown agent %q: use claude or codex", agent)
+				return fmt.Errorf("unknown agent %q: use claude, codex or opencode", agent)
 			}
 			task, err := readPrompt(cmd, args[len(args)-1])
 			if err != nil {
@@ -126,8 +128,8 @@ func newAgentsStartCmd(opts *options) *cobra.Command {
 			return followAgent(cmd, opts, client, r, a, 0)
 		},
 	}
-	cmd.Flags().StringVar(&agent, "agent", "claude", "claude or codex")
-	cmd.Flags().StringVar(&model, "model", "", "the agent's model, such as opus or gpt-5 (default: the agent's own)")
+	cmd.Flags().StringVar(&agent, "agent", "claude", "claude, codex or opencode")
+	cmd.Flags().StringVar(&model, "model", "", "the agent's model, such as opus, gpt-5 or, for OpenCode, provider/model (default: the agent's own)")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "directory to work in (default: the home directory)")
 	cmd.Flags().BoolVarP(&detach, "detach", "d", false, "start the agent and print its id without following it")
 	return cmd

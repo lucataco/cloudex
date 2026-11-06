@@ -169,7 +169,7 @@ class Desktop:
 
 @dataclass(frozen=True)
 class ProviderKey:
-    provider: str  # anthropic or openai
+    provider: str  # anthropic, openai, openrouter, google, groq, mistral, xai or deepseek
     hint: str  # the key's last 4 characters; the key itself is never returned
     updated_at: int  # milliseconds since the epoch
 
@@ -350,7 +350,7 @@ class Cloudex:
         return [_provider_key(k) for k in self._call("GET", "/v1/keys")]
 
     def set_key(self, provider: str, key: str) -> ProviderKey:
-        """Sets a provider's key ("anthropic" or "openai").
+        """Sets a provider's key: "anthropic", "openai", "openrouter", "google", "groq", "mistral", "xai" or "deepseek".
 
         Sandboxes started from then on get a placeholder, and the real key is
         added to their HTTPS calls to the provider on the way out, so it never
@@ -869,7 +869,7 @@ class Sandbox:
         cwd: Optional[str] = None,
         model: Optional[str] = None,
     ) -> "Agent":
-        """Starts Claude Code (or agent="codex") on a task, with no terminal, and returns at once.
+        """Starts Claude Code (or agent="codex" or "opencode") on a task, with no terminal, and returns at once.
 
         Follow it with events() or wait(), and continue the conversation with
         send(). cwd defaults to the home directory, model to the agent's own.
@@ -889,7 +889,7 @@ class Sandbox:
 
 
 class Agent:
-    """Claude Code or Codex working on a task in a sandbox.
+    """Claude Code, Codex or OpenCode working on a task in a sandbox.
 
     Its fields are as of the last call that returned it; refresh(), events()
     and wait() update them. info holds everything the API reports.

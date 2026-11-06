@@ -5,7 +5,7 @@ description: Run code, servers and coding agents in Cloudex sandboxes, Ubuntu ma
 
 # Cloudex
 
-`cloudex` drives sandboxes: Ubuntu 24.04 machines with sudo, Docker, Node, Python, git, `gh`, Claude Code and Codex, running in the user's Cloudflare account. Commands print JSON when their output isn't a terminal, so read the JSON; `exec`, `cp` and `run` print the command's own output instead. `cloudex <command> --help` lists every flag.
+`cloudex` drives sandboxes: Ubuntu 24.04 machines with sudo, Docker, Node, Python, git, `gh`, Claude Code, Codex and OpenCode, running in the user's Cloudflare account. Commands print JSON when their output isn't a terminal, so read the JSON; `exec`, `cp` and `run` print the command's own output instead. `cloudex <command> --help` lists every flag.
 
 ## Sandboxes
 
@@ -29,7 +29,7 @@ description: Run code, servers and coding agents in Cloudex sandboxes, Ubuntu ma
 
 ## Agents in a sandbox
 
-- `cloudex agents start <sandbox> "<task>"` starts Claude Code there (`--agent codex` for Codex) with no terminal. On a terminal it prints what the agent does until the turn ends. Without one it prints a raw JSON event per line, tool output included, so use `cloudex agents start -d <sandbox> "<task>"`, which returns at once, and then `cloudex agents logs <sandbox> --json=false` to read what it did (`-f` waits until the turn ends).
+- `cloudex agents start <sandbox> "<task>"` starts Claude Code there (`--agent codex` for Codex, `--agent opencode --model provider/model` for OpenCode) with no terminal. On a terminal it prints what the agent does until the turn ends. Without one it prints a raw JSON event per line, tool output included, so use `cloudex agents start -d <sandbox> "<task>"`, which returns at once, and then `cloudex agents logs <sandbox> --json=false` to read what it did (`-f` waits until the turn ends).
 - `cloudex agents logs <sandbox> -f` follows the most recently active agent, `cloudex agents send <sandbox> "<message>"` continues its conversation, and `cloudex agents interrupt <sandbox>` stops its turn.
 - If an agent fails to sign in or authenticate, ask the user to run `cloudex keys set anthropic` (or `openai`). The key is stored outside the sandbox, and sandboxes started afterwards use it; one that is already running needs `cloudex stop` and `cloudex resume` to pick up a first key for that provider.
 - Inside a sandbox, `cloudex` manages only that sandbox: `cloudex host <port>`, `cloudex info`, `cloudex set --idle <time>` and `cloudex stop`.

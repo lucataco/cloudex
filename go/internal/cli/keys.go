@@ -12,27 +12,42 @@ import (
 	"golang.org/x/term"
 )
 
-// The environment variable each provider's key usually lives in on this computer.
-var providerEnv = map[string]string{"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+// The providers, in the order help lists them, and the environment variable
+// each one's key usually lives in on this computer.
+var providerNames = []string{"anthropic", "openai", "openrouter", "google", "groq", "mistral", "xai", "deepseek"}
+
+var providerEnv = map[string]string{
+	"anthropic":  "ANTHROPIC_API_KEY",
+	"openai":     "OPENAI_API_KEY",
+	"openrouter": "OPENROUTER_API_KEY",
+	"google":     "GEMINI_API_KEY",
+	"groq":       "GROQ_API_KEY",
+	"mistral":    "MISTRAL_API_KEY",
+	"xai":        "XAI_API_KEY",
+	"deepseek":   "DEEPSEEK_API_KEY",
+}
+
+var providerList = strings.Join(providerNames[:len(providerNames)-1], ", ") + " or " + providerNames[len(providerNames)-1]
 
 func newKeysCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "keys",
 		Short: "Give sandboxes AI provider keys without putting the keys in them",
-		Long: "Store an Anthropic or OpenAI API key in your deployment. Sandboxes started after\n" +
-			"that get a placeholder key, and the real one is added to their HTTPS calls to\n" +
-			"the provider as they leave, so it never enters a sandbox, its saves, backups or\n" +
-			"forks. Claude Code, Codex, the providers' SDKs and curl work as if the key were\n" +
-			"there. A key a sandbox brings itself is used as is. While a provider's key is\n" +
-			"stored here, Claude Code and Codex in a sandbox use it even if someone signs in\n" +
-			"there with a subscription; to use a subscription instead, remove the key with\n" +
-			"cloudex keys rm.\n\n" +
+		Long: "Store an AI provider's API key in your deployment: " + providerList + ".\n" +
+			"Sandboxes started after that get a placeholder key, and the real one is added to\n" +
+			"their HTTPS calls to the provider as they leave, so it never enters a sandbox, its\n" +
+			"saves, backups or forks. Claude Code, Codex, OpenCode, the providers' SDKs and curl\n" +
+			"work as if the key were there. A key a sandbox brings itself is used as is.\n" +
+			"While a provider's key is stored here, the agents in a sandbox use it even if\n" +
+			"someone signs in there with a subscription; to use a subscription instead,\n" +
+			"remove the key with cloudex keys rm.\n\n" +
 			"A new provider reaches a running sandbox when it next starts (stop it, then\n" +
 			"resume it, to start it now); a changed key reaches it within a minute. With no\n" +
 			"subcommand, lists the keys.",
-		Example: "  cloudex keys set anthropic\n  cloudex keys set openai --from-env\n  cloudex keys\n  cloudex keys rm openai",
-		Args:    cobra.NoArgs,
-		RunE:    func(cmd *cobra.Command, _ []string) error { return listKeys(cmd, opts) },
+		Example: "  cloudex keys set anthropic\n  cloudex keys set openai --from-env\n  cloudex keys set openrouter < key.txt\n" +
+			"  cloudex keys\n  cloudex keys rm openai",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return listKeys(cmd, opts) },
 	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "list",
@@ -43,16 +58,17 @@ func newKeysCmd(opts *options) *cobra.Command {
 
 	var fromEnv bool
 	set := &cobra.Command{
-		Use:   "set <anthropic|openai>",
+		Use:   "set <provider>",
 		Short: "Store a provider's key",
-		Long: "Store a provider's API key. It's read from a hidden prompt, from standard input\n" +
-			"when piped, or with --from-env from $ANTHROPIC_API_KEY or $OPENAI_API_KEY.\n" +
+		Long: "Store a provider's API key: " + providerList + ". It's read from a hidden\n" +
+			"prompt, from standard input when piped, or with --from-env from the provider's\n" +
+			"usual variable, such as $ANTHROPIC_API_KEY, $OPENROUTER_API_KEY or, for Google, $GEMINI_API_KEY.\n" +
 			"The provider is asked whether it accepts the key first, and a key it rejects isn't stored.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			provider := args[0]
 			if _, ok := providerEnv[provider]; !ok {
-				return fmt.Errorf("unknown provider %s: use anthropic or openai", provider)
+				return fmt.Errorf("unknown provider %s: use %s", provider, providerList)
 			}
 			key, err := providerKey(cmd, provider, fromEnv)
 			if err != nil {
@@ -75,11 +91,11 @@ func newKeysCmd(opts *options) *cobra.Command {
 			return nil
 		},
 	}
-	set.Flags().BoolVar(&fromEnv, "from-env", false, "read the key from $ANTHROPIC_API_KEY or $OPENAI_API_KEY")
+	set.Flags().BoolVar(&fromEnv, "from-env", false, "read the key from the provider's usual variable, such as $ANTHROPIC_API_KEY")
 	cmd.AddCommand(set)
 
 	cmd.AddCommand(&cobra.Command{
-		Use:     "rm <anthropic|openai>",
+		Use:     "rm <provider>",
 		Aliases: []string{"delete"},
 		Short:   "Remove a provider's key",
 		Args:    cobra.ExactArgs(1),
