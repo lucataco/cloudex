@@ -39,8 +39,18 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
 # login survives stop and resume. They can't update themselves (the npm prefix
 # is root's), so Claude Code's updater is off rather than failing on every start.
 RUN npm install -g @anthropic-ai/claude-code@2.1.318 @openai/codex@0.166.0 && npm cache clean --force \
-  && echo DISABLE_AUTOUPDATER=1 >> /etc/environment \
-  && echo 'export DISABLE_AUTOUPDATER=1' > /etc/profile.d/cloudex-agents.sh
+  && printf 'DISABLE_AUTOUPDATER=1\nOPENCODE_DISABLE_AUTOUPDATE=1\n' >> /etc/environment \
+  && printf 'export DISABLE_AUTOUPDATER=1 OPENCODE_DISABLE_AUTOUPDATE=1\n' > /etc/profile.d/cloudex-agents.sh
+
+# OpenCode from its release, checked against the release's digest: the npm
+# package installs the binary in a postinstall script, which is how it failed
+# in this image before.
+ARG OPENCODE_VERSION=2.2.5
+ARG OPENCODE_SHA256=09f44302c10fd036912f59c81fd1aef5df45dd06f649197f9dfc9bbe2a79614e
+RUN curl -fsSL -o /tmp/opencode.tgz "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
+  && echo "${OPENCODE_SHA256}  /tmp/opencode.tgz" | sha256sum -c - \
+  && tar xzf /tmp/opencode.tgz -C /usr/local/bin opencode && chmod 755 /usr/local/bin/opencode && rm /tmp/opencode.tgz \
+  && opencode --version
 
 # The sandbox user is uid 1000 (the API execs as 1000:1000), so drop the
 # image's stock ubuntu user, which holds that id. sshd ends sessions whose
