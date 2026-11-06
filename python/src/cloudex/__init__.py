@@ -52,7 +52,7 @@ __all__ = [
     "Save",
     "Settings",
 ]
-__version__ = "0.1.17"
+__version__ = "0.1.18"
 
 
 class CloudexError(Exception):
