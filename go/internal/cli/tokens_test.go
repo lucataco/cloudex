@@ -32,7 +32,7 @@ func TestLoginWithoutAKeySignsInWithACode(t *testing.T) {
 			}
 			w.Write([]byte(`{"access_token":"cx_aaaaaaaa_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","token_type":"Bearer","token":{"id":"tk-aaaaaaaa","name":"ci box","kind":"token","role":"user","ownOnly":false,"createdAt":1,"createdBy":"admin","expiresAt":null,"lastUsedAt":null}}`))
 		case "GET /v1/health":
-			w.Write([]byte(`{"ok":true,"version":"0.1.19","previewZone":null}`))
+			w.Write([]byte(`{"ok":true,"version":"0.2.0","previewZone":null}`))
 		case "GET /v1/sandboxes":
 			if r.Header.Get("Authorization") != "Bearer cx_aaaaaaaa_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 				w.WriteHeader(401)

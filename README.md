@@ -5,9 +5,11 @@ is a Linux machine with a shell, Docker, SSH and coding agents. Stopping saves i
 disk; resuming brings it back. You pay Cloudflare directly; there is no Cloudex
 service in between. Site: [cloudex.build](https://cloudex.build).
 
-**Status: v0.1.17 is the long-term-support release of v0.1.** It gets bug fixes
-while v0.2 is built, and v0.1 commands, API routes and SDK calls won't change in
-a breaking way.
+**Status: v0.2.0** adds OpenCode, keys for six more AI providers, and access
+tokens with sign-in by code; a web dashboard comes in v0.2.1. v0.1 commands, API
+routes and SDK calls still work unchanged. v0.1.17 stays the long-term-support
+release of v0.1 and gets bug fixes as v0.1.x releases from the `lts-v0.1.17`
+branch.
 
 ## What you need
 
