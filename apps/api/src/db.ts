@@ -79,12 +79,40 @@ const SCHEMA = [
     grant_expires_in INTEGER,
     granted_by TEXT
   )`,
+  // One-time dashboard sign-in links (POST /v1/auth/links): the code's
+  // SHA-256, and the session it makes. They last 60 seconds.
+  `CREATE TABLE IF NOT EXISTS login_links (
+    hash TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    own_only INTEGER NOT NULL,
+    parent TEXT,
+    created_by TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  )`,
 ];
+
+// Changes to tables made by an earlier version, each run once per isolate. A
+// column that's already there is fine.
+const MIGRATIONS = [
+  // v0.2.1: the token a dashboard session acts for.
+  "ALTER TABLE tokens ADD COLUMN parent TEXT",
+];
+
+async function migrate(db: D1Database) {
+  await db.batch(SCHEMA.map((s) => db.prepare(s)));
+  for (const m of MIGRATIONS) {
+    try {
+      await db.prepare(m).run();
+    } catch (e) {
+      if (!/duplicate column/i.test(String(e))) throw e;
+    }
+  }
+}
 
 // Created on first use so a fresh deployment needs no migration step.
 let ready: Promise<unknown> | undefined;
 export function ensureSchema(db: D1Database) {
-  ready ??= db.batch(SCHEMA.map((s) => db.prepare(s))).catch((e) => {
+  ready ??= migrate(db).catch((e) => {
     ready = undefined;
     throw e;
   });

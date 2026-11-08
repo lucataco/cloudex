@@ -12,6 +12,8 @@
 // image can have a desktop without being rebuilt.
 
 export const DESKTOP_PORT = 6080;
+// The VNC server itself, which the dashboard's own noVNC reaches through the relay.
+export const VNC_PORT = 5901;
 
 // noVNC options: scale the remote screen into the window, and favour bandwidth
 // over photo quality (text is sent losslessly anyway). Measured in spikes/RESULTS.md (S5).

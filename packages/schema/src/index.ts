@@ -473,6 +473,9 @@ export const Token = z.object({
   createdBy: z.string(), // "admin", or the id of the token that made it
   expiresAt: z.number().int().nullable(),
   lastUsedAt: z.number().int().nullable(), // to the minute
+  // A session made from a token acts for it: it reaches that token's own
+  // sandboxes, and goes when the token is revoked or expires. Null otherwise.
+  parent: z.string().nullable().default(null),
 });
 export type Token = z.infer<typeof Token>;
 
@@ -541,3 +544,30 @@ export type DeviceApprove = z.input<typeof DeviceApprove>;
 
 export const DeviceDeny = z.object({ user_code: z.string().min(1).max(20) });
 export type DeviceDeny = z.input<typeof DeviceDeny>;
+
+// Dashboard sign-in. A one-time link (cloudex dashboard) is good for 60 s and
+// signs a browser in with the caller's own role; path is where it opens.
+export const CreateLoginLink = z.object({
+  path: z
+    .string()
+    .max(200)
+    .regex(/^\/[A-Za-z0-9._~\/-]*$/, "a path on the dashboard, such as /s/web")
+    .default("/"),
+});
+export type CreateLoginLink = z.input<typeof CreateLoginLink>;
+
+export const LoginLink = z.object({
+  url: z.string(),
+  expiresIn: z.number().int(),
+});
+export type LoginLink = z.infer<typeof LoginLink>;
+
+// What the login page trades for a session cookie: a login link's code, a
+// token or the admin key pasted in, or the device code of a sign-in someone
+// approved. Sessions last 30 days from their last use.
+export const StartSession = z.union([
+  z.object({ link: z.string().min(1).max(200) }),
+  z.object({ token: z.string().min(1).max(500) }),
+  z.object({ device_code: z.string().min(1).max(200) }),
+]);
+export type StartSession = z.input<typeof StartSession>;

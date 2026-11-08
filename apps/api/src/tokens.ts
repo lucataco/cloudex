@@ -14,9 +14,14 @@ import { ensureSchema } from "./db";
 import { type Need, ruleFor } from "./rules";
 import { fail, sameSecret } from "./util";
 
+// renewed: a session whose 30 days just started again, whose cookie the
+// answer sets again.
 export type Who =
   | { kind: "admin" }
-  | { kind: "token"; token: Token };
+  | { kind: "token"; token: Token; renewed?: boolean };
+
+// Dashboard sessions last this long from their last use.
+export const SESSION_TTL_SEC = 30 * 86_400;
 
 const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";
 
@@ -43,6 +48,7 @@ type Row = {
   created_by: string;
   expires_at: number | null;
   last_used_at: number | null;
+  parent: string | null;
 };
 
 const fromRow = (r: Row): Token => ({
@@ -55,11 +61,16 @@ const fromRow = (r: Row): Token => ({
   createdBy: r.created_by,
   expiresAt: r.expires_at,
   lastUsedAt: r.last_used_at,
+  parent: r.parent ?? null,
 });
+
+// Whose sandboxes an ownOnly caller reaches: its own, or for a session made
+// from a token, that token's.
+export const ownerKey = (t: Token) => t.parent ?? t.id;
 
 export async function createToken(
   db: D1Database,
-  t: { name: string; kind?: Token["kind"]; role: Role; ownOnly: boolean; expiresInSec?: number; createdBy: string },
+  t: { name: string; kind?: Token["kind"]; role: Role; ownOnly: boolean; expiresInSec?: number; createdBy: string; parent?: string | null },
 ): Promise<Token & { secret: string }> {
   await ensureSchema(db);
   const short = random32(8);
@@ -76,28 +87,37 @@ export async function createToken(
     createdBy: t.createdBy,
     expiresAt: t.expiresInSec ? now + t.expiresInSec * 1000 : null,
     lastUsedAt: null,
+    parent: t.parent ?? null,
   };
   await db
     .prepare(
-      `INSERT INTO tokens (id, name, kind, role, own_only, hash, created_at, created_by, expires_at, last_used_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+      `INSERT INTO tokens (id, name, kind, role, own_only, hash, created_at, created_by, expires_at, last_used_at, parent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
     )
-    .bind(token.id, token.name, token.kind, token.role, token.ownOnly ? 1 : 0, await sha256(secret), now, token.createdBy, token.expiresAt)
+    .bind(token.id, token.name, token.kind, token.role, token.ownOnly ? 1 : 0, await sha256(secret), now, token.createdBy, token.expiresAt, token.parent)
     .run();
   return { ...token, secret };
 }
 
 export async function listTokens(db: D1Database): Promise<Token[]> {
   await ensureSchema(db);
-  // Expired ones go when listed.
-  await db.prepare("DELETE FROM tokens WHERE expires_at IS NOT NULL AND expires_at < ?").bind(Date.now()).run();
+  // Expired ones go when listed, and the sessions of tokens that went.
+  await db.batch([
+    db.prepare("DELETE FROM tokens WHERE expires_at IS NOT NULL AND expires_at < ?").bind(Date.now()),
+    db.prepare("DELETE FROM tokens WHERE parent IS NOT NULL AND parent NOT IN (SELECT id FROM tokens)"),
+  ]);
   const { results } = await db.prepare("SELECT * FROM tokens ORDER BY created_at DESC").all<Row>();
   return results.map(fromRow);
 }
 
 export async function revokeToken(db: D1Database, id: string): Promise<Token | null> {
   await ensureSchema(db);
-  const row = await db.prepare("DELETE FROM tokens WHERE id = ? RETURNING *").bind(id).first<Row>();
+  // A token's dashboard sessions go with it.
+  const [gone] = await db.batch<Row>([
+    db.prepare("DELETE FROM tokens WHERE id = ? RETURNING *").bind(id),
+    db.prepare("DELETE FROM tokens WHERE parent = ?").bind(id),
+  ]);
+  const row = gone?.results[0];
   return row ? fromRow(row) : null;
 }
 
@@ -106,21 +126,42 @@ export async function revokeToken(db: D1Database, id: string): Promise<Token | n
 export async function authenticate(env: Env, header: string, ctx?: { waitUntil(p: Promise<unknown>): void }): Promise<Who | null> {
   const given = /^Bearer\s+(\S+)$/i.exec(header)?.[1];
   if (!given) return null;
+  return authenticateSecret(env, given, ctx);
+}
+
+// The same for a secret on its own: the bearer's, or a session cookie's.
+export async function authenticateSecret(env: Env, given: string, ctx?: { waitUntil(p: Promise<unknown>): void }): Promise<Who | null> {
   if (env.ADMIN_KEY && (await sameSecret(given, env.ADMIN_KEY))) return { kind: "admin" };
   const m = SECRET.exec(given);
   if (!m) return null;
   await ensureSchema(env.DB);
-  const row = await env.DB.prepare("SELECT * FROM tokens WHERE id = ?").bind(`tk-${m[1]}`).first<Row>();
+  // A session made from a token needs the token too: it ends when the token does.
+  const row = await env.DB.prepare(
+    `SELECT t.*, p.id AS parent_found, p.expires_at AS parent_expires_at
+       FROM tokens t LEFT JOIN tokens p ON p.id = t.parent WHERE t.id = ?`,
+  )
+    .bind(`tk-${m[1]}`)
+    .first<Row & { parent_found: string | null; parent_expires_at: number | null }>();
   if (!row || !(await sameSecret(await sha256(given), row.hash))) return null;
   const now = Date.now();
   if (row.expires_at !== null && row.expires_at < now) return null;
+  if (row.parent !== null && (row.parent_found === null || (row.parent_expires_at !== null && row.parent_expires_at < now))) return null;
+  let renewed = false;
   if (row.last_used_at === null || now - row.last_used_at > 60_000) {
-    const p = env.DB.prepare("UPDATE tokens SET last_used_at = ? WHERE id = ?").bind(now, row.id).run();
+    // A session's 30 days start again, but never past its token's end.
+    let expires = row.expires_at;
+    if (row.kind === "session") {
+      expires = now + SESSION_TTL_SEC * 1000;
+      if (row.parent_expires_at !== null) expires = Math.min(expires, row.parent_expires_at);
+      renewed = true;
+    }
+    const p = env.DB.prepare("UPDATE tokens SET last_used_at = ?, expires_at = ? WHERE id = ?").bind(now, expires, row.id).run();
     if (ctx) ctx.waitUntil(p.catch(() => {}));
     else await p;
     row.last_used_at = now;
+    row.expires_at = expires;
   }
-  return { kind: "token", token: fromRow(row) };
+  return { kind: "token", token: fromRow(row), renewed };
 }
 
 export const me = (who: Who): Me =>
@@ -135,7 +176,7 @@ export async function ownerOf(db: D1Database, id: string): Promise<string | null
 export async function setOwner(db: D1Database, id: string, who: Who) {
   if (who.kind !== "token") return;
   await ensureSchema(db);
-  await db.prepare("INSERT OR REPLACE INTO sandbox_owners (id, owner) VALUES (?, ?)").bind(id, who.token.id).run();
+  await db.prepare("INSERT OR REPLACE INTO sandbox_owners (id, owner) VALUES (?, ?)").bind(id, ownerKey(who.token)).run();
 }
 
 const RANK: Record<Role, number> = { read: 1, user: 2, admin: 3 };
@@ -165,7 +206,7 @@ export async function authorize(
   if (rule.ref) {
     const ref = decodeURIComponent(rule.ref);
     const id = await resolveId(ref);
-    if (!id || (await ownerOf(env.DB, id)) !== t.id) fail(404, `no sandbox named ${ref}`);
+    if (!id || (await ownerOf(env.DB, id)) !== ownerKey(t)) fail(404, `no sandbox named ${ref}`);
   }
 }
 
@@ -291,7 +332,7 @@ export async function decideDevice(
 
 // What the device gets when it asks: RFC 8628's error codes until there's a
 // decision, then the token, once.
-export async function pollDevice(db: D1Database, deviceCode: string) {
+export async function pollDevice(db: D1Database, deviceCode: string, session?: { name: string }) {
   await ensureSchema(db);
   const hash = await sha256(deviceCode);
   const row = await db.prepare("SELECT * FROM device_requests WHERE device_hash = ?").bind(hash).first<DeviceRow>();
@@ -313,11 +354,67 @@ export async function pollDevice(db: D1Database, deviceCode: string) {
   const gone = await db.prepare("DELETE FROM device_requests WHERE device_hash = ? AND status = 'approved'").bind(hash).run();
   if (gone.meta.changes === 0) return { error: "expired_token" as const };
   const token = await createToken(db, {
-    name: row.name,
+    name: session?.name ?? row.name,
+    kind: session ? "session" : "token",
     role: row.grant_role ?? "user",
     ownOnly: row.grant_own_only === 1,
-    expiresInSec: row.grant_expires_in ?? undefined,
+    // A session lasts 30 days from its last use, whatever the approval said.
+    expiresInSec: session ? SESSION_TTL_SEC : (row.grant_expires_in ?? undefined),
     createdBy: row.granted_by ?? "admin",
   });
   return { token };
+}
+
+// Dashboard sessions. A session gets the role of whoever signs it in, never
+// more; one signed in with a token acts for that token (parent), so it reaches
+// the same own sandboxes and ends when the token does.
+export async function startSession(db: D1Database, from: Who, name: string) {
+  const t = from.kind === "token" ? from.token : null;
+  return createToken(db, {
+    name,
+    kind: "session",
+    role: t?.role ?? "admin",
+    ownOnly: t?.ownOnly ?? false,
+    expiresInSec: SESSION_TTL_SEC,
+    createdBy: t ? t.id : "admin",
+    parent: t ? (t.kind === "session" ? t.parent : t.id) : null,
+  });
+}
+
+// One-time links, made by cloudex dashboard: the code goes in the link's
+// fragment, so it isn't in any server's logs, and the login page trades it.
+const LINK_TTL = 60_000;
+
+export async function createLoginLink(db: D1Database, who: Who) {
+  await ensureSchema(db);
+  const now = Date.now();
+  await db.prepare("DELETE FROM login_links WHERE expires_at < ?").bind(now).run();
+  const code = random32(32);
+  const t = who.kind === "token" ? who.token : null;
+  await db
+    .prepare("INSERT INTO login_links (hash, role, own_only, parent, created_by, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(await sha256(code), t?.role ?? "admin", t?.ownOnly ? 1 : 0, t ? (t.kind === "session" ? t.parent : t.id) : null, t ? t.id : "admin", now + LINK_TTL)
+    .run();
+  return { code, expiresIn: LINK_TTL / 1000 };
+}
+
+// The session a link's code makes, once; null for a code that's used, expired
+// or made up.
+export async function useLoginLink(db: D1Database, code: string, name: string) {
+  await ensureSchema(db);
+  const row = await db
+    .prepare("DELETE FROM login_links WHERE hash = ? RETURNING *")
+    .bind(await sha256(code))
+    .first<{ role: Role; own_only: number; parent: string | null; created_by: string; expires_at: number }>();
+  if (!row || row.expires_at < Date.now()) return null;
+  if (row.parent && !(await db.prepare("SELECT id FROM tokens WHERE id = ?").bind(row.parent).first())) return null;
+  return createToken(db, {
+    name,
+    kind: "session",
+    role: row.role,
+    ownOnly: row.own_only === 1,
+    expiresInSec: SESSION_TTL_SEC,
+    createdBy: row.created_by,
+    parent: row.parent,
+  });
 }

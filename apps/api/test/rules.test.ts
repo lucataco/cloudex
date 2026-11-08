@@ -7,7 +7,7 @@ import test from "node:test";
 import { openapi } from "@cloudex/schema/openapi";
 import { RULES, ruleFor } from "../src/rules.ts";
 
-const PUBLIC = new Set(["health", "openapi", "startDeviceLogin", "pollDeviceLogin"]);
+const PUBLIC = new Set(["health", "openapi", "startDeviceLogin", "pollDeviceLogin", "startSession", "endSession"]);
 const ADMIN_ONLY = new Set([
   "listKeys",
   "setKey",
@@ -57,4 +57,7 @@ test("reading routes never need more than read, and :ref is captured", () => {
   assert.equal(ruleFor("GET", "/v1/tokens").need, "admin");
   assert.equal(ruleFor("GET", "/v1/sandboxes/web/nothing-here").need, "admin");
   assert.equal(ruleFor("HEAD", "/v1/saves").need, "read");
+  assert.deepEqual(ruleFor("GET", "/v1/sandboxes/web/terminal"), { need: "write", notOwnOnly: false, ref: "web" });
+  assert.equal(ruleFor("GET", "/v1/sandboxes/web/desktop/vnc").need, "write");
+  assert.equal(ruleFor("POST", "/v1/auth/links").need, "any");
 });

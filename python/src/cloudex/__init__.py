@@ -196,6 +196,8 @@ class Token:
     expires_at: Optional[int]
     last_used_at: Optional[int]  # to the minute
     secret: Optional[str] = None
+    # A session made from a token acts for that token, and ends with it.
+    parent: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -519,6 +521,7 @@ def _token(t: Dict[str, Any]) -> Token:
         expires_at=t.get("expiresAt"),
         last_used_at=t.get("lastUsedAt"),
         secret=t.get("secret"),
+        parent=t.get("parent"),
     )
 
 

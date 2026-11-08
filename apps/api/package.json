@@ -6,7 +6,9 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
+    "predev": "pnpm --filter @cloudex/dashboard build",
     "dev": "wrangler dev",
+    "predeploy": "pnpm --filter @cloudex/dashboard build",
     "deploy": "wrangler deploy",
     "types": "wrangler types",
     "typecheck": "tsc -p .",

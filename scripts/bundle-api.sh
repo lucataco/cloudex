@@ -9,6 +9,9 @@ out="$root/go/internal/deploy/assets"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# The dashboard first: the API embeds its files (apps/api/src/dashboard.ts).
+(cd "$root/apps/dashboard" && node build.mjs >/dev/null)
+
 cd "$root/apps/api"
 # --containers-rollout none skips building the image; deploy copies a published one.
 pnpm exec wrangler deploy --dry-run --minify --containers-rollout none --outdir "$tmp" \

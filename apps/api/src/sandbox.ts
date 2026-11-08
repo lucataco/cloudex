@@ -60,7 +60,7 @@ import {
 import { AGENT_BAD_REQUEST, AGENT_BOOT, AGENT_NOT_FOUND, AGENT_SCRIPT } from "./agents";
 import { COMMAND_BAD_REQUEST, COMMAND_BOOT, COMMAND_CONFLICT, COMMAND_NOT_FOUND, COMMAND_SCRIPT } from "./commands";
 import { deleteSandbox, renameSandbox, upsertSandbox } from "./db";
-import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER } from "./desktop";
+import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER, VNC_PORT } from "./desktop";
 import { ARCHIVE_SCRIPT, FILE_BAD_REQUEST, FILE_FORBIDDEN, FILE_NOT_FOUND, FILE_SCRIPT, UNPACK_SCRIPT } from "./files";
 import { PLATFORM_FILES, PLATFORM_SCRIPT, PLATFORM_VERSION, RELAY_NOTHING, RELAY_SCRIPT, START_SCRIPT } from "./guest";
 import { KEYS_SCRIPT, PROVIDERS, listKeys, placeholderVars } from "./keys";
@@ -113,6 +113,27 @@ const GUEST_USER = "1000:1000"; // the image's cloudex user
 const AS_GUEST = ["setpriv", "--reuid=1000", "--regid=1000", "--init-groups", "--inh-caps=-all", "--"];
 const guestArgv = (argv: string[], root = false) => (root ? argv : [...AS_GUEST, ...argv]);
 const GUEST_HOME = "/home/cloudex";
+
+// Dashboard terminals: a tmux server of their own, set up to act like a plain
+// terminal. No prefix key and no status line, so keys all reach the shell; the
+// mouse wheel scrolls back through tmux's history.
+const TMUX_SOCKET = "cloudex-dash";
+const TMUX_SESSION = /^[A-Za-z0-9_-]{1,40}$/;
+const tmuxArgv = (session: string) => [
+  "tmux", "-L", TMUX_SOCKET, "-f", "/dev/null", "start-server",
+  ";", "set", "-g", "prefix", "None",
+  ";", "set", "-g", "status", "off",
+  ";", "set", "-g", "mouse", "on",
+  ";", "set", "-g", "history-limit", "50000",
+  ";", "set", "-g", "default-terminal", "screen-256color",
+  ";", "set", "-sg", "escape-time", "10",
+  ";", "set", "-g", "set-clipboard", "on",
+  ";", "set", "-gw", "aggressive-resize", "on",
+  ";", "new-session", "-A", "-s", session,
+];
+
+// How long a new bridge waits to see whether its port is answering at all.
+const PROBE_MS = 250;
 const OUTPUT_LIMIT = 1 << 20;
 const FILE_TIMEOUT_MS = 30 * 60_000; // an upload or unpack of up to 100 MB
 const KEEPALIVE_MS = 15_000; // the longest a streamed exec stays quiet
@@ -1463,9 +1484,11 @@ export class Sandbox extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + (asked ? 1000 : ALARM_EVERY_MS));
   }
 
-  // The Worker forwards two kinds of request here:
+  // The Worker forwards these requests here:
   //   /tcp/<port>[?key=<ssh public key>]  WebSocket bridged to a guest TCP port
   //   /http/<port>/<path>                 an HTTP preview of a guest port
+  //   /term?session=&root=&cols=&rows=    WebSocket to a shell under a pty
+  //   /vnc                                WebSocket to the desktop's VNC server
   async fetch(req: Request): Promise<Response> {
     try {
       return await this.serve(req);
@@ -1479,6 +1502,19 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.record;
     if (!r || this.removing) return new Response("no such sandbox", { status: 404 });
     const url = new URL(req.url);
+    if (url.pathname === "/term" || url.pathname === "/vnc") {
+      if (r.state !== "running") return new Response(`${wrongState(r)}\n`, { status: 409 });
+      if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return new Response("expected a WebSocket upgrade", { status: 426 });
+      }
+      this.touch();
+      if (url.pathname === "/term") return this.terminal(url);
+      // The VNC server listens on localhost only, so through the relay previews use.
+      const through = await this.relay(VNC_PORT, "10.0.0.1");
+      if (through === null) return new Response("the desktop isn't running: start it first\n", { status: 409 });
+      if (!through) return new Response("couldn't reach the desktop's VNC server\n", { status: 502 });
+      return this.bridge(through);
+    }
     const m = /^\/(tcp|http)\/(\d{1,5})(\/.*)?$/.exec(url.pathname);
     if (!m) return new Response("not found", { status: 404 });
     const port = Number(m[2]);
@@ -1677,6 +1713,93 @@ export class Sandbox extends DurableObject<Env> {
     if (code !== 0) throw new Error(`adding the SSH key failed (exit ${code})`);
   }
 
+  // A shell under a pty, bridged to a WebSocket (S3 in research/v0.2-plan.md).
+  // Binary messages are the terminal's bytes; text messages are JSON control:
+  // {"resize":[cols,rows]}, {"ping":1}, {"kill":1}. The shell's exit code
+  // comes as {"exit":N} before the socket closes. With session, the shell runs
+  // in that tmux session (made if it's new) on a tmux server of the
+  // dashboard's own, so a socket that drops, as a deploy does, reconnects to
+  // the same shell. Closing the socket hangs up, as closing ssh does: a plain
+  // shell ends, a tmux session stays until it's killed or its shell exits.
+  // Only messages from the browser count as activity, so the dashboard pings
+  // while its tab is visible.
+  private async terminal(url: URL): Promise<Response> {
+    const size = (v: unknown, d: number) => Math.min(1000, Math.max(2, Math.floor(Number(v)) || d));
+    const cols = size(url.searchParams.get("cols"), 80);
+    const rows = size(url.searchParams.get("rows"), 24);
+    const root = ["1", "true"].includes(url.searchParams.get("root") ?? "");
+    const session = url.searchParams.get("session");
+    if (session !== null && !TMUX_SESSION.test(session)) {
+      return new Response("a session name is 1-40 letters, digits, - and _\n", { status: 400 });
+    }
+    const home = root ? "/root" : GUEST_HOME;
+    const user = root ? "root" : "cloudex";
+    const env = { HOME: home, USER: user, LOGNAME: user, SHELL: "/bin/bash", TERM: "xterm-256color", LANG: "C.UTF-8", COLORTERM: "truecolor" };
+    const argv = session === null ? ["bash", "-l"] : tmuxArgv(session);
+    const p = await this.container.exec(guestArgv(argv, root), { cwd: home, env, pty: { cols, rows }, stdin: "pipe" });
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
+    server.accept();
+    server.binaryType = "arraybuffer";
+    const writer = p.stdin!.getWriter();
+    let closed = false;
+    const done = () => {
+      if (closed) return;
+      closed = true;
+      this.touch();
+      writer.close().catch(() => {});
+      try {
+        p.kill(1); // SIGHUP, as a closed terminal sends
+      } catch {}
+    };
+    server.addEventListener("message", (e) => {
+      this.touch();
+      if (typeof e.data !== "string") {
+        writer.write(new Uint8Array(e.data as ArrayBuffer)).catch(() => server.close(1011, "the shell is gone"));
+        return;
+      }
+      let m: { resize?: unknown; kill?: unknown };
+      try {
+        m = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      if (Array.isArray(m.resize)) {
+        try {
+          p.resize(size(m.resize[0], cols), size(m.resize[1], rows));
+        } catch {}
+      }
+      if (m.kill && session !== null) {
+        void this.container
+          .exec(guestArgv(["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", `=${session}`], root), { cwd: home, env })
+          .then((k) => k.exitCode)
+          .catch(() => {});
+      }
+    });
+    server.addEventListener("close", done);
+    server.addEventListener("error", done);
+    void (async () => {
+      const reader = p.stdout!.getReader();
+      try {
+        for (;;) {
+          const { value, done: eof } = await reader.read();
+          if (eof) break;
+          server.send(value);
+        }
+      } catch {
+        // the shell's output ended
+      } finally {
+        const code = await p.exitCode.catch(() => -1);
+        try {
+          server.send(JSON.stringify({ exit: code }));
+          server.close(1000, "exited");
+        } catch {}
+        done();
+      }
+    })();
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
   // WebSocket <-> guest TCP. Reads from the guest are coalesced into frames of
   // up to 256 KiB, which took scp downloads from 6-8 to 17 MiB/s in the spikes.
   private async bridge(port: number): Promise<Response> {
@@ -1685,6 +1808,17 @@ export class Sandbox extends DurableObject<Env> {
       await withTimeout(sock.opened, 15_000, `connecting to port ${port}`);
     } catch (e) {
       return new Response(`nothing is listening on port ${port}: ${message(e)}`, { status: 502 });
+    }
+    // The connection opens even when nothing listens on the port, and then
+    // ends at once with nothing read. A server that speaks first (ssh, VNC)
+    // answers within the wait; a quiet one costs it once per connection.
+    const reader = sock.readable.getReader();
+    const first = reader.read().catch(() => ({ done: true as const, value: undefined }));
+    const early = await Promise.race([first, sleep(PROBE_MS).then(() => null)]);
+    if (early?.done) {
+      reader.releaseLock();
+      await sock.close().catch(() => {});
+      return new Response(`nothing is listening on port ${port}\n`, { status: 502 });
     }
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
@@ -1728,10 +1862,9 @@ export class Sandbox extends DurableObject<Env> {
       server.send(frame);
     };
     void (async () => {
-      const reader = sock.readable.getReader();
       try {
-        for (;;) {
-          const { value, done: eof } = await reader.read();
+        for (let read = first; ; read = reader.read()) {
+          const { value, done: eof } = await read;
           if (eof) break;
           pending.push(value);
           pendingBytes += value.byteLength;

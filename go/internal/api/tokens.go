@@ -18,6 +18,8 @@ type Token struct {
 	CreatedBy  string `json:"createdBy"`
 	ExpiresAt  *int64 `json:"expiresAt"`
 	LastUsedAt *int64 `json:"lastUsedAt"`
+	// Parent is, for a dashboard session signed in with a token, that token.
+	Parent *string `json:"parent,omitempty"`
 }
 
 // NewToken is a token as made, with its secret, which nothing shows again.
@@ -144,4 +146,17 @@ func (c *Client) ApproveDeviceLogin(ctx context.Context, r DeviceApproveRequest)
 func (c *Client) DenyDeviceLogin(ctx context.Context, userCode string) (*DeviceRequest, error) {
 	var d DeviceRequest
 	return &d, c.do(ctx, http.MethodPost, "/v1/auth/device/deny", map[string]string{"user_code": userCode}, &d)
+}
+
+// LoginLink is a one-time link that signs a browser in to the dashboard.
+type LoginLink struct {
+	URL       string `json:"url"`
+	ExpiresIn int    `json:"expiresIn"`
+}
+
+// LoginLink makes a link to the dashboard at path (such as /s/web) that signs
+// a browser in as this client, once, within ExpiresIn seconds.
+func (c *Client) LoginLink(ctx context.Context, path string) (*LoginLink, error) {
+	var l LoginLink
+	return &l, c.do(ctx, http.MethodPost, "/v1/auth/links", map[string]string{"path": path}, &l)
 }

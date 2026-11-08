@@ -3,6 +3,8 @@
   "name": "cloudex-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
+  // The dashboard's built files (apps/dashboard/build.mjs), bundled into worker.js.
+  "alias": { "cloudex-dashboard-assets": "../dashboard/dist/assets.js" },
   "observability": { "enabled": true },
   // One container per Sandbox Durable Object. A newly pushed image can take
   // 15-20 minutes before it starts (spike S7), so deploys must wait for a test boot.

@@ -32,6 +32,9 @@ import {
   HostRequest,
   HostResult,
   KillCommand,
+  LoginLink,
+  CreateLoginLink,
+  StartSession,
   Me,
   NewToken,
   Provider,
@@ -71,6 +74,8 @@ const requests = {
   DevicePoll,
   DeviceApprove,
   DeviceDeny,
+  CreateLoginLink,
+  StartSession,
 };
 const responses = {
   Sandbox,
@@ -96,6 +101,7 @@ const responses = {
   DeviceCode,
   DeviceToken,
   DeviceRequest,
+  LoginLink,
   Error: ApiError,
 };
 
@@ -610,6 +616,53 @@ export function openapi(version: string) {
         post: op("denyDeviceLogin", "Refuse a device login by its user code (admins only)", {
           requestBody: body("DeviceDeny"),
           responses: { 200: ok("The refused request", ref("DeviceRequest")) },
+        }),
+      },
+      "/v1/auth/links": {
+        post: op("createLoginLink", "Make a one-time link that signs a browser in to the dashboard", {
+          description:
+            "Good for 60 seconds and once. The browser's session gets the caller's role, and a token's session " +
+            "acts for that token. cloudex dashboard makes one and opens it.",
+          requestBody: body("CreateLoginLink", false),
+          responses: { 201: ok("The link", ref("LoginLink")) },
+        }),
+      },
+      "/v1/auth/session": {
+        post: op("startSession", "Sign the dashboard in: trade a link code, a token or an approved device code for a session cookie", {
+          security: [],
+          description:
+            "For the dashboard's own login page: it must come from the same origin, with the header X-Cloudex: 1. " +
+            "Sets the __Host-cx_session cookie and answers who the session is. A device code that isn't approved yet " +
+            "gets the same 400 errors as /v1/auth/token.",
+          requestBody: body("StartSession"),
+          responses: { 200: ok("The session", ref("Me")) },
+        }),
+        delete: op("endSession", "Sign the dashboard out: revoke the cookie's session", {
+          security: [],
+          responses: { 200: ok("Signed out", { type: "object", properties: { signedOut: { type: "boolean" } }, required: ["signedOut"] }) },
+        }),
+      },
+      "/v1/sandboxes/{ref}/terminal": {
+        parameters: [
+          sandboxRef,
+          { name: "session", in: "query", description: "A tmux session to attach to, or make: reconnecting gets the same shell back", schema: { type: "string", pattern: "^[A-Za-z0-9_-]{1,40}$" } },
+          { name: "root", in: "query", description: "A root shell rather than the cloudex user's", schema: { type: "boolean", default: false } },
+          { name: "cols", in: "query", schema: { type: "integer", minimum: 2, maximum: 1000, default: 80 } },
+          { name: "rows", in: "query", schema: { type: "integer", minimum: 2, maximum: 1000, default: 24 } },
+        ],
+        get: op("openTerminal", "A WebSocket to a login shell in the sandbox, under a pty", {
+          description:
+            "Binary messages are the terminal's bytes each way. Text messages are JSON: send {\"resize\":[cols,rows]}, " +
+            "{\"ping\":1} (which counts as activity, so an open terminal keeps the sandbox up) or {\"kill\":1} " +
+            "(ends a tmux session); the sandbox sends {\"exit\":code} when the shell ends.",
+          responses: { 101: { description: "Switching to the WebSocket" } },
+        }),
+      },
+      "/v1/sandboxes/{ref}/desktop/vnc": {
+        parameters: [sandboxRef],
+        get: op("connectDesktop", "A WebSocket carrying the desktop's VNC (RFB) connection", {
+          description: "Start the desktop first (POST /v1/sandboxes/{ref}/desktop). The dashboard's noVNC speaks RFB over it.",
+          responses: { 101: { description: "Switching to the WebSocket" } },
         }),
       },
     },

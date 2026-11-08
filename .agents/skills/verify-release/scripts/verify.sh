@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Checks what Cloudex ships against a live deployment, the way a user runs it.
-#   verify.sh [area...]    areas: setup lifecycle connect inside agents tokens sdk (default: all)
+#   verify.sh [area...]    areas: setup lifecycle connect inside agents tokens dashboard sdk (default: all)
 # Env: CLOUDEX_BIN (default: cloudex on PATH), CLOUDEX_CONFIG_DIR (the deployment to use,
 # default ~/.config/cloudex), VERIFY_OUT (results directory), VERIFY_KEEP=1 keeps sandboxes.
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
@@ -67,7 +67,7 @@ trap cleanup EXIT
 
 want() { [[ $# -eq 0 || " ${areas[*]} " == *" $1 "* ]]; }
 areas=("$@")
-[[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents tokens sdk)
+[[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents tokens dashboard sdk)
 echo "Cloudex verify: $("$CX" version 2>&1 | head -1) against $API_URL, prefix $P, areas: ${areas[*]}"
 
 A=$P-a
@@ -451,6 +451,53 @@ if want tokens; then
 		OUT=$(CLOUDEX_CONFIG_DIR=$dev CLOUDEX_API_KEY= CLOUDEX_API_URL= "$CX" status --json 2>/dev/null)
 		ok K13 "the device signed in with a read token of its own" [ "$(field .me.token.name)" = "$P-device" -a "$(field .me.role)" = read ]
 	fi
+fi
+
+# ---------------------------------------------------------------- dashboard
+if want dashboard; then
+	key=$(jq -r .apiKey "$CLOUDEX_CONFIG_DIR/config.json")
+	curl -s -D "$work/h" -o "$work/b" --max-time 30 "$API_URL/"
+	csp=$(grep -ci "^content-security-policy: default-src 'self'; script-src 'self';" "$work/h")
+	nostore=$(grep -ci '^cache-control: no-store' "$work/h")
+	ok D01 "the API URL serves the dashboard page, uncached, with a strict CSP" [ "$csp" = 1 -a "$nostore" = 1 ]
+	js=$(grep -o '/assets/app\.[0-9a-f]*\.js' "$work/b" | head -1)
+	ok D02 "the dashboard's script is served and cached for good" \
+		[ -n "$js" -a "$(curl -s -o /dev/null -w '%{http_code}' "$API_URL$js")" = 200 ]
+	cx dashboard --json
+	link=$(field .url)
+	ok D03 "cloudex dashboard --json makes a one-time sign-in link" has "$link" "/login#link="
+	lc=$(sed -E 's/.*link=([a-z2-7]+).*/\1/' <<<"$link")
+	signin() { curl -s -D "$work/h" -o "$work/b" -w '%{http_code}' --max-time 30 -X POST -H 'content-type: application/json' -H 'x-cloudex: 1' -H "origin: $API_URL" -d "$1" "$API_URL/v1/auth/session"; }
+	code=$(signin "{\"link\":\"$lc\"}")
+	cookie=$(grep -i '^set-cookie: __Host-cx_session=' "$work/h" | sed -E 's/^[^:]*: (__Host-cx_session=[^;]+).*/\1/' | tr -d '\r')
+	sid=$(jq -r '.token.id // empty' "$work/b")
+	ok D04 "the link signs a browser in with an HttpOnly, SameSite=Strict session cookie" \
+		[ "$code" = 200 -a -n "$cookie" -a -n "$(grep -i '^set-cookie:.*HttpOnly; SameSite=Strict' "$work/h")" ]
+	ok D05 "a sign-in link works only once" [ "$(signin "{\"link\":\"$lc\"}")" = 401 ]
+	cc() { curl -s -o "$work/b" -w '%{http_code}' --max-time 30 -H "cookie: $cookie" "$@"; }
+	ok D06 "the session cookie works from the dashboard, with X-Cloudex: 1" [ "$(cc -H 'x-cloudex: 1' "$API_URL/v1/me")" = 200 ]
+	ok D07 "the cookie alone, or from another site, is refused" \
+		[ "$(cc "$API_URL/v1/me")" = 403 -a "$(cc -H 'x-cloudex: 1' -H 'origin: https://example.com' "$API_URL/v1/me")" = 403 ]
+	"$CX" tokens --json >"$work/o" 2>/dev/null
+	ok D08 "the browser's session is listed with the tokens" [ -n "$sid" -a "$(jq -r --arg id "$sid" '.[] | select(.id == $id) | .kind' "$work/o")" = session ]
+	cc -X DELETE -H 'x-cloudex: 1' -H "origin: $API_URL" "$API_URL/v1/auth/session" >/dev/null
+	ok D09 "signing out ends the session" [ "$(cc -H 'x-cloudex: 1' "$API_URL/v1/me")" = 401 ]
+	cx tokens create "$P-dash-read" --role read
+	rs=$(field .secret)
+	code=$(signin "{\"token\":\"$rs\"}")
+	cookie=$(grep -i '^set-cookie: __Host-cx_session=' "$work/h" | sed -E 's/^[^:]*: (__Host-cx_session=[^;]+).*/\1/' | tr -d '\r')
+	ok D10 "a pasted read token gives a read session, which can't make a sandbox" \
+		[ "$code" = 200 -a "$(jq -r .role "$work/b")" = read -a "$(cc -X POST -H 'x-cloudex: 1' -H 'content-type: application/json' -d '{}' "$API_URL/v1/sandboxes")" = 403 ]
+	cx tokens revoke "$(field .id)"
+	ok D11 "revoking a token ends the sessions it signed in" [ "$(cc -H 'x-cloudex: 1' "$API_URL/v1/me")" = 401 ]
+	need_a
+	tc() { CLOUDEX_API_KEY=$key node "$here/term-check.mjs" "$API_URL" "$A_ID" "$1" >"$work/o" 2>&1; CODE=$?; OUT=$(cat "$work/o"); }
+	tc echo
+	ok D12 "the terminal WebSocket runs a shell as cloudex at the asked size, and sends its exit code" [ "$CODE" = 0 ]
+	tc tmux
+	ok D13 "a terminal in a tmux session gets the same shell back after reconnecting" [ "$CODE" = 0 ]
+	tc dead
+	ok D14 "a TCP port nothing listens on is refused, not opened" [ "$CODE" = 0 ]
 fi
 
 # ---------------------------------------------------------------- sdk

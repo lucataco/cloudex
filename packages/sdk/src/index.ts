@@ -102,6 +102,8 @@ export interface Token {
   expiresAt: number | null;
   /** To the minute. */
   lastUsedAt: number | null;
+  /** For a session made from a token: that token, whose sandboxes it reaches and with which it ends. */
+  parent: string | null;
 }
 
 /** A token as made, with its secret, which nothing shows again. */

@@ -4,6 +4,7 @@
 import { Hono } from "hono";
 import {
   AgentMessage,
+  CreateLoginLink,
   CreateSandbox,
   CreateSave,
   CreateToken,
@@ -23,6 +24,7 @@ import {
   type SandboxSize,
   SetProviderKey,
   StartAgent,
+  StartSession,
   UpdateSandbox,
   UpdateSettings,
   type Health,
@@ -35,19 +37,27 @@ import { backupBucket } from "./backup";
 import { deleteSandbox, idForName, listSandboxes, nameTaken } from "./db";
 import {
   DEVICE_INTERVAL,
+  SESSION_TTL_SEC,
   type Who,
   authenticate,
+  authenticateSecret,
   authorize,
+  createLoginLink,
   createToken,
   decideDevice,
   listTokens,
   me,
+  ownerKey,
   pollDevice,
   revokeToken,
   setOwner,
   startDevice,
+  startSession,
+  useLoginLink,
   waitingDevices,
 } from "./tokens";
+import { serveDashboard } from "./dashboard";
+import { notFromDashboard, readSession, sessionCookie, sessionName } from "./session";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, keyRefusal, listKeys, setKey } from "./keys";
 import { NO_SUCH_SANDBOX, type ForkSource } from "./sandbox";
@@ -121,17 +131,85 @@ app.post("/v1/auth/token", async (c) => {
   return c.json({ access_token: secret, token_type: "Bearer", token });
 });
 
+// The dashboard's sign-in (session.ts): the login page trades a one-time
+// link's code, a pasted token or key, or an approved device code for a
+// session cookie. The session never has more than what signed it in.
+app.post("/v1/auth/session", async (c) => {
+  const bad = notFromDashboard(c.req.raw, true);
+  if (bad) return c.json({ error: `forbidden: ${bad}` }, 403);
+  const input = StartSession.parse(await c.req.json());
+  const name = sessionName(c.req.header("user-agent"));
+  let made;
+  if ("link" in input) {
+    made = await useLoginLink(c.env.DB, input.link, name);
+    if (!made) return c.json({ error: "that sign-in link was used already or has expired (they last 60 seconds): run cloudex dashboard again" }, 401);
+  } else if ("token" in input) {
+    const who = await authenticateSecret(c.env, input.token.trim());
+    if (!who) return c.json({ error: "that isn't this deployment's admin key or a working token" }, 401);
+    made = await startSession(c.env.DB, who, name);
+  } else {
+    const r = await pollDevice(c.env.DB, input.device_code, { name });
+    if ("error" in r) return c.json({ error: r.error }, 400);
+    made = r.token;
+  }
+  const { secret, ...token } = made;
+  c.header("set-cookie", sessionCookie(secret, SESSION_TTL_SEC));
+  c.header("cache-control", "no-store");
+  return c.json(me({ kind: "token", token }));
+});
+
+app.delete("/v1/auth/session", async (c) => {
+  const secret = readSession(c.req.raw);
+  const bad = secret && notFromDashboard(c.req.raw);
+  if (bad) return c.json({ error: `forbidden: ${bad}` }, 403);
+  const who = secret ? await authenticateSecret(c.env, secret) : null;
+  if (who?.kind === "token" && who.token.kind === "session") await revokeToken(c.env.DB, who.token.id);
+  c.header("set-cookie", sessionCookie(null));
+  return c.json({ signedOut: true });
+});
+
+// Every other /v1 route: the admin key or a token as the bearer, or the
+// dashboard's session cookie.
 app.use("/v1/*", async (c, next) => {
-  const who = await authenticate(c.env, c.req.header("authorization") ?? "", c.executionCtx);
+  const header = c.req.header("authorization");
+  const cookie = header ? null : readSession(c.req.raw);
+  if (cookie) {
+    const bad = notFromDashboard(c.req.raw);
+    if (bad) return c.json({ error: `forbidden: ${bad}` }, 403);
+  }
+  let who = cookie ? await authenticateSecret(c.env, cookie, c.executionCtx) : await authenticate(c.env, header ?? "", c.executionCtx);
+  // A cookie holds a session, never a token of another kind or the admin key.
+  if (cookie && !(who?.kind === "token" && who.token.kind === "session")) who = null;
   if (!who) {
-    const why = c.req.header("authorization")
-      ? "the key isn't this deployment's admin key or a working token (a token may have been revoked, or have expired)"
-      : "no key: send Authorization: Bearer <the admin key or a token>";
+    const why = cookie
+      ? "the dashboard's session has ended (it was signed out or revoked, or wasn't used for 30 days): sign in again"
+      : header
+        ? "the key isn't this deployment's admin key or a working token (a token may have been revoked, or have expired)"
+        : "no key: send Authorization: Bearer <the admin key or a token>";
+    if (cookie) c.header("set-cookie", sessionCookie(null));
     return c.json({ error: `unauthorized: ${why}` }, 401);
   }
   await authorize(c.env, who, c.req.method, new URL(c.req.url).pathname, async (ref) => (await resolve(c.env, ref))?.id ?? null);
   c.set("who", who);
   await next();
+  // A session's 30 days started again: so does its cookie's.
+  if (cookie && who.kind === "token" && who.renewed && c.res.status !== 101) {
+    try {
+      c.res.headers.append("set-cookie", sessionCookie(cookie, SESSION_TTL_SEC));
+    } catch {
+      // an answer passed through with fixed headers; the next one sets it
+    }
+  }
+});
+
+// A one-time link that signs a browser in as the caller: cloudex dashboard.
+app.post("/v1/auth/links", async (c) => {
+  const text = await c.req.text();
+  const { path } = CreateLoginLink.parse(text ? JSON.parse(text) : {});
+  const { code, expiresIn } = await createLoginLink(c.env.DB, c.get("who"));
+  const origin = new URL(c.req.url).origin;
+  const next = path === "/" ? "" : `&next=${encodeURIComponent(path)}`;
+  return c.json({ url: `${origin}/login#link=${code}${next}`, expiresIn }, 201);
 });
 
 app.get("/v1/me", (c) => c.json(me(c.get("who"))));
@@ -197,7 +275,7 @@ app.post("/v1/sandboxes", async (c) => {
 
 app.get("/v1/sandboxes", async (c) => {
   const who = c.get("who");
-  return c.json(await listSandboxes(c.env.DB, who.kind === "token" && who.token.ownOnly ? who.token.id : undefined));
+  return c.json(await listSandboxes(c.env.DB, who.kind === "token" && who.token.ownOnly ? ownerKey(who.token) : undefined));
 });
 
 app.get("/v1/sandboxes/:ref", async (c) => c.json(await (await sandbox(c.env, c.req.param("ref"))).stub.get()));
@@ -310,6 +388,9 @@ async function download(env: Env, ref: string, query: Record<string, string>, ar
       "content-type": archive ? "application/gzip" : "application/octet-stream",
       "content-disposition": `attachment; filename*=UTF-8''${name}`,
       "cache-control": "no-store",
+      // A sandbox's file never runs as a page of this host, where the
+      // dashboard's cookie works.
+      "content-security-policy": "default-src 'none'; sandbox",
       "x-cloudex-path": encodeURIComponent(info.path),
     },
   });
@@ -487,6 +568,19 @@ app.post("/v1/sandboxes/:ref/agents/:agent/interrupt", async (c) =>
   c.json(await agentOp(c.env, c.req.param("ref"), "interrupt", [agentId(c.req.param("agent"))])),
 );
 
+// A shell in the sandbox under a pty, over a WebSocket (sandbox.ts terminal).
+app.get("/v1/sandboxes/:ref/terminal", async (c) => {
+  const { stub } = await sandbox(c.env, c.req.param("ref"));
+  const url = new URL(c.req.url);
+  return stub.fetch(new Request(`http://sandbox/term${url.search}`, c.req.raw));
+});
+
+// The desktop's VNC server over a WebSocket, for the dashboard's noVNC.
+app.get("/v1/sandboxes/:ref/desktop/vnc", async (c) => {
+  const { stub } = await sandbox(c.env, c.req.param("ref"));
+  return stub.fetch(new Request("http://sandbox/vnc", c.req.raw));
+});
+
 // WebSocket to a guest TCP port: `cloudex ssh` and `cloudex proxy` use port 22.
 app.get("/v1/sandboxes/:ref/tcp/:port{[0-9]+}", async (c) => {
   const { stub } = await sandbox(c.env, c.req.param("ref"));
@@ -555,6 +649,9 @@ app.delete("/v1/keys/:provider", async (c) => {
 });
 
 app.all("/v1/*", (c) => c.json({ error: "not found" }, 404));
+
+// The dashboard (dashboard.ts) is everything else on this host.
+app.on(["GET", "HEAD"], "*", (c) => serveDashboard(c.req.raw));
 
 // Preview links: https://<port>-<id>-<token>.<zone>. One label, so the zone's
 // Universal SSL certificate covers it.

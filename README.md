@@ -5,9 +5,10 @@ is a Linux machine with a shell, Docker, SSH and coding agents. Stopping saves i
 disk; resuming brings it back. You pay Cloudflare directly; there is no Cloudex
 service in between. Site: [cloudex.build](https://cloudex.build).
 
-**Status: v0.2.0** adds OpenCode, keys for six more AI providers, and access
-tokens with sign-in by code; a web dashboard comes in v0.2.1. v0.1 commands, API
-routes and SDK calls still work unchanged. v0.1.17 stays the long-term-support
+**Status: v0.2.1** adds a web dashboard, served by your deployment itself, with
+terminals and desktops in the browser. v0.2.0 added OpenCode, keys for six more AI
+providers, and access tokens with sign-in by code. v0.1 commands, API routes and
+SDK calls still work unchanged. v0.1.17 stays the long-term-support
 release of v0.1 and gets bug fixes as v0.1.x releases from the `lts-v0.1.17`
 branch.
 
@@ -63,6 +64,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | `cloudex set [sandbox] [--name] [--idle 2h]` | Rename a sandbox, or change how long it may sit idle |
 | `cloudex ssh [sandbox] [-- ssh args]` | Shell in over SSH, through your API (no public IP) |
 | `cloudex desktop [sandbox] [--size 1280x720] [--link] [--quality 0-9]` | Open the sandbox's desktop, with Chrome and a terminal, in your browser |
+| `cloudex dashboard [sandbox]` | Open the web dashboard, signed in: sandboxes, terminals, desktops, agents, commands, files, saves and access |
 | `cloudex exec [sandbox] -- <command>` | Run a command, printing its output as it comes and ending with its exit code; `-d` leaves it running in the background |
 | `cloudex commands [sandbox]`, `commands logs -f <id>`, `commands kill <id>`, `commands rm <id>` | List background commands, follow their output, stop them, delete a finished one's record and output |
 | `cloudex cp <from> <to>` | Copy files and directories into or out of a sandbox (`web:path`, or `:path` for the current one) |
@@ -222,7 +224,8 @@ sandbox names it knows of, and showing it to you. Agents get the report and a
 
 | Path | What |
 |---|---|
-| `apps/api` | Control plane Worker: the `/v1` API and one `Sandbox` Durable Object per sandbox, each owning one container |
+| `apps/api` | Control plane Worker: the `/v1` API, the dashboard at `/`, and one `Sandbox` Durable Object per sandbox, each owning one container |
+| `apps/dashboard` | The web dashboard (Preact, xterm.js and noVNC), built into the API Worker |
 | `images/base` | The sandbox image: Ubuntu 24.04, Node, Python, Docker, sshd, tmux, Claude Code, Codex and OpenCode |
 | `go/cmd/cloudex` | The `cloudex` CLI |
 | `packages/schema` | Zod models shared by the API and the SDKs, and the OpenAPI document built from them |
@@ -238,11 +241,12 @@ pnpm install && pnpm typecheck && pnpm test
 cd go && go test ./...
 cd python && PYTHONPATH=src python3 -m unittest discover -s tests
 
-# API on localhost:8787 without the container image
+# API and dashboard on localhost:8787 without the container image
 echo 'ADMIN_KEY=dev-admin-key' > apps/api/.dev.vars
+pnpm --filter @cloudex/dashboard build
 pnpm --filter @cloudex/api exec wrangler dev --enable-containers=false
 
-# CLI with the current API bundle embedded
+# CLI with the current API bundle (and the dashboard in it) embedded
 scripts/bundle-api.sh && (cd go && go build -o bin/cloudex ./cmd/cloudex)
 ```
 

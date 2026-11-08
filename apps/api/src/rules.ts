@@ -10,6 +10,8 @@ export type Need = "any" | "read" | "write" | "admin";
 // Every other route is for admins: tokens, provider keys, device approvals.
 export const RULES: [string, string, Need, boolean?][] = [
   ["GET", "/v1/me", "any"],
+  // A dashboard sign-in with the caller's own role.
+  ["POST", "/v1/auth/links", "any"],
   ["GET", "/v1/sandboxes", "read"],
   ["POST", "/v1/sandboxes", "write"],
   ["GET", "/v1/sandboxes/:ref", "read"],
@@ -41,6 +43,8 @@ export const RULES: [string, string, Need, boolean?][] = [
   ["POST", "/v1/sandboxes/:ref/agents/:id/messages", "write"],
   ["POST", "/v1/sandboxes/:ref/agents/:id/interrupt", "write"],
   ["GET", "/v1/sandboxes/:ref/tcp/:port", "write"],
+  ["GET", "/v1/sandboxes/:ref/terminal", "write"],
+  ["GET", "/v1/sandboxes/:ref/desktop/vnc", "write"],
   // Links let anyone holding them into the sandbox's servers.
   ["POST", "/v1/sandboxes/:ref/hosts", "write"],
   ["GET", "/v1/sandboxes/:ref/hosts", "write"],
