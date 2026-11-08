@@ -77,9 +77,9 @@ func newStatusCmd(opts *options) *cobra.Command {
 			}
 			switch {
 			case who != nil && who.Token != nil:
-				fmt.Fprintf(w, "Signed   in with the token %s (%s), %s\n", who.Token.ID, who.Token.Name, describeToken(*who.Token))
+				fmt.Fprintf(w, "Auth     the token %s (%s), %s\n", who.Token.ID, who.Token.Name, describeToken(*who.Token))
 			case who != nil && who.Role != "":
-				fmt.Fprintln(w, "Signed   in with the admin key")
+				fmt.Fprintln(w, "Auth     the admin key")
 			}
 			if showKey {
 				fmt.Fprintf(w, "Key      %s\n", client.Key)
