@@ -20,7 +20,27 @@ permissions:
   packages: write
 
 jobs:
+  # Fix releases for an older line (v0.1.x from lts-v0.1.17) can be tagged after
+  # a newer release. Only the newest version becomes GitHub's latest release,
+  # which `cloudex update` and the install script read, the image's :latest
+  # tag, and npm's latest tag.
+  newest:
+    runs-on: ubuntu-latest
+    outputs:
+      newest: ${{ steps.check.outputs.newest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          top=$(git tag -l 'v*' --sort=-v:refname | head -1)
+          if [ "$top" = "$GITHUB_REF_NAME" ]; then newest=true; else newest=false; fi
+          echo "newest=$newest" >> "$GITHUB_OUTPUT"
+          echo "::notice::$GITHUB_REF_NAME is newest=$newest (the newest tag is $top)"
+
   image:
+    needs: newest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,11 +60,11 @@ jobs:
           push: true
           tags: |
             ghcr.io/lucataco/cloudex-base:${{ github.ref_name }}
-            ghcr.io/lucataco/cloudex-base:latest
+            ${{ needs.newest.outputs.newest == 'true' && 'ghcr.io/lucataco/cloudex-base:latest' || '' }}
           cache-from: type=gha
 
   cli:
-    needs: image
+    needs: [newest, image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,10 +82,10 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/* --title "${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" dist/* --title "${{ github.ref_name }}" --generate-notes --latest="${{ needs.newest.outputs.newest }}"
 
   npm:
-    needs: cli
+    needs: [newest, cli]
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -89,7 +109,9 @@ jobs:
             echo "cloudex@$version is already on npm"
             exit 0
           fi
-          npm stage publish --access public
+          # An older line's SDK goes under its own dist-tag, like v0.1-lts.
+          if [ "${{ needs.newest.outputs.newest }}" = true ]; then tag=latest; else tag="v${version%.*}-lts"; fi
+          npm stage publish --access public --tag "$tag"
           echo "::notice::cloudex@$version is staged on npm; approve it with npm stage approve <id> (the id is in the log above)"
 
   pypi:
