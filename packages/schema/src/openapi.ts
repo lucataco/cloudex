@@ -552,7 +552,8 @@ export function openapi(version: string) {
           },
         ],
         get: op("connectTcp", "A WebSocket carrying a TCP connection to a port in the sandbox", {
-          description: "Binary messages each way. cloudex ssh uses port 22.",
+          description: "Binary messages each way. cloudex ssh uses port 22." +
+            " A socket opened with a token or session closes with code 4401 once that token is revoked or expires, or the session signs out (checked about once a minute).",
           responses: { 101: { description: "Switching to the WebSocket" } },
         }),
       },
@@ -587,7 +588,8 @@ export function openapi(version: string) {
           security: [],
           description:
             "Show user_code to someone signed in, who approves it with cloudex tokens approve or in the dashboard, " +
-            "then poll /v1/auth/token every interval seconds with device_code. Codes last 10 minutes.",
+            "then poll /v1/auth/token every interval seconds with device_code. Codes last 10 minutes. " +
+            "429 when 20 are waiting, or 3 from the same address.",
           requestBody: body("DeviceStart"),
           responses: { 200: ok("The codes", ref("DeviceCode")) },
         }),
@@ -607,7 +609,9 @@ export function openapi(version: string) {
       },
       "/v1/auth/device/approve": {
         post: op("approveDeviceLogin", "Approve a device login by its user code (admins only)", {
-          description: "The role is the one asked for, or user, unless given; the token expires in 90 days unless expiresInSec says otherwise.",
+          description:
+            "Without a role, it gets user, or read if it asked for read: admin is granted only when named here, since anyone can ask for it. " +
+            "The token expires in 90 days unless expiresInSec says otherwise; a dashboard session from it never lasts past that.",
           requestBody: body("DeviceApprove"),
           responses: { 200: ok("The approved request", ref("DeviceRequest")) },
         }),
@@ -622,7 +626,8 @@ export function openapi(version: string) {
         post: op("createLoginLink", "Make a one-time link that signs a browser in to the dashboard", {
           description:
             "Good for 60 seconds and once. The browser's session gets the caller's role, and a token's session " +
-            "acts for that token. cloudex dashboard makes one and opens it.",
+            "acts for that token. cloudex dashboard makes one and opens it. A dashboard session can't make one (403). " +
+            "path must be one of the dashboard's pages (/, /saves, /access or /s/{sandbox}/...), else 400.",
           requestBody: body("CreateLoginLink", false),
           responses: { 201: ok("The link", ref("LoginLink")) },
         }),
@@ -633,7 +638,7 @@ export function openapi(version: string) {
           description:
             "For the dashboard's own login page: it must come from the same origin, with the header X-Cloudex: 1. " +
             "Sets the __Host-cx_session cookie and answers who the session is. A device code that isn't approved yet " +
-            "gets the same 400 errors as /v1/auth/token.",
+            "gets the same 400 errors as /v1/auth/token. A pasted dashboard session is refused (403).",
           requestBody: body("StartSession"),
           responses: { 200: ok("The session", ref("Me")) },
         }),
@@ -654,14 +659,17 @@ export function openapi(version: string) {
           description:
             "Binary messages are the terminal's bytes each way. Text messages are JSON: send {\"resize\":[cols,rows]}, " +
             "{\"ping\":1} (which counts as activity, so an open terminal keeps the sandbox up) or {\"kill\":1} " +
-            "(ends a tmux session); the sandbox sends {\"exit\":code} when the shell ends.",
+            "(ends a tmux session); the sandbox sends {\"exit\":code} when the shell ends." +
+            " A socket opened with a token or session closes with code 4401 once that token is revoked or expires, or the session signs out (checked about once a minute).",
           responses: { 101: { description: "Switching to the WebSocket" } },
         }),
       },
       "/v1/sandboxes/{ref}/desktop/vnc": {
         parameters: [sandboxRef],
         get: op("connectDesktop", "A WebSocket carrying the desktop's VNC (RFB) connection", {
-          description: "Start the desktop first (POST /v1/sandboxes/{ref}/desktop). The dashboard's noVNC speaks RFB over it.",
+          description:
+            "Start the desktop first (POST /v1/sandboxes/{ref}/desktop). The dashboard's noVNC speaks RFB over it." +
+            " A socket opened with a token or session closes with code 4401 once that token is revoked or expires, or the session signs out (checked about once a minute).",
           responses: { 101: { description: "Switching to the WebSocket" } },
         }),
       },

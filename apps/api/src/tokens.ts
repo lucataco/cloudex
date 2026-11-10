@@ -49,6 +49,8 @@ type Row = {
   expires_at: number | null;
   last_used_at: number | null;
   parent: string | null;
+  // A session from a device approval never lasts past the approval's expiry.
+  ends_at: number | null;
 };
 
 const fromRow = (r: Row): Token => ({
@@ -70,7 +72,17 @@ export const ownerKey = (t: Token) => t.parent ?? t.id;
 
 export async function createToken(
   db: D1Database,
-  t: { name: string; kind?: Token["kind"]; role: Role; ownOnly: boolean; expiresInSec?: number; createdBy: string; parent?: string | null },
+  t: {
+    name: string;
+    kind?: Token["kind"];
+    role: Role;
+    ownOnly: boolean;
+    expiresInSec?: number;
+    createdBy: string;
+    parent?: string | null;
+    // A session's ceiling: renewing never takes it past this (ms).
+    endsAt?: number | null;
+  },
 ): Promise<Token & { secret: string }> {
   await ensureSchema(db);
   const short = random32(8);
@@ -89,12 +101,14 @@ export async function createToken(
     lastUsedAt: null,
     parent: t.parent ?? null,
   };
+  const endsAt = t.endsAt ?? null;
+  if (endsAt !== null) token.expiresAt = token.expiresAt === null ? endsAt : Math.min(token.expiresAt, endsAt);
   await db
     .prepare(
-      `INSERT INTO tokens (id, name, kind, role, own_only, hash, created_at, created_by, expires_at, last_used_at, parent)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+      `INSERT INTO tokens (id, name, kind, role, own_only, hash, created_at, created_by, expires_at, last_used_at, parent, ends_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
     )
-    .bind(token.id, token.name, token.kind, token.role, token.ownOnly ? 1 : 0, await sha256(secret), now, token.createdBy, token.expiresAt, token.parent)
+    .bind(token.id, token.name, token.kind, token.role, token.ownOnly ? 1 : 0, await sha256(secret), now, token.createdBy, token.expiresAt, token.parent, endsAt)
     .run();
   return { ...token, secret };
 }
@@ -148,11 +162,13 @@ export async function authenticateSecret(env: Env, given: string, ctx?: { waitUn
   if (row.parent !== null && (row.parent_found === null || (row.parent_expires_at !== null && row.parent_expires_at < now))) return null;
   let renewed = false;
   if (row.last_used_at === null || now - row.last_used_at > 60_000) {
-    // A session's 30 days start again, but never past its token's end.
+    // A session's 30 days start again, but never past its token's end, or
+    // the end its approval set.
     let expires = row.expires_at;
     if (row.kind === "session") {
       expires = now + SESSION_TTL_SEC * 1000;
       if (row.parent_expires_at !== null) expires = Math.min(expires, row.parent_expires_at);
+      if (row.ends_at !== null) expires = Math.min(expires, row.ends_at);
       renewed = true;
     }
     const p = env.DB.prepare("UPDATE tokens SET last_used_at = ?, expires_at = ? WHERE id = ?").bind(now, expires, row.id).run();
@@ -162,6 +178,31 @@ export async function authenticateSecret(env: Env, given: string, ctx?: { waitUn
     row.expires_at = expires;
   }
   return { kind: "token", token: fromRow(row), renewed };
+}
+
+// Whether a token (and the token a session acts for) is still there and
+// unexpired: what an open WebSocket checks now and then (sandbox.ts), since
+// only its upgrade went through authenticate. Throws when D1 can't say.
+export async function tokenAlive(db: D1Database, id: string): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT t.expires_at, t.parent, p.id AS parent_found, p.expires_at AS parent_expires_at
+         FROM tokens t LEFT JOIN tokens p ON p.id = t.parent WHERE t.id = ?`,
+    )
+    .bind(id)
+    .first<{ expires_at: number | null; parent: string | null; parent_found: string | null; parent_expires_at: number | null }>();
+  const now = Date.now();
+  if (!row || (row.expires_at !== null && row.expires_at < now)) return false;
+  if (row.parent === null) return true;
+  return row.parent_found !== null && (row.parent_expires_at === null || row.parent_expires_at >= now);
+}
+
+// A session can't make another sign-in: a link or session from it would
+// outlive it, revoked or signed out.
+export function refuseSession(who: Who) {
+  if (who.kind === "token" && who.token.kind === "session") {
+    fail(403, "a dashboard session can't make another sign-in: use a token or the admin key (cloudex dashboard does)");
+  }
 }
 
 export const me = (who: Who): Me =>
@@ -215,6 +256,9 @@ export async function authorize(
 const DEVICE_TTL = 10 * 60_000;
 export const DEVICE_INTERVAL = 5;
 const MAX_WAITING = 20;
+// And a few from any one address, so that one caller can't take them all.
+// Requests with no address count as one.
+const MAX_WAITING_PER_IP = 3;
 // No vowels, so codes don't spell words; no letters that look like digits.
 const CODE_LETTERS = "BCDFGHJKLMNPQRSTVWXZ";
 
@@ -261,8 +305,12 @@ export async function startDevice(
   await ensureSchema(db);
   const now = Date.now();
   await db.prepare("DELETE FROM device_requests WHERE expires_at < ?").bind(now).run();
-  const waiting = await db.prepare("SELECT COUNT(*) AS n FROM device_requests").first<number>("n");
+  // Only those still waiting: a denied or approved request stays until its
+  // device collects the answer, or expires, and mustn't hold a place.
+  const waiting = await db.prepare("SELECT COUNT(*) AS n FROM device_requests WHERE status = 'pending'").first<number>("n");
   if ((waiting ?? 0) >= MAX_WAITING) fail(429, "too many sign-ins are waiting for approval; try again in a few minutes");
+  const fromIp = await db.prepare("SELECT COUNT(*) AS n FROM device_requests WHERE status = 'pending' AND ip IS ?").bind(req.ip).first<number>("n");
+  if ((fromIp ?? 0) >= MAX_WAITING_PER_IP) fail(429, "too many sign-ins from this address are waiting for approval; try again in a few minutes");
   const deviceCode = random32(40);
   for (let i = 0; ; i++) {
     const code = userCode();
@@ -302,8 +350,13 @@ export async function waitingDevices(db: D1Database) {
   return results.map(requestFromRow);
 }
 
-// The approver chooses the role (by default the one asked for, or user), but
-// can't grant more than they have.
+// The role a device gets when the approver names none: the one asked for if
+// that's read or user, else user. Anyone can ask for admin without a key, so
+// admin is only ever granted by name.
+export const defaultGrant = (asked: Role | null): Role => (asked === "read" ? "read" : "user");
+
+// The approver chooses the role (by default defaultGrant's), but can't grant
+// more than they have.
 export async function decideDevice(
   db: D1Database,
   who: Who,
@@ -321,7 +374,7 @@ export async function decideDevice(
     await db.prepare("UPDATE device_requests SET status = 'denied', granted_by = ? WHERE device_hash = ?").bind(by, row.device_hash).run();
     return requestFromRow(row);
   }
-  const role = decision.role ?? row.role ?? "user";
+  const role = decision.role ?? defaultGrant(row.role);
   if (who.kind === "token" && RANK[role] > RANK[who.token.role]) fail(403, `this token can't grant the role ${role}, which is more than its own`);
   await db
     .prepare("UPDATE device_requests SET status = 'approved', grant_role = ?, grant_own_only = ?, grant_expires_in = ?, granted_by = ? WHERE device_hash = ?")
@@ -358,8 +411,10 @@ export async function pollDevice(db: D1Database, deviceCode: string, session?: {
     kind: session ? "session" : "token",
     role: row.grant_role ?? "user",
     ownOnly: row.grant_own_only === 1,
-    // A session lasts 30 days from its last use, whatever the approval said.
+    // A session lasts 30 days from its last use, but never past the expiry
+    // the approver chose.
     expiresInSec: session ? SESSION_TTL_SEC : (row.grant_expires_in ?? undefined),
+    endsAt: session && row.grant_expires_in ? now + row.grant_expires_in * 1000 : null,
     createdBy: row.granted_by ?? "admin",
   });
   return { token };

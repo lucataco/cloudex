@@ -8,7 +8,7 @@ import type { Sandbox } from "@cloudex/schema";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { post, sb, whoAmI, wsUrl } from "../api";
+import { SIGNED_OUT, post, sb, toLogin, whoAmI, wsUrl } from "../api";
 import { Act, Problem } from "../ui";
 
 type Tab = { id: string; root: boolean };
@@ -171,9 +171,15 @@ function Term(props: { box: string; tab: Tab; visible: boolean; running: boolean
       }
       t.write(new Uint8Array(e.data as ArrayBuffer));
     };
-    sock.onclose = () => {
+    sock.onclose = (e) => {
       if (ws.current === sock) ws.current = null;
       if (st.disposed || st.ended) return;
+      // The session was signed out or revoked: no reconnecting.
+      if (e.code === SIGNED_OUT) {
+        st.ended = true;
+        toLogin();
+        return;
+      }
       if (!opened) st.failures++;
       setStatus("reconnecting");
       // A few failures in a row: the sandbox may have stopped, or the
@@ -198,6 +204,13 @@ function Term(props: { box: string; tab: Tab; visible: boolean; running: boolean
       macOptionClickForcesSelection: true,
       allowTransparency: false,
       theme: THEME,
+      // OSC 8 links in the output open without xterm's confirm(), whose text
+      // the sandbox would write; http(s) only, in a tab that can't reach this one.
+      linkHandler: {
+        activate: (_e, uri) => {
+          if (/^https?:\/\//i.test(uri)) window.open(uri, "_blank", "noopener,noreferrer");
+        },
+      },
     });
     const f = new FitAddon();
     t.loadAddon(f);
@@ -236,9 +249,18 @@ function Term(props: { box: string; tab: Tab; visible: boolean; running: boolean
       ro.disconnect();
       const sock = ws.current;
       if (sock) {
-        // A tab closed in the dashboard ends its tmux session too.
-        if (st.killing && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ kill: 1 }));
-        setTimeout(() => sock.close(), st.killing ? 300 : 0);
+        // A tab closed in the dashboard ends its tmux session too, even when
+        // its socket is still opening (Firefox opens one at a time to a
+        // host, so after a reload the other tabs' sockets wait their turn).
+        const kill = () => {
+          sock.send(JSON.stringify({ kill: 1 }));
+          setTimeout(() => sock.close(), 300);
+        };
+        if (st.killing && sock.readyState === WebSocket.CONNECTING) {
+          sock.onopen = kill;
+          sock.onmessage = null;
+        } else if (st.killing && sock.readyState === WebSocket.OPEN) kill();
+        else setTimeout(() => sock.close(), 0);
       }
       t.dispose();
     };

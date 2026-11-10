@@ -4,7 +4,7 @@
 // since a page from the sandbox on this host could use the dashboard's cookie.
 import type { Desktop as DesktopInfo, Sandbox } from "@cloudex/schema";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { del, post, sb, wsUrl } from "../api";
+import { SIGNED_OUT, del, post, sb, toLogin, wsUrl } from "../api";
 import type { RFB, RFBClass } from "../novnc";
 import { Act, Problem, errText } from "../ui";
 
@@ -44,7 +44,13 @@ export function Desktop(props: { box: Sandbox }) {
     if (s.gone) return;
     rfb.current?.disconnect();
     screen.current!.replaceChildren();
-    const r = new RFBc(screen.current!, wsUrl(`${sb(box.id)}/desktop/vnc`));
+    // The socket is made here so that its close code shows: noVNC's
+    // disconnect event doesn't carry it. This listener goes first, before
+    // noVNC's own.
+    const sock = new WebSocket(wsUrl(`${sb(box.id)}/desktop/vnc`));
+    let signedOut = false;
+    sock.addEventListener("close", (e) => (signedOut = e.code === SIGNED_OUT));
+    const r = new RFBc(screen.current!, sock);
     r.scaleViewport = !fitWindow;
     r.resizeSession = fitWindow;
     r.qualityLevel = 4;
@@ -64,6 +70,12 @@ export function Desktop(props: { box: Sandbox }) {
     r.addEventListener("disconnect", async () => {
       if (rfb.current === r) rfb.current = null;
       if (s.gone || s.stopping) return;
+      // The session was signed out or revoked: no reconnecting.
+      if (signedOut) {
+        s.gone = true;
+        toLogin();
+        return;
+      }
       if (!connected) s.failures++;
       setPhase("reconnecting");
       // Twice in a row: the desktop may have gone with a stop. Start it again.

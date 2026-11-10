@@ -20,8 +20,8 @@ permissions:
   packages: write
 
 jobs:
-  # Fix releases for an older line (v0.1.x from lts-v0.1.17) can be tagged after
-  # a newer release. Only the newest version becomes GitHub's latest release,
+  # A fix release for an older version can be tagged after a newer release.
+  # Only the newest version becomes GitHub's latest release,
   # which `cloudex update` and the install script read, the image's :latest
   # tag, and npm's latest tag.
   newest:
@@ -109,7 +109,7 @@ jobs:
             echo "cloudex@$version is already on npm"
             exit 0
           fi
-          # An older line's SDK goes under its own dist-tag, like v0.1-lts.
+          # An older version's SDK goes under its own dist-tag, like v0.1-lts.
           if [ "${{ needs.newest.outputs.newest }}" = true ]; then tag=latest; else tag="v${version%.*}-lts"; fi
           npm stage publish --access public --tag "$tag"
           echo "::notice::cloudex@$version is staged on npm; approve it with npm stage approve <id> (the id is in the log above)"

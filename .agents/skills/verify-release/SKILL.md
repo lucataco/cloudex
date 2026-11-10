@@ -22,9 +22,20 @@ Cloudex has unit tests, but most of what breaks lives between the CLI, the Worke
 CLOUDEX_BIN=go/bin/cloudex .agents/skills/verify-release/scripts/verify.sh   # a dev build
 ```
 
-Areas: `setup`, `lifecycle`, `connect`, `inside` (the `cloudex` command in a sandbox), `agents` (skipped without provider keys; see `cloudex keys`), `sdk` (`sdk-smoke.mjs` and `sdk_smoke.py`). A full run takes about 10 minutes. It prints `PASS`, `FAIL` or `SKIP` with a check id, writes `results.tsv` to `$VERIFY_OUT` (default: a temp directory), and exits 1 if anything failed. `VERIFY_KEEP=1` keeps the sandboxes so you can look at a failure.
+Areas: `setup`, `lifecycle`, `connect`, `inside` (the `cloudex` command in a sandbox), `agents` (skipped without provider keys; see `cloudex keys`), `tokens`, `dashboard` (the dashboard's API, sign-in and terminal socket, with curl), `browser` (the dashboard in a real browser; see below), `sdk` (`sdk-smoke.mjs` and `sdk_smoke.py`). A full run takes about 10 minutes, and the browser area adds about 5 to 10 (the desktop's first start is most of it). It prints `PASS`, `FAIL` or `SKIP` with a check id, writes `results.tsv` to `$VERIFY_OUT` (default: a temp directory), and exits 1 if anything failed. `VERIFY_KEEP=1` keeps the sandboxes so you can look at a failure.
 
 A `SKIP` isn't a pass. Report each one with its reason.
+
+### The dashboard in a browser
+
+The `browser` area runs `scripts/browser/run.mjs`, which drives headless Chrome over the DevTools protocol (or Firefox over WebDriver BiDi) with nothing but Node 24. It signs in the way a user does, with `cloudex dashboard --no-open --json`, and goes through the sign-in pages, terminal (vi, htop, resize, UTF-8, tabs, reload, a dropped socket), desktop, commands, files, saves, access, code sign-in and approving `/login?code=`, phone width, sign-out and revoking, then checks the console for CSP violations and request URLs for secrets. Its checks are `B01`–`B40`, in the same `PASS`/`FAIL`/`SKIP` lines. It makes its own sandbox, `vr<HHMMSS>-chrome`, and ends every session, token and sign-in it starts, even after a failure or `Ctrl-C`; `B40` fails if anything is left. The agent turn (`B16`–`B18`) spends provider tokens, so it runs only with the `agents` area or `VERIFY_AGENTS=1`. Chrome is the default; `VERIFY_BROWSERS="chrome firefox"` runs both, and `CHROME`/`FIREFOX` point at a browser outside the usual places. Without one, the area is a `SKIP`. On its own, with the same `CLOUDEX_BIN` and `CLOUDEX_CONFIG_DIR`:
+
+```sh
+node .agents/skills/verify-release/scripts/browser/run.mjs --browser firefox --only terminal,reconnect
+node .agents/skills/verify-release/scripts/browser/selftest.mjs   # its pure parts, no browser
+```
+
+A failure saves `<id>.png` to `$VERIFY_OUT/browser-<browser>` (or the directory it names), with the browser's log. `--keep` keeps the sandbox.
 
 ## Test a branch before it ships
 
@@ -36,7 +47,7 @@ A `SKIP` isn't a pass. Report each one with its reason.
 
 ## Checks that need eyes
 
-The scripts can't see a terminal UI or a picture. Go through [references/manual.md](references/manual.md) before a release. Use the `control-cli` skill for terminals and the `control-ui` skill (or the Chrome DevTools MCP) for the desktop.
+The scripts can't see a terminal UI or a picture, and the browser checks don't run Safari. Go through [references/manual.md](references/manual.md) before a release; it marks what the `browser` area already covers. Use the `control-cli` skill for terminals and the `control-ui` skill (or the Chrome DevTools MCP) for the desktop.
 
 ## When a check fails
 

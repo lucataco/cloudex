@@ -96,6 +96,8 @@ const SCHEMA = [
 const MIGRATIONS = [
   // v0.2.1: the token a dashboard session acts for.
   "ALTER TABLE tokens ADD COLUMN parent TEXT",
+  // v0.2.1: the end a device approval set for a session, past which it isn't renewed.
+  "ALTER TABLE tokens ADD COLUMN ends_at INTEGER",
 ];
 
 async function migrate(db: D1Database) {

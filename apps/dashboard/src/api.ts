@@ -51,6 +51,11 @@ export const del = <T>(path: string) => api<T>("DELETE", path);
 
 export const sb = (ref: string) => `/v1/sandboxes/${encodeURIComponent(ref)}`;
 
+// The close code of a WebSocket whose token or session ended while it was
+// open (CREDENTIAL_ENDED in apps/api/src/util.ts): sign in again rather than
+// reconnecting.
+export const SIGNED_OUT = 4401;
+
 // A WebSocket URL on this host. The cookie goes with it, and the API checks
 // its Origin.
 export const wsUrl = (path: string) => `${location.protocol === "http:" ? "ws" : "wss"}://${location.host}${path}`;

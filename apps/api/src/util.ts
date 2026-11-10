@@ -60,6 +60,14 @@ export async function previewToken(secret: string, id: string, port: number, ver
 // Sandbox object to check against revoked links.
 export const LINK_HEADER = "x-cloudex-link";
 
+// The id of the token that opened a WebSocket, from the Worker to the Sandbox
+// object, which checks now and then that the token still works.
+export const TOKEN_HEADER = "x-cloudex-token-id";
+
+// The close code of a WebSocket whose token or session ended while it was
+// open: the dashboard goes to its login page rather than reconnecting.
+export const CREDENTIAL_ENDED = 4401;
+
 export const previewUrl = (zone: string, id: string, port: number, token: string) => `https://${port}-${id}-${token}.${zone}`;
 
 // Compares digests so the check takes the same time whatever the input.

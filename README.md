@@ -8,9 +8,7 @@ service in between. Site: [cloudex.build](https://cloudex.build).
 **Status: v0.2.1** adds a web dashboard, served by your deployment itself, with
 terminals and desktops in the browser. v0.2.0 added OpenCode, keys for six more AI
 providers, and access tokens with sign-in by code. v0.1 commands, API routes and
-SDK calls still work unchanged. v0.1.17 stays the long-term-support
-release of v0.1 and gets bug fixes as v0.1.x releases from the `lts-v0.1.17`
-branch.
+SDK calls still work unchanged.
 
 ## What you need
 

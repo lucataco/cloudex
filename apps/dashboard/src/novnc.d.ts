@@ -13,4 +13,5 @@ export interface RFB extends EventTarget {
   clipboardPasteFrom(text: string): void;
   sendCtrlAltDel(): void;
 }
-export type RFBClass = new (target: HTMLElement, url: string, options?: object) => RFB;
+// url can be a WebSocket already made, whose close code the page then sees.
+export type RFBClass = new (target: HTMLElement, url: string | WebSocket, options?: object) => RFB;

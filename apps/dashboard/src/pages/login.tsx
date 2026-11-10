@@ -1,5 +1,7 @@
 // /login: signing in, and approving another computer's sign-in.
-//   /login#link=CODE&next=/s/web   a one-time link from cloudex dashboard
+//   /login#link=CODE&next=/s/web   a one-time link from cloudex dashboard; a
+//                                  browser signed in already keeps its session
+//                                  and goes to next, leaving the link unused
 //   /login?code=ABCD-EFGH          a device login to approve (cloudex login
 //                                  shows this link), once signed in
 // Signing in without a link: get a code here and approve it with cloudex
@@ -8,10 +10,9 @@
 import type { DeviceCode, DeviceRequest, Me, Role } from "@cloudex/schema";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { ApiError, api, get, post } from "../api";
+import { safeNext } from "@cloudex/schema/paths";
 import { navigate } from "../router";
 import { Act, Cmd, Problem, ago } from "../ui";
-
-const safeNext = (n: string | null) => (n && /^\/[A-Za-z0-9._~\/?=&%-]*$/.test(n) && !n.startsWith("//") ? n : "/");
 
 const start = (body: object) => api<Me>("POST", "/v1/auth/session", body, { login: false });
 
@@ -31,24 +32,27 @@ export function Login() {
   useEffect(() => {
     const hash = new URLSearchParams(location.hash.slice(1));
     const link = hash.get("link");
-    if (link) {
-      // The code goes out of the address bar and history at once.
-      history.replaceState(null, "", location.pathname + location.search);
-      start({ link }).then(
-        () => location.replace(safeNext(hash.get("next"))),
-        (e) => {
-          setError(e.message);
-          setMe(null);
-        },
-      );
-      return;
-    }
+    // The code goes out of the address bar and history at once.
+    if (link) history.replaceState(null, "", location.pathname + location.search);
     api<Me>("GET", "/v1/me", undefined, { login: false }).then(
       (m) => {
-        if (approving) setMe(m);
+        // Signed in already: a link never replaces the session, since someone
+        // else's link would sign this browser in as them. It stays unused; to
+        // use one, sign out first.
+        if (link) location.replace(safeNext(hash.get("next")));
+        else if (approving) setMe(m);
         else location.replace(safeNext(query.get("next")));
       },
-      () => setMe(null),
+      () => {
+        if (!link) return setMe(null);
+        start({ link }).then(
+          () => location.replace(safeNext(hash.get("next"))),
+          (e) => {
+            setError(e.message);
+            setMe(null);
+          },
+        );
+      },
     );
   }, []);
 
@@ -188,7 +192,8 @@ function Approve(props: { code: string; me: Me }) {
       (all) => {
         const r = all.find((x) => x.userCode === code) ?? null;
         setReq(r);
-        if (r?.role) setRole(r.role);
+        // Admin only when chosen here: anyone can ask for it without a key.
+        if (r?.role === "read") setRole("read");
       },
       (e) => setError(e.message),
     );
@@ -250,11 +255,16 @@ function Approve(props: { code: string; me: Me }) {
         <dt>Program</dt>
         <dd class="mono small">{req.userAgent ?? "?"}</dd>
         <dt>Asked</dt>
-        <dd>
-          {ago(req.createdAt)}
-          {req.role ? `, for the role ${req.role}` : ""}
-        </dd>
+        <dd>{ago(req.createdAt)}</dd>
+        <dt>Asked for</dt>
+        <dd>{req.role ? `the role ${req.role}` : "no role in particular"}</dd>
       </dl>
+      {req.role === "admin" ? (
+        <p class="warn">
+          This sign-in asks for admin, which can do everything, including making tokens and approving other sign-ins. It starts as user below; choose admin
+          only if you know this computer and it needs it.
+        </p>
+      ) : null}
       <div class="form">
         <label>
           Role

@@ -49,6 +49,7 @@ import {
   me,
   ownerKey,
   pollDevice,
+  refuseSession,
   revokeToken,
   setOwner,
   startDevice,
@@ -64,6 +65,7 @@ import { NO_SUCH_SANDBOX, type ForkSource } from "./sandbox";
 import { type SaveManifest, deleteSave, getSave, listSaves, readManifest } from "./saves";
 import {
   LINK_HEADER,
+  TOKEN_HEADER,
   VERSION,
   errorStatus,
   fail,
@@ -146,6 +148,7 @@ app.post("/v1/auth/session", async (c) => {
   } else if ("token" in input) {
     const who = await authenticateSecret(c.env, input.token.trim());
     if (!who) return c.json({ error: "that isn't this deployment's admin key or a working token" }, 401);
+    refuseSession(who);
     made = await startSession(c.env.DB, who, name);
   } else {
     const r = await pollDevice(c.env.DB, input.device_code, { name });
@@ -204,6 +207,7 @@ app.use("/v1/*", async (c, next) => {
 
 // A one-time link that signs a browser in as the caller: cloudex dashboard.
 app.post("/v1/auth/links", async (c) => {
+  refuseSession(c.get("who"));
   const text = await c.req.text();
   const { path } = CreateLoginLink.parse(text ? JSON.parse(text) : {});
   const { code, expiresIn } = await createLoginLink(c.env.DB, c.get("who"));
@@ -568,24 +572,36 @@ app.post("/v1/sandboxes/:ref/agents/:agent/interrupt", async (c) =>
   c.json(await agentOp(c.env, c.req.param("ref"), "interrupt", [agentId(c.req.param("agent"))])),
 );
 
+// The WebSockets below are checked only here, at the upgrade, so the Sandbox
+// object is told which token opened one (its id, never the secret) and ends
+// it when that token goes (sandbox.ts watchCredential). The admin key has no
+// row to check.
+function socketRequest(c: { req: { raw: Request }; get(k: "who"): Who }, to: string) {
+  const fwd = new Request(to, c.req.raw);
+  fwd.headers.delete(TOKEN_HEADER);
+  const who = c.get("who");
+  if (who.kind === "token") fwd.headers.set(TOKEN_HEADER, who.token.id);
+  return fwd;
+}
+
 // A shell in the sandbox under a pty, over a WebSocket (sandbox.ts terminal).
 app.get("/v1/sandboxes/:ref/terminal", async (c) => {
   const { stub } = await sandbox(c.env, c.req.param("ref"));
   const url = new URL(c.req.url);
-  return stub.fetch(new Request(`http://sandbox/term${url.search}`, c.req.raw));
+  return stub.fetch(socketRequest(c, `http://sandbox/term${url.search}`));
 });
 
 // The desktop's VNC server over a WebSocket, for the dashboard's noVNC.
 app.get("/v1/sandboxes/:ref/desktop/vnc", async (c) => {
   const { stub } = await sandbox(c.env, c.req.param("ref"));
-  return stub.fetch(new Request("http://sandbox/vnc", c.req.raw));
+  return stub.fetch(socketRequest(c, "http://sandbox/vnc"));
 });
 
 // WebSocket to a guest TCP port: `cloudex ssh` and `cloudex proxy` use port 22.
 app.get("/v1/sandboxes/:ref/tcp/:port{[0-9]+}", async (c) => {
   const { stub } = await sandbox(c.env, c.req.param("ref"));
   const url = new URL(c.req.url);
-  return stub.fetch(new Request(`http://sandbox/tcp/${c.req.param("port")}${url.search}`, c.req.raw));
+  return stub.fetch(socketRequest(c, `http://sandbox/tcp/${c.req.param("port")}${url.search}`));
 });
 
 // Preview links: POST hands out a port's link, GET lists the ones that work,
@@ -689,6 +705,7 @@ async function preview(req: Request, env: Env, m: RegExpExecArray): Promise<Resp
   const url = new URL(req.url);
   const fwd = new Request(`http://sandbox/http/${port}${url.pathname}${url.search}`, req);
   fwd.headers.set(LINK_HEADER, token);
+  fwd.headers.delete(TOKEN_HEADER);
   // The app sees the link's own host name and the visitor's address, as
   // behind any proxy; not hosts or addresses the visitor claims.
   for (const h of SPOOFABLE) fwd.headers.delete(h);

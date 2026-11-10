@@ -1,6 +1,7 @@
 // Models shared by the API Worker, the CLI and the SDKs. Keep this the single
 // source of truth: the OpenAPI spec, and from it the SDKs, are generated here.
 import { z } from "zod";
+import { isDashboardPath } from "./paths.ts";
 
 // Container instance types on Cloudflare. standard-4 is 4 vCPU, 12 GiB and 20 GB of disk.
 // lite (256 MiB, 2 GB of disk) is left out: the sandbox image fails to boot on it.
@@ -495,7 +496,7 @@ export type Me = z.infer<typeof Me>;
 // signed in approves its code, and the computer collects its token.
 export const DeviceStart = z.object({
   name: z.string().min(1).max(100), // what the token will be called, such as the computer's name
-  role: Role.optional(), // the role asked for; the approver decides
+  role: Role.optional(), // the role asked for; the approver decides, and grants admin only by choosing it
 });
 export type DeviceStart = z.input<typeof DeviceStart>;
 
@@ -536,7 +537,7 @@ export type DeviceRequest = z.infer<typeof DeviceRequest>;
 
 export const DeviceApprove = z.object({
   user_code: z.string().min(1).max(20),
-  role: Role.optional(), // default: the role asked for, or user
+  role: Role.optional(), // default: user, or read if read was asked for; never admin
   ownOnly: z.boolean().default(false),
   expiresInSec: ExpiresIn.optional(), // default 90 days
 });
@@ -551,7 +552,9 @@ export const CreateLoginLink = z.object({
   path: z
     .string()
     .max(200)
-    .regex(/^\/[A-Za-z0-9._~\/-]*$/, "a path on the dashboard, such as /s/web")
+    .regex(/^\/[A-Za-z0-9._~\/?=&%-]*$/, "a page of the dashboard, such as /s/web")
+    // Its own pages only (paths.ts), as the login page checks.
+    .refine(isDashboardPath, "a page of the dashboard, such as /s/web")
     .default("/"),
 });
 export type CreateLoginLink = z.input<typeof CreateLoginLink>;

@@ -86,7 +86,8 @@ import {
   store,
   view,
 } from "./settings";
-import { LINK_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
+import { tokenAlive } from "./tokens";
+import { CREDENTIAL_ENDED, LINK_HEADER, TOKEN_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
 // Exits 0 once the entrypoint is ready in this boot, and 3 while it holds for
 // a restore (CLOUDEX_HOLD).
@@ -106,6 +107,8 @@ const RESTORE_SAVE_TIMEOUT_MS = 25 * 60_000;
 const SAVE_LIFETIME_MS = 29 * 24 * 3600_000;
 const PLATFORM_MAX_INACTIVITY_MS = 6 * 3600_000;
 const ALARM_EVERY_MS = 60_000;
+// How often an open terminal, desktop or TCP WebSocket checks that its token still works.
+const CREDENTIAL_CHECK_MS = 60_000;
 const GUEST_USER = "1000:1000"; // the image's cloudex user
 // Runs the rest of a command line as the cloudex user, as an ssh login would.
 // exec's own user option keeps every capability root has (as ambient ones) and
@@ -1502,18 +1505,19 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.record;
     if (!r || this.removing) return new Response("no such sandbox", { status: 404 });
     const url = new URL(req.url);
+    const tokenId = req.headers.get(TOKEN_HEADER);
     if (url.pathname === "/term" || url.pathname === "/vnc") {
       if (r.state !== "running") return new Response(`${wrongState(r)}\n`, { status: 409 });
       if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         return new Response("expected a WebSocket upgrade", { status: 426 });
       }
       this.touch();
-      if (url.pathname === "/term") return this.terminal(url);
+      if (url.pathname === "/term") return this.terminal(url, tokenId);
       // The VNC server listens on localhost only, so through the relay previews use.
       const through = await this.relay(VNC_PORT, "10.0.0.1");
       if (through === null) return new Response("the desktop isn't running: start it first\n", { status: 409 });
       if (!through) return new Response("couldn't reach the desktop's VNC server\n", { status: 502 });
-      return this.bridge(through);
+      return this.bridge(through, tokenId);
     }
     const m = /^\/(tcp|http)\/(\d{1,5})(\/.*)?$/.exec(url.pathname);
     if (!m) return new Response("not found", { status: 404 });
@@ -1550,7 +1554,30 @@ export class Sandbox extends DurableObject<Env> {
       if (!SSH_KEY.test(key)) return new Response("that isn't an SSH public key", { status: 400 });
       await this.authorize(key);
     }
-    return this.bridge(port);
+    return this.bridge(port, tokenId);
+  }
+
+  // The Worker checked the token that opened a WebSocket at the upgrade only,
+  // so this checks it about once a minute while the socket is open, and ends
+  // the socket with CREDENTIAL_ENDED once the token (or the token a session
+  // acts for) is revoked or expires, or the session signs out. No id: the
+  // admin key, which has no row. A D1 error leaves it open until the next check.
+  // Returns what stops the checks, which closing the socket does too.
+  private watchCredential(ws: WebSocket, tokenId: string | null, ended: () => void): () => void {
+    if (!tokenId) return () => {};
+    const timer = setInterval(async () => {
+      if (!(await tokenAlive(this.env.DB, tokenId).catch(() => true))) {
+        clearInterval(timer);
+        try {
+          ws.close(CREDENTIAL_ENDED, "signed out: the token or session that opened this has ended");
+        } catch {}
+        ended();
+      }
+    }, CREDENTIAL_CHECK_MS);
+    const stop = () => clearInterval(timer);
+    ws.addEventListener("close", stop);
+    ws.addEventListener("error", stop);
+    return stop;
   }
 
   // A preview request for a guest port. A server listening only on localhost
@@ -1723,7 +1750,7 @@ export class Sandbox extends DurableObject<Env> {
   // shell ends, a tmux session stays until it's killed or its shell exits.
   // Only messages from the browser count as activity, so the dashboard pings
   // while its tab is visible.
-  private async terminal(url: URL): Promise<Response> {
+  private async terminal(url: URL, tokenId: string | null): Promise<Response> {
     const size = (v: unknown, d: number) => Math.min(1000, Math.max(2, Math.floor(Number(v)) || d));
     const cols = size(url.searchParams.get("cols"), 80);
     const rows = size(url.searchParams.get("rows"), 24);
@@ -1746,6 +1773,7 @@ export class Sandbox extends DurableObject<Env> {
     const done = () => {
       if (closed) return;
       closed = true;
+      unwatch();
       this.touch();
       writer.close().catch(() => {});
       try {
@@ -1778,6 +1806,7 @@ export class Sandbox extends DurableObject<Env> {
     });
     server.addEventListener("close", done);
     server.addEventListener("error", done);
+    const unwatch = this.watchCredential(server, tokenId, () => done());
     void (async () => {
       const reader = p.stdout!.getReader();
       try {
@@ -1802,7 +1831,7 @@ export class Sandbox extends DurableObject<Env> {
 
   // WebSocket <-> guest TCP. Reads from the guest are coalesced into frames of
   // up to 256 KiB, which took scp downloads from 6-8 to 17 MiB/s in the spikes.
-  private async bridge(port: number): Promise<Response> {
+  private async bridge(port: number, tokenId: string | null): Promise<Response> {
     const sock = this.container.getTcpPort(port).connect(`10.0.0.1:${port}`);
     try {
       await withTimeout(sock.opened, 15_000, `connecting to port ${port}`);
@@ -1830,6 +1859,7 @@ export class Sandbox extends DurableObject<Env> {
     const done = () => {
       if (closed) return;
       closed = true;
+      unwatch();
       this.touch();
       writer.close().catch(() => {});
     };
@@ -1840,6 +1870,7 @@ export class Sandbox extends DurableObject<Env> {
     });
     server.addEventListener("close", done);
     server.addEventListener("error", done);
+    const unwatch = this.watchCredential(server, tokenId, () => done());
 
     let pending: Uint8Array[] = [];
     let pendingBytes = 0;

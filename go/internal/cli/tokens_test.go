@@ -119,3 +119,48 @@ func TestExpiry(t *testing.T) {
 		t.Error("normalizeCode")
 	}
 }
+
+// A sign-in that asks for admin gets user unless --role admin says otherwise,
+// whatever the server would default to, and the CLI says what it asked for.
+func TestTokensApproveNeverGrantsAdminByDefault(t *testing.T) {
+	waiting := `[{"userCode":"BCDF-GHJK","name":"laptop","role":"admin","ip":"1.2.3.4","country":"US","userAgent":null,"createdAt":1,"expiresAt":2}]`
+	approved := `{"userCode":"BCDF-GHJK","name":"laptop","role":"user","ip":"1.2.3.4","country":"US","userAgent":null,"createdAt":1,"expiresAt":2}`
+	f := withFakeAPI(t, map[string]string{"GET /v1/auth/device": waiting, "POST /v1/auth/device/approve": approved})
+	code, out, errOut := run(t, "tokens", "approve", "bcdf-ghjk", "--yes")
+	if code != 0 || !strings.Contains(errOut, "asked for the role admin; it gets user") || !strings.Contains(out, "role user; it asked for admin") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	var body map[string]any
+	json.Unmarshal([]byte(f.bodies[1]), &body)
+	if body["role"] != "user" {
+		t.Fatalf("body %v", body)
+	}
+
+	f = withFakeAPI(t, map[string]string{"GET /v1/auth/device": waiting, "POST /v1/auth/device/approve": strings.Replace(approved, `"role":"user"`, `"role":"admin"`, 1)})
+	if code, out, errOut := run(t, "tokens", "approve", "BCDF-GHJK", "--yes", "--role", "admin"); code != 0 || strings.Contains(errOut, "it gets") || !strings.Contains(out, "role admin") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	json.Unmarshal([]byte(f.bodies[1]), &body)
+	if body["role"] != "admin" {
+		t.Fatalf("body %v", body)
+	}
+}
+
+func TestTokensApproveKeepsReadWhenAskedFor(t *testing.T) {
+	waiting := `[{"userCode":"BCDF-GHJK","name":"viewer","role":"read","ip":null,"country":null,"userAgent":null,"createdAt":1,"expiresAt":2}]`
+	f := withFakeAPI(t, map[string]string{
+		"GET /v1/auth/device":          waiting,
+		"POST /v1/auth/device/approve": strings.Trim(waiting, "[]"),
+	})
+	if code, out, errOut := run(t, "tokens", "approve", "BCDF-GHJK", "--yes"); code != 0 || !strings.Contains(out, "role read") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	var body map[string]any
+	json.Unmarshal([]byte(f.bodies[1]), &body)
+	if body["role"] != "read" {
+		t.Fatalf("body %v", body)
+	}
+	if code, out, _ := run(t, "tokens", "approve"); code != 0 || !strings.Contains(out, "ASKED FOR") || !strings.Contains(out, "read") {
+		t.Fatalf("code %d, stdout %q", code, out)
+	}
+}

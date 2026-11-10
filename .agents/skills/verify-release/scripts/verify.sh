@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Checks what Cloudex ships against a live deployment, the way a user runs it.
-#   verify.sh [area...]    areas: setup lifecycle connect inside agents tokens dashboard sdk (default: all)
+#   verify.sh [area...]    areas: setup lifecycle connect inside agents tokens dashboard browser sdk (default: all)
 # Env: CLOUDEX_BIN (default: cloudex on PATH), CLOUDEX_CONFIG_DIR (the deployment to use,
-# default ~/.config/cloudex), VERIFY_OUT (results directory), VERIFY_KEEP=1 keeps sandboxes.
+# default ~/.config/cloudex), VERIFY_OUT (results directory), VERIFY_KEEP=1 keeps sandboxes,
+# VERIFY_BROWSERS (browser area: "chrome", the default, "firefox", or both), CHROME and FIREFOX
+# (where they are, when not in the usual places), VERIFY_AGENTS=1 (the browser's agent turn
+# without the agents area).
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
 set -uo pipefail
 
@@ -61,14 +64,17 @@ cleanup() {
 	for t in $("$CX" tokens --json 2>/dev/null | jq -r --arg p "$P-" '.[]? | select(.name | startswith($p)) | .id'); do
 		"$CX" tokens revoke "$t" >/dev/null 2>&1
 	done
+	for c in $("$CX" tokens approve --json 2>/dev/null | jq -r --arg p "$P-" '.[]? | select(.name | startswith($p)) | .userCode'); do
+		"$CX" tokens deny "$c" >/dev/null 2>&1
+	done
 	echo "results: $results"
 }
 trap cleanup EXIT
 
 want() { [[ $# -eq 0 || " ${areas[*]} " == *" $1 "* ]]; }
 areas=("$@")
-[[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents tokens dashboard sdk)
-echo "Cloudex verify: $("$CX" version 2>&1 | head -1) against $API_URL, prefix $P, areas: ${areas[*]}"
+[[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents tokens dashboard browser sdk)
+echo "Cloudex verify: $("$CX" version --json 2>/dev/null | jq -r '.version // empty' 2>/dev/null) against $API_URL, prefix $P, areas: ${areas[*]}"
 
 A=$P-a
 need_a() {
@@ -480,6 +486,9 @@ if want dashboard; then
 		[ "$(cc "$API_URL/v1/me")" = 403 -a "$(cc -H 'x-cloudex: 1' -H 'origin: https://example.com' "$API_URL/v1/me")" = 403 ]
 	"$CX" tokens --json >"$work/o" 2>/dev/null
 	ok D08 "the browser's session is listed with the tokens" [ -n "$sid" -a "$(jq -r --arg id "$sid" '.[] | select(.id == $id) | .kind' "$work/o")" = session ]
+	# A link made from a session would outlive it, signed out or revoked.
+	ok D15 "a dashboard session can't make a sign-in link" \
+		[ "$(cc -X POST -H 'x-cloudex: 1' -H "origin: $API_URL" -H 'content-type: application/json' -d '{}' "$API_URL/v1/auth/links")" = 403 ]
 	cc -X DELETE -H 'x-cloudex: 1' -H "origin: $API_URL" "$API_URL/v1/auth/session" >/dev/null
 	ok D09 "signing out ends the session" [ "$(cc -H 'x-cloudex: 1' "$API_URL/v1/me")" = 401 ]
 	cx tokens create "$P-dash-read" --role read
@@ -490,6 +499,44 @@ if want dashboard; then
 		[ "$code" = 200 -a "$(jq -r .role "$work/b")" = read -a "$(cc -X POST -H 'x-cloudex: 1' -H 'content-type: application/json' -d '{}' "$API_URL/v1/sandboxes")" = 403 ]
 	cx tokens revoke "$(field .id)"
 	ok D11 "revoking a token ends the sessions it signed in" [ "$(cc -H 'x-cloudex: 1' "$API_URL/v1/me")" = 401 ]
+	# Device sign-ins need no key, so one address may keep only three waiting.
+	# The first asks for admin, which an approval that names no role must not give.
+	devs=() dcodes=()
+	for i in 1 2 3 4; do
+		role=user
+		[[ $i == 1 ]] && role=admin
+		dc=$(curl -s -o "$work/d$i" -w '%{http_code}' --max-time 30 -X POST -H 'content-type: application/json' \
+			-d "{\"name\":\"$P-dev-$i\",\"role\":\"$role\"}" "$API_URL/v1/auth/device")
+		dcodes+=("$dc")
+		[[ $dc == 200 ]] && devs+=("$i")
+	done
+	ok D16 "a fourth sign-in waiting from one address is refused with a 429" is "${dcodes[*]}" "200 200 200 429"
+	admin_code=$(jq -r '.user_code // empty' "$work/d1" 2>/dev/null)
+	ap() { curl -s -o "$work/b" -w '%{http_code}' --max-time 30 -X POST -H "authorization: Bearer $key" -H 'content-type: application/json' -d "$2" "$API_URL/v1/auth/device/$1"; }
+	poll_dev() { curl -s -o "$work/t" --max-time 30 -X POST -H 'content-type: application/json' -d "{\"device_code\":\"$(jq -r .device_code "$work/d$1")\"}" "$API_URL/v1/auth/token"; }
+	# A denied one stops waiting at once, though its computer hasn't asked for the answer yet.
+	ap deny "{\"user_code\":\"$(jq -r '.user_code // empty' "$work/d3")\"}" >/dev/null
+	dc=$(curl -s -o "$work/d5" -w '%{http_code}' --max-time 30 -X POST -H 'content-type: application/json' \
+		-d "{\"name\":\"$P-dev-5\"}" "$API_URL/v1/auth/device")
+	[[ $dc == 200 ]] && devs+=(5)
+	OUT="the next sign-in got $dc" CODE=""
+	ok D18 "a denied sign-in its computer hasn't collected no longer holds a place" is "$dc" 200
+	granted="" got=""
+	if [[ -n $admin_code && $(ap approve "{\"user_code\":\"$admin_code\",\"expiresInSec\":3600}") == 200 ]]; then
+		granted=$(jq -r '.role // empty' "$work/b")
+		poll_dev 1
+		got=$(jq -r '.token.role // empty' "$work/t")
+		tid=$(jq -r '.token.id // empty' "$work/t")
+		[[ -n $tid ]] && "$CX" tokens revoke "$tid" >/dev/null 2>&1
+	fi
+	OUT="approved as ${granted:-?}, token ${got:-none}" CODE=""
+	ok D17 "a sign-in that asked for admin, approved without a role, gets user" [ "$granted" = user -a "${got:-}" = user ]
+	# Deny the others, and collect the answer so nothing is left waiting.
+	for i in "${devs[@]}"; do
+		[[ $i == 1 ]] && continue
+		ap deny "{\"user_code\":\"$(jq -r .user_code "$work/d$i")\"}" >/dev/null # 404 for 3, denied already
+		poll_dev "$i"
+	done
 	need_a
 	tc() { CLOUDEX_API_KEY=$key node "$here/term-check.mjs" "$API_URL" "$A_ID" "$1" >"$work/o" 2>&1; CODE=$?; OUT=$(cat "$work/o"); }
 	tc echo
@@ -498,6 +545,36 @@ if want dashboard; then
 	ok D13 "a terminal in a tmux session gets the same shell back after reconnecting" [ "$CODE" = 0 ]
 	tc dead
 	ok D14 "a TCP port nothing listens on is refused, not opened" [ "$CODE" = 0 ]
+fi
+
+# ---------------------------------------------------------------- browser
+# The dashboard in headless Chrome (or Firefox), as a user goes through it:
+# browser/run.mjs signs in with cloudex dashboard, makes its own $P-<browser>
+# sandbox and ends every session and token it starts. Its checks are B01 on.
+if want browser; then
+	for b in ${VERIFY_BROWSERS:-chrome}; do
+		up=$(tr '[:lower:]' '[:upper:]' <<<"$b")
+		if ! command -v node >/dev/null; then
+			skip "B-$b" "the dashboard in $b" "node is needed"
+			continue
+		fi
+		if ! node "$here/browser/run.mjs" --find "$b" >/dev/null 2>&1; then
+			skip "B-$b" "the dashboard in $b" "no $b found; set $up to its path"
+			continue
+		fi
+		# The agent turn spends provider tokens, as the agents area does: it runs with that area.
+		ag=${VERIFY_AGENTS:-}
+		want agents && ag=1
+		keep=()
+		[[ ${VERIFY_KEEP:-} == 1 ]] && keep=(--keep)
+		before=$(grep -c $'\tFAIL\t' "$results")
+		CLOUDEX_BIN=$CX VERIFY_PREFIX=$P VERIFY_AGENTS=$ag node "$here/browser/run.mjs" --browser "$b" \
+			--results "$results" --out "$out/browser-$b" ${keep[@]+"${keep[@]}"} </dev/null
+		rc=$?
+		after=$(grep -c $'\tFAIL\t' "$results")
+		fails=$((fails + after - before))
+		[[ $rc != 0 && $after == "$before" ]] && fail "B-$b" "the browser checks in $b ran to the end" "run.mjs exited $rc"
+	done
 fi
 
 # ---------------------------------------------------------------- sdk

@@ -105,7 +105,8 @@ func newTokensCmd(opts *options) *cobra.Command {
 		Short: "Approve a computer's sign-in by the code it shows",
 		Long: "cloudex login on a computer without a key shows a code such as BCDF-GHJK.\n" +
 			"Approving it gives that computer a token of its own, which expires in 90 days\n" +
-			"unless --expires says otherwise; the role is the one it asked for, or user.\n" +
+			"unless --expires says otherwise. Its role is user, or read if it asked for read;\n" +
+			"admin only with --role admin, since anyone can ask for admin.\n" +
 			"With no code, lists the sign-ins waiting. Only approve a code you started\n" +
 			"yourself: whoever holds the other computer gets the token.",
 		Example: "  cloudex tokens approve BCDF-GHJK\n  cloudex tokens approve BCDF-GHJK --own --expires 7d",
@@ -136,31 +137,44 @@ func newTokensCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			asked := ""
+			if req.Role != nil {
+				asked = *req.Role
+			}
+			// The role goes in the request either way, so that no server
+			// grants admin for one that only asked.
+			role := arole
+			if role == "" {
+				role = defaultGrant(asked)
+			}
+			if asked == "admin" && role != "admin" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "It asked for the role admin; it gets %s. Pass --role admin to give it admin.\n", role)
+			}
 			if !yes && !opts.json {
 				if !isTerminal(os.Stdin) {
 					return errors.New("pass --yes to approve without a terminal to confirm on")
 				}
-				fmt.Fprintf(cmd.ErrOrStderr(), "Sign-in %s: %s, from %s, %s.\n", code, req.Name, where(req), ago(req.CreatedAt))
+				fmt.Fprintf(cmd.ErrOrStderr(), "Sign-in %s: %s, from %s, %s, %s. It gets the role %s.\n", code, req.Name, where(req), ago(req.CreatedAt), askedFor(asked), role)
 				if !ask(cmd, "Approve it? [y/N] ") {
 					return errors.New("not approved")
 				}
 			}
-			d, err := client.ApproveDeviceLogin(cmd.Context(), api.DeviceApproveRequest{UserCode: code, Role: arole, OwnOnly: aown, ExpiresInSec: sec})
+			d, err := client.ApproveDeviceLogin(cmd.Context(), api.DeviceApproveRequest{UserCode: code, Role: role, OwnOnly: aown, ExpiresInSec: sec})
 			if err != nil {
 				return err
 			}
 			if opts.json {
 				return writeJSON(cmd.OutOrStdout(), d)
 			}
-			r := "user"
+			r := role
 			if d.Role != nil {
 				r = *d.Role
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Approved %s (%s, role %s). It gets its token within a few seconds.\n", code, d.Name, r)
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Approved %s (%s, role %s; %s). It gets its token within a few seconds.\n", code, d.Name, r, askedFor(asked))
 			return err
 		},
 	}
-	approve.Flags().StringVar(&arole, "role", "", "admin, user or read (default: the role it asked for, or user)")
+	approve.Flags().StringVar(&arole, "role", "", "admin, user or read (default: user, or read if it asked for read)")
 	approve.Flags().BoolVar(&aown, "own", false, "only the sandboxes that computer makes")
 	approve.Flags().StringVar(&aexpires, "expires", "90d", "how long its token works, such as 12h, 30d or never")
 	approve.Flags().BoolVarP(&yes, "yes", "y", false, "approve without asking")
@@ -187,6 +201,22 @@ func newTokensCmd(opts *options) *cobra.Command {
 		},
 	})
 	return cmd
+}
+
+// The role a sign-in gets when --role doesn't say: the one it asked for if
+// that's read or user, else user. The API does the same.
+func defaultGrant(asked string) string {
+	if asked == "read" {
+		return "read"
+	}
+	return "user"
+}
+
+func askedFor(asked string) string {
+	if asked == "" {
+		return "it asked for no role in particular"
+	}
+	return "it asked for " + asked
 }
 
 func listTokens(cmd *cobra.Command, opts *options) error {
@@ -241,9 +271,13 @@ func listDeviceLogins(cmd *cobra.Command, opts *options, rs []api.DeviceRequest)
 		return err
 	}
 	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "CODE\tNAME\tFROM\tASKED")
+	fmt.Fprintln(tw, "CODE\tNAME\tFROM\tASKED\tASKED FOR")
 	for _, r := range rs {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", r.UserCode, r.Name, where(&r), ago(r.CreatedAt))
+		wants := "-"
+		if r.Role != nil {
+			wants = *r.Role
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", r.UserCode, r.Name, where(&r), ago(r.CreatedAt), wants)
 	}
 	return tw.Flush()
 }

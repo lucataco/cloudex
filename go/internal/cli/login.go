@@ -80,7 +80,7 @@ func newLoginCmd(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&url, "url", "", "the deployment's API URL")
 	cmd.Flags().BoolVar(&withKey, "key", false, "ask for a key instead of signing in with a code")
 	cmd.Flags().StringVar(&name, "name", "", "what this computer's token is called (default: cloudex on <host name>)")
-	cmd.Flags().StringVar(&role, "role", "", "the role to ask for: admin, user or read (the approver decides)")
+	cmd.Flags().StringVar(&role, "role", "", "the role to ask for: admin, user or read (the approver decides, and admin only if they choose it)")
 	return cmd
 }
 
