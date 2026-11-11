@@ -101,6 +101,14 @@ export const Node = z.object({
   rttMs: z.number().int().optional(),
   // GET /v1/nodes/{node} only: the machine image, as the agent last reported it.
   image: NodeImage.optional(),
+  // GET /v1/nodes/{node} only (v0.2.2 M5): machines the agent reported that
+  // belong to no sandbox (left alone, and listed here), and sandboxes deleted
+  // while the node was offline whose machines it removes when it's back.
+  orphans: z.array(z.string()).optional(),
+  pendingDeletes: z.array(z.string()).optional(),
+  // GET /v1/nodes/{node} only: the agent's clock less the deployment's at its
+  // last connect, in seconds (more than 60 either way is refused).
+  clockSkewSec: z.number().int().optional(),
 });
 export type Node = z.infer<typeof Node>;
 
@@ -152,12 +160,15 @@ const SandboxId = z.string().regex(/^cx-[a-z0-9]{6}$/, "a sandbox id");
 
 // Agent to Worker, as JSON text frames. Besides these, the agent sends "ping"
 // every 10 s, which the Node object answers "pong" without waking.
+// machinesError (v0.2.2 M5): the agent couldn't list its machines (Docker
+// didn't answer), so machines is empty for that reason, not because it has none.
 export const NodeHello = z.object({
   type: z.literal("hello"),
   protocol: z.number().int(),
   version: AgentVersion,
   facts: NodeFacts,
   machines: z.array(NodeMachine).max(1000),
+  machinesError: z.string().max(500).optional(),
 });
 export const NodeFactsMessage = z.object({ type: z.literal("facts"), facts: NodeFacts });
 export const NodeStateMessage = z.object({ type: z.literal("state"), machine: NodeMachine });
@@ -188,7 +199,8 @@ export type NodeMessage = z.infer<typeof NodeMessage>;
 // M4 adds the Docker runtime (go/internal/node/runtime.go), each refused while
 // the node's isolation self-test doesn't pass:
 // - create {sandbox, image?, cpus?, memoryMb?, env?, hold?}: make the machine
-//   and its network, not started; answers {address, container, state};
+//   and its network, not started; answers {address, container, state}, and
+//   created: true when it made it (M5), not when it was there already;
 // - start {sandbox}: start it and wait for its entrypoint; answers the same;
 // - stop {sandbox}: stop it, keeping its disk;
 // - delete {sandbox}: remove the machine, its volumes and its network;

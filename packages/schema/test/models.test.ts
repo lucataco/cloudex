@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CreateSandbox, DesktopRequest, Name, UpdateSettings } from "../src/index.ts";
+import { CreateSandbox, DesktopRequest, Name, Sandbox, UpdateSettings } from "../src/index.ts";
 
 const issue = (r: { success: boolean; error?: { issues: { message: string }[] } }) => r.error?.issues[0]?.message;
 
@@ -28,4 +28,26 @@ test("a repo URL with a user name or token in it is refused, pointing at GH_TOKE
 test("a desktop request without a size leaves the screen as it is", () => {
   assert.equal(DesktopRequest.parse({}).size, undefined);
   assert.equal(DesktopRequest.parse({ size: "1920x1080" }).size, "1920x1080");
+});
+
+test("CreateSandbox takes a node, with cpus and memory; Sandbox says where it runs (v0.2.2)", () => {
+  const c = CreateSandbox.parse({ node: "box", cpus: 0.5, memoryMb: 2048 });
+  assert.equal(c.node, "box");
+  assert.equal(c.cpus, 0.5);
+  assert.throws(() => CreateSandbox.parse({ node: "box", cpus: 0.1 }));
+  assert.throws(() => CreateSandbox.parse({ node: "box", memoryMb: 256 }));
+  const base = {
+    id: "cx-abc123", name: null, size: "standard-2", state: "running", idleMinutes: 30, createdAt: 1, updatedAt: 1,
+    startedAt: 1, stoppedAt: null, savedAt: null, savedBytes: null, error: null,
+  };
+  // An answer from before v0.2.2 has neither.
+  assert.equal(Sandbox.parse(base).placement, undefined);
+  const s = Sandbox.parse({
+    ...base,
+    placement: { provider: "node", node: { id: "nd-abcd1234", name: "box", online: false, state: "offline", lastSeenAt: 5 }, cpus: 1, memoryMb: 4096 },
+    isolation: "docker",
+  });
+  assert.equal(s.placement?.node?.name, "box");
+  assert.equal(s.isolation, "docker");
+  assert.throws(() => Sandbox.parse({ ...base, isolation: "chroot" }));
 });

@@ -281,6 +281,10 @@ type MachineInfo struct {
 	Address   string `json:"address"`
 	Container string `json:"container"`
 	State     string `json:"state"`
+	// Created is set when create made the machine, not when it was there
+	// already, so the Worker can tell a sandbox whose machine was removed
+	// outside Cloudex that it started over.
+	Created bool `json:"created,omitempty"`
 }
 
 func (r *Runtime) labels(extra ...string) []string {
@@ -383,7 +387,7 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 		return nil, err
 	}
 	r.logf("%s: made its machine on %s (%s)", req.Sandbox, n.Subnet, n.Bridge)
-	return &MachineInfo{Address: n.Machine.String(), Container: n.Name, State: "stopped"}, nil
+	return &MachineInfo{Address: n.Machine.String(), Container: n.Name, State: "stopped", Created: true}, nil
 }
 
 func (r *Runtime) describe(c *ContainerDetail, sandbox string) *MachineInfo {

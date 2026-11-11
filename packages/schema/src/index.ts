@@ -11,6 +11,36 @@ export type SandboxSize = z.infer<typeof SandboxSize>;
 export const SandboxState = z.enum(["starting", "running", "stopping", "stopped", "error"]);
 export type SandboxState = z.infer<typeof SandboxState>;
 
+// How a sandbox is kept apart from others and from the host it runs on (v0.2.2):
+//   vm      a Cloudflare container, which runs in a VM of its own
+//   sysbox  a node's Docker under Sysbox: root in it is an unprivileged user on the host
+//   docker  a node's plain Docker: for trusted code only, since code that escapes
+//           the container is root on the host, with its LAN and tailnet in reach
+//   none    a node joined with --unisolated, for testing only: no firewall
+export const Isolation = z.enum(["vm", "sysbox", "docker", "none"]);
+export type Isolation = z.infer<typeof Isolation>;
+
+// Where a sandbox runs: on Cloudflare, or on a node (your own Docker host,
+// see Node), which it stays on for life. node is that node as of now: online
+// while its agent is connected; state is revoked once it was removed (cloudex
+// node rm --force), or null when it has been forgotten since. cpus and
+// memoryMb are its machine's limits there.
+export const Placement = z.object({
+  provider: z.enum(["cloudflare", "node"]),
+  node: z
+    .object({
+      id: z.string(),
+      name: z.string(),
+      online: z.boolean(),
+      state: z.enum(["pending", "online", "offline", "revoked"]).nullable(),
+      lastSeenAt: z.number().int().nullable(),
+    })
+    .optional(),
+  cpus: z.number().optional(),
+  memoryMb: z.number().int().optional(),
+});
+export type Placement = z.infer<typeof Placement>;
+
 export const Sandbox = z.object({
   id: z.string(),
   name: z.string().nullable(),
@@ -39,6 +69,10 @@ export const Sandbox = z.object({
   // Providers whose keys this run uses without holding them (see ProviderKey).
   providerKeys: z.array(z.string()).optional(),
   error: z.string().nullable(),
+  // Where it runs, and how it's isolated there (v0.2.2). Answers from a
+  // deployment before v0.2.2 leave them out: it's on Cloudflare then.
+  placement: Placement.optional(),
+  isolation: Isolation.optional(),
 });
 export type Sandbox = z.infer<typeof Sandbox>;
 
@@ -87,8 +121,19 @@ export const CreateSandbox = z.object({
   name: Name.optional(),
   size: SandboxSize.default("standard-2"),
   // Stop (and save) after this many minutes without SSH, exec, preview or agent
-  // activity. 0 keeps it running until the platform's 6-hour limit.
+  // activity. 0 keeps it running until the platform's 6-hour limit on
+  // Cloudflare, and until it's stopped on a node, which has no such limit.
   idleMinutes: z.number().int().min(0).max(360).default(30),
+  // Run it on this node (its name or id, see Node) instead of Cloudflare.
+  // Needs the node online with a passing isolation self-test; an ownOnly
+  // token can't place a sandbox on a node whose isolation is plain Docker.
+  // cpus (from 0.25) and memoryMb (from 512) are the machine's limits there,
+  // only with node, and at most the node's own; by default the size's: 1/2,
+  // 1, 2 or 4 CPUs and 4, 6, 8 or 12 GiB, capped at the node's CPUs and half
+  // its memory. A sandbox on a node keeps its disk on the node when it stops.
+  node: z.string().min(1).max(64).optional(),
+  cpus: z.number().min(0.25).max(1024).optional(),
+  memoryMb: z.number().int().min(512).max(16 * 1024 * 1024).optional(),
   env: z.record(EnvName, EnvValue).refine(maxEntries(100), "at most 100 variables").optional(),
   files: z.record(FilePath, FileContent).refine(maxEntries(20), "at most 20 files").optional(),
   // An https:// URL, with #branch to pick one, or { url, dir, branch }. Cloned

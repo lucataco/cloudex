@@ -80,6 +80,9 @@ type Hello struct {
 	Version  string    `json:"version"`
 	Facts    Facts     `json:"facts"`
 	Machines []Machine `json:"machines"`
+	// MachinesError says the list couldn't be made (Docker didn't answer),
+	// so that the Worker doesn't take an empty list for machines that are gone.
+	MachinesError string `json:"machinesError,omitempty"`
 }
 
 // FactsMessage reports facts that changed.
@@ -118,6 +121,16 @@ func NewHello(version string, f Facts, machines []Machine) Hello {
 		machines = []Machine{}
 	}
 	return Hello{Type: "hello", Protocol: Protocol, Version: version, Facts: f, Machines: machines}
+}
+
+// HelloError is a hello whose machine list couldn't be made.
+func HelloError(version string, f Facts, err error) Hello {
+	h := NewHello(version, f, nil)
+	h.MachinesError = err.Error()
+	if len(h.MachinesError) > 500 {
+		h.MachinesError = h.MachinesError[:500]
+	}
+	return h
 }
 
 func okResult(id string, value any) Result {

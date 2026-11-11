@@ -221,9 +221,19 @@ export function openapi(version: string) {
       },
       "/v1/sandboxes": {
         get: op("listSandboxes", "List sandboxes, newest first", {
+          description:
+            "Each says where it runs (placement): on Cloudflare, or on a node, with whether that node is online as the " +
+            "deployment last heard.",
           responses: { 200: ok("The sandboxes", { type: "array", items: ref("Sandbox") }) },
         }),
         post: op("createSandbox", "Create and start a sandbox; answers once it's running", {
+          description:
+            "With node, it runs on that node (your own Docker host; see listNodes) and stays there. The node must be " +
+            "online (503 otherwise, naming it and when it was last seen) and pass its isolation self-test; an own-only " +
+            "token can't use a node whose isolation is plain Docker (403). cpus and memoryMb go only with node. On a " +
+            "node, in this version: stopping keeps the disk on the node (no save or backup), there's no 6-hour limit, " +
+            "and forks, named saves, agents, provider keys and the cloudex command inside aren't available yet " +
+            "(501 where asked for).",
           requestBody: body("CreateSandbox", false),
           responses: { 201: sandbox },
         }),
@@ -237,6 +247,10 @@ export function openapi(version: string) {
           responses: { 200: sandbox },
         }),
         delete: op("deleteSandbox", "Delete a sandbox and its backups", {
+          description:
+            "On a node, its machine and network are removed there. While that node is offline the delete is a 503, " +
+            "unless force is set: then the sandbox goes at once and the node removes the machine when it's back.",
+          parameters: [{ name: "force", in: "query", description: "On a node that's offline, delete it anyway", schema: { type: "boolean", default: false } }],
           responses: {
             200: ok("Deleted", { type: "object", properties: { deleted: { type: "string" } }, required: ["deleted"] }),
           },
@@ -244,12 +258,17 @@ export function openapi(version: string) {
       },
       "/v1/sandboxes/{ref}/stop": {
         parameters: [sandboxRef],
-        post: op("stopSandbox", "Save the disk, back up /home and stop", { responses: { 200: sandbox } }),
+        post: op("stopSandbox", "Save the disk, back up /home and stop", {
+          description: "On a node, the machine stops and keeps its disk there, with no save or backup; it takes about a second.",
+          responses: { 200: sandbox },
+        }),
       },
       "/v1/sandboxes/{ref}/resume": {
         parameters: [sandboxRef],
         post: op("resumeSandbox", "Start a stopped sandbox from its save, or from its backup", {
-          description: "With size, it runs on that size from then on.",
+          description:
+            "With size, it runs on that size from then on. On a node, the machine starts again with its disk, in " +
+            "under two seconds; size and fromBackup are refused there (400).",
           requestBody: body("ResumeRequest", false),
           responses: { 200: sandbox },
         }),
@@ -259,7 +278,8 @@ export function openapi(version: string) {
         post: op("forkSandbox", "Make sandboxes that start from a copy of this one's disk", {
           description:
             "A running sandbox is saved first and keeps running. Forks that fail to start are " +
-            "returned in state error, with the reason; resuming one tries again.",
+            "returned in state error, with the reason; resuming one tries again. Not available for a sandbox on a " +
+            "node yet (501).",
           requestBody: body("ForkRequest", false),
           responses: { 201: ok("The forks", { type: "array", items: ref("Sandbox") }) },
         }),
@@ -270,7 +290,8 @@ export function openapi(version: string) {
           description:
             "The save holds every file that differs from the sandbox image, and the sandbox's settings, in the " +
             "deployment's R2 bucket until it's deleted. The sandbox keeps running. A save of a taken name " +
-            "replaces that save once it's done. Takes about 15 seconds per GB of changes.",
+            "replaces that save once it's done. Takes about 15 seconds per GB of changes. Not available for a sandbox " +
+            "on a node yet (501).",
           requestBody: body("CreateSave"),
           responses: { 201: ok("The save", ref("Save")) },
         }),
@@ -476,7 +497,8 @@ export function openapi(version: string) {
         post: op("startAgent", "Start Claude Code or Codex on a task", {
           description:
             "Runs the agent with no terminal, as the cloudex user in a login shell, so it uses provider keys. " +
-            "Answers at once; follow it with the events. The agent and its conversation live on the sandbox's disk.",
+            "Answers at once; follow it with the events. The agent and its conversation live on the sandbox's disk. " +
+            "Not available for a sandbox on a node yet, where provider keys don't reach (501); nor is sending one a message.",
           requestBody: body("StartAgent"),
           responses: { 201: agent },
         }),
@@ -533,18 +555,28 @@ export function openapi(version: string) {
           responses: { 201: ok("The node, its join token and the install command", ref("NewNode")) },
         }),
         get: op("listNodes", "List the nodes, with whether each is online now", {
+          description:
+            "Anyone with a key may list them, to place sandboxes on one. With live=false the answer comes from the " +
+            "deployment's index alone, as each node's object last wrote it, without asking the objects; pollers should " +
+            "use that.",
+          parameters: [{ name: "live", in: "query", description: "Ask each node's object whether it's online now", schema: { type: "boolean", default: true } }],
           responses: { 200: ok("The nodes", { type: "array", items: ref("Node") }) },
         }),
       },
       "/v1/nodes/{node}": {
         parameters: [{ name: "node", in: "path", required: true, description: "The node's name or id (nd-xxxxxxxx)", schema: { type: "string" } }],
         get: op("getNode", "Get a node; while it's online, with a round trip to its agent", {
+          description:
+            "Also the machine image as the agent last reported it, the machines it runs that belong to no sandbox " +
+            "(orphans, left alone), and the sandboxes deleted while it was offline whose machines it removes when it's " +
+            "back (pendingDeletes).",
           responses: { 200: ok("The node", ref("Node")) },
         }),
         delete: op("deleteNode", "Remove a node: its key stops working and its agent is disconnected (admins only)", {
           description:
             "The node stays listed as revoked; removing a revoked node forgets it. A node that still has sandboxes " +
-            "is refused (409) unless force is set.",
+            "is refused (409) unless force is set. With force, an online node removes their machines first; the " +
+            "sandboxes stay listed in state error, saying so, until they're deleted.",
           parameters: [{ name: "force", in: "query", description: "Remove it even though it has sandboxes", schema: { type: "boolean", default: false } }],
           responses: { 200: ok("Revoked or forgotten", { type: "object", properties: { revoked: { type: "string" }, deleted: { type: "string" } } }) },
         }),

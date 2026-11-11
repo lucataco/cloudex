@@ -5,9 +5,9 @@
 // (CreateLoginLink), and the login page checks next before going there. No
 // imports, so that the dashboard can use it without bundling zod.
 
-// The pages: /, /saves, /access and /s/<sandbox>[/<tab>...]. The query is
-// the page's own, such as a files page's ?path=.
-const PAGE = /^\/(saves|access|s\/[A-Za-z0-9._~%-]+(\/[A-Za-z0-9._~%-]+)*\/?)?$/;
+// The pages: /, /saves, /nodes, /access and /s/<sandbox>[/<tab>...]. The
+// query is the page's own, such as a files page's ?path=.
+const PAGE = /^\/(saves|nodes|access|s\/[A-Za-z0-9._~%-]+(\/[A-Za-z0-9._~%-]+)*\/?)?$/;
 const QUERY = /^[A-Za-z0-9._~\/?=&%-]*$/;
 // . and .. segments, %2e spelled or not, which a browser resolves away.
 const DOTS = /^(\.|%2e)+$/i;

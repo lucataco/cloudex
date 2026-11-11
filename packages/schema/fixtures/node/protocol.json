@@ -102,6 +102,28 @@
       }
     },
     {
+      "name": "hello-machines-error",
+      "model": "NodeMessage",
+      "message": {
+        "type": "hello",
+        "protocol": 1,
+        "version": "dev",
+        "facts": {
+          "arch": "arm64",
+          "runtime": "docker",
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
+          "cpus": null,
+          "memoryMb": null,
+          "diskFreeGb": null
+        },
+        "machines": [],
+        "machinesError": "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+      }
+    },
+    {
       "name": "facts",
       "model": "NodeMessage",
       "message": {

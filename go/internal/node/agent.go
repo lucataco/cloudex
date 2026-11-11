@@ -399,7 +399,7 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 		defer wcancel()
 		return c.Write(wctx, websocket.MessageText, b)
 	}
-	if err := send(NewHello(a.Version, a.facts(), a.machines())); err != nil {
+	if err := send(a.hello()); err != nil {
 		return "sending hello: " + err.Error(), 0
 	}
 	a.ctlMu.Lock()
@@ -511,19 +511,21 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 	}
 }
 
-// machines lists the machines this agent runs, for hello.
-func (a *Agent) machines() []Machine {
+// hello says who the agent is and lists the machines it runs, which the
+// Worker reconciles with their sandboxes (v0.2.2 M5). A list it couldn't make
+// says so, so that no sandbox is taken for gone.
+func (a *Agent) hello() Hello {
 	if a.Runtime == nil {
-		return []Machine{}
+		return NewHello(a.Version, a.facts(), nil)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ms, err := a.Runtime.Machines(ctx)
 	if err != nil {
 		a.logf("listing machines for hello: %v", err)
-		return []Machine{}
+		return HelloError(a.Version, a.facts(), err)
 	}
-	return ms
+	return NewHello(a.Version, a.facts(), ms)
 }
 
 func (a *Agent) kickSelfTest() {
