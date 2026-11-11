@@ -58,7 +58,9 @@ export function placeOn(n: Node, who: Placer, req: PlaceRequest): Placed | Refus
   const iso = n.isolation;
   if (!iso || !n.runtime) return { status: 503, error: `node ${name} hasn't reported its host yet; try again in a minute` };
   if (!iso.unisolated) {
-    if (iso.firewall === "unchecked") return { status: 503, error: `node ${name} hasn't finished its isolation self-test yet; try again in a minute` };
+    // unchecked passes: the agent waits up to a minute for its self-test's
+    // verdict (it runs one whenever it starts) and refuses a machine without
+    // a passing one, saying why.
     if (iso.firewall === "fail") {
       const why = (iso.failed ?? []).slice(0, 3).join("; ");
       return {

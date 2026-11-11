@@ -79,13 +79,12 @@ test("an offline, pending or removed node is refused, naming it", () => {
   assert.match(gone.error, /was removed/);
 });
 
-test("a node whose self-test fails or hasn't run takes no sandbox, unless it joined --unisolated", () => {
+test("a node whose self-test fails takes no sandbox, unless it joined --unisolated; one that hasn't run is left to the agent", () => {
   const fail = refusal(placeOn(node({ isolation: { firewall: "fail", unisolated: false, failed: ["metadata 169.254.169.254:80 answered"] } }), user, std2));
   assert.equal(fail.status, 503);
   assert.match(fail.error, /self-test fails \(metadata 169\.254\.169\.254:80 answered\), so it runs no sandboxes/);
-  const unchecked = refusal(placeOn(node({ isolation: { firewall: "unchecked", unisolated: false } }), user, std2));
-  assert.equal(unchecked.status, 503);
-  assert.match(unchecked.error, /hasn't finished its isolation self-test/);
+  // The agent waits up to a minute for its first verdict, and refuses without a pass.
+  assert.equal(placed(placeOn(node({ isolation: { firewall: "unchecked", unisolated: false } }), user, std2)).isolation, "sysbox");
   assert.equal(refusal(placeOn(node({ isolation: null, runtime: null }), user, std2)).status, 503);
 });
 

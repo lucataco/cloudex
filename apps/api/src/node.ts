@@ -88,6 +88,8 @@ export type NodeStatus = {
 };
 
 const STALE_CHECK_MS = 3 * 60_000;
+// How long ops under way wait for the agent to come back after its socket went.
+const OP_GRACE_MS = 10_000;
 const TOMB = "tomb:";
 
 // Close codes 1005, 1006 and 1015 can't be sent (spike: a peer that drops
@@ -148,7 +150,14 @@ export class Node extends DurableObject<Env> {
   private async wentOffline(lastSeenAt: number) {
     const id = await this.ctx.storage.get<string>("id");
     await this.ctx.storage.put("lastSeenAt", lastSeenAt);
-    this.rejectAll(`[503] the node went offline (last seen ${new Date(lastSeenAt).toISOString()})`);
+    // Ops under way wait a little: an agent whose connection dropped (an
+    // edge reset, a deploy) is back within a second or two, and answers
+    // them on its new connection.
+    if (this.waiters.size) {
+      setTimeout(() => {
+        if (!this.current().use) this.rejectAll(`[503] the node went offline (last seen ${new Date(lastSeenAt).toISOString()})`);
+      }, OP_GRACE_MS);
+    }
     if (!id) return;
     await mirrorNode(this.env.DB, id, { state: "offline", lastSeenAt }).catch((e) => console.error(`[${id}] ${e}`));
     if (await this.ctx.storage.get<boolean>("revoked")) return;
@@ -415,7 +424,18 @@ export class Node extends DurableObject<Env> {
       this.waiters.delete(id);
       fail(503, `the node's connection broke: ${e instanceof Error ? e.message : e}`);
     }
-    return answer;
+    const out = await answer;
+    // A removed machine is no longer the node's, for the orphans listed in
+    // cloudex node info, until its next hello lists them all again.
+    if (name === "delete" && typeof args.sandbox === "string") await this.forgetMachine(args.sandbox);
+    return out;
+  }
+
+  private async forgetMachine(sandbox: string) {
+    const hello = await this.ctx.storage.get<Hello>("hello");
+    if (hello?.machines.some((m) => m.id === sandbox)) {
+      await this.ctx.storage.put("hello", { ...hello, machines: hello.machines.filter((m) => m.id !== sandbox) });
+    }
   }
 
   // cloudex node rm: the node is refused from now on, and its socket closes.

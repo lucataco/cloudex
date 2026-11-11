@@ -284,6 +284,8 @@ export class Sandbox extends DurableObject<Env> {
   // an op found it so), so that the alarm doesn't keep asking it; cleared by
   // the next sign that it's back. Advisory: requests try the node anyway.
   private nodeDown: { since: number; lastSeenAt: number | null } | null = null;
+  // Set once its node was removed (cloudex node rm --force): it can't run again.
+  private nodeGone = false;
   private get compute(): Compute {
     return this.onNode ?? this.cloudflare;
   }
@@ -312,6 +314,7 @@ export class Sandbox extends DurableObject<Env> {
       this.record = await ctx.storage.get<SandboxRecord>("sandbox");
       this.place(await ctx.storage.get<NodePlacement>("node"));
       this.nodeDown = (await ctx.storage.get<{ since: number; lastSeenAt: number | null }>("nodeDown")) ?? null;
+      this.nodeGone = Boolean(this.onNode) && (await ctx.storage.get<string>("revokedNode")) === this.onNode?.placement.node;
       this.lastActivity = (await ctx.storage.get<number>("lastActivity")) ?? Date.now();
       // After an eviction or deploy, reattach the exit watcher to a running box.
       // (A node's machine has no watcher here: its exits come from its Node
@@ -365,6 +368,7 @@ export class Sandbox extends DurableObject<Env> {
   // The record of a running sandbox, for work inside it, which counts as activity.
   private mustRun(): SandboxRecord {
     const r = this.mustRecord();
+    if (this.onNode && this.nodeGone) fail(410, removedMessage(this.onNode.placement.name));
     if (r.state !== "running") fail(409, wrongState(r));
     this.touch();
     return r;
@@ -2114,7 +2118,8 @@ export class Sandbox extends DurableObject<Env> {
         ...(p.cpus !== undefined ? { cpus: p.cpus } : {}),
         ...(p.memoryMb !== undefined ? { memoryMb: p.memoryMb } : {}),
       },
-      60_000,
+      // The agent waits up to a minute for its first self-test after it starts.
+      120_000,
     );
     const answer = await this.nodeOp("start", { sandbox: r.id }, 150_000);
     const address = typeof answer.address === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(answer.address) ? answer.address : null;
@@ -2294,6 +2299,7 @@ export class Sandbox extends DurableObject<Env> {
   async nodeRevoked(node: string, machineDeleted = false) {
     if (this.onNode?.placement.node !== node) return;
     await this.ctx.storage.put("revokedNode", node);
+    this.nodeGone = true;
     this.streams.closeAll(4003, "the node was removed");
     const r = this.record;
     if (!r || this.removing) return;

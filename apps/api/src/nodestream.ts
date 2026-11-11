@@ -396,6 +396,7 @@ export class NodeStreams {
   private spliceAnswer = new Map<string, (m: StreamFromAgent | Error) => void>();
   private waiters: { resolve: (ws: WebSocket) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }[] = [];
   private asked = 0;
+  private askFailed = false;
   private seenReady = false;
 
   private readonly h: StreamHost;
@@ -483,16 +484,23 @@ export class NodeStreams {
   }
 
   private askMore(n: number) {
-    // At most once a second; the agent also keeps more on its own when they go fast.
-    if (Date.now() - this.asked < 1000) return;
+    // At most once a second; the agent also keeps more on its own when they
+    // go fast. After an ask that failed (the node is offline), each new
+    // waiter asks again, so that it hears why at once rather than waiting
+    // SPARE_WAIT_MS for streams that won't come.
+    if (Date.now() - this.asked < 1000 && !this.askFailed) return;
     this.asked = Date.now();
-    this.h.more(n).catch((e: unknown) => {
-      const why = e instanceof Error ? e.message : String(e);
-      for (const w of this.waiters.splice(0)) {
-        clearTimeout(w.timer);
-        w.reject(new Error(why.startsWith("[") ? why : `[503] ${why}`));
-      }
-    });
+    this.h.more(n).then(
+      () => (this.askFailed = false),
+      (e: unknown) => {
+        this.askFailed = true;
+        const why = e instanceof Error ? e.message : String(e);
+        for (const w of this.waiters.splice(0)) {
+          clearTimeout(w.timer);
+          w.reject(new Error(why.startsWith("[") ? why : `[503] ${why}`));
+        }
+      },
+    );
   }
 
   // Opens a framed stream: an exec, an HTTP exchange or a TCP connection.
