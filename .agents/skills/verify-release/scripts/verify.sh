@@ -763,8 +763,15 @@ install_node() {
 cf_fresh() {
 	if [[ -n ${VERIFY_CF_TOKEN_CMD:-} ]]; then
 		local t
-		t=$(eval "$VERIFY_CF_TOKEN_CMD" 2>/dev/null | tail -1)
-		[[ -n $t ]] && export CLOUDFLARE_API_TOKEN=$t
+		for _ in 1 2 3; do
+			t=$(eval "$VERIFY_CF_TOKEN_CMD" 2>/dev/null | tail -1)
+			# One the API takes: a token just refreshed has been refused for a moment.
+			if [[ -n $t ]] && curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $t" | jq -e .success >/dev/null 2>&1; then
+				export CLOUDFLARE_API_TOKEN=$t
+				break
+			fi
+			sleep 5
+		done
 	fi
 	return 0
 }
