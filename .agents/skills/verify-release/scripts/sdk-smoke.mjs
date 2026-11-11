@@ -1,7 +1,7 @@
 // The TypeScript SDK against a live deployment: node sdk-smoke.mjs <path to dist/index.js> <name prefix>
 // Uses the deployment in $CLOUDEX_CONFIG_DIR. Deletes what it makes. With $VERIFY_NODE, its
-// sandbox runs on that node, and what isn't on nodes in v0.2.2 (forks, named saves,
-// agents) must be refused with a 501 instead.
+// sandbox runs on that node, a save of it starts back on that node, and what isn't
+// on nodes in v0.2.2 (forks) must be refused with a 501 instead.
 import assert from "node:assert/strict";
 
 const [, , dist, prefix] = process.argv;
@@ -99,7 +99,14 @@ try {
   await box.exec("echo forked > ~/marker");
   if (node) {
     await refused("fork", box.fork({ count: 2, name: `${prefix}-f` }));
-    await refused("save", box.save(`${prefix}-save`));
+    const save = await box.save(`${prefix}-save`);
+    saves.push(save.name);
+    assert.equal(save.node?.name, node, "the save names its node");
+    const [fromSave] = await cx.startFromSave(save.name, { name: `${prefix}-s`, node });
+    made.push(fromSave);
+    assert.equal(fromSave.placement.node?.name, node);
+    assert.equal((await fromSave.exec("cat ~/marker")).stdout, "forked\n");
+    step("save on a node, startFromSave on the node");
   } else {
     const forks = await box.fork({ count: 2, name: `${prefix}-f` });
     made.push(...forks);
@@ -126,9 +133,7 @@ try {
   await assert.rejects(cx.get(`${prefix}-missing`), (e) => e instanceof CloudexError && e.status === 404);
   step("errors are CloudexError with status");
 
-  if (node) {
-    await refused("prompt", box.prompt("Reply with exactly the word SDKOK and nothing else."));
-  } else if ((await cx.listKeys()).some((k) => k.provider === "anthropic")) {
+  if ((await cx.listKeys()).some((k) => k.provider === "anthropic")) {
     const agent = await box.prompt("Reply with exactly the word SDKOK and nothing else. Do not run any tools.");
     await agent.wait();
     assert.match(agent.lastMessage ?? "", /SDKOK/, `agent said: ${agent.lastMessage} ${agent.error}`);

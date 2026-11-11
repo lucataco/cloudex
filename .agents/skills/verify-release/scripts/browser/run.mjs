@@ -290,9 +290,8 @@ async function main() {
     T.agents = has ? { on: true } : { on: false, why: "no anthropic key on the deployment (cloudex keys set anthropic)" };
   } else T.agents = { on: false, why: "it spends provider tokens: set VERIFY_AGENTS=1, or run verify.sh with the agents area" };
   // VERIFY_NODE: the run's sandbox is on that node (v0.2.2), where agents
-  // aren't available yet: the API refuses them with a 501.
+  // run as on Cloudflare since M6 (provider calls go through the node's agent).
   T.node = process.env.VERIFY_NODE || "";
-  if (T.node) T.agents = { on: false, why: "not on nodes in v0.2.2: agents need provider keys, which don't reach nodes yet (the API refuses them with a 501)" };
 
   console.log(`browser checks in ${kind === "chrome" ? "Chrome" : "Firefox"} (${exe}), sandbox ${prefix}, screenshots of failures in ${shots}`);
   const made = await cx(["new", "--name", prefix, "--no-use", "--json", ...(T.node ? ["--on", T.node] : [])]);

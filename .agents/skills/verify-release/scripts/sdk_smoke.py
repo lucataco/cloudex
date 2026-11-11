@@ -11,8 +11,9 @@ import urllib.request
 from cloudex import Cloudex, CloudexError
 
 prefix = sys.argv[1]
-# With $VERIFY_NODE, its sandbox runs on that node, and what isn't on nodes in
-# v0.2.2 (forks, named saves, agents) must be refused with a 501 instead.
+# With $VERIFY_NODE, its sandbox runs on that node, a save of it starts back on
+# that node, and what isn't on nodes in v0.2.2 (forks) must be refused with a
+# 501 instead.
 node = os.environ.get("VERIFY_NODE") or None
 
 
@@ -118,7 +119,14 @@ try:
         assert any(n.name == node for n in cx.nodes.list(live=False))
         step("create on a node, placement, nodes.list")
         refused("fork", lambda: box.fork(count=2, name=f"{prefix}-f"))
-        refused("save", lambda: box.save(f"{prefix}-save"))
+        save = box.save(f"{prefix}-save")
+        saves.append(save.name)
+        assert save.node and save.node["name"] == node, save.node
+        (from_save,) = cx.start_from_save(save.name, name=f"{prefix}-s", node=node)
+        made.append(from_save)
+        assert from_save.placement["node"]["name"] == node
+        assert from_save.exec("cat ~/marker").stdout == "forked\n"
+        step("save on a node, start_from_save on the node")
     else:
         forks = box.fork(count=2, name=f"{prefix}-f")
         made += forks
@@ -147,9 +155,7 @@ try:
         assert e.status == 404, e.status
     step("errors are CloudexError with status")
 
-    if node:
-        refused("prompt", lambda: box.prompt("Reply with exactly the word SDKOK and nothing else.", agent="codex"))
-    elif any(k.provider == "openai" for k in cx.list_keys()):
+    if any(k.provider == "openai" for k in cx.list_keys()):
         agent = box.prompt("Reply with exactly the word SDKOK and nothing else. Do not run any tools.", agent="codex")
         agent.wait()
         assert "SDKOK" in (agent.last_message or ""), (agent.last_message, agent.error)

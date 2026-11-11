@@ -13,11 +13,11 @@
 # VERIFY_NODE_MACHINE_IMAGE (the installer's --machine-image), VERIFY_NODE_DEPLOY=1 (N07,
 # which runs cloudex deploy with $CLOUDFLARE_API_TOKEN), VERIFY_NODE_LONG=1 (N12's 30 idle
 # minutes, and with VERIFY_NODE_DEPLOY=1 N13's deploy during an scp), VERIFY_NODE_REBOOT=1
-# (N23 reboots the host).
+# (N23 reboots the host), and with VERIFY_NODE_DEPLOY=1, N44's deploy during a node save.
 # VERIFY_NODE=<node> (v0.2.2): the lifecycle, connect, inside, agents, tokens, dashboard, sdk
 # and browser areas make their sandboxes on that node, which must be online (cloudex node
-# add, then its installer), instead of on Cloudflare; what isn't on nodes yet SKIPs, saying
-# why, once the API has refused it as it should.
+# add, then its installer), instead of on Cloudflare; what isn't on nodes yet (forks, sizes
+# and backups) SKIPs, saying why, once the API has refused it as it should.
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
 set -uo pipefail
 
@@ -208,18 +208,21 @@ if want lifecycle; then
 			skip L14 "fork --count 2 makes two named forks" "$NOT_ON_NODES: forks (refused: $(grep -m1 "^error:" <<<"$ERR" | cut -c8-127))"
 			skip L15 "a fork has the disk and settings" "$NOT_ON_NODES: forks"
 		fi
+		# Named saves (M6): made on the node, and started from on it.
 		cx save "$A" "$P-base"
-		if [[ $CODE == 0 ]]; then fail L16 "a named save of a node sandbox is refused" "it was made: ${OUT:0:200}"; else
-			for c in "L16 save makes a named save" "L17 saving under a taken name replaces it" "L18 saves lists it" "L19 new --from a save" \
-				"L20 a sandbox from a save has the disk and settings" "L25 saves rm deletes the save"; do
-				skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: named saves of a node sandbox come with M6 (refused: $(grep -m1 "^error:" <<<"$ERR" | cut -c8-127))"
-			done
-		fi
+		ok L16 "save makes a named save, and says it was made on the node" [ "$(field .name)" = "$P-base" -a "$(field .replaced)" = false -a "$(field .node.name)" = "$VERIFY_NODE" ]
+		cx save "$A" "$P-base"
+		ok L17 "saving under a taken name replaces it" [ "$(field .replaced)" = true ]
+		cx saves
+		ok L18 "saves lists it" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 1 ]
+		cx new --from "$P-base" --name "$P-s" "${ON[@]}"
+		ok L19 "new --from a save, on the node" [ "$(field '.[0].state')" = running -a "$(field '.[0].fromSave')" = "$P-base" -a "$(field '.[0].placement.node.name')" = "$VERIFY_NODE" ]
+		cx exec "$P-s" -- 'cat ~/vr-home /opt/vr-sys; echo $VR_ONE'
+		ok L20 "a sandbox from a save has the disk and settings" is "$OUT" "$(printf 'kept\nkept\n1')"
 		for c in "L21 resume --size changes the size" "L22 resume --from-backup says what it restored" "L23 the backup brings /home back and nothing else"; do
 			skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: sizes and backups are Cloudflare's; resume --size and --from-backup refuse with a 400 (N34)"
 		done
 		"$CX" new --name "$P-f-1" --no-use "${ON[@]}" >/dev/null 2>&1
-		cx new --name "$P-s" --no-use "${ON[@]}"
 	else
 		cx fork "$A" --count 2 --name "$P-f"
 		ok L14 "fork --count 2 makes two named forks" [ "$(field 'map(.name) | sort | join(",")')" = "$P-f-1,$P-f-2" -a "$(field '.[0].forkedFrom')" = "$A_ID" ]
@@ -248,11 +251,9 @@ if want lifecycle; then
 	cx delete "$P-s" --yes
 	cx info "$P-s"
 	ok L24 "delete removes it" [ "$CODE" != 0 ]
-	if ! on_node; then
-		cx saves rm "$P-base" --yes
-		cx saves
-		ok L25 "saves rm deletes the save" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 0 ]
-	fi
+	cx saves rm "$P-base" --yes
+	cx saves
+	ok L25 "saves rm deletes the save" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 0 ]
 	cx new --from "$P-nosave" --name "$P-x"
 	ok L26 "new --from something missing fails clearly" [ "$CODE" != 0 ]
 	cx new --name "$P-cred" --repo "https://user:token@github.com/octocat/Hello-World" ${ON[@]+"${ON[@]}"}
@@ -390,18 +391,9 @@ http.server.HTTPServer((\"127.0.0.1\", 8127), H).serve_forever()"'
 fi
 
 # ---------------------------------------------------------------- inside
-if want inside && on_node; then
-	# The cloudex command inside needs cloudex.internal, which nodes get with M6.
-	need_a
-	cx exec "$A" -- 'stat -c %u /'
-	ok I07 "/ is owned by root, so tools that check it work" is "$OUT" 0
-	cx exec "$A" -- 'cloudex info --json'
-	ok I08 "cloudex inside a sandbox on a node says it doesn't work there yet" [ "$CODE" != 0 -a "$(has "$ERR" "doesn't work yet in a sandbox on a node" && echo y)" = y ]
-	for c in "I01 cloudex inside a sandbox knows itself" "I02 cloudex set --idle inside" "I06 cloudex set --idle over 6h inside says the limit" \
-		"I03 cloudex inside refuses other sandboxes clearly" "I04 cloudex host inside prints a working link" "I05 cloudex feedback inside sends nothing without a terminal"; do
-		skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: the cloudex command inside needs cloudex.internal, which nodes get with M6"
-	done
-elif want inside; then
+# On a node (v0.2.2 M6), the cloudex command reaches the API through the
+# node's agent (cloudex.internal there), and the same checks hold.
+if want inside; then
 	need_a
 	cx exec "$A" -- 'stat -c %u /'
 	ok I07 "/ is owned by root, so tools that check it work" is "$OUT" 0
@@ -439,17 +431,13 @@ if want agents; then
 	fi
 	cx keys
 	providers=$(field 'map(.provider) | join(" ")' 2>/dev/null)
-	if on_node; then
-		need_a
-		cx agents start "$A" "Reply with exactly the word VERIFYOK and nothing else."
-		if [[ $CODE == 0 ]]; then fail A00 "agents on a node are refused" "one started: ${OUT:0:200}"; else
-			skip A00 "agents" "$NOT_ON_NODES: agents need provider keys, which reach nodes with M6 (refused: $(grep -m1 "^error:" <<<"$ERR" | cut -c8-127))"
-		fi
-	elif [[ -z $providers || $providers == null ]]; then
+	# On a node (v0.2.2 M6), the agents' provider calls go through the node's
+	# agent to the deployment, which adds the key.
+	if [[ -z $providers || $providers == null ]]; then
 		skip A00 "agents" "no provider keys on the deployment (cloudex keys set anthropic|openai)"
 	else
 		need_a
-		cx new --name "$P-ag" --no-use
+		cx new --name "$P-ag" --no-use ${ON[@]+"${ON[@]}"}
 		# OpenCode gets a small model: on its own it picks one, often the dearest.
 		for pair in "anthropic claude" "openai codex" "anthropic opencode anthropic/claude-haiku-4-5"; do
 			set -- $pair
@@ -672,7 +660,9 @@ fi
 # control socket open (M2, N01-N08); streams and exec over the link (M3,
 # N09-N16); the Docker runtime, the firewall, the self-test and the installer
 # (M4, N17-N25); sandboxes on nodes, offline, reconnects and removal (M5,
-# N26-N35), all through ordinary sandboxes (cloudex new --on). It runs on the
+# N26-N35); cloudex.internal, provider keys, the node CA, saves and moving,
+# and a hostile machine (M6, N36-N44), all through ordinary sandboxes
+# (cloudex new --on). It runs on the
 # host VERIFY_NODE_SSH reaches, as the
 # installer sets it up: scripts/node-install.sh, as root with
 # VERIFY_NODE_SUDO=1 (passwordless sudo there), else --unisolated (testing
@@ -1166,7 +1156,7 @@ M5_CHECKS=("N26 a node that goes offline shows offline, with when it was last se
 	"N31 the WHERE column says where each sandbox runs: the node, then the node (offline) while it's offline"
 	"N32 new --on --cpus 2 --memory 2G gives the machine exactly those limits (docker inspect), and info shows them"
 	"N33 an own-only token can't place a sandbox on a node whose isolation is plain Docker (or none); a token that isn't own-only can"
-	"N34 forks, named saves, agents, resume --size and --from-backup on a node refuse with a message that says why; the cloudex command inside says it doesn't work there yet"
+	"N34 forks, resume --size and --from-backup on a node refuse with a message that says why, and so do a fork onto a node and new --from <sandbox> --on"
 	"N35 removing a node with a sandbox needs --force; then its machine is deleted, and the sandbox stays, in error, saying so, until it's deleted")
 m5_skip() { for c in "${M5_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
 m5_desc() { for c in "${M5_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
@@ -1224,14 +1214,16 @@ node_m5() {
 		[[ $CODE != 0 && $ERR == *"$want"* ]] || r="$r $what: code $CODE, ${ERR:0:120};"
 	}
 	refused fork "forks aren't available for a sandbox on a node" fork "$S5" --name "$P-n5f"
-	refused save "named saves of a sandbox on a node aren't available" save "$S5" "$P-n5s"
-	refused agent "don't reach sandboxes on nodes yet" agents start "$S5" "Reply with OK."
 	refused "resume --size" "sizes are for Cloudflare" resume "$S5" --size standard-4
-	refused "cloudex inside" "doesn't work yet in a sandbox on a node" exec "$S5" -- 'cloudex info'
 	"$CX" stop "$S5" >/dev/null 2>&1
 	refused "resume --from-backup" "so it has no backups" resume "$S5" --from-backup
-	refused "new --on --from" "--on doesn't go with --from" new --on "$N" --from "$S5"
+	refused "new --from <sandbox> --on" "forks can't start on a node" new --on "$N" --from "$S5"
 	"$CX" resume "$S5" >/dev/null 2>&1
+	# A fork of a Cloudflare sandbox onto a node, through the API (the CLI refuses it first).
+	local fc
+	fc=$(curl -s -o "$work/b" -w '%{http_code}' --max-time 30 -X POST -H "authorization: Bearer $(jq -r .apiKey "$src_cfg/config.json")" \
+		-H 'content-type: application/json' -d "{\"node\":\"$N\"}" "$API_URL/v1/sandboxes/$S5ID/fork")
+	[[ $fc == 400 && $(jq -r .error "$work/b") == *"not on a node"* ]] || r="$r API fork with node: $fc $(head -c 120 "$work/b");"
 	OUT="${r:-all refused, each saying why}" CODE=""
 	ok N34 "$(m5_desc N34)" [ -z "$r" ]
 
@@ -1325,12 +1317,230 @@ node_m5() {
 	"$CX" delete "$S5" --yes >/dev/null 2>&1
 }
 
+M6_CHECKS=("N36 with fake keys, claude -p, codex exec and opencode run on a node get the provider's own 401 through its agent and the Worker, and the placeholder gets a 200"
+	"N37 the deployment's real provider keys are in no file in a node machine or the agent's volume, in no process's environment there or on the host, in no container's config and in no agent log line"
+	"N38 a node machine sees the node CA's certificate for api.anthropic.com; certificates that CA signs for any other name (the API's host, github.com, pypi.org, example.com, a provider's subdomain) fail there with openssl, curl, Python and Node"
+	"N39 the cloudex command inside a node machine: info, set and host work, and stop from inside stops it, keeping its disk"
+	"N40 guest activity reaches the deployment: a background command's pings keep a sandbox with --idle 2m running, and /save-on-term is answered on the node"
+	"N41 a named save made on a node starts on Cloudflare with its files, and one made there starts back on the node, and saves says where each was made"
+	"N42 a machine with NET_ADMIN can't reach another machine's agent address or forge its source, finds nothing on the agent's control address, can't use the agent as a proxy or for another sandbox's API, gets no backups or saves without a grant, and a body over 100 MB is refused"
+	"N43 the agent listens only on its machine networks' addresses, on 80 and 443: never on 0.0.0.0 or its control address"
+	"N44 a deploy during a save of a node sandbox ends cleanly: the sandbox keeps running, and the save either finished or left no objects in R2")
+m6_skip() { for c in "${M6_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
+m6_desc() { for c in "${M6_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
+
+# cloudex.internal, provider keys and named saves on nodes (M6): the agent's
+# listeners, the node CA, the Worker's /v1/node/egress, and moving between a
+# node and Cloudflare.
+node_m6() {
+	local S6=$P-n6 S6B=$P-n6b S6ID S6BID MC MCB keys providers
+	cx new --on "$N" --name "$S6" --no-use
+	S6ID=$(field .id)
+	if [[ $CODE != 0 || -z $S6ID ]]; then
+		m6_skip "couldn't make a sandbox on the node: ${ERR:0:200}"
+		return
+	fi
+	MC=cloudex-$S6ID
+	keys=$("$CX" keys --json 2>/dev/null)
+	providers=$(jq -r 'map(.provider) | join(" ")' <<<"$keys" 2>/dev/null)
+
+	# N36: the three agents' own clients, with keys the provider refuses.
+	if [[ " $providers " != *" anthropic "* || " $providers " != *" openai "* ]]; then
+		skip N36 "$(m6_desc N36)" "needs anthropic and openai keys on the deployment (cloudex keys), which point their hosts at the agent"
+	else
+		local a36
+		a36=$("$CX" exec "$S6" --timeout 5m -- 'cd /tmp; grep -c "^[0-9.]* api.anthropic.com$" /etc/hosts
+			echo "== claude"; ANTHROPIC_API_KEY=sk-ant-api03-cloudexfakekey0000 timeout 90 claude -p --model claude-haiku-4-5 hi 2>&1 | tail -2
+			echo "== codex"; CODEX_API_KEY=sk-cloudexfakekey0000 timeout 150 codex exec --skip-git-repo-check -m gpt-5-mini hi 2>&1 | grep -F api.openai.com/v1/responses | tail -1 | cut -c1-160
+			echo "== opencode"; ANTHROPIC_API_KEY=sk-ant-api03-cloudexfakekey0000 timeout 90 opencode run -m anthropic/claude-haiku-4-5 hi 2>&1 | tail -1
+			echo "== placeholder"; curl -s -o /dev/null -w "%{http_code}\n" https://api.anthropic.com/v1/models -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01"' 2>&1)
+		OUT=$(tr '\n' ' ' <<<"$a36" | sed 's/\x1b\[[0-9;]*m//g' | head -c 600) CODE=""
+		ok N36 "$(m6_desc N36)" [ "$(head -1 <<<"$a36")" = 1 -a -n "$(grep -A1 '^== claude' <<<"$a36" | grep 'Invalid API key')" \
+			-a -n "$(grep -A1 '^== codex' <<<"$a36" | grep '401 Unauthorized: Incorrect API key')" -a -n "$(grep -A1 '^== opencode' <<<"$a36" | grep 'invalid x-api-key')" \
+			-a "$(grep -A1 '^== placeholder' <<<"$a36" | tail -1)" = 200 ]
+	fi
+
+	# N37: the real keys, by shape and their last four characters.
+	local re="" p hint pre
+	while read -r p hint; do
+		[[ -n $p ]] || continue
+		case $p in anthropic) pre='sk-ant-' ;; openrouter) pre='sk-or-' ;; google) pre='AIza' ;; groq) pre='gsk_' ;; xai) pre='xai-' ;; openai | deepseek) pre='sk-' ;; *) pre='' ;; esac
+		re="${re:+$re|}${pre}[A-Za-z0-9_-]{16,}${hint}"
+	done < <(jq -r '.[] | "\(.provider) \(.hint[-4:])"' <<<"$keys" 2>/dev/null)
+	if [[ -z $re ]]; then
+		skip N37 "$(m6_desc N37)" "no provider keys on the deployment"
+	else
+		"${NODE_SSH[@]}" "cat > $NODE_DIR/keygrep.sh" <"$here/keygrep.sh"
+		local g
+		g=$(node_sh "bash $NODE_DIR/keygrep.sh '$re' $MC $NODE_SUDO" 2>/dev/null | tr '\n' ' ')
+		OUT="matches by place (counts only): $g" CODE=""
+		ok N37 "$(m6_desc N37)" [ -n "$g" -a -z "$(tr ' ' '\n' <<<"$g" | grep -E '^[0-9]+$' | grep -v '^0$')" -a "$(wc -w <<<"$g")" -ge 10 ]
+	fi
+
+	# N38: the node CA in the machine, and its name constraints.
+	local api_host names c38 iss
+	api_host=$(sed -E 's#^https?://([^/:]+).*#\1#' <<<"$API_URL")
+	names="api.anthropic.com $api_host github.com pypi.org example.com x.api.anthropic.com"
+	iss=$("$CX" exec "$S6" -- 'echo | openssl s_client -connect api.anthropic.com:443 -servername api.anthropic.com 2>/dev/null | sed -n "s/^issuer=//p"' 2>/dev/null)
+	for n in $names; do
+		node_sh "docker exec cloudex-node cloudex-node ca test-cert $n | docker exec -i $MC sh -c 'mkdir -p /tmp/cx-ca && cat > /tmp/cx-ca/$n.pem'" >/dev/null 2>&1
+	done
+	c38=$("${NODE_SSH[@]}" "docker exec -i $MC bash -l -s $names" <"$here/ca-probe.sh" 2>/dev/null)
+	OUT="issuer of api.anthropic.com: $iss; $(tr '\n' ';' <<<"$c38")" CODE=""
+	ok N38 "$(m6_desc N38)" [ -n "$(grep "Cloudex node CA" <<<"$iss")" -a "$(grep -c . <<<"$c38")" = 6 \
+		-a "$(grep '^api.anthropic.com ' <<<"$c38")" = "api.anthropic.com ok ok ok ok" \
+		-a -z "$(grep -v '^api.anthropic.com ' <<<"$c38" | grep -w ok)" ]
+
+	# N39: the cloudex command inside, and stop from inside.
+	local i1 i2 i3="" stin=""
+	i1=$("$CX" exec "$S6" -- 'cloudex info --json' 2>/dev/null | jq -r .id)
+	i2=$("$CX" exec "$S6" -- 'cloudex set --idle 45m --json' 2>/dev/null | jq -r .idleMinutes)
+	if [[ -n $ZONE ]]; then
+		"$CX" exec -d "$S6" -- 'mkdir -p /tmp/n39 && echo n39 >/tmp/n39/index.html && cd /tmp/n39 && exec python3 -m http.server 8125' >/dev/null 2>&1
+		sleep 2
+		i3=$(curl -s --max-time 30 "$("$CX" exec "$S6" -- 'cloudex host 8125 --json' 2>/dev/null | jq -r .url)")
+	fi
+	"$CX" exec "$S6" -- 'echo n39 > ~/n39; cloudex stop' >/dev/null 2>&1
+	local t39
+	t39=$(now_s)
+	for _ in $(seq 1 30); do stin=$("$CX" info "$S6" --json 2>/dev/null | jq -r .state); [[ $stin == stopped ]] && break; sleep 5; done
+	t39=$(since "$t39")
+	local kept39
+	kept39=$("$CX" resume "$S6" >/dev/null 2>&1; "$CX" exec "$S6" -- 'cat ~/n39' 2>/dev/null)
+	OUT="info: $i1; set --idle: $i2; host: ${i3:-no preview domain}; stopped from inside after $t39 s ($stin); its file after resume: $kept39" CODE=""
+	ok N39 "$(m6_desc N39)" [ "$i1" = "$S6ID" -a "$i2" = 45 -a \( -z "$ZONE" -o "$i3" = n39 \) -a "$stin" = stopped -a "$kept39" = n39 ]
+
+	# N40: activity from inside (a background command pings cloudex.internal
+	# every minute while it prints); without it, --idle 2m stops it by 3 minutes.
+	local sot st40
+	sot=$("$CX" exec "$S6" -- 'curl -s -m 10 -X POST http://cloudex.internal/save-on-term' 2>/dev/null)
+	"$CX" set "$S6" --idle 2m >/dev/null 2>&1
+	"$CX" exec -d "$S6" -- 'for i in $(seq 1 14); do date; sleep 20; done' >/dev/null 2>&1
+	sleep 240
+	st40=$("$CX" info "$S6" --json 2>/dev/null | jq -r .state)
+	"$CX" set "$S6" --idle 30m >/dev/null 2>&1
+	OUT="after 240 s with --idle 2m and a background command printing: $st40; /save-on-term: $sot" CODE=""
+	ok N40 "$(m6_desc N40)" [ "$st40" = running -a "$sot" = '{"saved":false}' ]
+
+	# N41: moving, both ways.
+	local t41 sv1 cf1 sv2 nb1 f41a f41b mv1 mv2
+	"$CX" exec "$S6" -- 'echo moved > ~/n41; sudo sh -c "echo sys > /opt/n41"' >/dev/null 2>&1
+	cx save "$S6" "$P-n6s"
+	sv1=$(field .node.name)
+	t41=$(now_s)
+	cx new --from "$P-n6s" --name "$P-n6cf" --no-use
+	mv1=$(since "$t41")
+	cf1=$(field '.[0].placement.provider')
+	f41a=$("$CX" exec "$P-n6cf" -- 'cat ~/n41 /opt/n41; ls /usr/local/share/ca-certificates; grep -c "Cloudex: provider hosts" /etc/hosts' 2>/dev/null | tr '\n' ' ')
+	"$CX" exec "$P-n6cf" -- 'echo back >> ~/n41' >/dev/null 2>&1
+	cx save "$P-n6cf" "$P-n6c"
+	sv2=$(field '.node // "cloudflare"')
+	t41=$(now_s)
+	cx new --from "$P-n6c" --on "$N" --name "$P-n6b2" --no-use
+	mv2=$(since "$t41")
+	nb1=$(field '.[0].placement.node.name')
+	f41b=$("$CX" exec "$P-n6b2" -- 'cat ~/n41 /opt/n41; ls /usr/local/share/ca-certificates; grep -c "^[0-9.]* api.anthropic.com$" /etc/hosts' 2>/dev/null | tr '\n' ' ')
+	local listed
+	listed=$("$CX" saves 2>/dev/null | grep -E "^$P-n6[sc] " | awk '{print $1, $NF}' | sort | tr '\n' ' ')
+	OUT="node save made on $sv1, started on $cf1 in $mv1 s: $f41a; Cloudflare save made on $sv2, started on node $nb1 in $mv2 s: $f41b; saves: $listed" CODE=""
+	local cfwant="moved sys cloudflare-containers-ca.crt 0 " ndwant="moved back sys cloudex-node-ca.crt 1 "
+	[[ -z $providers ]] && cfwant="moved sys 0 " ndwant="moved back sys 0 "
+	ok N41 "$(m6_desc N41)" [ "$sv1" = "$N" -a "$cf1" = cloudflare -a "$f41a" = "$cfwant" -a "$sv2" = cloudflare -a "$nb1" = "$N" -a "$f41b" = "$ndwant" \
+		-a "$listed" = "$P-n6c cloudflare $P-n6s $N " ]
+	"$CX" delete "$P-n6cf" --yes >/dev/null 2>&1
+	"$CX" delete "$P-n6b2" --yes >/dev/null 2>&1
+	"$CX" saves rm "$P-n6c" --yes >/dev/null 2>&1
+
+	# N42: a hostile machine with NET_ADMIN, on S6's network: a container the
+	# host starts there under plain Docker, or S6's own root under Sysbox.
+	cx new --on "$N" --name "$S6B" --no-use
+	S6BID=$(field .id)
+	MCB=cloudex-$S6BID
+	local runtime own other osub ctl h42
+	runtime=$("$CX" node info "$N" --json 2>/dev/null | jq -r .runtime)
+	own=$(node_sh "docker inspect $MC -f '{{(index .NetworkSettings.Networks \"$MC\").IPAddress}}'" | awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 - 1}')
+	other=$(node_sh "docker inspect $MCB -f '{{(index .NetworkSettings.Networks \"$MCB\").IPAddress}}'" | awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 - 1}')
+	osub=$(node_sh "docker network inspect $MCB -f '{{(index .IPAM.Config 0).Subnet}}'")
+	ctl=$(node_sh "docker inspect cloudex-node -f '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}'" | tr ' ' '\n' | grep -v '^cloudex-cx-' | cut -d= -f2 | tr '\n' ' ')
+	"${NODE_SSH[@]}" "cat > $NODE_DIR/hostile-probe.sh" <"$here/hostile-probe.sh"
+	if [[ $runtime == sysbox ]]; then
+		"$CX" cp "$here/hostile-probe.sh" "$S6:hostile-probe.sh" >/dev/null 2>&1
+		h42=$("$CX" exec "$S6" --root --timeout 5m -- "API_HOST=$api_host bash /home/cloudex/hostile-probe.sh $own $other $osub $S6BID $ctl" 2>&1)
+	else
+		local img sub5
+		img=$(node_sh "docker inspect $MC -f '{{.Config.Image}}'")
+		sub5=$(awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 + 3}' <<<"$own")
+		h42=$(node_sh "docker run --rm --label build.cloudex.node=verify --label build.cloudex.role=check --network $MC --ip $sub5 --cap-add NET_ADMIN -e API_HOST=$api_host -v $NODE_DIR/hostile-probe.sh:/p.sh:ro --entrypoint bash $img /p.sh $own $other $osub $S6BID $ctl" 2>&1)
+	fi
+	cp <(echo "$h42") "$out/hostile-probe.txt"
+	local want42="own-save-on-term {\"saved\":false}
+own-self-no-token 403
+own-token-other-sandbox 403
+proxy-absolute not found
+proxy-connect 405
+proxy-websocket 426
+tls-github.com 000
+tls-pypi.org 000
+tls-example.com 000
+tls-$api_host 000
+tls-provider-other-host 421
+backup-put 501
+save-put-no-grant 403
+body-over-limit 413
+routed-other-agent-80 000
+routed-other-agent-443 000
+forged-source 000"
+	local got42
+	got42=$(grep -v '^control-' <<<"$h42" | sed 's/ *$//')
+	local ctl42
+	ctl42=$(grep '^control-' <<<"$h42" | awk '{print $2}' | sort -u | tr '\n' ' ')
+	OUT="on $runtime: $(tr '\n' ';' <<<"$h42" | head -c 900)" CODE=""
+	ok N42 "$(m6_desc N42)" [ "$got42" = "$want42" -a "$ctl42" = "000 " ]
+
+	# N43: the agent's listening sockets, from its own network namespace.
+	local l43 bad43
+	l43=$(node_sh "docker run --rm --network container:cloudex-node --entrypoint ss $(node_sh "docker inspect $MC -f '{{.Config.Image}}'") -Hltn" 2>/dev/null | awk '{print $4}' | sort | tr '\n' ' ')
+	bad43=$(tr ' ' '\n' <<<"$l43" | grep . | grep -vE '^10\.|^172\.' ; tr ' ' '\n' <<<"$l43" | grep . | grep -vE ':(80|443)$'; for a in $ctl; do tr ' ' '\n' <<<"$l43" | grep -F "$a:"; done)
+	OUT="listening: $l43" CODE=""
+	ok N43 "$(m6_desc N43)" [ -n "$(grep -F "$own:80" <<<"$l43")" -a -n "$(grep -F "$own:443" <<<"$l43")" -a -z "$bad43" ]
+
+	# N44: a deploy during a node save.
+	if [[ ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
+		"$CX" exec "$S6" --timeout 10m -- 'head -c 3000000000 /dev/urandom > ~/n44.bin' >/dev/null 2>&1
+		("$CX" save "$S6" "$P-n6d" >"$work/o44" 2>"$work/e44"; echo $? >"$work/rc44") &
+		local spid=$!
+		sleep 8
+		"$CX" deploy --yes --skip-check >"$work/deploy44.log" 2>&1
+		wait "$spid"
+		local rc44 st44 saved44 acc objs ids
+		rc44=$(cat "$work/rc44")
+		sleep 20
+		st44=$("$CX" info "$S6" --json 2>/dev/null | jq -r .state)
+		saved44=$("$CX" saves --json 2>/dev/null | jq -r --arg n "$P-n6d" '.[] | select(.name == $n) | .id')
+		acc=$(curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id')
+		ids=$("$CX" saves --json 2>/dev/null | jq -r '.[].id' | tr '\n' '|')
+		curl -s "https://api.cloudflare.com/client/v4/accounts/$acc/r2/buckets/cloudex-backups/objects?prefix=saves/&per_page=1000" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" >"$work/r2.json"
+		local listed44
+		listed44=$(jq -r '.success' "$work/r2.json")
+		objs=$(jq -r '.result[]?.key' "$work/r2.json" | cut -d/ -f2 | sort -u | grep -vE "^(${ids%|})$" | tr '\n' ' ')
+		OUT="save exit $rc44 ($(tail -1 "$work/e44" | head -c 160)); deploy: $(grep -c 'API deployed' "$work/deploy44.log"); the sandbox: $st44; the save: ${saved44:-not made}; R2 listed: $listed44; save ids in R2 that no save names: ${objs:-none}" CODE=""
+		ok N44 "$(m6_desc N44)" [ "$st44" = running -a "$listed44" = true -a -z "$objs" ]
+		"$CX" saves rm "$P-n6d" --yes >/dev/null 2>&1
+	else
+		skip N44 "$(m6_desc N44)" "set VERIFY_NODE_DEPLOY=1 (and CLOUDFLARE_API_TOKEN) to redeploy during the save"
+	fi
+	"$CX" saves rm "$P-n6s" --yes >/dev/null 2>&1
+	"$CX" delete "$S6B" --yes >/dev/null 2>&1
+	"$CX" delete "$S6" --yes >/dev/null 2>&1
+}
+
 if want node; then
 	if [[ -z ${VERIFY_NODE_SSH:-} ]]; then
 		skip N00 "the node area" "set VERIFY_NODE_SSH to a command that runs a command on a host for the agent, such as 'ssh box'"
 		m3_skip "no node host: set VERIFY_NODE_SSH"
 		m4_skip "no node host: set VERIFY_NODE_SSH" ""
 		m5_skip "no node host: set VERIFY_NODE_SSH"
+		m6_skip "no node host: set VERIFY_NODE_SSH"
 	else
 		read -ra NODE_SSH <<<"$VERIFY_NODE_SSH"
 		NODE_DIR="\$HOME/.cloudex-verify-$P"
@@ -1463,6 +1673,7 @@ if want node; then
 			node_m3
 			node_m4
 			node_m5
+			node_m6
 			[[ -n $M3_SANDBOX ]] && "$CX" delete "$M3_SANDBOX" --yes >/dev/null 2>&1
 			left=$(node_sh "docker ps -aq --filter label=build.cloudex.role=machine | wc -l; docker network ls -q --filter label=build.cloudex.role=machine | wc -l" | tr '\n' ' ')
 			# N35: a node with a sandbox is removed only with --force, which
