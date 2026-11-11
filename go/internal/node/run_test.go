@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -60,5 +61,23 @@ func TestRunStillReturnsAnOrdinaryAnswer(t *testing.T) {
 	out, code, err := d.Run(context.Background(), "m", "0", []string{"echo", "ab", "3"})
 	if err != nil || out != "ababab" || code != 3 {
 		t.Fatalf("%q %d %v", out, code, err)
+	}
+}
+
+func TestAStartGivesUpAtOnceOnAPlantedSh(t *testing.T) {
+	// The ready check prints nothing: endless output means the machine's
+	// root replaced /bin/sh, and asking again every 100 ms for 90 s would
+	// only pile its execs up in Docker.
+	f, sock := startFakeDocker(t)
+	r := &Runtime{Docker: &Docker{Socket: sock}}
+	t0 := time.Now()
+	err := r.waitReady(context.Background(), "m", 90*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "ready check printed more than 64 KiB") || time.Since(t0) > 5*time.Second {
+		t.Fatalf("err %v after %v", err, time.Since(t0))
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cfg.Cmd[0] != "/bin/sh" {
+		t.Fatalf("ran %v", f.cfg.Cmd)
 	}
 }

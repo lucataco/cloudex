@@ -644,6 +644,11 @@ func (r *Runtime) waitReady(ctx context.Context, id string, limit time.Duration)
 		if err == nil && (code == 0 || code == 3) {
 			return nil
 		}
+		if errors.Is(err, ErrRunOutput) {
+			// The check prints nothing, so its sh was replaced: asking again
+			// would only leave more of its endless execs in Docker (review H1).
+			return fmt.Errorf("the machine's ready check printed more than %d KiB, so its /bin/sh isn't the image's: the machine isn't usable", RunOutputMax>>10)
+		}
 		if c, ierr := r.Docker.ContainerInspect(ctx, id); ierr == nil && !c.State.Running {
 			return fmt.Errorf("the machine exited while starting (exit %d)", c.State.ExitCode)
 		}
