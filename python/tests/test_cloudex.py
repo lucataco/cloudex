@@ -580,6 +580,41 @@ class CloudexTest(unittest.TestCase):
         self.assertEqual(box.write_file("f", "x", mode=0o77).mode, "077")
         self.assertEqual(box.write_file("f", "x", mode=7).mode, "007")
 
+    def test_nodes_create_on_a_node_placement_list_get_add_remove(self):
+        placement = {"provider": "node", "node": {"id": "nd-abcd1234", "name": "box", "online": True, "state": "online", "lastSeenAt": 5},
+                     "cpus": 2, "memoryMb": 2048}
+        node = {"id": "nd-abcd1234", "name": "box", "state": "online", "createdAt": 1, "lastSeenAt": None, "version": "v0.2.2",
+                "runtime": "sysbox", "isolation": {"firewall": "pass", "unisolated": False}, "cpus": 2, "memoryMb": 7936,
+                "diskFreeGb": 80.0, "colo": "IAD", "locationHint": "enam", "machines": 1, "revokedAt": None}
+        FakeAPI.routes["POST /v1/sandboxes"] = (201, info("cx-abc123", placement=placement, isolation="sysbox"))
+        FakeAPI.routes["GET /v1/nodes"] = (200, [node])
+        FakeAPI.routes["GET /v1/nodes?live=false"] = (200, [dict(node, state="offline")])
+        FakeAPI.routes["GET /v1/nodes/box"] = (200, dict(node, rttMs=40, orphans=["cx-oooooo"], pendingDeletes=[]))
+        FakeAPI.routes["POST /v1/nodes"] = (201, {"node": dict(node, name="box2", state="pending"), "joinToken": "cxj_x", "expiresAt": 9, "install": "curl x"})
+        FakeAPI.routes["DELETE /v1/nodes/box?force=1"] = (200, {"revoked": "nd-abcd1234"})
+        FakeAPI.routes["DELETE /v1/sandboxes/cx-abc123?force=1"] = (200, {"deleted": "cx-abc123"})
+        box = self.cx.create(node="box", cpus=2, memory_mb=2048)
+        self.assertEqual(FakeAPI.seen[0]["body"], {"node": "box", "cpus": 2, "memoryMb": 2048})
+        self.assertEqual((box.placement["node"]["name"], box.isolation), ("box", "sysbox"))
+        self.assertEqual(self.cx.nodes.list()[0].state, "online")
+        self.assertEqual(self.cx.nodes.list(live=False)[0].state, "offline")
+        got = self.cx.nodes.get("box")
+        self.assertEqual((got.rtt_ms, got.orphans, got.memory_mb), (40, ["cx-oooooo"], 7936))
+        added = self.cx.nodes.add("box2")
+        self.assertEqual((added.node.name, added.join_token, added.install), ("box2", "cxj_x", "curl x"))
+        self.cx.nodes.remove("box", force=True)
+        box.delete(force=True)
+        self.assertEqual([x["route"] for x in FakeAPI.seen[-2:]], ["DELETE /v1/nodes/box?force=1", "DELETE /v1/sandboxes/cx-abc123?force=1"])
+        FakeAPI.routes["GET /v1/sandboxes/old"] = (200, info("cx-old000"))
+        self.assertEqual(self.cx.get("old").placement, {"provider": "cloudflare"})
+
+    def test_a_refusal_on_a_node_raises_with_the_status_and_message(self):
+        FakeAPI.routes["POST /v1/sandboxes"] = (503, {"error": "node box is offline (last seen 2026-11-11 14:02 UTC)"})
+        with self.assertRaises(CloudexError) as caught:
+            self.cx.create(node="box")
+        self.assertEqual(caught.exception.status, 503)
+        self.assertIn("node box is offline", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

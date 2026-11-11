@@ -48,6 +48,8 @@ __all__ = [
     "Health",
     "HostLink",
     "Me",
+    "NewNode",
+    "Node",
     "ProviderKey",
     "Sandbox",
     "Save",
@@ -251,6 +253,89 @@ class Save:
 
 
 @dataclass(frozen=True)
+class Node:
+    """A node: your own Linux host with Docker that runs sandboxes for the
+    deployment (Cloudex.create(node=...)), through its agent, which dials out
+    and stays connected. What it reports about itself comes from its agent:
+    treat it as text.
+    """
+
+    id: str  # nd-xxxxxxxx
+    name: str
+    state: str  # pending, online, offline or revoked
+    created_at: int  # milliseconds since the epoch
+    last_seen_at: Optional[int]
+    version: Optional[str]  # the agent's
+    runtime: Optional[str]  # docker or sysbox
+    isolation: Optional[Dict[str, Any]]  # {"firewall": "pass"|"fail"|"unchecked", "unisolated": bool, ...}
+    cpus: Optional[int]
+    memory_mb: Optional[int]
+    disk_free_gb: Optional[float]
+    colo: Optional[str]
+    location_hint: Optional[str]
+    machines: int  # sandboxes on it
+    revoked_at: Optional[int]
+    rtt_ms: Optional[int] = None  # nodes.get only, while it's online
+    image: Optional[Dict[str, Any]] = None  # nodes.get only
+    orphans: Optional[List[str]] = None  # nodes.get only: machines of no sandbox, left alone
+    pending_deletes: Optional[List[str]] = None  # nodes.get only: sandboxes deleted while it was offline
+    clock_skew_sec: Optional[int] = None  # nodes.get only: its agent's clock less the deployment's, at its last connect
+
+
+@dataclass(frozen=True)
+class NewNode:
+    """A node as added: its agent joins with join_token (once, before
+    expires_at); run install on the host, as root."""
+
+    node: Node
+    join_token: str
+    expires_at: int
+    install: str
+
+
+def _node(n: Dict[str, Any]) -> Node:
+    return Node(
+        id=n["id"], name=n["name"], state=n["state"], created_at=n.get("createdAt", 0), last_seen_at=n.get("lastSeenAt"),
+        version=n.get("version"), runtime=n.get("runtime"), isolation=n.get("isolation"), cpus=n.get("cpus"),
+        memory_mb=n.get("memoryMb"), disk_free_gb=n.get("diskFreeGb"), colo=n.get("colo"), location_hint=n.get("locationHint"),
+        machines=n.get("machines", 0), revoked_at=n.get("revokedAt"), rtt_ms=n.get("rttMs"), image=n.get("image"),
+        orphans=n.get("orphans"), pending_deletes=n.get("pendingDeletes"), clock_skew_sec=n.get("clockSkewSec"),
+    )
+
+
+class Nodes:
+    """Nodes: your own Docker hosts that run sandboxes (Cloudex.create(node=...)).
+
+    Anyone may list them; adding and removing one needs the admin key or an
+    admin token.
+    """
+
+    def __init__(self, client: "Cloudex"):
+        self._client = client
+
+    def list(self, live: bool = True) -> List[Node]:
+        """The nodes. live=False answers from the deployment's index without
+        asking each node whether it's online now, which pollers should use."""
+        return [_node(n) for n in self._client._call("GET", "/v1/nodes" + ("" if live else "?live=false"))]
+
+    def get(self, ref: str) -> Node:
+        """A node by name or id, with a round trip to its agent while it's online."""
+        return _node(self._client._call("GET", "/v1/nodes/" + urllib.parse.quote(ref, safe="")))
+
+    def add(self, name: str) -> NewNode:
+        """Adds a node; run the answer's install command on it, as root, within 30 minutes."""
+        n = self._client._call("POST", "/v1/nodes", {"name": name})
+        return NewNode(node=_node(n["node"]), join_token=n["joinToken"], expires_at=n["expiresAt"], install=n["install"])
+
+    def remove(self, ref: str, force: bool = False) -> None:
+        """Removes a node: its agent is disconnected and its key stops working.
+
+        One with sandboxes is refused unless force. Removing a removed node forgets it.
+        """
+        self._client._call("DELETE", "/v1/nodes/" + urllib.parse.quote(ref, safe="") + ("?force=1" if force else ""))
+
+
+@dataclass(frozen=True)
 class Health:
     ok: bool
     version: str
@@ -342,6 +427,11 @@ class Cloudex:
     def __repr__(self) -> str:
         return f"Cloudex({self.api_url!r})"
 
+    @property
+    def nodes(self) -> Nodes:
+        """Your own Docker hosts that run sandboxes: nodes.list(), get(), add() and remove()."""
+        return Nodes(self)
+
     def health(self) -> Health:
         """The deployment's version and features."""
         h = self._call("GET", "/v1/health")
@@ -367,17 +457,30 @@ class Cloudex:
         env: Optional[Dict[str, str]] = None,
         files: Optional[Dict[str, str]] = None,
         repo: Union[str, Dict[str, str], None] = None,
+        node: Optional[str] = None,
+        cpus: Optional[float] = None,
+        memory_mb: Optional[int] = None,
     ) -> "Sandbox":
         """Creates a sandbox and returns once it's running, usually in about 10 seconds.
 
         size is standard-1 to standard-4 (default standard-2). idle_minutes
         (default 30) is how long without activity before it saves and stops;
-        0 waits for the 6-hour platform limit. env and files (paths in the home
-        directory, such as ~/.npmrc) are applied at every start; repo, an
-        https:// URL with #branch if wanted, or {"url", "dir", "branch"}, is
-        cloned into the home directory. A failed clone leaves a notice.
+        0 waits for the 6-hour platform limit on Cloudflare, and never stops
+        it on a node. env and files (paths in the home directory, such as
+        ~/.npmrc) are applied at every start; repo, an https:// URL with
+        #branch if wanted, or {"url", "dir", "branch"}, is cloned into the home
+        directory. A failed clone leaves a notice.
+
+        node (a name or id, see nodes) runs it on your own Docker host instead
+        of Cloudflare, with cpus (from 0.25) and memory_mb (from 512), at most
+        the node's own; by default the size's. The node must be online and
+        pass its isolation self-test, and an own-only token can't use a node
+        whose isolation is plain Docker. On a node, stop keeps the disk there;
+        forks, named saves and agents aren't available there yet.
         """
-        body = _drop_none(name=name, size=size, idleMinutes=idle_minutes, env=env, files=files, repo=repo)
+        body = _drop_none(
+            name=name, size=size, idleMinutes=idle_minutes, env=env, files=files, repo=repo, node=node, cpus=cpus, memoryMb=memory_mb
+        )
         return Sandbox(self, self._call("POST", "/v1/sandboxes", body))
 
     def list_keys(self) -> List[ProviderKey]:
@@ -635,6 +738,17 @@ class Sandbox:
         """Providers whose keys this run uses without holding them (see Cloudex.set_key)."""
         return self.info.get("providerKeys") or []
 
+    @property
+    def placement(self) -> Dict[str, Any]:
+        """Where it runs: {"provider": "cloudflare"}, or {"provider": "node", "node": {"id", "name",
+        "online", "state", "lastSeenAt"}, "cpus", "memoryMb"}. Cloudflare for a deployment before v0.2.2."""
+        return self.info.get("placement") or {"provider": "cloudflare"}
+
+    @property
+    def isolation(self) -> Optional[str]:
+        """vm (Cloudflare), or on a node sysbox, docker (plain Docker: trusted code only) or none (testing only)."""
+        return self.info.get("isolation")
+
     def __repr__(self) -> str:
         label = f" {self.name!r}" if self.name else ""
         return f"<Sandbox {self.id}{label} {self.state}>"
@@ -663,7 +777,7 @@ class Sandbox:
         return self._update("GET", "")
 
     def stop(self) -> "Sandbox":
-        """Saves the disk, backs up /home and stops."""
+        """Saves the disk, backs up /home and stops. On a node, stops and keeps the disk there."""
         return self._update("POST", "/stop")
 
     def resume(self, from_backup: bool = False, size: Optional[str] = None) -> "Sandbox":
@@ -678,9 +792,13 @@ class Sandbox:
         """Renames the sandbox, or changes how long it may sit idle; a new idle time applies at once."""
         return self._update("PATCH", "", _drop_none(name=name, idleMinutes=idle_minutes))
 
-    def delete(self) -> None:
-        """Deletes the sandbox and its backups."""
-        self._client._call("DELETE", self._path())
+    def delete(self, force: bool = False) -> None:
+        """Deletes the sandbox and its backups.
+
+        On a node that's offline this raises (503) unless force: then it goes
+        at once, and the node removes its machine when it's back.
+        """
+        self._client._call("DELETE", self._path("?force=1" if force else ""))
 
     def exec(
         self,

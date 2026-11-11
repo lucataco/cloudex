@@ -10,6 +10,28 @@
 export type SandboxSize = "standard-1" | "standard-2" | "standard-3" | "standard-4";
 export type SandboxState = "starting" | "running" | "stopping" | "stopped" | "error";
 
+/**
+ * How a sandbox is kept apart from others and from the host it runs on:
+ * "vm" on Cloudflare (a VM of its own); on a node, "sysbox" (root in it is an
+ * unprivileged user on the host), "docker" (plain Docker: for trusted code
+ * only, since code that escapes is root on the host) or "none" (a node joined
+ * with --unisolated, for testing only).
+ */
+export type Isolation = "vm" | "sysbox" | "docker" | "none";
+
+/**
+ * Where a sandbox runs: on Cloudflare, or on a node (your own Docker host,
+ * see Cloudex.nodes), which it stays on. node is that node as of the call:
+ * online while its agent is connected; state is "revoked" once it was removed,
+ * or null once forgotten. cpus and memoryMb are its machine's limits there.
+ */
+export interface Placement {
+  provider: "cloudflare" | "node";
+  node?: { id: string; name: string; online: boolean; state: NodeState | null; lastSeenAt: number | null };
+  cpus?: number;
+  memoryMb?: number;
+}
+
 /** A sandbox as the API reports it. Times are milliseconds since the epoch. */
 export interface SandboxInfo {
   id: string;
@@ -38,6 +60,73 @@ export interface SandboxInfo {
   /** Providers whose keys this run uses without holding them (see Cloudex.setKey). */
   providerKeys?: string[];
   error: string | null;
+  /** Where it runs, and how it's isolated there; left out by deployments before v0.2.2 (it's on Cloudflare then). */
+  placement?: Placement;
+  isolation?: Isolation;
+}
+
+export type NodeState = "pending" | "online" | "offline" | "revoked";
+
+/** How a node keeps its machines apart: its firewall self-test, and whether it joined --unisolated (testing only). */
+export interface NodeIsolation {
+  firewall: "pass" | "fail" | "unchecked";
+  unisolated: boolean;
+  checkedAt?: number;
+  /** The self-test's checks that failed. */
+  failed?: string[];
+}
+
+/** The sandbox image on a node, and whether the node has it. */
+export interface NodeImage {
+  ref: string;
+  state: "present" | "pulling" | "missing" | "refused";
+  progress?: number;
+}
+
+/**
+ * A node: your own Linux host with Docker that runs sandboxes for the
+ * deployment, through its agent (cloudex-node), which dials out and stays
+ * connected. What it reports about itself (its name aside) comes from its
+ * agent: show it as text.
+ */
+export interface NodeInfo {
+  id: string;
+  name: string;
+  state: NodeState;
+  createdAt: number;
+  lastSeenAt: number | null;
+  version: string | null;
+  protocol: number | null;
+  arch: string | null;
+  runtime: "docker" | "sysbox" | null;
+  isolation: NodeIsolation | null;
+  cpus: number | null;
+  memoryMb: number | null;
+  diskFreeGb: number | null;
+  colo: string | null;
+  continent: string | null;
+  locationHint: string | null;
+  /** Sandboxes on it. */
+  machines: number;
+  revokedAt: number | null;
+  /** Nodes.get only, while it's online: a round trip to its agent, in ms. */
+  rttMs?: number;
+  /** Nodes.get only. */
+  image?: NodeImage;
+  /** Nodes.get only: machines on it of no sandbox (left alone). */
+  orphans?: string[];
+  /** Nodes.get only: sandboxes deleted while it was offline, whose machines it removes when it's back. */
+  pendingDeletes?: string[];
+  /** Nodes.get only: its agent's clock less the deployment's at its last connect, in seconds. */
+  clockSkewSec?: number;
+}
+
+/** A node as added: the token its agent joins with (once, before expiresAt), and the command that installs the agent. */
+export interface NewNodeInfo {
+  node: NodeInfo;
+  joinToken: string;
+  expiresAt: number;
+  install: string;
 }
 
 /**
@@ -141,6 +230,18 @@ export interface CreateOptions {
   files?: Record<string, string>;
   /** An https:// repo to clone into the home directory, with #branch to pick one. */
   repo?: string | RepoOptions;
+  /**
+   * Run it on this node (a name or id; see Cloudex.nodes) instead of
+   * Cloudflare. The node must be online and pass its isolation self-test; an
+   * own-only token can't use a node whose isolation is plain Docker. On a
+   * node, stop keeps the disk there; forks, named saves and agents aren't
+   * available there yet.
+   */
+  node?: string;
+  /** With node: its machine's CPUs, from 0.25 up to the node's; default the size's (1 for standard-2). */
+  cpus?: number;
+  /** With node: its machine's memory in MiB, from 512 up to the node's; default the size's, at most half the node's. */
+  memoryMb?: number;
 }
 
 export interface RepoOptions {
@@ -467,10 +568,31 @@ export class Cloudex {
     return this.#wrap(await this.#call<SandboxInfo>("GET", sandboxPath(ref)));
   }
 
-  /** Creates a sandbox and answers once it's running, usually in about 10 seconds. */
+  /** Creates a sandbox and answers once it's running, usually in about 10 seconds. With node, on that node. */
   async create(options: CreateOptions = {}): Promise<Sandbox> {
     return this.#wrap(await this.#call<SandboxInfo>("POST", "/v1/sandboxes", options));
   }
+
+  /**
+   * Nodes: your own Docker hosts that run sandboxes (create with node). Anyone
+   * may list them; adding and removing one needs the admin key or an admin
+   * token. list({ live: false }) answers from the deployment's index without
+   * asking each node, which pollers should use.
+   */
+  readonly nodes = {
+    list: (options: { live?: boolean } = {}): Promise<NodeInfo[]> =>
+      this.#call("GET", options.live === false ? "/v1/nodes?live=false" : "/v1/nodes"),
+    get: (ref: string): Promise<NodeInfo> => this.#call("GET", `/v1/nodes/${encodeURIComponent(ref)}`),
+    /** Adds a node; run the answer's install command on it, as root, within 30 minutes. */
+    add: (name: string): Promise<NewNodeInfo> => this.#call("POST", "/v1/nodes", { name }),
+    /**
+     * Removes a node: its agent is disconnected and its key stops working. One
+     * with sandboxes is refused unless force. Removing a removed node forgets it.
+     */
+    remove: async (ref: string, options: { force?: boolean } = {}): Promise<void> => {
+      await this.#call("DELETE", `/v1/nodes/${encodeURIComponent(ref)}${options.force ? "?force=1" : ""}`);
+    },
+  };
 
   /** The AI provider keys sandboxes use; the keys themselves are never returned. */
   listKeys(): Promise<ProviderKey[]> {
@@ -637,6 +759,10 @@ export class Sandbox {
   get info(): SandboxInfo {
     return this.#info;
   }
+  /** Where it runs; on Cloudflare for a deployment before v0.2.2. */
+  get placement(): Placement {
+    return this.#info.placement ?? { provider: "cloudflare" };
+  }
 
   toJSON(): SandboxInfo {
     return this.#info;
@@ -646,7 +772,7 @@ export class Sandbox {
     return this.#update("GET", "");
   }
 
-  /** Saves the disk, backs up /home and stops. */
+  /** Saves the disk, backs up /home and stops. On a node, stops and keeps the disk there. */
   async stop(): Promise<this> {
     return this.#update("POST", "/stop");
   }
@@ -661,9 +787,13 @@ export class Sandbox {
     return this.#update("PATCH", "", options);
   }
 
-  /** Deletes the sandbox and its backups. */
-  async delete(): Promise<void> {
-    await this.#call("DELETE", this.#path(""));
+  /**
+   * Deletes the sandbox and its backups. On a node that's offline this
+   * throws (503) unless force: then it goes at once, and the node removes its
+   * machine when it's back.
+   */
+  async delete(options: { force?: boolean } = {}): Promise<void> {
+    await this.#call("DELETE", this.#path(options.force ? "?force=1" : ""));
   }
 
   /**

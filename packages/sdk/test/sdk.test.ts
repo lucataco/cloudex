@@ -685,3 +685,39 @@ test("a file mode below 0o100 is sent with three digits", async () => {
   assert.equal((await box.writeFile("f", "x", { mode: 0o77 })).mode, "077");
   assert.equal((await box.writeFile("g", "x", { mode: 7 })).mode, "007");
 });
+
+test("nodes: create on a node, placement, list (live or from the index), get, add and remove", async () => {
+  const placement = { provider: "node", node: { id: "nd-abcd1234", name: "box", online: true, state: "online", lastSeenAt: 5 }, cpus: 2, memoryMb: 2048 };
+  routes = {
+    "POST /v1/sandboxes": [201, info("cx-abc123", { placement, isolation: "sysbox" })],
+    "GET /v1/nodes": [200, [{ id: "nd-abcd1234", name: "box", state: "online" }]],
+    "GET /v1/nodes?live=false": [200, [{ id: "nd-abcd1234", name: "box", state: "offline" }]],
+    "GET /v1/nodes/box": [200, { id: "nd-abcd1234", name: "box", state: "online", orphans: [], pendingDeletes: [] }],
+    "POST /v1/nodes": [201, { node: { id: "nd-abcd1234", name: "box2" }, joinToken: "cxj_x", expiresAt: 9, install: "curl ..." }],
+    "DELETE /v1/nodes/box?force=1": [200, { revoked: "nd-abcd1234" }],
+    "DELETE /v1/nodes/box2": [200, { deleted: "nd-abcd1234" }],
+    "DELETE /v1/sandboxes/cx-abc123?force=1": [200, { deleted: "cx-abc123" }],
+  };
+  const cx = new Cloudex({ apiUrl: url, apiKey: "k" });
+  const s = await cx.create({ node: "box", cpus: 2, memoryMb: 2048 });
+  assert.deepEqual(seen[0]!.body, { node: "box", cpus: 2, memoryMb: 2048 });
+  assert.equal(s.placement.node?.name, "box");
+  assert.equal(s.info.isolation, "sysbox");
+  assert.equal((await cx.nodes.list())[0]!.state, "online");
+  assert.equal((await cx.nodes.list({ live: false }))[0]!.state, "offline");
+  assert.deepEqual((await cx.nodes.get("box")).pendingDeletes, []);
+  assert.equal((await cx.nodes.add("box2")).install, "curl ...");
+  await cx.nodes.remove("box", { force: true });
+  await cx.nodes.remove("box2");
+  await s.delete({ force: true });
+  assert.deepEqual(seen.map((x) => x.route).slice(-3), ["DELETE /v1/nodes/box?force=1", "DELETE /v1/nodes/box2", "DELETE /v1/sandboxes/cx-abc123?force=1"]);
+  // A sandbox from a deployment before v0.2.2 runs on Cloudflare.
+  routes["GET /v1/sandboxes/old"] = [200, info("cx-old000")];
+  assert.deepEqual((await cx.get("old")).placement, { provider: "cloudflare" });
+});
+
+test("a refusal on a node comes as a CloudexError with the API's status and message", async () => {
+  routes = { "POST /v1/sandboxes": [503, { error: "node box is offline (last seen 2026-11-11 14:02 UTC)" }] };
+  const cx = new Cloudex({ apiUrl: url, apiKey: "k" });
+  await assert.rejects(cx.create({ node: "box" }), (e: unknown) => e instanceof CloudexError && e.status === 503 && /node box is offline/.test(e.message));
+});
