@@ -250,6 +250,9 @@ class Save:
     created_at: int  # milliseconds since the epoch
     ms: int  # how long making it took
     replaced: Optional[bool] = None  # only from Sandbox.save: whether it replaced an earlier save of the name
+    # The node it was made on, {"id", "name"} (its name then), or None for
+    # Cloudflare. A save from a node holds whatever that node put in it.
+    node: Optional[Dict[str, str]] = None
 
 
 @dataclass(frozen=True)
@@ -476,7 +479,7 @@ class Cloudex:
         the node's own; by default the size's. The node must be online and
         pass its isolation self-test, and an own-only token can't use a node
         whose isolation is plain Docker. On a node, stop keeps the disk there;
-        forks, named saves and agents aren't available there yet.
+        forks aren't available there yet (save it, then start_from_save).
         """
         body = _drop_none(
             name=name, size=size, idleMinutes=idle_minutes, env=env, files=files, repo=repo, node=node, cpus=cpus, memoryMb=memory_mb
@@ -546,14 +549,19 @@ class Cloudex:
         name: Optional[str] = None,
         size: Optional[str] = None,
         idle_minutes: Optional[int] = None,
+        node: Optional[str] = None,
+        cpus: Optional[float] = None,
+        memory_mb: Optional[int] = None,
     ) -> List["Sandbox"]:
         """Starts sandboxes (1 to 10) from a named save, with the same options as a fork.
 
         Size and idle minutes default to the saved sandbox's. Restoring takes
         about 15 seconds per GB. Ones that failed to start come back in state
-        "error"; resume() tries again.
+        "error"; resume() tries again. node (with cpus and memory_mb) starts
+        them on that node, as create does, which moves a sandbox between
+        Cloudflare and a node.
         """
-        body = _drop_none(name=name, count=count, size=size, idleMinutes=idle_minutes)
+        body = _drop_none(name=name, count=count, size=size, idleMinutes=idle_minutes, node=node, cpus=cpus, memoryMb=memory_mb)
         return [Sandbox(self, info) for info in self._call("POST", _save_path(save) + "/sandboxes", body)]
 
     def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
@@ -646,6 +654,7 @@ def _save(s: Dict[str, Any]) -> Save:
         created_at=s["createdAt"],
         ms=s["ms"],
         replaced=s.get("replaced"),
+        node=s.get("node"),
     )
 
 

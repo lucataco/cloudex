@@ -154,6 +154,11 @@ export interface SaveInfo {
   createdAt: number;
   /** How long making it took. */
   ms: number;
+  /**
+   * The node it was made on, by its name then, or null for Cloudflare. A save
+   * from a node holds whatever that node put in it: treat it like code from that node.
+   */
+  node?: { id: string; name: string } | null;
   /** Only from Sandbox.save: whether it replaced an earlier save of the name. */
   replaced?: boolean;
 }
@@ -234,8 +239,8 @@ export interface CreateOptions {
    * Run it on this node (a name or id; see Cloudex.nodes) instead of
    * Cloudflare. The node must be online and pass its isolation self-test; an
    * own-only token can't use a node whose isolation is plain Docker. On a
-   * node, stop keeps the disk there; forks, named saves and agents aren't
-   * available there yet.
+   * node, stop keeps the disk there; forks aren't available there yet (save
+   * it, then start sandboxes from the save).
    */
   node?: string;
   /** With node: its machine's CPUs, from 0.25 up to the node's; default the size's (1 for standard-2). */
@@ -302,6 +307,16 @@ export interface ForkOptions {
   size?: SandboxSize;
   /** Default: the original's. */
   idleMinutes?: number;
+  /**
+   * Cloudex.startFromSave only: start them on this node (a name or id), as
+   * create does, which moves a sandbox between Cloudflare and a node. Forks
+   * can't start on a node.
+   */
+  node?: string;
+  /** With node: each machine's CPUs. */
+  cpus?: number;
+  /** With node: each machine's memory in MiB. */
+  memoryMb?: number;
 }
 
 export interface ExecOptions {

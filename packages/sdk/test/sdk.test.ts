@@ -201,6 +201,11 @@ test("named saves: save, list, start from and delete", async () => {
   assert.deepEqual(seen.at(-1)?.body, { name: "b" });
   assert.equal(copy!.info.fromSave, "base");
   assert.equal(copy!.state, "running");
+  // v0.2.2 M6: on a node, and a save that names the node it was made on.
+  routes["GET /v1/saves/onbox"] = [200, { ...save, name: "onbox", node: { id: "nd-abcd1234", name: "box" } }];
+  assert.equal((await cx.getSave("onbox")).node?.name, "box");
+  await cx.startFromSave("base", { name: "n", node: "box", cpus: 2, memoryMb: 2048 });
+  assert.deepEqual(seen.at(-1)?.body, { name: "n", node: "box", cpus: 2, memoryMb: 2048 });
   await cx.deleteSave("base");
   assert.equal(seen.at(-1)?.route, "DELETE /v1/saves/base");
   await assert.rejects(cx.getSave("gone"), (e: CloudexError) => e.status === 404);

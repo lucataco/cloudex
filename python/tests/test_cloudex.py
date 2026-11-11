@@ -171,6 +171,12 @@ class CloudexTest(unittest.TestCase):
         boxes = self.cx.start_from_save("base", count=2, name="b")
         self.assertEqual(FakeAPI.seen[-1]["body"], {"name": "b", "count": 2})
         self.assertEqual([(b.name, b.from_save) for b in boxes], [("b-1", "base")])
+        # v0.2.2 M6: on a node, and a save that names the node it was made on.
+        self.cx.start_from_save("base", name="n", node="box", cpus=2, memory_mb=2048)
+        self.assertEqual(FakeAPI.seen[-1]["body"], {"name": "n", "count": 1, "node": "box", "cpus": 2, "memoryMb": 2048})
+        self.assertIsNone(self.cx.list_saves()[0].node)
+        FakeAPI.routes["GET /v1/saves/onbox"] = (200, dict(save, name="onbox", node={"id": "nd-abcd1234", "name": "box"}))
+        self.assertEqual(self.cx.get_save("onbox").node, {"id": "nd-abcd1234", "name": "box"})
         self.cx.delete_save("base")
         self.assertEqual(FakeAPI.seen[-1]["route"], "DELETE /v1/saves/base")
         with self.assertRaises(CloudexError) as e:
