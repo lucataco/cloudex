@@ -5,10 +5,12 @@ is a Linux machine with a shell, Docker, SSH and coding agents. Stopping saves i
 disk; resuming brings it back. You pay Cloudflare directly; there is no Cloudex
 service in between. Site: [cloudex.build](https://cloudex.build).
 
-**Status: v0.2.1** adds a web dashboard, served by your deployment itself, with
-terminals and desktops in the browser. v0.2.0 added OpenCode, keys for six more AI
-providers, and access tokens with sign-in by code. v0.1 commands, API routes and
-SDK calls still work unchanged.
+**Status: v0.2.2** adds nodes: sandboxes on a Linux machine of your own, a home
+server or a VPS, under the same deployment, CLI, API, SDKs and dashboard. v0.2.1
+added a web dashboard, served by your deployment itself, with terminals and
+desktops in the browser. v0.2.0 added OpenCode, keys for six more AI providers,
+and access tokens with sign-in by code. v0.1 commands, API routes and SDK calls
+still work unchanged.
 
 ## What you need
 
@@ -17,6 +19,8 @@ SDK calls still work unchanged.
 - Optional: a domain in the same Cloudflare account, for preview links. Cloudex adds
   a proxied `*.<domain>` record and routes `*.<domain>/*` to its Worker; requests
   for your other subdomains, like `www`, pass through to their origins.
+- Optional: a Linux machine (amd64, systemd, Docker 24 or later, root) to run
+  sandboxes on as a node.
 
 ## Get started
 
@@ -55,6 +59,7 @@ after a command; `CLOUDEX_NO_UPDATE_CHECK=1` turns that off.
 | Command | What it does |
 |---|---|
 | `cloudex new [--name] [--size standard-2] [--idle 30m]` | Create and start a sandbox; it becomes the current one |
+| `cloudex node add <name>`, `node list`, `node info`, `node rm` | Add your own Linux machine as a node, and see or remove nodes; `cloudex new --on <node> [--cpus] [--memory]` runs a sandbox there |
 | `cloudex fork [sandbox] [--name] [--count 1-10]` | New sandboxes that start from a copy of one's disk (also `cloudex new --from <sandbox>`) |
 | `cloudex save [sandbox] <name>`, `saves`, `saves rm <name>` | Keep a copy of a sandbox's disk under a name, for good; start sandboxes from it with `cloudex new --from <name>` |
 | `cloudex env [sandbox]`, `env set NAME=VALUE`, `env unset NAME` | A sandbox's environment variables and files (`--file`, `--env-file`); `cloudex new` takes them too, and `--repo` |
@@ -171,18 +176,42 @@ For coding agents on your own computer, [skills/cloudex](skills/cloudex/SKILL.md
 is a skill that teaches them the CLI.
 
 Sandboxes stop and save after `--idle` without SSH, exec, preview or agent
-activity (30 minutes by default), and in any case within Cloudflare's 6-hour
+activity (30 minutes by default), and on Cloudflare in any case within its 6-hour
 limit. An open `cloudex ssh` session counts, since it sends a keepalive every
 30 seconds; a connection that has gone silent doesn't. With provider keys, an
 agent's calls to its provider count too. Without them, agents need signing in
 once inside the sandbox (`cloudex ssh`, then run `claude`, `codex` or `opencode`); the login
 is saved with the disk, and copied into forks.
 
+**Nodes.** `cloudex node add box` prints a command to run as root on a Linux
+machine of yours (amd64, systemd, nftables, Docker 24 or later). It installs a
+firewall that keeps sandboxes off the host, its LAN and its tailnet, and starts
+an agent, `cloudex-node`, in a container; the agent dials out to your
+deployment, so the machine needs no open port. It checks the firewall from
+inside a throwaway sandbox before it says it worked, and again every hour.
+`cloudex new --on box --cpus 4 --memory 16G` then runs a sandbox there, with
+ssh, exec, files, preview links, the dashboard's terminal and desktop, agents
+with provider keys, named saves and the `cloudex` command inside working as on
+Cloudflare, through your deployment. A sandbox on a node has no 6-hour limit,
+and stopping keeps its disk on the machine, in about a second. Forks, backups
+and sizes aren't available there yet; to move a sandbox between a node and
+Cloudflare, save it and start a sandbox from the save, with or without `--on`.
+With Sysbox on the machine, root in a sandbox is an unprivileged user on the
+host and Docker works inside. Without it, sandboxes run under plain Docker,
+where code that escapes its container is root on the host: use such a node only
+for code you trust, and own-only tokens (CI) can't use it. The node's agent
+sees its sandboxes' provider calls in plain text, but never the provider keys,
+which the Worker adds; a save made on a node holds whatever that node put in
+it. `curl -fsSL https://cloudex.build/node | sudo bash -s -- --uninstall`
+removes everything the installer made. See
+[cloudex.build/docs/nodes](https://cloudex.build/docs/nodes).
+
 ## SDKs
 
 The [TypeScript SDK](packages/sdk) and the [Python SDK](python) do what the CLI
-does from code: create, fork, exec, host links, desktop, stop and resume, and
-named saves (`box.save`, `cx.startFromSave`). They also drive agents, like
+does from code: create, fork, exec, host links, desktop, stop and resume, named
+saves (`box.save`, `cx.startFromSave`), and nodes (`cx.nodes`, and `node` in
+`create` and `startFromSave`). They also drive agents, like
 `cloudex agents`: start Claude Code, Codex or OpenCode on a task with no terminal, follow
 its events, send it follow-ups, and interrupt or steer it. The agent and its
 conversation live on the sandbox's disk, so a fork can take the same
@@ -226,11 +255,13 @@ sandbox names it knows of, and showing it to you. Agents get the report and a
 | `apps/dashboard` | The web dashboard (Preact, xterm.js and noVNC), built into the API Worker |
 | `images/base` | The sandbox image: Ubuntu 24.04, Node, Python, Docker, sshd, tmux, Claude Code, Codex and OpenCode |
 | `go/cmd/cloudex` | The `cloudex` CLI |
+| `go/cmd/cloudex-node` | The agent on a node, which dials out to the deployment and runs sandboxes under Docker (`go/internal/node`) |
+| `images/node` | The agent's image, `ghcr.io/lucataco/cloudex-node` |
 | `packages/schema` | Zod models shared by the API and the SDKs, and the OpenAPI document built from them |
 | `packages/sdk` | The TypeScript SDK, [`cloudex` on npm](https://www.npmjs.com/package/cloudex) |
 | `python` | The Python SDK, [`cloudex` on PyPI](https://pypi.org/project/cloudex/) |
 | `skills/cloudex` | A skill that teaches coding agents on your computer to use the CLI |
-| `scripts/` | `bundle-api.sh` embeds the API in the CLI; `build-cli.sh` builds release archives |
+| `scripts/` | `bundle-api.sh` embeds the API in the CLI; `build-cli.sh` builds release archives; `node-install.sh` installs a node's firewall and agent (published at `https://cloudex.build/node`) |
 
 ## Develop
 
@@ -257,8 +288,8 @@ sandbox can start on it.
 Before a release, run the verify-release skill
 (`.agents/skills/verify-release/SKILL.md`) against a test deployment.
 
-Releases: push a `v*` tag. CI publishes `ghcr.io/lucataco/cloudex-base:<tag>` and
-CLI archives built against it.
+Releases: push a `v*` tag. CI publishes `ghcr.io/lucataco/cloudex-base:<tag>`,
+`ghcr.io/lucataco/cloudex-node:<tag>` and CLI archives built against them.
 
 ## License
 

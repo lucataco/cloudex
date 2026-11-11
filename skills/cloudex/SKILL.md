@@ -18,6 +18,14 @@ description: Run code, servers and coding agents in Cloudex sandboxes, Ubuntu ma
 - `cloudex delete <sandbox> --yes` deletes a sandbox and its data for good. Ask the user before deleting one you didn't create.
 - Sandboxes cost the user money while they run. Stop or delete the ones you no longer need.
 
+## Nodes (the user's own machines)
+
+- A node is a Linux machine of the user's that runs sandboxes for the same deployment. `cloudex node list` shows the nodes, whether each is online, and its isolation. Adding (`cloudex node add`) and removing (`cloudex node rm`) nodes changes the user's machines and needs an admin key: leave that to the user.
+- `cloudex new --on <node> --name <name>` starts a sandbox on a node, with `--cpus 4 --memory 16G` if it needs more than the default (1 CPU, 6 GiB). Everything else works on it as on Cloudflare, except forks, backups and `--size`. It has no 6-hour limit, and `cloudex stop` keeps its disk on the node.
+- Use a node only when the user asks for it. A node whose isolation is `docker (trusted code only)` runs sandboxes under plain Docker, where code that escapes is root on the user's machine: don't run untrusted code there, such as code from pull requests or unknown repos.
+- If a node is offline, its sandboxes can't be reached (`node <name> is offline`): tell the user rather than working around it.
+- To move a sandbox between a node and Cloudflare, save it (`cloudex save <sandbox> <name>`), then `cloudex new --from <name>`, with `--on <node>` for a node. The new sandbox has a new id and new preview links.
+
 ## Running things
 
 - `cloudex exec <sandbox> -- '<shell command>'` runs a command with bash as the cloudex user in its home directory, prints its output as it comes, and exits with its exit code. It stops the command after 10 minutes by default; `--timeout 1h` is the most. `--root` runs as root, `--cwd app` runs in ~/app (/root/app with `--root`). Several arguments after `--` are quoted for you: `cloudex exec web -- python3 -c 'print(1)'`. `exec` doesn't send standard input: a command that reads it sees it end at once. To put text in a file, use `cloudex cp - web:g`. Its output is text, so copy binary files out with `cloudex cp web:f ./f`.

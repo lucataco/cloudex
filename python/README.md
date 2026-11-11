@@ -94,6 +94,34 @@ with open("app.tar.gz", "rb") as f:
 tgz = box.download_archive("app/dist")
 ```
 
+## Nodes
+
+A node is a Linux machine of your own that runs sandboxes for the deployment
+(see [cloudex.build/docs/nodes](https://cloudex.build/docs/nodes)). `node=` in
+`create` or `start_from_save` puts sandboxes there, with `cpus` and `memory_mb`
+as their limits, up to the node's own. By default they get their size's: 1 CPU
+and 6 GiB for `standard-2`, at most the node's CPUs and half its memory.
+
+```python
+for n in cx.nodes.list():  # Node objects: state, runtime, isolation, cpus, memory_mb, ...
+    print(n.name, n.state, n.runtime)
+n1 = cx.create(name="n1", node="box", cpus=4, memory_mb=16384)
+print(n1.placement)  # {"provider": "node", "node": {"id", "name", "online", "state", "lastSeenAt"}, "cpus", "memoryMb"}
+print(n1.isolation)  # "sysbox", "docker" (plain Docker: trusted code only), or "vm" on Cloudflare
+
+# Move it: save it there, start a sandbox from the save on Cloudflare (or on a node, with node=).
+n1.save("n1-copy")
+on_cloudflare = cx.start_from_save("n1-copy", name="n1-cf")[0]
+```
+
+On a node, `stop()` keeps the disk there, `resume()` takes a second or two,
+and there's no 6-hour limit. Forks, backups and `size` aren't available there
+yet. The node must be online and pass its isolation self-test; an own-only
+token can't use a node whose isolation is plain Docker. `delete(force=True)`
+deletes a sandbox whose node is offline, and the node removes its machine when
+it's back. A save made on a node has `node` set: it holds whatever that node put
+in it.
+
 ## Connecting
 
 `Cloudex(api_url, api_key)` takes the API URL that `cloudex deploy` printed and
@@ -106,7 +134,7 @@ or set `$CLOUDEX_API_KEY`. The key gives full control of your sandboxes.
 
 | Call | Does |
 |---|---|
-| `cx.create(name=, size=, idle_minutes=, env=, files=, repo=)` | Create a sandbox; returns once it's running (and the repo is cloned) |
+| `cx.create(name=, size=, idle_minutes=, env=, files=, repo=, node=, cpus=, memory_mb=)` | Create a sandbox; returns once it's running (and the repo is cloned); on a node with `node` |
 | `cx.get(ref)`, `cx.list()`, `cx.health()` | Look up by id or name, list, check the deployment |
 | `box.exec(cmd, root=, cwd=, timeout_sec=)` | Run shell code, or an argument list, and wait; check `exit_code` |
 | `box.exec_stream(cmd, root=, cwd=, timeout_sec=)` | The same, as a generator of `ExecEvent`s that ends with `exit` |
@@ -119,14 +147,16 @@ or set `$CLOUDEX_API_KEY`. The key gives full control of your sandboxes.
 | `box.download_archive(path, root=)`, `box.upload_archive(path, data, root=)` | A directory as a tar.gz; unpack one into a directory |
 | `box.fork(count=, name=, size=, idle_minutes=)` | Up to 10 sandboxes starting from a copy of the disk |
 | `box.save(name)` | Keep a copy of the running sandbox's disk under a name until it's deleted; a taken name's save is replaced (needs R2) |
-| `cx.start_from_save(name, count=, name=, size=, idle_minutes=)` | Up to 10 sandboxes starting from a named save |
+| `cx.start_from_save(save, count=, name=, size=, idle_minutes=, node=, cpus=, memory_mb=)` | Up to 10 sandboxes starting from a named save; on a node with `node` |
 | `cx.list_saves()`, `cx.get_save(name)`, `cx.delete_save(name)` | The named saves, newest first; one by name; delete one |
 | `box.host(port)` | HTTPS link to a port on your preview domain; servers on localhost work too |
 | `box.links()`, `box.revoke_links(port=None)` | The links that work; make one port's link, or all of them, stop working |
 | `box.update(name=, idle_minutes=)` | Rename, or change the idle time |
 | `box.desktop(size=)`, `box.stop_desktop()` | Start the desktop (Chrome, a terminal) and get a link to it |
-| `box.stop()`, `box.resume(from_backup=, size=)`, `box.delete()` | Save and stop, start again (on another size with `size`), delete |
-| `box.refresh()` | Fetch the latest state; `box.id`, `box.name`, `box.state` and `box.info` hold it |
+| `box.stop()`, `box.resume(from_backup=, size=)`, `box.delete(force=)` | Save and stop, start again (on another size with `size`), delete (`force`: on a node that's offline) |
+| `box.refresh()` | Fetch the latest state; `box.id`, `box.name`, `box.state`, `box.placement`, `box.isolation` and `box.info` hold it |
+| `cx.nodes.list(live=)`, `cx.nodes.get(ref)` | The nodes, as `Node` objects (`live=False` answers from the deployment's index, for polling); one, with a round trip to its agent |
+| `cx.nodes.add(name)`, `cx.nodes.remove(ref, force=)` | Add a node (a `NewNode`, with the command that installs its agent); remove one (admin only) |
 | `box.settings()`, `box.update_settings(env=, files=)` | Environment variables and files the sandbox gets at every start; `None` removes one |
 | `cx.set_key(provider, key)`, `cx.list_keys()`, `cx.delete_key(provider)` | AI provider keys sandboxes use without holding them (`"anthropic"`, `"openai"`, `"openrouter"`, `"google"`, `"groq"`, `"mistral"`, `"xai"`, `"deepseek"`) |
 | `box.prompt(prompt, agent=, cwd=, model=)` | Start Claude Code (default), Codex or OpenCode on a task; returns an `Agent` at once |
