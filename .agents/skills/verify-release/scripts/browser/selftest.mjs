@@ -141,7 +141,8 @@ await test("scenarios and ids", () => {
   assert.deepEqual(Object.keys(ORDER), SCENARIOS);
   const src = fs.readFileSync(path.join(here, "scenarios.mjs"), "utf8");
   const ids = [...new Set([...src.matchAll(/"(B\d\d)"/g)].map((m) => m[1]))].sort();
-  const want = Array.from({ length: 39 }, (_, i) => `B${String(i + 1).padStart(2, "0")}`);
+  // B40 is run.mjs's own; B41 and B42 are the nodes scenario's (v0.2.2).
+  const want = [...Array.from({ length: 39 }, (_, i) => `B${String(i + 1).padStart(2, "0")}`), "B41", "B42"];
   assert.deepEqual(ids, want);
   const run = fs.readFileSync(path.join(here, "run.mjs"), "utf8");
   assert.ok(run.includes('"B40"') && run.includes('"B00"'));
