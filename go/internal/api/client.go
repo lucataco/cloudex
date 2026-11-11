@@ -39,6 +39,38 @@ type Sandbox struct {
 	FromSave     *string  `json:"fromSave"`
 	ProviderKeys []string `json:"providerKeys"`
 	Error        *string  `json:"error"`
+	// Where it runs (v0.2.2); nil from an older deployment, on Cloudflare then.
+	Placement *Placement `json:"placement,omitempty"`
+	// vm on Cloudflare; on a node sysbox, docker (trusted code only) or none (testing only).
+	Isolation *string `json:"isolation,omitempty"`
+}
+
+// Placement is where a sandbox runs: on Cloudflare, or on a node.
+type Placement struct {
+	Provider string         `json:"provider"` // cloudflare or node
+	Node     *PlacementNode `json:"node,omitempty"`
+	CPUs     *float64       `json:"cpus,omitempty"`
+	MemoryMB *int           `json:"memoryMb,omitempty"`
+}
+
+// PlacementNode is the node a sandbox runs on, as of the call.
+type PlacementNode struct {
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	Online     bool    `json:"online"`
+	State      *string `json:"state"` // pending, online, offline or revoked; nil once forgotten
+	LastSeenAt *int64  `json:"lastSeenAt"`
+}
+
+// OnNode is the node the sandbox runs on, or nil on Cloudflare.
+func (s *Sandbox) OnNode() *PlacementNode {
+	if s.Placement == nil || s.Placement.Provider != "node" {
+		return nil
+	}
+	if s.Placement.Node == nil {
+		return &PlacementNode{Name: "?"}
+	}
+	return s.Placement.Node
 }
 
 // Label is the name if there is one, otherwise the id.
@@ -56,6 +88,10 @@ type CreateRequest struct {
 	Env         map[string]string `json:"env,omitempty"`
 	Files       map[string]string `json:"files,omitempty"`
 	Repo        string            `json:"repo,omitempty"` // https URL, with #branch if wanted
+	// On a node (v0.2.2): its name or id, and the machine's limits there.
+	Node     string   `json:"node,omitempty"`
+	CPUs     *float64 `json:"cpus,omitempty"`
+	MemoryMB *int     `json:"memoryMb,omitempty"`
 }
 
 // Settings lists a sandbox's environment variables, files and repo. Values
@@ -380,6 +416,12 @@ func (c *Client) DeleteKey(ctx context.Context, provider string) error {
 
 func (c *Client) Delete(ctx context.Context, ref string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/sandboxes/"+url.PathEscape(ref), nil, nil)
+}
+
+// DeleteForce deletes a sandbox on a node that's offline anyway: the node
+// removes its machine when it's back.
+func (c *Client) DeleteForce(ctx context.Context, ref string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/sandboxes/"+url.PathEscape(ref)+"?force=1", nil, nil)
 }
 
 func (c *Client) Exec(ctx context.Context, ref string, r ExecRequest) (*ExecResult, error) {

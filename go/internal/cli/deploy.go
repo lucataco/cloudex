@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/cloudflare"
 	"github.com/lucataco/cloudex/go/internal/config"
 	"github.com/lucataco/cloudex/go/internal/deploy"
@@ -157,6 +158,9 @@ func newDoctorCmd(opts *options) *cobra.Command {
 						bad = "the API rejected the key. " + keyAdvice(client.BaseURL)
 					}
 					check(err == nil, "the API key works", bad)
+					if err == nil {
+						nodeWarnings(cmd.Context(), client, h.Version, func(msg string) { fmt.Fprintln(w, "warn ", msg) })
+					}
 				}
 			}
 			if token := os.Getenv("CLOUDFLARE_API_TOKEN"); token != "" && cfg != nil && cfg.AccountID != "" {
@@ -168,5 +172,45 @@ func newDoctorCmd(opts *options) *cobra.Command {
 			}
 			return nil
 		},
+	}
+}
+
+// nodeWarnings says what's wrong with the deployment's nodes (v0.2.2): ones
+// offline, with an agent of another version, failing their isolation
+// self-test, nearly out of disk, or with a clock more than 30 s off. Warnings
+// only: a node can be off on purpose.
+func nodeWarnings(ctx context.Context, client *api.Client, apiVersion string, warn func(string)) {
+	ns, err := client.ListNodes(ctx)
+	if err != nil {
+		return // a deployment from before nodes, or a read token that can't
+	}
+	for _, n := range ns {
+		name := clean(n.Name)
+		switch n.State {
+		case "pending":
+			warn(fmt.Sprintf("node %s never joined: run the command cloudex node add %s printed on it, or remove it with cloudex node rm %s", name, name, name))
+			continue
+		case "revoked":
+			continue
+		case "offline":
+			last := "never seen"
+			if n.LastSeenAt != nil {
+				last = "last seen " + ago(*n.LastSeenAt)
+			}
+			warn(fmt.Sprintf("node %s is offline (%s); its sandboxes can't run until its agent is back", name, last))
+			continue
+		}
+		if n.Version != nil && apiVersion != "" && *n.Version != apiVersion && apiVersion != "dev" {
+			warn(fmt.Sprintf("node %s runs agent %s and the deployment %s: run the installer there again with --version %s", name, clean(*n.Version), apiVersion, apiVersion))
+		}
+		if n.Isolation != nil && n.Isolation.Firewall == "fail" && !n.Isolation.Unisolated {
+			warn(fmt.Sprintf("node %s fails its isolation self-test, so it runs no sandboxes: cloudex node info %s says why", name, name))
+		}
+		if n.DiskFreeGB != nil && *n.DiskFreeGB < 15 {
+			warn(fmt.Sprintf("node %s has %.0f GB of Docker disk free; it refuses new sandboxes under 10", name, *n.DiskFreeGB))
+		}
+		if d, err := client.GetNode(ctx, n.ID); err == nil && d.ClockSkewSec != nil && (*d.ClockSkewSec > 30 || *d.ClockSkewSec < -30) {
+			warn(fmt.Sprintf("node %s's clock is %s; over 60 s its agent is refused: set its time with NTP", name, skewText(*d.ClockSkewSec)))
+		}
 	}
 }

@@ -69,8 +69,47 @@ func optionalRef(args []string) string {
 	return ""
 }
 
+// parseMemory reads --memory, such as 4G, 4GiB, 512M or 512MiB, as MiB.
+func parseMemory(s string) (int, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	unit := 0
+	for _, u := range []struct {
+		suffix string
+		mib    int
+	}{{"GIB", 1024}, {"GB", 1024}, {"G", 1024}, {"MIB", 1}, {"MB", 1}, {"M", 1}} {
+		if strings.HasSuffix(t, u.suffix) {
+			t, unit = strings.TrimSuffix(t, u.suffix), u.mib
+			break
+		}
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+	if unit == 0 || err != nil || v <= 0 {
+		return 0, fmt.Errorf("bad --memory %q: give it with a unit, such as 4G or 512M", s)
+	}
+	return int(v * float64(unit)), nil
+}
+
+// whereText says where a sandbox runs: cloudflare, or its node's name, with
+// whether that node is offline or was removed.
+func whereText(s *api.Sandbox) string {
+	n := s.OnNode()
+	if n == nil {
+		return "cloudflare"
+	}
+	switch {
+	case n.State == nil:
+		return clean(n.Name) + " (removed)"
+	case *n.State == "revoked":
+		return clean(n.Name) + " (removed)"
+	case !n.Online:
+		return clean(n.Name) + " (offline)"
+	}
+	return clean(n.Name)
+}
+
 func newNewCmd(opts *options) *cobra.Command {
-	var name, size, from, repo string
+	var name, size, from, repo, on, mem string
+	var cpus float64
 	var count int
 	idle := 30 * time.Minute
 	var noUse bool
@@ -84,14 +123,25 @@ func newNewCmd(opts *options) *cobra.Command {
 			"start (see cloudex env), and --repo clones a repo into its home directory.\n\n" +
 			"With --from, the new sandboxes start from a copy of another's disk, and its\n" +
 			"settings (see cloudex fork), or from a named save (see cloudex save). When a\n" +
-			"sandbox and a save share a name, the sandbox wins; --from save:<name> picks the save.",
+			"sandbox and a save share a name, the sandbox wins; --from save:<name> picks the save.\n\n" +
+			"With --on, it runs on one of your nodes (see cloudex node) instead of Cloudflare,\n" +
+			"with --cpus and --memory as its machine's limits there. A sandbox on a node keeps\n" +
+			"its disk there when it stops, and has no 6-hour limit; forks, named saves and\n" +
+			"agents aren't available on nodes yet.",
 		Example: "  cloudex new --name my-box\n" +
+			"  cloudex new --on box --cpus 2 --memory 4G --name n1\n" +
 			"  cloudex new --repo https://github.com/you/app --env GH_TOKEN=$(gh auth token) --env-file .env\n" +
 			"  cloudex new --from my-box --count 3 --name agent\n" +
 			"  cloudex new --from base --name task-1",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			settingsFlags := len(envPairs)+len(envFiles)+len(files) > 0 || repo != ""
+			if on == "" && (cmd.Flags().Changed("cpus") || cmd.Flags().Changed("memory")) {
+				return errors.New("--cpus and --memory go with --on: on Cloudflare, pick a --size instead")
+			}
+			if on != "" && from != "" {
+				return errors.New("--on doesn't go with --from yet: sandboxes on nodes can't start from a fork or a save in this version")
+			}
 			if from != "" && settingsFlags {
 				return errors.New("--env, --env-file, --file and --repo don't go with --from: the new sandboxes get the settings of the sandbox or save; change them after with cloudex env set")
 			}
@@ -117,7 +167,17 @@ func newNewCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			req := api.CreateRequest{Name: name, Size: size, Repo: repo}
+			req := api.CreateRequest{Name: name, Size: size, Repo: repo, Node: on}
+			if cmd.Flags().Changed("cpus") {
+				req.CPUs = &cpus
+			}
+			if cmd.Flags().Changed("memory") {
+				mb, err := parseMemory(mem)
+				if err != nil {
+					return err
+				}
+				req.MemoryMB = &mb
+			}
 			if len(env) > 0 {
 				req.Env = env
 			}
@@ -131,7 +191,11 @@ func newNewCmd(opts *options) *cobra.Command {
 				}
 				req.IdleMinutes = &minutes
 			}
-			fmt.Fprintln(cmd.ErrOrStderr(), "Starting a sandbox. The first start on a host can take a minute while it fetches the image.")
+			if on != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Starting a sandbox on node %s.\n", on)
+			} else {
+				fmt.Fprintln(cmd.ErrOrStderr(), "Starting a sandbox. The first start on a host can take a minute while it fetches the image.")
+			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), lifecycleTimeout)
 			defer cancel()
 			s, err := client.Create(ctx, req)
@@ -147,7 +211,14 @@ func newNewCmd(opts *options) *cobra.Command {
 			if opts.json {
 				return writeJSON(cmd.OutOrStdout(), s)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s is running (%s).\n", s.Label(), s.Size)
+			if n := s.OnNode(); n != nil {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s is running on node %s (%s).\n", s.Label(), clean(n.Name), limits(s))
+				if s.Isolation != nil && (*s.Isolation == "docker" || *s.Isolation == "none") {
+					fmt.Fprintln(cmd.ErrOrStderr(), isolationWarning(clean(n.Name), *s.Isolation))
+				}
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s is running (%s).\n", s.Label(), s.Size)
+			}
 			if s.Notice != nil && *s.Notice != "" {
 				fmt.Fprintln(cmd.OutOrStdout(), *s.Notice)
 			}
@@ -159,8 +230,11 @@ func newNewCmd(opts *options) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&name, "name", "", "a name to use instead of the id")
 	cmd.Flags().StringVar(&size, "size", "", "standard-1, standard-2 (default), standard-3 or standard-4")
-	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop after this long without activity, such as 30m or 2h; 0 waits for the 6-hour platform limit")
+	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop after this long without activity, such as 30m or 2h; 0 never stops it on a node, and waits for the 6-hour platform limit on Cloudflare")
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make it the current sandbox")
+	cmd.Flags().StringVar(&on, "on", "", "run it on this node (your own Docker host; see cloudex node) instead of Cloudflare")
+	cmd.Flags().Float64Var(&cpus, "cpus", 0, "with --on: its CPUs, such as 0.5 or 4 (default the size's: 1)")
+	cmd.Flags().StringVar(&mem, "memory", "", "with --on: its memory, such as 4G or 512M (default the size's: 6G, at most half the node's)")
 	cmd.Flags().StringVar(&from, "from", "", "start from a copy of this sandbox's disk (a fork), or from this named save")
 	cmd.Flags().IntVar(&count, "count", 1, fmt.Sprintf("with --from, how many sandboxes to start, up to %d", maxForks))
 	cmd.Flags().StringArrayVar(&envPairs, "env", nil, "NAME=VALUE: an environment variable (repeatable)")
@@ -196,7 +270,7 @@ func newListCmd(opts *options) *cobra.Command {
 				return err
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "  ID\tNAME\tSTATE\tSIZE\tSAVED\tCREATED")
+			fmt.Fprintln(tw, "  ID\tNAME\tSTATE\tWHERE\tSIZE\tSAVED\tCREATED")
 			for _, s := range list {
 				mark := " "
 				if s.ID == cfg.Current || (s.Name != nil && *s.Name == cfg.Current) {
@@ -210,7 +284,11 @@ func newListCmd(opts *options) *cobra.Command {
 				if s.SavedAt != nil {
 					saved = ago(*s.SavedAt)
 				}
-				fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\t%s\t%s\n", mark, s.ID, name, s.State, s.Size, saved, ago(s.CreatedAt))
+				size := s.Size
+				if s.OnNode() != nil {
+					size = "-" // its CPUs and memory: cloudex info
+				}
+				fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\t%s\t%s\t%s\n", mark, s.ID, name, s.State, whereText(&s), size, saved, ago(s.CreatedAt))
 			}
 			return tw.Flush()
 		},
@@ -251,10 +329,29 @@ func printSandbox(w io.Writer, s *api.Sandbox) {
 		fmt.Fprintf(tw, "Name\t%s\n", *s.Name)
 	}
 	fmt.Fprintf(tw, "State\t%s\n", s.State)
-	fmt.Fprintf(tw, "Size\t%s\n", s.Size)
-	if s.IdleMinutes > 0 {
-		fmt.Fprintf(tw, "Idle stop\tafter %d minutes\n", s.IdleMinutes)
+	n := s.OnNode()
+	if n != nil {
+		w := "node " + whereText(s)
+		if n.State != nil && *n.State == "offline" && n.LastSeenAt != nil {
+			w += ", last seen " + ago(*n.LastSeenAt)
+		}
+		fmt.Fprintf(tw, "Where\t%s\n", w)
+		fmt.Fprintf(tw, "Machine\t%s\n", limits(s))
 	} else {
+		if s.Placement != nil {
+			fmt.Fprintf(tw, "Where\tcloudflare\n")
+		}
+		fmt.Fprintf(tw, "Size\t%s\n", s.Size)
+	}
+	if s.Isolation != nil {
+		fmt.Fprintf(tw, "Isolation\t%s\n", sandboxIsolation(*s.Isolation))
+	}
+	switch {
+	case s.IdleMinutes > 0:
+		fmt.Fprintf(tw, "Idle stop\tafter %d minutes\n", s.IdleMinutes)
+	case n != nil:
+		fmt.Fprintf(tw, "Idle stop\toff\n")
+	default:
 		fmt.Fprintf(tw, "Idle stop\toff (6-hour platform limit)\n")
 	}
 	fmt.Fprintf(tw, "Created\t%s\n", ago(s.CreatedAt))
@@ -424,7 +521,8 @@ func newSetCmd(opts *options) *cobra.Command {
 		Long: "Change a sandbox's name, or how long it may go without SSH, exec, preview or\n" +
 			"agent activity before it stops and saves its disk. A new idle time applies at\n" +
 			"once, counting from now; 0 keeps the sandbox up until the platform's 6-hour\n" +
-			"limit. To change its size, stop it, then resume it with --size.",
+			"limit on Cloudflare, and for good on a node. To change its size, stop it, then\n" +
+			"resume it with --size.",
 		Example: "  cloudex set --idle 2h\n  cloudex set my-box --name web",
 		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -473,18 +571,20 @@ func newSetCmd(opts *options) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "a new name")
-	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop after this long without activity, such as 30m or 2h; 0 waits for the 6-hour platform limit")
+	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop after this long without activity, such as 30m or 2h; 0 never stops it on a node, and waits for the 6-hour platform limit on Cloudflare")
 	return cmd
 }
 
 func newDeleteCmd(opts *options) *cobra.Command {
-	var yes bool
+	var yes, force bool
 	cmd := &cobra.Command{
 		Use:     "delete [sandbox]",
 		Aliases: []string{"rm"},
 		Short:   "Delete a sandbox for good",
 		Long: "Delete a sandbox. Its files can't be recovered afterwards. Cloudflare removes the\n" +
-			"last saved disk from your account's registry within 30 days.",
+			"last saved disk from your account's registry within 30 days. On a node, its machine\n" +
+			"is removed there; while the node is offline that's refused, unless --force: then the\n" +
+			"sandbox goes at once, and the node removes the machine when it's back.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, client, err := opts.load()
@@ -511,7 +611,11 @@ func newDeleteCmd(opts *options) *cobra.Command {
 			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), lifecycleTimeout)
 			defer cancel()
-			if err := client.Delete(ctx, s.ID); err != nil {
+			del := client.Delete
+			if force {
+				del = client.DeleteForce
+			}
+			if err := del(ctx, s.ID); err != nil {
 				return err
 			}
 			if s.Name != nil {
@@ -531,7 +635,47 @@ func newDeleteCmd(opts *options) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "don't ask for confirmation")
+	cmd.Flags().BoolVar(&force, "force", false, "on a node that's offline, delete it anyway; the node removes the machine when it's back")
 	return cmd
+}
+
+// limits is a node sandbox's machine: its CPUs and memory.
+func limits(s *api.Sandbox) string {
+	if s.Placement == nil || s.Placement.CPUs == nil || s.Placement.MemoryMB == nil {
+		return "-"
+	}
+	c := *s.Placement.CPUs
+	unit := "CPUs"
+	if c == 1 {
+		unit = "CPU"
+	}
+	return fmt.Sprintf("%s %s, %.1f GiB", strconv.FormatFloat(c, 'f', -1, 64), unit, float64(*s.Placement.MemoryMB)/1024)
+}
+
+// sandboxIsolation says how a sandbox is kept apart (Sandbox.isolation).
+func sandboxIsolation(iso string) string {
+	switch iso {
+	case "vm":
+		return "vm (Cloudflare)"
+	case "sysbox":
+		return "sysbox"
+	case "docker":
+		return "docker (trusted code only)"
+	case "none":
+		return "none (testing only)"
+	}
+	return clean(iso)
+}
+
+// isolationWarning is what new --on says on a node whose machines run under
+// plain Docker, or with no isolation at all.
+func isolationWarning(node, iso string) string {
+	if iso == "none" {
+		return "Node " + node + " joined with --unisolated, for testing only: machines on it reach the host\n" +
+			"and its network. Use it only for code you trust."
+	}
+	return "Machines on " + node + " run under plain Docker. Root in a machine is root on " + node + " if\n" +
+		"code escapes the container. Use this node only for code you trust."
 }
 
 // ago formats a millisecond timestamp as a rough age.

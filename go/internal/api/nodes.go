@@ -28,6 +28,12 @@ type Node struct {
 	RevokedAt    *int64         `json:"revokedAt"`
 	RTTMs        *int64         `json:"rttMs,omitempty"`
 	Image        *NodeImage     `json:"image,omitempty"`
+	// GetNode only (v0.2.2 M5): machines of no sandbox, sandboxes deleted
+	// while it was offline whose machines it removes when it's back, and its
+	// agent's clock less the deployment's at its last connect.
+	Orphans        []string `json:"orphans,omitempty"`
+	PendingDeletes []string `json:"pendingDeletes,omitempty"`
+	ClockSkewSec   *int     `json:"clockSkewSec,omitempty"`
 }
 
 type NodeIsolation struct {
@@ -78,36 +84,4 @@ func (c *Client) DeleteNode(ctx context.Context, ref string, force bool) (map[st
 	}
 	var out map[string]string
 	return out, c.do(ctx, http.MethodDelete, path, nil, &out)
-}
-
-// CreateDevSandbox is the development path (v0.2.2 M3, M4), for admins: a
-// sandbox on a node, whose machine the node's agent makes and starts (cloudex
-// node dev-sandbox, hidden). M5 places sandboxes on nodes for real. cpus and
-// memoryMB are optional (0).
-func (c *Client) CreateDevSandbox(ctx context.Context, node, name string, cpus float64, memoryMB int) (*Sandbox, error) {
-	body := map[string]any{}
-	if name != "" {
-		body["name"] = name
-	}
-	if cpus > 0 {
-		body["cpus"] = cpus
-	}
-	if memoryMB > 0 {
-		body["memoryMb"] = memoryMB
-	}
-	var s Sandbox
-	return &s, c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(node)+"/dev-sandboxes", body, &s)
-}
-
-// DevSandboxLifecycle stops or starts a development sandbox's machine.
-func (c *Client) DevSandboxLifecycle(ctx context.Context, node, ref, action string) (*Sandbox, error) {
-	var s Sandbox
-	return &s, c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(node)+"/dev-sandboxes/"+url.PathEscape(ref)+"/"+action, nil, &s)
-}
-
-// DevSandboxStreams says how many spare and open node streams a development
-// sandbox has, and where its object runs (the release checks).
-func (c *Client) DevSandboxStreams(ctx context.Context, node, ref string) (map[string]any, error) {
-	var out map[string]any
-	return out, c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(node)+"/dev-sandboxes/"+url.PathEscape(ref), nil, &out)
 }

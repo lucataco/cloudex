@@ -84,67 +84,6 @@ func newNodeCmd(opts *options) *cobra.Command {
 		},
 	})
 
-	var devName string
-	var devCPUs float64
-	var devMemory int
-	dev := &cobra.Command{
-		Use:    "dev-sandbox <node>",
-		Hidden: true,
-		Short:  "Development only (v0.2.2 M3, M4): a sandbox on a node, whose agent makes and starts its machine",
-		Args:   cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			_, client, err := opts.load()
-			if err != nil {
-				return err
-			}
-			s, err := client.CreateDevSandbox(cmd.Context(), args[0], devName, devCPUs, devMemory)
-			if err != nil {
-				return err
-			}
-			return writeJSON(cmd.OutOrStdout(), s)
-		},
-	}
-	dev.Flags().StringVar(&devName, "name", "", "a name for the sandbox")
-	dev.Flags().Float64Var(&devCPUs, "cpus", 0, "its CPUs (default 1)")
-	dev.Flags().IntVar(&devMemory, "memory-mb", 0, "its memory in MiB (default 6144, or half the host's)")
-	cmd.AddCommand(dev)
-	for _, action := range []string{"stop", "start"} {
-		cmd.AddCommand(&cobra.Command{
-			Use:    "dev-" + action + " <node> <sandbox>",
-			Hidden: true,
-			Short:  "Development only (v0.2.2 M4): " + action + " a development sandbox's machine",
-			Args:   cobra.ExactArgs(2),
-			RunE: func(cmd *cobra.Command, args []string) error {
-				_, client, err := opts.load()
-				if err != nil {
-					return err
-				}
-				s, err := client.DevSandboxLifecycle(cmd.Context(), args[0], args[1], action)
-				if err != nil {
-					return err
-				}
-				return writeJSON(cmd.OutOrStdout(), s)
-			},
-		})
-	}
-	cmd.AddCommand(&cobra.Command{
-		Use:    "dev-streams <node> <sandbox>",
-		Hidden: true,
-		Short:  "Development only (v0.2.2 M3): a dev sandbox's spare and open node streams, and its object's colo",
-		Args:   cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			_, client, err := opts.load()
-			if err != nil {
-				return err
-			}
-			out, err := client.DevSandboxStreams(cmd.Context(), args[0], args[1])
-			if err != nil {
-				return err
-			}
-			return writeJSON(cmd.OutOrStdout(), out)
-		},
-	})
-
 	var force, yes bool
 	rm := &cobra.Command{
 		Use:     "rm <name>",
@@ -152,7 +91,9 @@ func newNodeCmd(opts *options) *cobra.Command {
 		Short:   "Remove a node: its agent is disconnected and its key stops working",
 		Long: "Remove a node. Its agent is disconnected at once and can't connect again; the\n" +
 			"node stays listed as revoked until it's removed a second time. A node that still\n" +
-			"has sandboxes is refused unless --force is given.",
+			"has sandboxes is refused unless --force is given. With --force, an online node\n" +
+			"removes their machines first; the sandboxes stay listed, in state error, until\n" +
+			"you delete them.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, client, err := opts.load()
@@ -254,6 +195,15 @@ func printNode(cmd *cobra.Command, n *api.Node) error {
 		row("Round trip", fmt.Sprintf("%d ms", *n.RTTMs))
 	}
 	row("Sandboxes", fmt.Sprint(n.Machines))
+	if n.ClockSkewSec != nil && (*n.ClockSkewSec > 5 || *n.ClockSkewSec < -5) {
+		row("Clock", skewText(*n.ClockSkewSec))
+	}
+	if len(n.PendingDeletes) > 0 {
+		row("Pending deletes", fmt.Sprintf("%s (deleted while it was offline; it removes their machines when it's back)", clean(strings.Join(n.PendingDeletes, " "))))
+	}
+	if len(n.Orphans) > 0 {
+		row("Orphans", fmt.Sprintf("%s (machines of no sandbox, left alone; remove them on the host with docker rm -f cloudex-<id>)", clean(strings.Join(n.Orphans, " "))))
+	}
 	row("Added", ago(n.CreatedAt))
 	return tw.Flush()
 }
@@ -279,7 +229,14 @@ func isolationLabel(n *api.Node) string {
 	}
 }
 
-// plainDockerWarning is what node add says, and what new --on will say on a
+func skewText(sec int) string {
+	if sec > 0 {
+		return fmt.Sprintf("%d s ahead of the deployment's", sec)
+	}
+	return fmt.Sprintf("%d s behind the deployment's", -sec)
+}
+
+// plainDockerWarning is what node add says, and what new --on says on a
 // plain-Docker node (v0.2.2 M5).
 func plainDockerWarning(node string) string {
 	return "If the host has no Sysbox, machines on " + node + " run under plain Docker. Root in a machine\n" +
