@@ -30,7 +30,7 @@ test("every operation has an id and a success response", () => {
       assert.ok(Object.keys(o.responses).some((c) => /^[12]\d\d$/.test(c)), `${method} ${path}: no success response`);
     }
   }
-  assert.equal(ids.size, 60);
+  assert.equal(ids.size, 66);
 });
 
 test("responses take fields added later", () => {

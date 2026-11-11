@@ -57,6 +57,10 @@ export const RULES: [string, string, Need, boolean?][] = [
   ["GET", "/v1/saves/:name", "read"],
   ["DELETE", "/v1/saves/:name", "write", true],
   ["POST", "/v1/saves/:name/sandboxes", "write"],
+  // Nodes: anyone may see them (to pick one in M5); adding and removing one
+  // stays for admins. :node isn't a sandbox, so ownOnly tokens see them all.
+  ["GET", "/v1/nodes", "read"],
+  ["GET", "/v1/nodes/:node", "read"],
 ];
 
 const COMPILED = RULES.map(([method, path, need, notOwnOnly]) => ({
