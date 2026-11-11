@@ -316,6 +316,24 @@
       }
     },
     {
+      "name": "welcome with the provider hosts (M6)",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "welcome",
+        "image": "ghcr.io/lucataco/cloudex-base:v0.2.2@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "providers": [
+          "api.anthropic.com",
+          "api.openai.com",
+          "openrouter.ai",
+          "generativelanguage.googleapis.com",
+          "api.groq.com",
+          "api.mistral.ai",
+          "api.x.ai",
+          "api.deepseek.com"
+        ]
+      }
+    },
+    {
       "name": "facts-pass",
       "model": "NodeMessage",
       "message": {
@@ -511,6 +529,34 @@
         "credit": {
           "ch": 0,
           "n": 65536
+        }
+      }
+    },
+    {
+      "name": "start, holding for a restore (M6)",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-7",
+        "name": "start",
+        "args": {
+          "sandbox": "cx-abc123",
+          "hold": true
+        }
+      }
+    },
+    {
+      "name": "start's answer with the node CA (M6)",
+      "model": "NodeMessage",
+      "message": {
+        "type": "result",
+        "id": "op-7",
+        "ok": true,
+        "value": {
+          "address": "10.250.0.19",
+          "container": "cloudex-cx-abc123",
+          "state": "running",
+          "ca": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n"
         }
       }
     }
@@ -901,6 +947,17 @@
       "message": {
         "type": "welcome"
       }
+    },
+    {
+      "name": "welcome with a provider that isn't a host name",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "welcome",
+        "image": "x",
+        "providers": [
+          "*.openai.com"
+        ]
+      }
     }
   ],
   "window": 4194304,
@@ -909,5 +966,36 @@
     "badTicket": 4401,
     "badMessage": 4400,
     "heartbeat": 4408
+  },
+  "egress": {
+    "_": "The route a node's agent passes its machines' requests to cloudex.internal and to the providers on (go/internal/node/egress.go, apps/api/src/nodeegress.ts): ROUTE?target=<the URL, query-escaped>, signed with the node's key and naming the sandbox. The agent refuses bodies over bodyMax itself (the edge refuses them), and sends /activity on at most once every activityEverySec per machine. Every valid target is one the Worker accepts and every invalid one it refuses.",
+    "route": "/v1/node/egress",
+    "bodyMax": 100000000,
+    "activityEverySec": 30,
+    "savePartMax": 67108864,
+    "targets": {
+      "valid": [
+        "http://cloudex.internal/activity",
+        "http://cloudex.internal/v1/sandboxes/self?x=1",
+        "http://cloudex.internal/saves/sv-abcdefghij/0",
+        "https://api.anthropic.com/v1/messages?beta=true",
+        "https://api.openai.com/v1/responses",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini:streamGenerateContent?alt=sse"
+      ],
+      "invalid": [
+        "https://github.com/",
+        "https://pypi.org/simple/",
+        "https://cloudex-api.example.workers.dev/v1/sandboxes",
+        "http://cloudex.internal:8080/activity",
+        "https://cloudex.internal/activity",
+        "http://api.openai.com/v1/models",
+        "https://user:pw@api.openai.com/v1/models",
+        "https://api.openai.com:8443/v1/models",
+        "https://x.api.anthropic.com/v1/messages",
+        "ftp://cloudex.internal/x",
+        "not a url",
+        ""
+      ]
+    }
   }
 }

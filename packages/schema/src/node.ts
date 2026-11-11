@@ -201,7 +201,9 @@ export type NodeMessage = z.infer<typeof NodeMessage>;
 // - create {sandbox, image?, cpus?, memoryMb?, env?, hold?}: make the machine
 //   and its network, not started; answers {address, container, state}, and
 //   created: true when it made it (M5), not when it was there already;
-// - start {sandbox}: start it and wait for its entrypoint; answers the same;
+// - start {sandbox, hold?}: start it and wait for its entrypoint (or, with
+//   hold, for it to hold for a restore, M6); answers the same, and ca: the
+//   node CA's certificate (M6), once the welcome has named the providers;
 // - stop {sandbox}: stop it, keeping its disk;
 // - delete {sandbox}: remove the machine, its volumes and its network;
 // - selftest: run the isolation self-test now; answers {pass, failed, checks, tookMs}.
@@ -222,8 +224,23 @@ export const NodeTickets = z.object({
   error: z.string().max(500).optional(),
 });
 // Sent after the agent's hello (v0.2.2 M4): the image machines run, which the
-// agent pulls and checks against its own list of allowed images.
-export const NodeWelcome = z.object({ type: z.literal("welcome"), image: z.string().max(400) });
+// agent pulls and checks against its own list of allowed images; and (M6) the
+// hosts of the AI providers whose HTTPS calls the deployment intercepts,
+// which the agent's node CA is name-constrained to.
+export const ProviderHost = z.string().regex(/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/, "a host name").max(253);
+export const NodeWelcome = z.object({
+  type: z.literal("welcome"),
+  image: z.string().max(400),
+  providers: z.array(ProviderHost).max(32).optional(),
+});
+
+// The route a node's agent passes its machines' requests to cloudex.internal
+// and to the providers on (v0.2.2 M6): EGRESS_ROUTE?target=<url>, signed. The
+// agent refuses a body over EGRESS_BODY_MAX itself, since the edge would
+// (M0 Q1), and sends /activity on at most every EGRESS_ACTIVITY_SEC.
+export const EGRESS_ROUTE = "/v1/node/egress";
+export const EGRESS_BODY_MAX = 100_000_000;
+export const EGRESS_ACTIVITY_SEC = 30;
 export const WorkerMessage = z.discriminatedUnion("type", [NodeOp, NodeTickets, NodeWelcome]);
 export type WorkerMessage = z.infer<typeof WorkerMessage>;
 

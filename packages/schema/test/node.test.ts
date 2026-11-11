@@ -4,6 +4,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
+  EGRESS_ACTIVITY_SEC,
+  EGRESS_BODY_MAX,
+  EGRESS_ROUTE,
   NODE_PROTOCOL,
   NodeClose,
   NodeJoin,
@@ -24,6 +27,7 @@ const fixture = JSON.parse(readFileSync(new URL("../fixtures/node/protocol.json"
   close: Record<string, number>;
   streamClose: Record<string, number>;
   window: number;
+  egress: { route: string; bodyMax: number; activityEverySec: number; savePartMax: number; targets: { valid: string[]; invalid: string[] } };
   valid: Example[];
   invalid: Example[];
 };
@@ -63,4 +67,12 @@ test("node names follow sandbox names, and can't look like node ids", () => {
   assert.ok(NodeName.safeParse("box").success);
   assert.equal(NodeName.safeParse("nd-box").success, false);
   assert.equal(NodeName.safeParse("Box").success, false);
+});
+
+test("the egress route and its limits are the ones in the fixture (M6)", () => {
+  assert.equal(fixture.egress.route, EGRESS_ROUTE);
+  assert.equal(fixture.egress.bodyMax, EGRESS_BODY_MAX);
+  assert.equal(fixture.egress.activityEverySec, EGRESS_ACTIVITY_SEC);
+  // Save and backup parts (backup.ts PART) fit under the edge's limit.
+  assert.ok(fixture.egress.savePartMax <= EGRESS_BODY_MAX);
 });
