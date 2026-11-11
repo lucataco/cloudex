@@ -23,20 +23,32 @@ const (
 	CloseBadMessage = 4400
 )
 
-// Isolation is what the agent knows about how its machines are kept apart.
+// Isolation is what the agent knows about how its machines are kept apart:
+// the result of its self-test (selftest.go), when it last ran, and the checks
+// that failed.
 type Isolation struct {
-	Firewall   string `json:"firewall"` // pass, fail or unchecked
-	Unisolated bool   `json:"unisolated"`
+	Firewall   string   `json:"firewall"` // pass, fail or unchecked
+	Unisolated bool     `json:"unisolated"`
+	CheckedAt  int64    `json:"checkedAt,omitempty"` // ms
+	Failed     []string `json:"failed,omitempty"`
+}
+
+// ImageFact is the machine image and whether the node has it.
+type ImageFact struct {
+	Ref      string   `json:"ref"`
+	State    string   `json:"state"`              // present, pulling, missing or refused
+	Progress *float64 `json:"progress,omitempty"` // 0 to 1, while pulling
 }
 
 // Facts describe the host. Sizes it can't tell are null.
 type Facts struct {
-	Arch       string    `json:"arch"`    // amd64 or arm64
-	Runtime    string    `json:"runtime"` // docker or sysbox
-	Isolation  Isolation `json:"isolation"`
-	CPUs       *int      `json:"cpus"`
-	MemoryMB   *int      `json:"memoryMb"`
-	DiskFreeGB *float64  `json:"diskFreeGb"`
+	Arch       string     `json:"arch"`    // amd64 or arm64
+	Runtime    string     `json:"runtime"` // docker or sysbox
+	Isolation  Isolation  `json:"isolation"`
+	CPUs       *int       `json:"cpus"`
+	MemoryMB   *int       `json:"memoryMb"`
+	DiskFreeGB *float64   `json:"diskFreeGb"`
+	Image      *ImageFact `json:"image,omitempty"`
 }
 
 // Machine is a sandbox's container on this node, as the agent sees it.
@@ -129,6 +141,12 @@ type TicketRequest struct {
 	ID      string `json:"id"`   // tk-...
 	Sandbox string `json:"sandbox"`
 	Count   int    `json:"count"`
+}
+
+// Welcome follows the agent's hello: the image the deployment's machines run.
+type Welcome struct {
+	Type  string `json:"type"` // welcome
+	Image string `json:"image"`
 }
 
 // Tickets is the answer: each one opens one stream socket, once, within 60 s.

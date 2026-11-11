@@ -57,6 +57,8 @@ func decodeAs(t *testing.T, model string, raw json.RawMessage) any {
 		v = &Joined{}
 	case model == "WorkerMessage" && head.Type == "tickets":
 		v = &Tickets{}
+	case model == "WorkerMessage" && head.Type == "welcome":
+		v = &Welcome{}
 	case model == "WorkerMessage":
 		v = &Op{}
 	case model == "StreamToAgent" || model == "StreamFromAgent":

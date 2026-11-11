@@ -38,14 +38,27 @@ export type NodeRuntime = z.infer<typeof NodeRuntime>;
 
 // firewall: the result of the agent's self-test of the machine firewall
 // (unchecked until it has run one). unisolated: joined with --unisolated, for
-// testing only; machines there reach the host and its network.
+// testing only; machines there reach the host and its network. checkedAt and
+// failed (v0.2.2 M4): when the self-test last ran, and the checks that failed.
 export const NodeIsolation = z.object({
   firewall: z.enum(["pass", "fail", "unchecked"]),
   unisolated: z.boolean(),
+  checkedAt: z.number().int().min(0).optional(),
+  failed: z.array(z.string().max(200)).max(16).optional(),
 });
 export type NodeIsolation = z.infer<typeof NodeIsolation>;
 
 export const AgentVersion = z.string().regex(/^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/, "a version, such as v0.2.2");
+
+// The machine image (v0.2.2 M4) and whether the node has it: present,
+// pulling (progress from 0 to 1), missing, or refused (not on the node's
+// list of allowed images).
+export const NodeImage = z.object({
+  ref: z.string().max(400),
+  state: z.enum(["present", "pulling", "missing", "refused"]),
+  progress: z.number().min(0).max(1).optional(),
+});
+export type NodeImage = z.infer<typeof NodeImage>;
 
 // What the agent reports about its host. Unknown sizes are null.
 export const NodeFacts = z.object({
@@ -55,6 +68,7 @@ export const NodeFacts = z.object({
   cpus: z.number().int().min(1).max(4096).nullable(),
   memoryMb: z.number().int().min(1).max(64 * 1024 * 1024).nullable(),
   diskFreeGb: z.number().min(0).max(1_000_000).nullable(),
+  image: NodeImage.optional(),
 });
 export type NodeFacts = z.infer<typeof NodeFacts>;
 
@@ -85,6 +99,8 @@ export const Node = z.object({
   revokedAt: z.number().int().nullable(),
   // GET /v1/nodes/{node} only, while it's online: a round trip to the agent, in ms.
   rttMs: z.number().int().optional(),
+  // GET /v1/nodes/{node} only: the machine image, as the agent last reported it.
+  image: NodeImage.optional(),
 });
 export type Node = z.infer<typeof Node>;
 
@@ -168,13 +184,16 @@ export type NodeMessage = z.infer<typeof NodeMessage>;
 
 // Worker to agent. The set of ops is fixed: none of them runs anything on the
 // host. M2 has ping (an empty answer, for round trips) and facts (fresh facts).
-// M3 adds, for development machines only (a container the agent was told to
-// adopt with --dev-machine; M5 replaces these with real machines):
-// - adopt {sandbox}: the dev machine runs this sandbox from now on; answers
-//   {address}, the machine's address on the host;
-// - release {sandbox}: it doesn't any more (the container stays);
-// - streams {sandbox, count}: open that many more spare stream sockets.
-export const NodeOpName = z.enum(["ping", "facts", "adopt", "release", "streams"]);
+// M3 adds streams {sandbox, count}: open that many more spare stream sockets.
+// M4 adds the Docker runtime (go/internal/node/runtime.go), each refused while
+// the node's isolation self-test doesn't pass:
+// - create {sandbox, image?, cpus?, memoryMb?, env?, hold?}: make the machine
+//   and its network, not started; answers {address, container, state};
+// - start {sandbox}: start it and wait for its entrypoint; answers the same;
+// - stop {sandbox}: stop it, keeping its disk;
+// - delete {sandbox}: remove the machine, its volumes and its network;
+// - selftest: run the isolation self-test now; answers {pass, failed, checks, tookMs}.
+export const NodeOpName = z.enum(["ping", "facts", "streams", "create", "start", "stop", "delete", "selftest"]);
 export type NodeOpName = z.infer<typeof NodeOpName>;
 export const NodeOp = z.object({
   type: z.literal("op"),
@@ -190,7 +209,10 @@ export const NodeTickets = z.object({
   tickets: z.array(z.string().max(512)).max(STREAM_TICKETS_MAX),
   error: z.string().max(500).optional(),
 });
-export const WorkerMessage = z.discriminatedUnion("type", [NodeOp, NodeTickets]);
+// Sent after the agent's hello (v0.2.2 M4): the image machines run, which the
+// agent pulls and checks against its own list of allowed images.
+export const NodeWelcome = z.object({ type: z.literal("welcome"), image: z.string().max(400) });
+export const WorkerMessage = z.discriminatedUnion("type", [NodeOp, NodeTickets, NodeWelcome]);
 export type WorkerMessage = z.infer<typeof WorkerMessage>;
 
 // ---------------------------------------------------------------- streams (M3)

@@ -110,12 +110,21 @@
           "arch": "amd64",
           "runtime": "sysbox",
           "isolation": {
-            "firewall": "pass",
-            "unisolated": false
+            "firewall": "fail",
+            "unisolated": false,
+            "checkedAt": 1762819200000,
+            "failed": [
+              "plain: metadata 169.254.169.254:80: open"
+            ]
           },
           "cpus": 8,
           "memoryMb": 32000,
-          "diskFreeGb": 200
+          "diskFreeGb": 200,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "pulling",
+            "progress": 0.42
+          }
         }
       }
     },
@@ -203,14 +212,17 @@
       }
     },
     {
-      "name": "op-adopt",
+      "name": "op-create",
       "model": "WorkerMessage",
       "message": {
         "type": "op",
-        "id": "op-k2j4h8",
-        "name": "adopt",
+        "id": "op-c1",
+        "name": "create",
         "args": {
-          "sandbox": "cx-abc123"
+          "sandbox": "cx-abc123",
+          "image": "ghcr.io/lucataco/cloudex-base:v0.2.2@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "cpus": 2,
+          "memoryMb": 4096
         }
       }
     },
@@ -224,6 +236,83 @@
         "args": {
           "sandbox": "cx-abc123",
           "count": 2
+        }
+      }
+    },
+    {
+      "name": "op-start",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-s1",
+        "name": "start",
+        "args": {
+          "sandbox": "cx-abc123"
+        }
+      }
+    },
+    {
+      "name": "op-stop",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-s2",
+        "name": "stop",
+        "args": {
+          "sandbox": "cx-abc123"
+        }
+      }
+    },
+    {
+      "name": "op-delete",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-d1",
+        "name": "delete",
+        "args": {
+          "sandbox": "cx-abc123"
+        }
+      }
+    },
+    {
+      "name": "op-selftest",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-t1",
+        "name": "selftest",
+        "args": {}
+      }
+    },
+    {
+      "name": "welcome",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "welcome",
+        "image": "ghcr.io/lucataco/cloudex-base:v0.2.2@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "name": "facts-pass",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "pass",
+            "unisolated": false,
+            "checkedAt": 1762819200000
+          },
+          "cpus": 2,
+          "memoryMb": 7936,
+          "diskFreeGb": 81.2,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "present"
+          }
         }
       }
     },
@@ -674,6 +763,121 @@
       "model": "StreamToAgent",
       "message": {
         "eof": 1
+      }
+    },
+    {
+      "name": "an image state outside the set",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "fail",
+            "unisolated": false,
+            "checkedAt": 1762819200000,
+            "failed": [
+              "plain: metadata 169.254.169.254:80: open"
+            ]
+          },
+          "cpus": 8,
+          "memoryMb": 32000,
+          "diskFreeGb": 200,
+          "image": {
+            "ref": "x",
+            "state": "running"
+          }
+        }
+      }
+    },
+    {
+      "name": "a pull past 100%",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "fail",
+            "unisolated": false,
+            "checkedAt": 1762819200000,
+            "failed": [
+              "plain: metadata 169.254.169.254:80: open"
+            ]
+          },
+          "cpus": 8,
+          "memoryMb": 32000,
+          "diskFreeGb": 200,
+          "image": {
+            "ref": "x",
+            "state": "pulling",
+            "progress": 1.5
+          }
+        }
+      }
+    },
+    {
+      "name": "too many failed checks",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "fail",
+            "unisolated": false,
+            "checkedAt": 1762819200000,
+            "failed": [
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x",
+              "x"
+            ]
+          },
+          "cpus": 8,
+          "memoryMb": 32000,
+          "diskFreeGb": 200,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "pulling",
+            "progress": 0.42
+          }
+        }
+      }
+    },
+    {
+      "name": "M3's adopt, gone",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-a1",
+        "name": "adopt",
+        "args": {
+          "sandbox": "cx-abc123"
+        }
+      }
+    },
+    {
+      "name": "a welcome without an image",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "welcome"
       }
     }
   ],
