@@ -31,6 +31,13 @@
 //   every MIRROR_MIN_MS; and a state or ticket request for a sandbox that isn't
 //   on this node (D1's index, re-read at most every MEMBERS_FRESH_MS on a
 //   miss) is dropped without waking that sandbox's object.
+// - The limits are the node's, not a socket's (review W1): a new connection
+//   carries on the count of the one it replaces, or of the last one to close
+//   (kept in storage), so reconnecting doesn't reset it. And the node's
+//   sandboxes hear it went offline only once it has stayed away
+//   OFFLINE_GRACE_MS, and hear from here at most every TELL_MIN_MS (but at
+//   once when it's back after they heard it was offline): a node that
+//   reconnects over and over doesn't wake them all each time.
 //
 // - After hello comes welcome (M4): the image the deployment's machines run
 //   (NODE_IMAGE), which the agent pulls and checks against its own list; and
@@ -79,9 +86,12 @@ export const CONNECT = {
   skew: "x-cx-internal-skew", // the agent's clock less the Worker's, in seconds, at connect
 } as const;
 
-// rl: this socket's messages in the current minute, by kind (limits below).
+// rl: the node's messages in the current minute, by kind (limits below),
+// carried from socket to socket.
 type Attachment = { gen: number; acceptedAt: number; lastMessageAt: number | null; hello?: boolean; rl?: Counts };
 type Counts = { at: number; facts: number; state: number; tickets: number; dropped: number };
+// When the alarm tells the node's sandboxes it went offline, if it still is.
+type OfflineDue = { at: number; lastSeenAt: number };
 
 // What one control socket may send in a minute, after its hello (2026-11-12
 // review, W1): an honest agent sends facts when they change (an image pull's
@@ -94,10 +104,30 @@ export const PER_MINUTE = { facts: 20, state: 120, tickets: 240 } as const;
 // between goes with the next write or the alarm.
 export const MIRROR_MIN_MS = 10_000;
 // How long the list of this node's sandboxes (from D1) is trusted before a
-// state or ticket for a sandbox not on it reads D1 again.
+// state or ticket for a sandbox not on it reads D1 again; and, for one on it,
+// before D1 is read again, so that a deleted sandbox drops off. A read that
+// failed is tried again no sooner than MEMBERS_FRESH_MS either.
 export const MEMBERS_FRESH_MS = 5_000;
+export const MEMBERS_MAX_AGE_MS = 60_000;
+// The node's sandboxes hear it went offline once it has stayed away this
+// long (an agent whose connection dropped is back within a second or two),
+// and hear from here at most every TELL_MIN_MS, except that coming back after
+// they heard it was offline is told at once (review W1). A reconcile that
+// couldn't read D1 is tried again after RECONCILE_RETRY_MS (review W4).
+export const OFFLINE_GRACE_MS = 10_000;
+export const TELL_MIN_MS = 30_000;
+const RECONCILE_RETRY_MS = 30_000;
 
-// Counts a message against its socket's limit; false when it's over.
+// The newer of two counts of the node's messages; each is a snapshot of the
+// same count, which only grows within a minute (review W1).
+export function newerCounts(a: Counts | undefined, b: Counts | undefined): Counts | undefined {
+  if (!a || !b) return a ?? b;
+  if (a.at !== b.at) return a.at > b.at ? a : b;
+  const sum = (c: Counts) => c.facts + c.state + c.tickets + c.dropped;
+  return sum(a) >= sum(b) ? a : b;
+}
+
+// Counts a message against the node's limit; false when it's over.
 export function allow(c: Counts | undefined, kind: keyof typeof PER_MINUTE, now: number): { ok: boolean; counts: Counts } {
   const counts = c && now - c.at < 60_000 ? { ...c } : { at: now, facts: 0, state: 0, tickets: 0, dropped: 0 };
   if (counts[kind] >= PER_MINUTE[kind]) {
@@ -140,7 +170,10 @@ export class Node extends DurableObject<Env> {
   // The sandboxes on this node, as D1's index had them at loadedAt, plus the
   // ones made or started through op() since; for dropping a node's state or
   // ticket request for a sandbox that isn't its own without waking it.
-  private members: { ids: Set<string>; loadedAt: number } | null = null;
+  // triedAt: the last read, which may have failed. made: the ones op() made
+  // or started since the last read.
+  private members: { ids: Set<string>; loadedAt: number; triedAt: number } | null = null;
+  private made = new Set<string>();
   private membersLoading: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -170,13 +203,15 @@ export class Node extends DurableObject<Env> {
     const best = newest(all);
     const { use, online, close } = pick(all, now);
     let alive: ControlSocket<WebSocket> | null = best;
+    // went: the node going offline being noted, for the alarm to wait on.
+    let went: Promise<void> | null = null;
     for (const s of close) {
       const stale = s === best;
       if (stale) alive = null;
       this.close(s.ws, stale ? NodeClose.stale : NodeClose.replaced, stale ? "no ping for 45 s" : "replaced by a newer connection");
-      if (stale) void this.wentOffline(lastSign(s));
+      if (stale) went = this.keepCounts(s.ws.deserializeAttachment() as Attachment | null).then(() => this.wentOffline(lastSign(s))).catch((e) => console.error(`going offline: ${errorStatus(e).message}`));
     }
-    return { use, online, alive };
+    return { use, online, alive, went };
   }
 
   private close(ws: WebSocket, code: number, reason: string) {
@@ -201,7 +236,24 @@ export class Node extends DurableObject<Env> {
     if (!id) return;
     await mirrorNode(this.env.DB, id, { state: "offline", lastSeenAt }).catch((e) => console.error(`[${id}] ${e}`));
     if (await this.ctx.storage.get<boolean>("revoked")) return;
-    this.ctx.waitUntil(this.tellSandboxes(id, () => ({ online: false, lastSeenAt })));
+    // The sandboxes hear it from the alarm, if it's still offline then (review W1).
+    const toldAt = (await this.ctx.storage.get<number>("toldAt")) ?? 0;
+    const at = Math.max(Date.now() + OFFLINE_GRACE_MS, toldAt + TELL_MIN_MS);
+    await this.ctx.storage.put("offlineDue", { at, lastSeenAt } satisfies OfflineDue);
+    await this.alarmBy(at);
+  }
+
+  // A closing socket's count, for the node's next socket (review W1).
+  private async keepCounts(a: Attachment | null) {
+    if (!a?.rl) return;
+    const kept = newerCounts(await this.ctx.storage.get<Counts>("rl"), a.rl);
+    if (kept === a.rl) await this.ctx.storage.put("rl", kept);
+  }
+
+  // Sets the alarm for t, unless it's set sooner.
+  private async alarmBy(t: number) {
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > t) await this.ctx.storage.setAlarm(t);
   }
 
   // Tells each sandbox the index has on this node.
@@ -231,9 +283,14 @@ export class Node extends DurableObject<Env> {
     try {
       sandboxes = await sandboxesOnNode(this.env.DB, id);
     } catch (e) {
-      console.error(`[${id}] reconcile: listing its sandboxes: ${errorStatus(e).message}`);
+      // Its sandboxes would go on thinking it's offline (review W4): again soon.
+      console.error(`[${id}] reconcile: listing its sandboxes: ${errorStatus(e).message}; again in ${RECONCILE_RETRY_MS / 1000} s`);
+      const at = Date.now() + RECONCILE_RETRY_MS;
+      await this.ctx.storage.put("reconcileDue", at);
+      await this.alarmBy(at);
       return;
     }
+    await this.ctx.storage.put({ toldAt: Date.now(), toldOffline: false });
     const plan = reconcilePlan({ machines: hello.machines, machinesKnown: !hello.machinesError, sandboxes, tombstones });
     for (const sb of plan.deletes) this.ctx.waitUntil(this.removeTombstoned(sb));
     const reports = new Map(plan.reports.map((r) => [r.id, r.machine]));
@@ -265,14 +322,41 @@ export class Node extends DurableObject<Env> {
   }
 
   // Every few minutes while a socket is open: one that stopped answering
-  // without a close is closed, and the node shows offline (current()).
+  // without a close is closed, and the node shows offline (current()). And
+  // when it's due: the facts to D1, the sandboxes told the node went offline
+  // (if it still is), and a reconcile put off (review W1, W4).
   async alarm() {
-    this.current();
-    if (await this.ctx.storage.get<boolean>("mirrorDue")) {
-      const [id, hello] = await Promise.all([this.ctx.storage.get<string>("id"), this.ctx.storage.get<Hello>("hello")]);
-      if (id && hello) await this.mirrorFacts(id, hello.facts, Date.now()).catch((e) => console.error(`[${id}] ${e}`));
+    const now = Date.now();
+    const { use, went } = this.current(now);
+    if (went) await went;
+    const storage = this.ctx.storage;
+    const [id, hello] = await Promise.all([storage.get<string>("id"), storage.get<Hello>("hello")]);
+    if ((await storage.get<boolean>("mirrorDue")) && id && hello) {
+      await this.mirrorFacts(id, hello.facts, now).catch((e) => console.error(`[${id}] ${e}`));
     }
-    if (this.sockets().length) await this.ctx.storage.setAlarm(Date.now() + STALE_CHECK_MS);
+    const off = await storage.get<OfflineDue>("offlineDue");
+    if (off && off.at <= now) {
+      await storage.delete("offlineDue");
+      // Back in the meantime: nothing to tell. Told already: nothing new.
+      if (!use && id && !(await storage.get<boolean>("revoked")) && !(await storage.get<boolean>("toldOffline"))) {
+        await storage.put({ toldAt: now, toldOffline: true });
+        this.ctx.waitUntil(this.tellSandboxes(id, () => ({ online: false, lastSeenAt: off.lastSeenAt })));
+      }
+    }
+    const due = await storage.get<number>("reconcileDue");
+    if (due !== undefined && due <= now) {
+      await storage.delete("reconcileDue");
+      // Offline again: its next hello reconciles.
+      if (use && id && hello) this.ctx.waitUntil(this.reconcile(id, hello));
+    }
+    const mirrorAt = (await storage.get<boolean>("mirrorDue")) ? ((await storage.get<number>("mirroredAt")) ?? 0) + MIRROR_MIN_MS : null;
+    const next = [
+      this.sockets().length ? now + STALE_CHECK_MS : null,
+      off && off.at > now ? off.at : null,
+      due !== undefined && due > now ? due : null,
+      mirrorAt !== null && mirrorAt > now ? mirrorAt : null,
+    ].filter((t): t is number => t !== null);
+    if (next.length) await storage.setAlarm(Math.min(...next));
   }
 
   // The facts to D1, when they changed, at most every MIRROR_MIN_MS; a change
@@ -284,9 +368,7 @@ export class Node extends DurableObject<Env> {
     const at = (s.get("mirroredAt") as number | undefined) ?? 0;
     if (now - at < MIRROR_MIN_MS) {
       await this.ctx.storage.put("mirrorDue", true);
-      const due = at + MIRROR_MIN_MS;
-      const alarm = await this.ctx.storage.getAlarm();
-      if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+      await this.alarmBy(at + MIRROR_MIN_MS);
       return;
     }
     await this.ctx.storage.put({ mirroredFacts: text, mirroredAt: now, mirrorDue: false });
@@ -294,17 +376,24 @@ export class Node extends DurableObject<Env> {
   }
 
   // Whether a sandbox is on this node: from memory, or D1's index when it's
-  // not there and the copy is older than MEMBERS_FRESH_MS.
-  // One read at a time: messages that arrive while it runs wait for it.
+  // not there and the copy is older than MEMBERS_FRESH_MS, or it's there and
+  // the copy is older than MEMBERS_MAX_AGE_MS (it may have been deleted since).
+  // One read at a time: messages that arrive while it runs wait for it; and
+  // one that fails isn't tried again for MEMBERS_FRESH_MS, the copy there is
+  // (or none) standing until then (review W1).
   private async isMember(id: string, sandbox: string, now: number): Promise<boolean> {
-    if (this.members?.ids.has(sandbox)) return true;
-    if (this.members && now - this.members.loadedAt < MEMBERS_FRESH_MS) return false;
+    const m = this.members;
+    if (m?.ids.has(sandbox) && now - m.loadedAt < MEMBERS_MAX_AGE_MS) return true;
+    if (m && now - m.triedAt < MEMBERS_FRESH_MS) return m.ids.has(sandbox);
     this.membersLoading ??= sandboxesOnNode(this.env.DB, id)
       .then((ids) => {
-        const made = this.members?.loadedAt === 0 ? this.members.ids : new Set<string>();
-        this.members = { ids: new Set([...ids, ...made]), loadedAt: now };
+        this.members = { ids: new Set([...ids, ...this.made]), loadedAt: now, triedAt: now };
+        this.made.clear();
       })
-      .catch((e) => console.error(`[${id}] listing its sandboxes: ${errorStatus(e).message}`))
+      .catch((e) => {
+        console.error(`[${id}] listing its sandboxes: ${errorStatus(e).message}`);
+        this.members = { ids: this.members?.ids ?? new Set(this.made), loadedAt: this.members?.loadedAt ?? 0, triedAt: now };
+      })
       .finally(() => (this.membersLoading = null));
     await this.membersLoading;
     return this.members?.ids.has(sandbox) ?? false;
@@ -344,11 +433,17 @@ export class Node extends DurableObject<Env> {
     await this.ctx.storage.put("connects", [...recent, now]);
     if (!known) await this.ctx.storage.put("id", id);
 
-    for (const s of this.sockets()) this.close(s.ws, NodeClose.replaced, "replaced by a newer connection");
+    // The node's count goes on on the new socket (review W1): from the ones
+    // it replaces, or the last to close.
+    let rl = await this.ctx.storage.get<Counts>("rl");
+    for (const s of this.sockets()) {
+      rl = newerCounts(rl, (s.ws.deserializeAttachment() as Attachment | null)?.rl);
+      this.close(s.ws, NodeClose.replaced, "replaced by a newer connection");
+    }
     const gen = ((await this.ctx.storage.get<number>("gen")) ?? 0) + 1;
     const { 0: client, 1: server } = new WebSocketPair();
     this.ctx.acceptWebSocket(server, ["control", `gen:${gen}`]);
-    server.serializeAttachment({ gen, acceptedAt: now, lastMessageAt: null } satisfies Attachment);
+    server.serializeAttachment({ gen, acceptedAt: now, lastMessageAt: null, ...(rl ? { rl } : {}) } satisfies Attachment);
     const where = {
       colo: h.get(CONNECT.colo) || null,
       continent: h.get(CONNECT.continent) || null,
@@ -422,6 +517,16 @@ export class Node extends DurableObject<Env> {
           } catch {}
         }
         if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(now + STALE_CHECK_MS);
+        // At once if its sandboxes heard it was offline, else no sooner than
+        // TELL_MIN_MS after they last heard from here: then the alarm
+        // reconciles, with the hello as it is by then (review W1).
+        const told = await this.ctx.storage.get(["toldAt", "toldOffline"]);
+        const after = ((told.get("toldAt") as number | undefined) ?? 0) + TELL_MIN_MS;
+        if (told.get("toldOffline") !== true && now < after) {
+          await this.ctx.storage.put("reconcileDue", after);
+          await this.alarmBy(after);
+          return;
+        }
         // Not awaited here: a sandbox busy starting waits on an op answer
         // that comes on this socket.
         this.ctx.waitUntil(this.reconcile(id, hello));
@@ -486,6 +591,7 @@ export class Node extends DurableObject<Env> {
   // The node's own socket went: it's offline unless a newer one is up.
   private async closed(ws: WebSocket) {
     const a = ws.deserializeAttachment() as Attachment | null;
+    await this.keepCounts(a);
     if (!a || this.sockets().some((s) => s.ws !== ws && s.open && s.gen > a.gen)) return;
     const ping = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? null;
     await this.wentOffline(lastSign({ ws, gen: a.gen, open: false, acceptedAt: a.acceptedAt, lastMessageAt: a.lastMessageAt, lastPingAt: ping, hello: a.hello === true }));
@@ -531,13 +637,18 @@ export class Node extends DurableObject<Env> {
       fail(503, `the node's connection broke: ${e instanceof Error ? e.message : e}`);
     }
     if ((name === "create" || name === "start") && typeof args.sandbox === "string") {
-      this.members ??= { ids: new Set(), loadedAt: 0 };
-      this.members.ids.add(args.sandbox);
+      this.made.add(args.sandbox);
+      this.members?.ids.add(args.sandbox);
     }
     const out = await answer;
     // A removed machine is no longer the node's, for the orphans listed in
-    // cloudex node info, until its next hello lists them all again.
-    if (name === "delete" && typeof args.sandbox === "string") await this.forgetMachine(args.sandbox);
+    // cloudex node info, until its next hello lists them all again; nor is
+    // its sandbox one of the node's (review W1).
+    if (name === "delete" && typeof args.sandbox === "string") {
+      this.made.delete(args.sandbox);
+      this.members?.ids.delete(args.sandbox);
+      await this.forgetMachine(args.sandbox);
+    }
     return out;
   }
 

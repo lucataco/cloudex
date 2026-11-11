@@ -1,11 +1,12 @@
 // The Node object's control socket (node.ts) against a node that floods it
 // (2026-11-12 review, W1): a second hello closes the socket; facts, state and
-// ticket requests are limited per socket; facts reach D1 only when they
-// change, at most every MIRROR_MIN_MS; and a state or ticket request for a
-// sandbox that isn't on the node wakes no Sandbox object.
+// ticket requests are limited per node, across its connections; facts reach
+// D1 only when they change, at most every MIRROR_MIN_MS; a state or ticket
+// request for a sandbox that isn't on the node wakes no Sandbox object; and a
+// node that reconnects over and over doesn't wake its sandboxes each time.
 import { registerHooks } from "node:module";
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 import { fakeD1 } from "./d1.ts";
 
 registerHooks({
@@ -19,18 +20,23 @@ registerHooks({
 });
 
 (globalThis as Record<string, unknown>).WebSocketRequestResponsePair = class {};
-const { Node, PER_MINUTE, MIRROR_MIN_MS } = await import("../src/node.ts");
+const { Node, PER_MINUTE, MIRROR_MIN_MS, CONNECTS_PER_MINUTE } = await import("../src/node.ts");
 
 const NODE = "nd-abcd1234";
 const db = fakeD1();
 // Every statement that writes the nodes table.
 let nodeWrites = 0;
 let memberReads = 0;
+// Set, reading the node's sandboxes fails, as D1 does now and then.
+let membersFail = false;
 const counted = {
   ...db,
   prepare(sql: string) {
     if (/^\s*UPDATE nodes/i.test(sql)) nodeWrites++;
-    if (/SELECT id FROM sandboxes WHERE node/i.test(sql)) memberReads++;
+    if (/SELECT id FROM sandboxes WHERE node/i.test(sql)) {
+      memberReads++;
+      if (membersFail) return { bind: () => ({ all: async () => Promise.reject(new Error("D1_ERROR: overloaded")) }) };
+    }
     return db.prepare(sql);
   },
   batch: db.batch,
@@ -100,7 +106,9 @@ function setup() {
   const ctx = {
     storage,
     setWebSocketAutoResponse() {},
-    getWebSockets: () => sockets,
+    // As the runtime does, a closed socket isn't listed.
+    getWebSockets: () => sockets.filter((w) => w.readyState !== 3),
+    acceptWebSocket: (ws: FakeWs) => void sockets.push(ws),
     getWebSocketAutoResponseTimestamp: () => null,
     waitUntil: (p: Promise<unknown>) => void waits.push(p),
   };
@@ -114,7 +122,28 @@ function setup() {
   const ws = new FakeWs({ gen: 1, acceptedAt: Date.now(), lastMessageAt: null });
   sockets.push(ws);
   const say = (m: unknown) => node.webSocketMessage(ws as never, JSON.stringify(m));
-  return { node, ws, say, woken, waits, storage };
+  return { node, ws, say, woken, waits, storage, sockets };
+}
+
+// A connect, as the Worker passes it on once its signature checked out
+// (node.fetch). Node's Response refuses the runtime's 101, so it's a 200 here.
+(globalThis as Record<string, unknown>).WebSocketPair = class {
+  0 = new FakeWs(null);
+  1 = new FakeWs(null);
+};
+const RealResponse = Response;
+globalThis.Response = class extends RealResponse {
+  constructor(body?: BodyInit | null, init?: ResponseInit) {
+    super(body, init?.status === 101 ? { ...init, status: 200 } : init);
+  }
+} as typeof Response;
+let nonces = 0;
+async function connect(t: ReturnType<typeof setup>) {
+  const headers = new Headers({ upgrade: "websocket", "x-cx-node": NODE, "x-cx-nonce": `nonce-${++nonces}` });
+  const res = await t.node.fetch({ headers } as unknown as Request);
+  assert.equal(res.status, 200, await res.clone().text());
+  const ws = t.sockets.at(-1)!;
+  return { ws, say: (m: unknown) => t.node.webSocketMessage(ws as never, JSON.stringify(m)) };
 }
 
 const facts = (cpus: number) => ({ arch: "amd64", runtime: "docker", isolation: { firewall: "pass", unisolated: false }, cpus, memoryMb: 1024, diskFreeGb: 50 });
@@ -189,4 +218,122 @@ test("state and ticket requests for a sandbox not on the node wake nothing; a fl
   assert.match(last.error ?? "", /too many ticket requests/);
   const good = fresh.ws.sent.map((m) => JSON.parse(m)).filter((m) => m.type === "tickets" && m.tickets.length === 1);
   assert.equal(good.length, PER_MINUTE.tickets);
+});
+
+const state = (id: string) => ({ type: "state", machine: { id, state: "running" } });
+
+test("the limits are the node's: a new connection, or one after a close, carries on the count", async () => {
+  const t = setup();
+  await t.say(hello);
+  await Promise.all(t.waits);
+  t.woken.length = 0;
+  for (let i = 0; i < PER_MINUTE.state; i++) await t.say(state("cx-mine01"));
+  await Promise.all(t.waits);
+  assert.equal(t.woken.length, PER_MINUTE.state);
+  // Replaced by a new connection.
+  const second = await connect(t);
+  assert.equal(t.ws.closed?.code, 4000);
+  await second.say(hello);
+  for (let i = 0; i < 10; i++) await second.say(state("cx-mine01"));
+  // Closed, and connected again.
+  await t.node.webSocketClose(second.ws as never, 1006, "");
+  const third = await connect(t);
+  await third.say(hello);
+  for (let i = 0; i < 10; i++) await third.say(state("cx-mine01"));
+  await Promise.all(t.waits);
+  assert.equal(t.woken.length, PER_MINUTE.state, "no more in the minute");
+});
+
+test("a node that reconnects over and over wakes its sandboxes once; staying away is told once, by the alarm; coming back at once", async () => {
+  const t = setup();
+  for (let i = 0; i < CONNECTS_PER_MINUTE; i++) {
+    const c = await connect(t);
+    await c.say(hello);
+    await t.node.webSocketClose(c.ws as never, 1006, "");
+  }
+  await Promise.all(t.waits);
+  assert.equal(t.woken.length, 1, `sandbox objects woken by ${CONNECTS_PER_MINUTE} connects and closes`);
+  const off = t.storage.kv.get("offlineDue") as { at: number; lastSeenAt: number };
+  assert.ok(off.at >= Date.now() + 5_000, "not before the grace");
+  // Its time comes, and the node is still away: told once.
+  t.storage.kv.set("offlineDue", { ...off, at: Date.now() });
+  await t.node.alarm();
+  await Promise.all(t.waits);
+  assert.equal(t.woken.length, 2);
+  await t.node.alarm();
+  await Promise.all(t.waits);
+  assert.equal(t.woken.length, 2);
+  // Back after they heard it was offline: told at once.
+  t.storage.kv.delete("connects");
+  const back = await connect(t);
+  await back.say(hello);
+  await Promise.all(t.waits);
+  assert.equal(t.woken.length, 3);
+  // A drop and a reconnect within the grace: nothing told for the drop.
+  await t.node.webSocketClose(back.ws as never, 1006, "");
+  const again = await connect(t);
+  await again.say(hello);
+  t.storage.kv.set("offlineDue", { ...(t.storage.kv.get("offlineDue") as object), at: Date.now() });
+  await t.node.alarm();
+  await Promise.all(t.waits);
+  assert.equal(t.woken.length, 3);
+  // Its hello's reconcile comes with the alarm, TELL_MIN_MS after the last.
+  t.storage.kv.set("reconcileDue", Date.now());
+  await t.node.alarm();
+  await Promise.all(t.waits);
+  assert.equal(t.woken.length, 4);
+});
+
+test("a deleted sandbox drops off the node's list", async () => {
+  db.exec(`INSERT INTO sandboxes (id, size, state, idle_minutes, created_at, updated_at, node) VALUES ('cx-gone01', 'standard-2', 'running', 10, 0, 0, '${NODE}')`);
+  db.exec(`INSERT INTO sandboxes (id, size, state, idle_minutes, created_at, updated_at, node) VALUES ('cx-gone02', 'standard-2', 'running', 10, 0, 0, '${NODE}')`);
+  const t = setup();
+  await t.say(hello);
+  await Promise.all(t.waits);
+  t.woken.length = 0;
+  await t.say(state("cx-gone01"));
+  await t.say(state("cx-gone02"));
+  await Promise.all(t.waits);
+  assert.deepEqual(t.woken, ["cx-gone01", "cx-gone02"]);
+  // Its machine removed through the node: off the list at once.
+  db.exec("DELETE FROM sandboxes WHERE id = 'cx-gone01'");
+  const removing = t.node.op("delete", { sandbox: "cx-gone01" }, 2000);
+  await new Promise((r) => setImmediate(r));
+  const op = JSON.parse(t.ws.sent.at(-1)!);
+  assert.equal(op.name, "delete");
+  await t.say({ type: "result", id: op.id, ok: true });
+  await removing;
+  await t.say(state("cx-gone01"));
+  await Promise.all(t.waits);
+  assert.deepEqual(t.woken, ["cx-gone01", "cx-gone02"], "not woken once its machine was removed");
+  // Deleted otherwise: off the list once it's MEMBERS_MAX_AGE_MS old.
+  db.exec("DELETE FROM sandboxes WHERE id = 'cx-gone02'");
+  mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  try {
+    // (A message in between, so that the socket isn't stale.)
+    mock.timers.tick(40_000);
+    await t.say({ type: "facts", facts: facts(2) });
+    mock.timers.tick(21_000);
+    await t.say(state("cx-gone02"));
+    await t.say(state("cx-gone01"));
+    await t.say(state("cx-mine01"));
+    await Promise.all(t.waits);
+    assert.deepEqual(t.woken, ["cx-gone01", "cx-gone02", "cx-mine01"], "neither woken again");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a failed read of the node's list of sandboxes isn't tried again at every message", async () => {
+  const f = setup();
+  await f.say(hello);
+  await Promise.all(f.waits);
+  membersFail = true;
+  memberReads = 0;
+  try {
+    for (let i = 0; i < 20; i++) await f.say(state(`cx-y${String(i).padStart(5, "0")}`));
+  } finally {
+    membersFail = false;
+  }
+  assert.equal(memberReads, 1, "one read of D1 for 20 messages while it fails");
 });
