@@ -1770,8 +1770,8 @@ if want node; then
 			kill_agent
 			again=$(probe connect --fault none)
 			OUT="state $st, connect $again, agent: ${log: -200}" CODE=""
-			ok N08 "after node rm the agent is disconnected, its next connect is refused, and the node shows revoked" \
-				[ "$st" = revoked -a "$again" = 401 -a -n "$(grep 'removed from the deployment' <<<"$log")" ]
+			ok N08 "after node rm the agent is disconnected, its next connect is refused with 410 (revoked, since it holds the node's key), and the node shows revoked" \
+				[ "$st" = revoked -a "$again" = 410 -a -n "$(grep 'removed from the deployment' <<<"$log")" ]
 			rrec=$("$CX" info "$P-n5r" --json 2>/dev/null | jq -c '{state, error}')
 			rleft=$(node_sh "docker ps -aq --filter label=build.cloudex.sandbox=$rid | wc -l" | tr -d ' ')
 			"$CX" delete "$P-n5r" --yes >/dev/null 2>&1
