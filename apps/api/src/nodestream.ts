@@ -29,6 +29,12 @@
 //     c:<stream>) and the node's are relayed byte for byte from
 //     webSocketMessage, so an idle session lets the object hibernate. SSH's own
 //     windows bound it, so it has no credits.
+// - What a node can make this object hold is bounded (2026-11-12 review): a
+//   channel's queue past its window (plus OVERRUN_SLACK), or a frame on a
+//   channel the stream doesn't use, closes the stream; a preview WebSocket's
+//   message is at most WS_MESSAGE_MAX and its credit comes back at
+//   WS_RELAY_RATE; a splice holds at most SPLICE_EARLY_MAX before its client
+//   is there, and may run SPLICE_AHEAD_MAX ahead of what its client answers.
 import {
   STREAM_WINDOW,
   StreamChannel,
@@ -47,6 +53,21 @@ export const CLIENT_IDLE_MS = 10 * 60_000;
 export const SPARES_MAX = 16;
 const SPARE_WAIT_MS = 15_000;
 const OPEN_ANSWER_MS = 30_000;
+// What a node may send past its credit before its stream is closed: the
+// window is the most the object holds for a channel nobody has read yet
+// (2026-11-12 review, W2). A little slack covers frames already on their way.
+export const OVERRUN_SLACK = 64 << 10;
+// A preview WebSocket's message from the machine, at most; and how fast its
+// credit comes back (the visitor's socket has no backpressure the object can
+// see, so the node's rate is what's bounded).
+export const WS_MESSAGE_MAX = 1 << 20;
+export const WS_RELAY_RATE = 8 << 20; // bytes a second
+// A splice's bytes from the node before the client's side is there, at most;
+// and how far the node may run ahead of the client, in bytes it sent since the
+// client last sent anything. ssh's own windows (2 MiB a channel in OpenSSH)
+// keep an honest node far below it: the client adjusts them as it reads.
+export const SPLICE_EARLY_MAX = 1 << 20;
+export const SPLICE_AHEAD_MAX = 32 << 20;
 
 // ---------------------------------------------------------------- tickets
 
@@ -130,6 +151,8 @@ class Inbox {
   private failed: Error | null = null;
   private wake: (() => void) | null = null;
   private owed = 0;
+  // Bytes queued and not yet read.
+  queued = 0;
   cancelled = false;
 
   private readonly credit: (n: number) => void;
@@ -144,6 +167,7 @@ class Inbox {
           while (!this.queue.length && !this.ended && !this.failed) await new Promise<void>((r) => (this.wake = r));
           const next = this.queue.shift();
           if (next) {
+            this.queued -= next.byteLength;
             c.enqueue(next);
             this.owed += next.byteLength;
             if (this.owed >= STREAM_WINDOW / 4) {
@@ -159,6 +183,7 @@ class Inbox {
         cancel: () => {
           this.cancelled = true;
           this.queue = [];
+          this.queued = 0;
           this.settled();
         },
       },
@@ -170,10 +195,15 @@ class Inbox {
     return this.cancelled || ((this.ended || this.failed !== null) && this.queue.length === 0);
   }
 
-  push(b: Uint8Array) {
-    if (this.cancelled) return;
+  // False when the sender went past its window: it sent more than it was
+  // granted, and the stream is closed.
+  push(b: Uint8Array): boolean {
+    if (this.cancelled) return true;
+    if (this.queued + b.byteLength > STREAM_WINDOW + OVERRUN_SLACK) return false;
     this.queue.push(b);
+    this.queued += b.byteLength;
     this.poke();
+    return true;
   }
   end() {
     this.ended = true;
@@ -222,6 +252,9 @@ class Outbox {
 
 export class StreamGone extends Error {}
 
+// What an agent may send on before the open says which it uses.
+const FROM_AGENT = new Set<number>([StreamChannel.stdout, StreamChannel.stderr, StreamChannel.textOut]);
+
 // One open, framed stream (an exec, an HTTP exchange or a TCP connection).
 export class Framed {
   readonly inbox: Inbox[] = [];
@@ -237,6 +270,12 @@ export class Framed {
   onWsClose: ((code: number, reason: string) => void) | null = null;
   readonly opened: Promise<StreamFromAgent>;
   exitCode: number | null = null;
+  // The channels the agent may send on, from what was opened: an exec's
+  // stdout (and stderr if wanted), an HTTP answer's body and a preview
+  // WebSocket's messages, a TCP connection's bytes. Null until the open.
+  private uses: Set<number> | null = null;
+  // A preview WebSocket's credit, paced at WS_RELAY_RATE.
+  private relay = { at: 0, sent: 0, owed: new Map<number, number>(), timer: null as ReturnType<typeof setTimeout> | null };
 
   readonly id: string;
   private readonly ws: WebSocket;
@@ -268,6 +307,9 @@ export class Framed {
 
   control(m: StreamToAgent) {
     if (this.closed) return;
+    if ("exec" in m) this.uses = new Set(m.exec.stderr ? [StreamChannel.stdout, StreamChannel.stderr] : [StreamChannel.stdout]);
+    else if ("http" in m) this.uses = new Set([StreamChannel.stdout, StreamChannel.textOut]);
+    else if ("tcp" in m) this.uses = new Set([StreamChannel.stdout]);
     try {
       this.ws.send(JSON.stringify(m));
     } catch {
@@ -296,15 +338,44 @@ export class Framed {
   }
 
   onBinary(b: Uint8Array) {
-    const ch = b[0]!;
+    const ch = b[0];
     const data = b.subarray(1);
+    // Only the channels this stream uses: data nobody reads would pile up here.
+    if (ch === undefined || !(this.uses ?? FROM_AGENT).has(ch)) {
+      return this.end(StreamClose.badMessage, `a frame on channel ${ch ?? "none"}, which this stream doesn't use`);
+    }
     if (this.onWsMessage && (ch === StreamChannel.stdout || ch === StreamChannel.textOut)) {
+      if (data.byteLength > WS_MESSAGE_MAX) return this.end(StreamClose.badMessage, `a WebSocket message over ${WS_MESSAGE_MAX} bytes`);
       this.onWsMessage(ch === StreamChannel.textOut ? new TextDecoder().decode(data) : data.slice().buffer);
-      // A relayed message is passed on at once; its credit goes back with it.
-      this.control({ credit: { ch, n: Math.max(1, data.byteLength) } });
+      // A relayed message is passed on at once; its credit goes back with it,
+      // at most WS_RELAY_RATE bytes a second.
+      this.paceCredit(ch, Math.max(1, data.byteLength));
       return;
     }
-    this.inbox[ch]?.push(data.slice());
+    if (!this.inbox[ch]!.push(data.slice())) this.end(StreamClose.badMessage, "the node sent past its credit");
+  }
+
+  private paceCredit(ch: number, n: number) {
+    const r = this.relay;
+    r.owed.set(ch, (r.owed.get(ch) ?? 0) + n);
+    const flush = () => {
+      r.timer = null;
+      const now = Date.now();
+      if (now - r.at >= 1000) {
+        r.at = now;
+        r.sent = 0;
+      }
+      for (const [c, k] of r.owed) {
+        const give = Math.min(k, WS_RELAY_RATE - r.sent);
+        if (give <= 0) break;
+        r.sent += give;
+        if (give === k) r.owed.delete(c);
+        else r.owed.set(c, k - give);
+        this.control({ credit: { ch: c, n: give } });
+      }
+      if (r.owed.size && !this.closed) r.timer = setTimeout(flush, Math.max(1, r.at + 1000 - Date.now()));
+    };
+    if (!r.timer) flush();
   }
 
   onText(text: string) {
@@ -359,6 +430,7 @@ export class Framed {
   gone(code: number, reason: string) {
     if (this.closed) return;
     this.closed = true;
+    if (this.relay.timer) clearTimeout(this.relay.timer);
     this.forget();
     const e = new StreamGone(`the node's stream closed (${code}${reason ? ` ${reason}` : ""})`);
     for (const i of this.inbox) i.fail(e);
@@ -393,6 +465,10 @@ export type StreamHost = {
 export class NodeStreams {
   private framed = new Map<string, Framed>();
   private early = new Map<string, ArrayBuffer[]>();
+  // A splice's bytes from the node: before its client is there (early), and
+  // since its client last sent anything (ahead).
+  private earlyBytes = new Map<string, number>();
+  private ahead = new Map<string, number>();
   private spliceAnswer = new Map<string, (m: StreamFromAgent | Error) => void>();
   private waiters: { resolve: (ws: WebSocket) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }[] = [];
   private asked = 0;
@@ -557,6 +633,7 @@ export class NodeStreams {
     this.spliceAnswer.delete(id);
     if (m instanceof Error || !("ok" in m)) {
       this.early.delete(id);
+      this.earlyBytes.delete(id);
       closeQuietly(ws, 1000, "not opened");
       const why = m instanceof Error ? m.message : "refused" in m ? "nothing is listening" : "error" in m ? m.error : "no answer";
       return new Response(`nothing is listening on port ${port}: ${why}\n`, { status: 502 });
@@ -567,6 +644,7 @@ export class NodeStreams {
     client.serializeAttachment({ tokenId, lastAt: Date.now() } satisfies ClientAttachment);
     for (const b of this.early.get(id) ?? []) client.send(b);
     this.early.delete(id);
+    this.earlyBytes.delete(id);
     this.h.touch();
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
@@ -586,6 +664,7 @@ export class NodeStreams {
       if (a && Date.now() - a.lastAt > 30_000) ws.serializeAttachment({ ...a, lastAt: Date.now() } satisfies ClientAttachment);
       const peer = this.ctx.getWebSockets(`n:${id}`)[0];
       if (!peer || !this.alive(peer)) return this.closeBoth(id, StreamClose.lost, "the node's side is gone");
+      this.ahead.delete(id);
       try {
         peer.send(bytes(msg));
       } catch {
@@ -612,10 +691,21 @@ export class NodeStreams {
         else if (!m) closeQuietly(ws, StreamClose.badMessage, "a control message outside the protocol");
         return;
       }
+      const size = msg.byteLength;
       const early = this.early.get(id);
-      if (early) return void early.push(msg);
+      if (early) {
+        const n = (this.earlyBytes.get(id) ?? 0) + size;
+        if (n > SPLICE_EARLY_MAX) return this.closeBoth(id, StreamClose.badMessage, `the node sent over ${SPLICE_EARLY_MAX} bytes before the connection was open`);
+        this.earlyBytes.set(id, n);
+        return void early.push(msg);
+      }
       const peer = this.ctx.getWebSockets(`c:${id}`)[0];
       if (!peer) return this.closeBoth(id, StreamClose.lost, "the client's side is gone");
+      const ahead = (this.ahead.get(id) ?? 0) + size;
+      if (ahead > SPLICE_AHEAD_MAX) {
+        return this.closeBoth(id, StreamClose.badMessage, `the node sent ${SPLICE_AHEAD_MAX >> 20} MiB the client hadn't asked for`);
+      }
+      this.ahead.set(id, ahead);
       try {
         peer.send(msg);
       } catch {
@@ -644,6 +734,8 @@ export class NodeStreams {
     for (const ws of [...this.ctx.getWebSockets(`c:${id}`), ...this.ctx.getWebSockets(`n:${id}`)]) closeQuietly(ws, code, reason);
     this.framed.get(id)?.gone(code, reason);
     this.early.delete(id);
+    this.earlyBytes.delete(id);
+    this.ahead.delete(id);
   }
 
   // Closes what's dead: node halves with no heartbeat for 45 s (and their
