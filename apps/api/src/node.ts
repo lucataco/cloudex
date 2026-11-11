@@ -257,7 +257,7 @@ export class Node extends DurableObject<Env> {
   }
 
   // Tells each sandbox the index has on this node.
-  private async tellSandboxes(id: string, report: (sandbox: string) => { online: boolean; lastSeenAt: number | null; machine?: MachineReport } | null) {
+  private async tellSandboxes(id: string, report: (sandbox: string) => { online: boolean; lastSeenAt: number | null; machine?: MachineReport; note?: string } | null) {
     let ids: string[];
     try {
       ids = await sandboxesOnNode(this.env.DB, id);
@@ -294,7 +294,15 @@ export class Node extends DurableObject<Env> {
     const plan = reconcilePlan({ machines: hello.machines, machinesKnown: !hello.machinesError, sandboxes, tombstones });
     for (const sb of plan.deletes) this.ctx.waitUntil(this.removeTombstoned(sb));
     const reports = new Map(plan.reports.map((r) => [r.id, r.machine]));
-    await this.tellSandboxes(id, (sb) => (plan.deletes.includes(sb) ? null : { online: true, lastSeenAt: hello.at, ...(reports.has(sb) ? { machine: reports.get(sb)! } : {}) }));
+    // Why the agent stopped a machine itself (its disk watchdog, a missing
+    // firewall), which its state message may not have brought: the link is
+    // often down then, as after a flush of the host's rules.
+    const notes = new Map(hello.machines.filter((m) => m.note).map((m) => [m.id, m.note!]));
+    await this.tellSandboxes(id, (sb) =>
+      plan.deletes.includes(sb)
+        ? null
+        : { online: true, lastSeenAt: hello.at, ...(reports.has(sb) ? { machine: reports.get(sb)!, ...(notes.has(sb) ? { note: notes.get(sb)! } : {}) } : {}) },
+    );
     if (plan.orphans.length) console.log(`[${id}] machines of no sandbox, left alone: ${plan.orphans.join(" ")}`);
   }
 

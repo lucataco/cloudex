@@ -772,6 +772,7 @@ func (a *Agent) answer(op Op) Result {
 		return okResult(op.ID, struct{}{})
 	case "delete":
 		a.stopPool(args.Sandbox)
+		r.forgetNote(args.Sandbox)
 		// Its listeners and their connections go before its network does
 		// (review H8), not at the next sync.
 		if a.egress != nil {

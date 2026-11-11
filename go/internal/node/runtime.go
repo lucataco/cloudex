@@ -45,6 +45,8 @@ type Runtime struct {
 	// each machine's writable layer where the storage driver can.
 	KeepFreeGB float64
 	DiskGB     int
+	// FreeSpace, in tests, stands in for the free space under DockerRoot.
+	FreeSpace func() float64
 	// Subnet hands out machine networks round-robin over the pool, so a
 	// deleted machine's /28 isn't reused at once (review H8): LastSubnet is
 	// the last one given, kept across restarts with SaveSubnet.
@@ -149,6 +151,9 @@ func (r *Runtime) Sysbox(ctx context.Context) bool {
 
 // FreeGB is the free space on Docker's disk; -1 when it can't tell.
 func (r *Runtime) FreeGB() float64 {
+	if r.FreeSpace != nil {
+		return r.FreeSpace()
+	}
 	if r.DockerRoot == "" {
 		return -1
 	}
@@ -719,11 +724,13 @@ func (r *Runtime) Machines(ctx context.Context) ([]Machine, error) {
 		if !sandboxID.MatchString(id) {
 			continue
 		}
-		state := "stopped"
+		m := Machine{ID: id, State: "stopped"}
 		if c.State == "running" {
-			state = "running"
+			m.State = "running"
+		} else {
+			m.Note = r.note(id) // why the agent stopped it, if it did
 		}
-		out = append(out, Machine{ID: id, State: state})
+		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
@@ -751,9 +758,10 @@ func (r *Runtime) Watch(ctx context.Context) {
 			}
 			switch e.Action {
 			case "start":
+				r.forgetNote(id)
 				r.OnState(Machine{ID: id, State: "running"})
 			case "die":
-				r.OnState(Machine{ID: id, State: "stopped", Note: r.takeNote(id)})
+				r.OnState(Machine{ID: id, State: "stopped", Note: r.note(id)})
 			case "oom":
 				r.logf("%s: its machine ran out of memory", id)
 			}

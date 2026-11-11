@@ -102,6 +102,7 @@ function setup() {
   storage.kv.set("id", NODE);
   const sockets: FakeWs[] = [];
   const woken: string[] = [];
+  const reports: [string, unknown][] = [];
   const waits: Promise<unknown>[] = [];
   const ctx = {
     storage,
@@ -116,13 +117,13 @@ function setup() {
     DB: counted,
     ADMIN_KEY: "admin-key-for-tests",
     NODE_IMAGE: "",
-    SANDBOX: { getByName: (sb: string) => ({ nodeReport: async () => void woken.push(sb) }) },
+    SANDBOX: { getByName: (sb: string) => ({ nodeReport: async (_id: string, r: unknown) => void (woken.push(sb), reports.push([sb, r])) }) },
   };
   const node = new Node(ctx as never, env as never);
   const ws = new FakeWs({ gen: 1, acceptedAt: Date.now(), lastMessageAt: null });
   sockets.push(ws);
   const say = (m: unknown) => node.webSocketMessage(ws as never, JSON.stringify(m));
-  return { node, ws, say, woken, waits, storage, sockets };
+  return { node, ws, say, woken, reports, waits, storage, sockets };
 }
 
 // A connect, as the Worker passes it on once its signature checked out
@@ -336,4 +337,15 @@ test("a failed read of the node's list of sandboxes isn't tried again at every m
     membersFail = false;
   }
   assert.equal(memberReads, 1, "one read of D1 for 20 messages while it fails");
+});
+
+test("a hello's note for a machine the agent stopped itself reaches its sandbox with the reconcile", async () => {
+  // The state message that told it is lost when the link is down then, as
+  // after a flush of the host's rules (review H3, seen live under Sysbox).
+  const t = setup();
+  await t.say({ ...hello, machines: [{ id: "cx-mine01", state: "stopped", note: "this node's firewall table (inet cloudex) disappeared" }] });
+  await Promise.all(t.waits);
+  const r = t.reports.find(([sb]) => sb === "cx-mine01")?.[1] as { machine?: string; note?: string } | undefined;
+  assert.equal(r?.machine, "stopped");
+  assert.match(r?.note ?? "", /firewall table/);
 });

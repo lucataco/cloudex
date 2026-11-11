@@ -75,13 +75,21 @@ func (r *Runtime) stopFor(ctx context.Context, sandbox, id, note string) error {
 	return nil
 }
 
-// takeNote is the reason the agent stopped a machine, once.
-func (r *Runtime) takeNote(sandbox string) string {
+// note is the reason the agent stopped a machine. It stays until the machine
+// starts again, so that a hello carries it too (Machines): the state message
+// that told it is lost when the link is down then, as it is after a flush of
+// the host's rules took Docker's with it.
+func (r *Runtime) note(sandbox string) string {
 	r.factsMu.Lock()
 	defer r.factsMu.Unlock()
-	n := r.notes[sandbox]
+	return r.notes[sandbox]
+}
+
+// forgetNote drops a machine's note once it runs again.
+func (r *Runtime) forgetNote(sandbox string) {
+	r.factsMu.Lock()
+	defer r.factsMu.Unlock()
 	delete(r.notes, sandbox)
-	return n
 }
 
 // StopAll stops every running machine of this node, saying why.
