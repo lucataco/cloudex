@@ -93,7 +93,7 @@ export type Refusal = { status: 401 | 400 | 410; error: string; revoked?: true }
 
 export const BAD_SIGNATURE = "unauthorized: the node's signature didn't check out (an unknown or removed node, or another key)";
 export const REVOKED =
-  "this node was removed from the deployment (cloudex node rm), so its key no longer works; uninstall the agent (node-install.sh --uninstall), or add the node again with cloudex node add and run the installer it prints";
+  "this node was removed from the deployment (cloudex node rm), so its key no longer works; uninstall the agent (node-install.sh --uninstall), then add the node again with cloudex node add and run the installer it prints";
 
 // A node's key, and the key it had when it was removed (revokeNode), for
 // telling a removed node's own agent that it was removed.
