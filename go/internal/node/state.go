@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,6 +132,8 @@ type Status struct {
 	APIURL     string `json:"apiUrl"`
 	NodeID     string `json:"nodeId"`
 	Version    string `json:"version"`
+	// The last self-test's result (M4).
+	Isolation *Isolation `json:"isolation,omitempty"`
 }
 
 func (s State) SaveStatus(st Status) error {
@@ -145,4 +150,86 @@ func (s State) ReadStatus() (*Status, error) {
 	return &st, json.Unmarshal(b, &st)
 }
 
+// Image is the machine image the deployment last named (image.json), so
+// that a restarted agent can test and pull before it connects.
+func (s State) Image() string {
+	var v struct {
+		Image string `json:"image"`
+	}
+	if b, err := os.ReadFile(s.path("image.json")); err == nil {
+		json.Unmarshal(b, &v)
+	}
+	return v.Image
+}
+
+func (s State) SaveImage(ref string) error {
+	if s.Dir == "" {
+		return nil
+	}
+	return s.write("image.json", map[string]string{"image": ref}, 0o600)
+}
+
 func readFile(path string) ([]byte, error) { return os.ReadFile(path) }
+
+// RuntimeConfig is how the agent runs machines (cloudex-node run's flags),
+// kept in runtime.json so that cloudex-node selftest, run in the agent's
+// container, uses the same.
+type RuntimeConfig struct {
+	Pool       string   `json:"pool"`
+	Self       string   `json:"self"`
+	Allowed    []string `json:"allowed,omitempty"`
+	Image      string   `json:"image,omitempty"`
+	DockerRoot string   `json:"dockerRoot,omitempty"`
+	Probes     []string `json:"probes,omitempty"`
+}
+
+func (s State) SaveRuntimeConfig(c RuntimeConfig) error {
+	if s.Dir == "" {
+		return nil
+	}
+	return s.write("runtime.json", c, 0o600)
+}
+
+func (s State) RuntimeConfig() (*RuntimeConfig, error) {
+	b, err := os.ReadFile(s.path("runtime.json"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var c RuntimeConfig
+	return &c, json.Unmarshal(b, &c)
+}
+
+// Runtime checks the configuration and makes the runtime.
+func (c RuntimeConfig) Runtime(d *Docker, lg *log.Logger) (*Runtime, error) {
+	pool, err := netip.ParsePrefix(c.Pool)
+	if err != nil {
+		return nil, fmt.Errorf("--pool: %w", err)
+	}
+	if err := CheckPool(pool); err != nil {
+		return nil, err
+	}
+	allowed := append([]string{DefaultImageRepo}, c.Allowed...)
+	for _, a := range allowed {
+		if !imageRef.MatchString(a) || ImageRepo(a) != a {
+			return nil, fmt.Errorf("--allow-image %q: give a repository without a tag, such as %s", a, DefaultImageRepo)
+		}
+	}
+	if c.Image != "" {
+		if err := ImageAllowed(c.Image, allowed); err != nil {
+			return nil, fmt.Errorf("--machine-image: %w", err)
+		}
+	}
+	for _, p := range c.Probes {
+		host := strings.TrimPrefix(p, "udp53=")
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if _, err := netip.ParseAddr(host); err != nil {
+			return nil, fmt.Errorf("--probe %q: give ip:port, or udp53=ip", p)
+		}
+	}
+	return &Runtime{Docker: d, Pool: pool, Self: c.Self, Allowed: allowed, ImageOverride: c.Image, DockerRoot: c.DockerRoot, HostProbes: c.Probes, Log: lg}, nil
+}

@@ -88,8 +88,8 @@ func newRoot() *cobra.Command {
 
 	var runJoin, runAPI, dockerSocket string
 	var runUnisolated bool
-	var devMachines []string
 	var spares int
+	var rc node.RuntimeConfig
 	run := &cobra.Command{
 		Use:   "run",
 		Short: "Keep this node connected to its deployment (joining first with --join)",
@@ -119,10 +119,22 @@ func newRoot() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			lg.Printf("%s: node %s (%s) connecting to %s", version, id.Name, id.ID, id.APIURL)
+			d := &node.Docker{Socket: dockerSocket}
 			a := &node.Agent{API: id.APIURL, ID: id.ID, Key: key, Version: version, Unisolated: id.Unisolated, State: s, Log: lg,
-				DevMachines: devMachines, Docker: &node.Docker{Socket: dockerSocket}, Spares: spares, Debug: os.Getenv("CLOUDEX_NODE_DEBUG") == "1"}
-			if len(devMachines) > 0 {
-				lg.Printf("development machines it may adopt: %v", devMachines)
+				Docker: d, Spares: spares, Debug: os.Getenv("CLOUDEX_NODE_DEBUG") == "1"}
+			if rc.Pool != "" {
+				rc.Self = selfContainer(rc.Self)
+				if err := s.SaveRuntimeConfig(rc); err != nil {
+					return err
+				}
+				r, err := rc.Runtime(d, lg)
+				if err != nil {
+					return err
+				}
+				a.Runtime = r
+				lg.Printf("machines: pool %s, agent container %q, images %v%s", rc.Pool, rc.Self, r.Allowed, map[bool]string{true: ", unisolated (testing only)"}[id.Unisolated])
+			} else {
+				lg.Printf("no --pool: this agent runs no machines")
 			}
 			if err := a.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				return err
@@ -134,18 +146,29 @@ func newRoot() *cobra.Command {
 	run.Flags().StringVar(&runJoin, "join", "", "a join token, used when this node hasn't joined yet")
 	run.Flags().StringVar(&runAPI, "api", "", "the deployment's URL, with --join")
 	run.Flags().BoolVar(&runUnisolated, "unisolated", false, "with --join: for testing only, run machines without the firewall's isolation")
-	run.Flags().StringArrayVar(&devMachines, "dev-machine", nil, "development only: a running container this agent may adopt for a sandbox (POST /v1/nodes/{node}/dev-sandboxes); repeatable")
 	run.Flags().IntVar(&spares, "spares", node.SparesMin, "spare stream sockets kept open per machine")
 	run.Flags().StringVar(&dockerSocket, "docker-socket", node.DefaultDockerSocket, "the Docker Engine API's socket")
-	run.Flags().MarkHidden("dev-machine")
+	run.Flags().StringVar(&rc.Pool, "pool", "", "the machine pool, such as 10.250.0.0/16 (the installer picks one); without it, no machines")
+	run.Flags().StringVar(&rc.Self, "container", "", "the agent's own container (default $CLOUDEX_NODE_CONTAINER, else its hostname inside a container)")
+	run.Flags().StringArrayVar(&rc.Allowed, "allow-image", nil, "an image repository machines may run, besides "+node.DefaultImageRepo+"; repeatable")
+	run.Flags().StringVar(&rc.Image, "machine-image", "", "run machines from this image instead of the deployment's (it must be allowed)")
+	run.Flags().StringVar(&rc.DockerRoot, "docker-root", "", "where Docker's data root is mounted read-only, for its free space")
+	run.Flags().StringArrayVar(&rc.Probes, "probe", nil, "an address of the host or its LAN (ip:port, or udp53=ip) the self-test must find closed; repeatable")
 
 	var asJSON bool
+	var wait time.Duration
 	status := &cobra.Command{
 		Use:   "status",
 		Short: "Say whether the agent is connected; exits 1 when it isn't",
-		Args:  cobra.NoArgs,
+		Long: "Say whether the agent is connected; exits 1 when it isn't. With --wait, waits up to\n" +
+			"that long for it to be connected and to have run its isolation self-test, then\n" +
+			"exits 0 if the self-test passed and 2 if it failed (the installer's step 5).",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			s := state()
+			if wait > 0 {
+				return waitReady(cmd, s, wait)
+			}
 			id, err := s.Identity()
 			if err != nil {
 				return err
@@ -179,8 +202,9 @@ func newRoot() *cobra.Command {
 		},
 	}
 	status.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	status.Flags().DurationVar(&wait, "wait", 0, "wait this long for the connection and the self-test's result")
 
-	root.AddCommand(join, run, status, newProbe(state))
+	root.AddCommand(join, run, status, newProbe(state), newFirewall(), newPickPool(), newSelfTest(state, &dockerSocket))
 	return root
 }
 
@@ -201,6 +225,63 @@ func doJoin(ctx context.Context, s node.State, apiURL, token string, unisolated 
 	}
 	id := node.Identity{ID: j.Node.ID, Name: j.Node.Name, APIURL: apiURL, Unisolated: unisolated, JoinedAt: time.Now().UnixMilli()}
 	return &id, s.SaveIdentity(id)
+}
+
+// waitReady is status --wait.
+func waitReady(cmd *cobra.Command, s node.State, wait time.Duration) error {
+	out := cmd.OutOrStdout()
+	deadline := time.Now().Add(wait)
+	said := ""
+	for {
+		id, _ := s.Identity()
+		st, _ := s.ReadStatus()
+		up := id != nil && st != nil && alive(st.PID) && st.Connected && time.Since(time.UnixMilli(st.LastPongAt)) < node.PongDead
+		iso := (*node.Isolation)(nil)
+		if st != nil {
+			iso = st.Isolation
+		}
+		switch {
+		case up && iso != nil && iso.Firewall == "pass":
+			fmt.Fprintf(out, "%s is online, and its isolation self-test passed\n", id.Name)
+			return nil
+		case up && iso != nil && iso.Firewall == "fail":
+			fmt.Fprintf(out, "%s is online, but its isolation self-test failed:\n", id.Name)
+			for _, f := range iso.Failed {
+				fmt.Fprintf(out, "  %s\n", f)
+			}
+			return exitCode(2)
+		}
+		now := "waiting for the agent to connect"
+		if up {
+			now = "connected; waiting for the isolation self-test"
+		} else if st != nil && st.LastError != "" {
+			now = "not connected yet: " + st.LastError
+		}
+		if now != said {
+			fmt.Fprintln(out, now)
+			said = now
+		}
+		if time.Now().After(deadline) {
+			return exitCode(1)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// selfContainer is the agent's own container: the flag, else
+// $CLOUDEX_NODE_CONTAINER, else its hostname when it runs in a container.
+func selfContainer(flag string) string {
+	if flag != "" {
+		return flag
+	}
+	if env := os.Getenv("CLOUDEX_NODE_CONTAINER"); env != "" {
+		return env
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		h, _ := os.Hostname()
+		return h
+	}
+	return ""
 }
 
 func firstNonEmpty(v ...string) string {

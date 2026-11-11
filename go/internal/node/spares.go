@@ -240,94 +240,52 @@ func (p *pool) dial() (*Stream, error) {
 // HeaderTicket carries a stream's ticket.
 const HeaderTicket = "x-cx-ticket"
 
-// ---------------------------------------------------------------- dev machines
+// ---------------------------------------------------------------- pools
 
-// DevMachines is dev.json: which sandbox each --dev-machine container runs,
-// for M3's development path (a container started by hand that the agent was
-// told it may adopt). M5 replaces this with machines the agent makes.
-type DevMachines struct {
-	Machines map[string]string `json:"machines"` // sandbox id -> container
-}
-
-func (s State) DevMachines() DevMachines {
-	var d DevMachines
-	if b, err := readFile(s.path("dev.json")); err == nil {
-		json.Unmarshal(b, &d)
-	}
-	if d.Machines == nil {
-		d.Machines = map[string]string{}
-	}
-	return d
-}
-
-func (s State) SaveDevMachines(d DevMachines) error { return s.write("dev.json", d, 0o600) }
-
-// adopt runs a sandbox on a --dev-machine container.
-func (a *Agent) adopt(sandbox string) (map[string]any, error) {
-	if !sandboxID.MatchString(sandbox) {
-		return nil, errors.New("not a sandbox id")
-	}
-	if len(a.DevMachines) == 0 {
-		return nil, errors.New("this agent has no --dev-machine to adopt (development only, until the Docker runtime)")
-	}
-	a.poolMu.Lock()
-	defer a.poolMu.Unlock()
-	d := a.State.DevMachines()
-	container, ok := d.Machines[sandbox]
-	if !ok {
-		used := map[string]bool{}
-		for _, c := range d.Machines {
-			used[c] = true
-		}
-		for _, c := range a.DevMachines {
-			if !used[c] {
-				container = c
-				break
-			}
-		}
-		if container == "" {
-			return nil, fmt.Errorf("every --dev-machine runs a sandbox already (%d)", len(a.DevMachines))
-		}
+// startPool keeps spares for a sandbox's machine while it runs.
+func (a *Agent) startPool(sandbox string) {
+	if a.Runtime == nil || a.runCtx == nil {
+		return
 	}
 	ctx, cancel := context.WithTimeout(a.runCtx, 10*time.Second)
-	defer cancel()
-	c, err := a.docker().Inspect(ctx, container)
-	if err != nil {
-		return nil, err
+	t, running, err := a.Runtime.Target(ctx, sandbox)
+	cancel()
+	if err != nil || !running || t.Address == "" {
+		return
 	}
-	if !c.Running || c.Address == "" {
-		return nil, fmt.Errorf("the dev machine %s isn't running, or has no address", container)
-	}
-	d.Machines[sandbox] = container
-	if err := a.State.SaveDevMachines(d); err != nil {
-		return nil, err
-	}
-	if old := a.pools[sandbox]; old != nil {
-		old.cancel()
-	}
-	a.pools[sandbox] = a.newPool(sandbox, Target{Container: c.ID, Address: c.Address})
-	a.logf("%s runs on the dev machine %s (%s)", sandbox, container, c.Address)
-	return map[string]any{"address": c.Address, "container": c.Name}, nil
-}
-
-func (a *Agent) release(sandbox string) error {
 	a.poolMu.Lock()
 	defer a.poolMu.Unlock()
-	d := a.State.DevMachines()
-	delete(d.Machines, sandbox)
+	if old := a.pools[sandbox]; old != nil {
+		if old.target == t {
+			return
+		}
+		old.cancel()
+	}
+	a.pools[sandbox] = a.newPool(sandbox, t)
+}
+
+func (a *Agent) stopPool(sandbox string) {
+	a.poolMu.Lock()
+	defer a.poolMu.Unlock()
 	if p := a.pools[sandbox]; p != nil {
 		p.cancel()
 		delete(a.pools, sandbox)
 	}
-	return a.State.SaveDevMachines(d)
 }
 
-// startPools brings back the spares of the dev machines adopted earlier.
+// startPools brings back the spares of the machines that run (after the
+// agent restarted, they kept running).
 func (a *Agent) startPools() {
-	d := a.State.DevMachines()
-	for sandbox := range d.Machines {
-		if _, err := a.adopt(sandbox); err != nil {
-			a.logf("%s: %v", sandbox, err)
+	ctx, cancel := context.WithTimeout(a.runCtx, 30*time.Second)
+	ms, err := a.Runtime.Machines(ctx)
+	cancel()
+	if err != nil {
+		a.logf("listing machines: %v", err)
+		return
+	}
+	for _, m := range ms {
+		if m.State == "running" {
+			a.startPool(m.ID)
 		}
 	}
 }

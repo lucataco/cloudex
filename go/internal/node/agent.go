@@ -123,13 +123,14 @@ type Agent struct {
 	// Wait, when set, replaces sleeping between attempts.
 	Wait func(ctx context.Context, d time.Duration) error
 
-	// M3's development path: containers started by hand that the agent may
-	// adopt for a sandbox (cloudex-node run --dev-machine), and the spare
-	// stream sockets it keeps for each (SparesMin by default).
-	DevMachines []string
-	Docker      *Docker
-	Spares      int
-	Debug       bool // logs each stream
+	// The Docker runtime (M4): machines, their networks, and the isolation
+	// self-test. Nil when the agent runs without a machine pool.
+	Runtime *Runtime
+	Docker  *Docker
+	Spares  int  // spare stream sockets kept for each running machine (SparesMin by default)
+	Debug   bool // logs each stream
+	// SelfTestEvery replaces the hour between self-tests (tests).
+	SelfTestEvery time.Duration
 
 	status   Status
 	statusMu sync.Mutex
@@ -142,6 +143,9 @@ type Agent struct {
 	ctlMu   sync.Mutex
 	ctlSend func(v any) error // the current control connection's, or nil
 	waiting map[string]chan Tickets
+
+	testNow chan struct{} // runs the self-test now
+	testMu  sync.Mutex
 }
 
 func (a *Agent) docker() *Docker {
@@ -217,7 +221,23 @@ func (a *Agent) facts() Facts {
 	if a.Facts != nil {
 		return a.Facts()
 	}
-	return HostFacts(a.Unisolated)
+	f := HostFacts(a.Unisolated)
+	if a.Runtime != nil {
+		f = a.Runtime.Facts(f)
+	}
+	return f
+}
+
+// send sends a message on the control socket, if it's up.
+func (a *Agent) send(v any) {
+	a.ctlMu.Lock()
+	send := a.ctlSend
+	a.ctlMu.Unlock()
+	if send != nil {
+		if err := send(v); err != nil {
+			a.logf("sending %T: %v", v, err)
+		}
+	}
 }
 
 func (a *Agent) setStatus(change func(*Status)) {
@@ -252,9 +272,35 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.poolMu.Lock()
 	a.pools = map[string]*pool{}
 	a.poolMu.Unlock()
-	if len(a.DevMachines) > 0 {
+	a.testNow = make(chan struct{}, 1)
+	if r := a.Runtime; r != nil {
+		r.NodeID = a.ID
+		r.Unisolated = a.Unisolated
+		r.OnFacts = func() { a.send(FactsMessage{Type: "facts", Facts: a.facts()}) }
+		r.OnState = func(m Machine) {
+			if m.State == "running" {
+				a.startPool(m.ID)
+			} else {
+				a.stopPool(m.ID)
+			}
+			a.send(StateMessage{Type: "state", Machine: m})
+		}
+		if img := a.State.Image(); img != "" && r.ImageOverride == "" {
+			r.SetImage(img)
+		} else if r.ImageOverride != "" {
+			r.SetImage(r.ImageOverride)
+		}
 		go a.handler().hangUpLeftovers(a.State)
-		go a.startPools()
+		go func() {
+			// What a self-test left when the agent died goes first, then the
+			// first self-test of this run starts.
+			sctx, cancel := context.WithTimeout(ctx, time.Minute)
+			r.Sweep(sctx)
+			cancel()
+			a.startPools()
+			a.selfTests(ctx)
+		}()
+		go r.Watch(ctx)
 	}
 	var down time.Time
 	attempt := 0
@@ -429,6 +475,17 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 		}
 		var head struct{ Type string }
 		json.Unmarshal(data, &head)
+		if head.Type == "welcome" {
+			var w Welcome
+			if json.Unmarshal(data, &w) == nil && w.Image != "" && a.Runtime != nil {
+				if a.State.Image() != w.Image {
+					a.State.SaveImage(w.Image)
+				}
+				a.Runtime.SetImage(w.Image)
+				a.kickSelfTest()
+			}
+			continue
+		}
 		if head.Type == "tickets" {
 			var t Tickets
 			if json.Unmarshal(data, &t) == nil {
@@ -456,56 +513,148 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 
 // machines lists the machines this agent runs, for hello.
 func (a *Agent) machines() []Machine {
-	ms := []Machine{}
-	if len(a.DevMachines) == 0 || a.State.Dir == "" {
-		return ms
+	if a.Runtime == nil {
+		return []Machine{}
 	}
-	for sandbox := range a.State.DevMachines().Machines {
-		ms = append(ms, Machine{ID: sandbox, State: "running"})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ms, err := a.Runtime.Machines(ctx)
+	if err != nil {
+		a.logf("listing machines for hello: %v", err)
+		return []Machine{}
 	}
 	return ms
 }
 
+func (a *Agent) kickSelfTest() {
+	select {
+	case a.testNow <- struct{}{}:
+	default:
+	}
+}
+
+// selfTests runs the isolation self-test at start, every hour, and when
+// asked (a new image, the selftest op), and keeps its result as the node's
+// isolation.
+func (a *Agent) selfTests(ctx context.Context) {
+	every := a.SelfTestEvery
+	if every == 0 {
+		every = SelfTestEvery
+	}
+	t := time.NewTimer(0)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		case <-a.testNow:
+		}
+		if a.Runtime.Image() == "" {
+			t.Reset(every) // the welcome message kicks it
+			continue
+		}
+		rep := a.runSelfTest(ctx)
+		if rep.Error != "" {
+			// It couldn't run (Docker was busy, the image is still coming):
+			// that's no verdict on the firewall, so again soon.
+			t.Reset(min(every, time.Minute))
+			continue
+		}
+		t.Reset(every)
+	}
+}
+
+func (a *Agent) runSelfTest(ctx context.Context) *SelfTestReport {
+	a.testMu.Lock()
+	defer a.testMu.Unlock()
+	tctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	rep := a.Runtime.SelfTest(tctx)
+	if ctx.Err() != nil {
+		return rep
+	}
+	a.Runtime.Record(rep)
+	if rep.Pass {
+		a.logf("isolation self-test passed: %d checks in %v", len(rep.Checks), time.Duration(rep.TookMs)*time.Millisecond)
+	} else {
+		a.logf("isolation self-test FAILED; this node refuses new machines: %s", strings.Join(rep.Failed(), "; "))
+	}
+	iso := a.facts().Isolation
+	a.setStatus(func(s *Status) { s.Isolation = &iso })
+	return rep
+}
+
 // answer runs an op. The set is fixed; nothing here runs anything on the host.
 func (a *Agent) answer(op Op) Result {
+	var args struct {
+		Sandbox string `json:"sandbox"`
+		Count   int    `json:"count"`
+	}
+	b, _ := json.Marshal(op.Args)
+	json.Unmarshal(b, &args)
 	switch op.Name {
 	case "ping":
 		return okResult(op.ID, struct{}{})
 	case "facts":
 		return okResult(op.ID, a.facts())
-	case "adopt", "release", "streams":
-		var args struct {
-			Sandbox string `json:"sandbox"`
-			Count   int    `json:"count"`
-		}
-		b, _ := json.Marshal(op.Args)
-		json.Unmarshal(b, &args)
+	case "streams":
 		if !sandboxID.MatchString(args.Sandbox) {
 			return errResult(op.ID, "not a sandbox id")
 		}
-		switch op.Name {
-		case "adopt":
-			v, err := a.adopt(args.Sandbox)
-			if err != nil {
-				return errResult(op.ID, err.Error())
-			}
-			return okResult(op.ID, v)
-		case "release":
-			if err := a.release(args.Sandbox); err != nil {
-				return errResult(op.ID, err.Error())
-			}
-			return okResult(op.ID, struct{}{})
-		default:
-			a.poolMu.Lock()
-			p := a.pools[args.Sandbox]
-			a.poolMu.Unlock()
-			if p == nil {
-				return errResult(op.ID, "no machine here runs "+args.Sandbox)
-			}
-			p.more(max(1, min(args.Count, SparesMax)))
-			return okResult(op.ID, struct{}{})
+		a.poolMu.Lock()
+		p := a.pools[args.Sandbox]
+		a.poolMu.Unlock()
+		if p == nil {
+			return errResult(op.ID, "no machine here runs "+args.Sandbox)
 		}
+		p.more(max(1, min(args.Count, SparesMax)))
+		return okResult(op.ID, struct{}{})
+	}
+	switch op.Name {
+	case "create", "start", "stop", "delete", "selftest":
 	default:
 		return errResult(op.ID, "unknown op "+op.Name+": this agent may be older than the deployment")
 	}
+	r := a.Runtime
+	if r == nil {
+		return errResult(op.ID, errNoRuntime.Error())
+	}
+	ctx, cancel := context.WithTimeout(a.runCtx, 3*time.Minute)
+	defer cancel()
+	switch op.Name {
+	case "create":
+		var req MachineRequest
+		if err := json.Unmarshal(b, &req); err != nil {
+			return errResult(op.ID, "bad arguments: "+err.Error())
+		}
+		m, err := r.Create(ctx, req)
+		if err != nil {
+			return errResult(op.ID, err.Error())
+		}
+		return okResult(op.ID, m)
+	case "start":
+		m, err := r.Start(ctx, args.Sandbox)
+		if err != nil {
+			return errResult(op.ID, err.Error())
+		}
+		a.startPool(args.Sandbox)
+		return okResult(op.ID, m)
+	case "stop":
+		a.stopPool(args.Sandbox)
+		if err := r.Stop(ctx, args.Sandbox); err != nil {
+			return errResult(op.ID, err.Error())
+		}
+		return okResult(op.ID, struct{}{})
+	case "delete":
+		a.stopPool(args.Sandbox)
+		if err := r.Delete(ctx, args.Sandbox); err != nil {
+			return errResult(op.ID, err.Error())
+		}
+		return okResult(op.ID, struct{}{})
+	case "selftest":
+		rep := a.runSelfTest(ctx)
+		return okResult(op.ID, map[string]any{"pass": rep.Pass, "failed": rep.Failed(), "checks": len(rep.Checks), "tookMs": rep.TookMs})
+	}
+	return errResult(op.ID, "unknown op "+op.Name+": this agent may be older than the deployment")
 }
