@@ -1053,8 +1053,16 @@ node_m4() {
 	"$CX" stop "$NM" >/dev/null 2>&1
 	"$CX" resume "$NM" >/dev/null 2>&1
 	boot2=$(in_m 'cat /run/cloudex-boot')
-	OUT="flags ok: $hc_ok ($(jq -c '{Privileged,CapDrop,PidsLimit,Memory,NanoCpus,Tmpfs,NetworkMode,Runtime}' <<<"$insp" 2>/dev/null)); inside ($runtime) ok: $in_ok ($inside); start ids $boot1 then $boot2" CODE=""
-	ok N20 "$(m3_desc N20)" [ "$hc_ok" = true -a "$in_ok" = true -a -n "$boot1" -a -n "$boot2" -a "$boot1" != "$boot2" ]
+	# The start ids first, since the rest of the detail is long.
+	local ids="start ids '$boot1' then '$boot2'" ids_ok=""
+	[[ -n $boot1 && -n $boot2 && $boot1 != "$boot2" ]] && ids_ok=yes
+	if [[ -z $boot1 && -z $boot2 && -z $(in_m 'grep -l cloudex-boot /usr/local/bin/* /entrypoint* 2>/dev/null | head -1') ]]; then
+		# An image from before v0.2.2 writes no /run/cloudex-boot (M4): nothing to compare.
+		ids="no start ids: the machine image predates them (set VERIFY_NODE_MACHINE_IMAGE to a v0.2.2 base image to check them)"
+		ids_ok=n/a
+	fi
+	OUT="$ids; flags ok: $hc_ok ($(jq -c '{Privileged,CapDrop,PidsLimit,Memory,NanoCpus,Tmpfs,NetworkMode,Runtime}' <<<"$insp" 2>/dev/null)); inside ($runtime) ok: $in_ok ($inside)" CODE=""
+	ok N20 "$(m3_desc N20)" [ "$hc_ok" = true -a "$in_ok" = true -a -n "$ids_ok" ]
 
 	# N21: a Docker restart.
 	if [[ -n $NODE_SUDO ]]; then
