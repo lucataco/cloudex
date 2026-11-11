@@ -1,7 +1,12 @@
 {
   "_": "Examples of the node agent's messages (src/node.ts). Both the TypeScript models (packages/schema/test/node.test.ts) and the Go agent (go/internal/node/protocol_test.go) are checked against this file: every valid example must parse on both sides and come back the same from Go, and every invalid one must be refused by the Worker's models. Change a message here first.",
   "protocol": 1,
-  "close": { "replaced": 4000, "revoked": 4003, "stale": 4008, "badMessage": 4400 },
+  "close": {
+    "replaced": 4000,
+    "revoked": 4003,
+    "stale": 4008,
+    "badMessage": 4400
+  },
   "signing": {
     "_": "The string a node signs: METHOD, PATH?QUERY, SANDBOX (empty when none), TS (unix seconds) and NONCE, joined by newlines.",
     "method": "GET",
@@ -25,7 +30,10 @@
         "facts": {
           "arch": "amd64",
           "runtime": "docker",
-          "isolation": { "firewall": "unchecked", "unisolated": false },
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
           "cpus": 4,
           "memoryMb": 16000,
           "diskFreeGb": null
@@ -35,7 +43,12 @@
     {
       "name": "joined",
       "model": "NodeJoined",
-      "message": { "node": { "id": "nd-abcd1234", "name": "box" } }
+      "message": {
+        "node": {
+          "id": "nd-abcd1234",
+          "name": "box"
+        }
+      }
     },
     {
       "name": "hello",
@@ -47,14 +60,23 @@
         "facts": {
           "arch": "amd64",
           "runtime": "docker",
-          "isolation": { "firewall": "unchecked", "unisolated": true },
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": true
+          },
           "cpus": 2,
           "memoryMb": 7936,
           "diskFreeGb": 42.5
         },
         "machines": [
-          { "id": "cx-abc123", "state": "running" },
-          { "id": "cx-def456", "state": "stopped" }
+          {
+            "id": "cx-abc123",
+            "state": "running"
+          },
+          {
+            "id": "cx-def456",
+            "state": "stopped"
+          }
         ]
       }
     },
@@ -68,7 +90,10 @@
         "facts": {
           "arch": "arm64",
           "runtime": "docker",
-          "isolation": { "firewall": "unchecked", "unisolated": false },
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
           "cpus": null,
           "memoryMb": null,
           "diskFreeGb": null
@@ -84,7 +109,10 @@
         "facts": {
           "arch": "amd64",
           "runtime": "sysbox",
-          "isolation": { "firewall": "pass", "unisolated": false },
+          "isolation": {
+            "firewall": "pass",
+            "unisolated": false
+          },
           "cpus": 8,
           "memoryMb": 32000,
           "diskFreeGb": 200
@@ -94,84 +122,566 @@
     {
       "name": "state",
       "model": "NodeMessage",
-      "message": { "type": "state", "machine": { "id": "cx-abc123", "state": "stopped" } }
+      "message": {
+        "type": "state",
+        "machine": {
+          "id": "cx-abc123",
+          "state": "stopped"
+        }
+      }
     },
     {
       "name": "result-ok",
       "model": "NodeMessage",
-      "message": { "type": "result", "id": "op-k2j4h5", "ok": true, "value": {} }
+      "message": {
+        "type": "result",
+        "id": "op-k2j4h5",
+        "ok": true,
+        "value": {}
+      }
     },
     {
       "name": "result-error",
       "model": "NodeMessage",
-      "message": { "type": "result", "id": "op-k2j4h6", "ok": false, "error": "unknown op exec" }
+      "message": {
+        "type": "result",
+        "id": "op-k2j4h6",
+        "ok": false,
+        "error": "unknown op exec"
+      }
     },
     {
       "name": "op-ping",
       "model": "WorkerMessage",
-      "message": { "type": "op", "id": "op-k2j4h5", "name": "ping", "args": {} }
+      "message": {
+        "type": "op",
+        "id": "op-k2j4h5",
+        "name": "ping",
+        "args": {}
+      }
     },
     {
       "name": "op-facts",
       "model": "WorkerMessage",
-      "message": { "type": "op", "id": "op-k2j4h7", "name": "facts", "args": {} }
+      "message": {
+        "type": "op",
+        "id": "op-k2j4h7",
+        "name": "facts",
+        "args": {}
+      }
+    },
+    {
+      "name": "tickets-request",
+      "model": "NodeMessage",
+      "message": {
+        "type": "tickets",
+        "id": "tk-a1b2c3",
+        "sandbox": "cx-abc123",
+        "count": 2
+      }
+    },
+    {
+      "name": "tickets",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "tickets",
+        "id": "tk-a1b2c3",
+        "tickets": [
+          "eyJuIjoibmQtYWJjZDEyMzQifQ.c2ln",
+          "eyJuIjoibmQtYWJjZDEyMzUifQ.c2ln"
+        ]
+      }
+    },
+    {
+      "name": "tickets-refused",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "tickets",
+        "id": "tk-a1b2c4",
+        "tickets": [],
+        "error": "this node was removed"
+      }
+    },
+    {
+      "name": "op-adopt",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-k2j4h8",
+        "name": "adopt",
+        "args": {
+          "sandbox": "cx-abc123"
+        }
+      }
+    },
+    {
+      "name": "op-streams",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-k2j4h9",
+        "name": "streams",
+        "args": {
+          "sandbox": "cx-abc123",
+          "count": 2
+        }
+      }
+    },
+    {
+      "name": "open-exec",
+      "model": "StreamToAgent",
+      "message": {
+        "exec": {
+          "argv": [
+            "bash",
+            "-lc",
+            "echo hi"
+          ],
+          "cwd": "/home/cloudex",
+          "env": {
+            "HOME": "/home/cloudex",
+            "LANG": "C.UTF-8"
+          },
+          "stdin": false,
+          "stderr": true
+        }
+      }
+    },
+    {
+      "name": "open-exec-pty",
+      "model": "StreamToAgent",
+      "message": {
+        "exec": {
+          "argv": [
+            "sh",
+            "-c",
+            "true"
+          ],
+          "user": "1000:1000",
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "stdin": true,
+          "stderr": false
+        }
+      }
+    },
+    {
+      "name": "open-tcp",
+      "model": "StreamToAgent",
+      "message": {
+        "tcp": {
+          "port": 22,
+          "splice": true
+        }
+      }
+    },
+    {
+      "name": "open-http",
+      "model": "StreamToAgent",
+      "message": {
+        "http": {
+          "port": 3000,
+          "method": "GET",
+          "path": "/a?b=1",
+          "headers": [
+            [
+              "host",
+              "3000-cx-abc123-x.example.com"
+            ],
+            [
+              "upgrade",
+              "websocket"
+            ]
+          ],
+          "body": false
+        }
+      }
+    },
+    {
+      "name": "resize",
+      "model": "StreamToAgent",
+      "message": {
+        "resize": {
+          "cols": 120,
+          "rows": 40
+        }
+      }
+    },
+    {
+      "name": "signal",
+      "model": "StreamToAgent",
+      "message": {
+        "signal": 15
+      }
+    },
+    {
+      "name": "stdin-eof",
+      "model": "StreamToAgent",
+      "message": {
+        "eof": 0
+      }
+    },
+    {
+      "name": "credit-stdout",
+      "model": "StreamToAgent",
+      "message": {
+        "credit": {
+          "ch": 1,
+          "n": 1048576
+        }
+      }
+    },
+    {
+      "name": "ws-close-to",
+      "model": "StreamToAgent",
+      "message": {
+        "close": {
+          "code": 1000,
+          "reason": "bye"
+        }
+      }
+    },
+    {
+      "name": "ok",
+      "model": "StreamFromAgent",
+      "message": {
+        "ok": true
+      }
+    },
+    {
+      "name": "refused",
+      "model": "StreamFromAgent",
+      "message": {
+        "refused": "172.17.0.2"
+      }
+    },
+    {
+      "name": "error",
+      "model": "StreamFromAgent",
+      "message": {
+        "error": "no such container"
+      }
+    },
+    {
+      "name": "status",
+      "model": "StreamFromAgent",
+      "message": {
+        "status": {
+          "code": 101,
+          "headers": [
+            [
+              "sec-websocket-protocol",
+              "vite-hmr"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "eof-stdout",
+      "model": "StreamFromAgent",
+      "message": {
+        "eof": 1
+      }
+    },
+    {
+      "name": "exit",
+      "model": "StreamFromAgent",
+      "message": {
+        "exit": 124
+      }
+    },
+    {
+      "name": "credit-stdin",
+      "model": "StreamFromAgent",
+      "message": {
+        "credit": {
+          "ch": 0,
+          "n": 65536
+        }
+      }
     }
   ],
   "invalid": [
     {
       "name": "no cpus",
       "model": "NodeMessage",
-      "message": { "type": "facts", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 0, "memoryMb": 1, "diskFreeGb": 1 } }
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "docker",
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
+          "cpus": 0,
+          "memoryMb": 1,
+          "diskFreeGb": 1
+        }
+      }
     },
     {
       "name": "more memory than any host has",
       "model": "NodeMessage",
-      "message": { "type": "facts", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1e12, "diskFreeGb": 1 } }
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "docker",
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
+          "cpus": 1,
+          "memoryMb": 1000000000000.0,
+          "diskFreeGb": 1
+        }
+      }
     },
     {
       "name": "fractional cpus",
       "model": "NodeMessage",
-      "message": { "type": "facts", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1.5, "memoryMb": 1, "diskFreeGb": 1 } }
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "docker",
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
+          "cpus": 1.5,
+          "memoryMb": 1,
+          "diskFreeGb": 1
+        }
+      }
     },
     {
       "name": "markup in the version",
       "model": "NodeMessage",
-      "message": { "type": "hello", "protocol": 1, "version": "<img src=x onerror=alert(1)>", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1, "diskFreeGb": 1 }, "machines": [] }
+      "message": {
+        "type": "hello",
+        "protocol": 1,
+        "version": "<img src=x onerror=alert(1)>",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "docker",
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
+          "cpus": 1,
+          "memoryMb": 1,
+          "diskFreeGb": 1
+        },
+        "machines": []
+      }
     },
     {
       "name": "SQL in a machine id",
       "model": "NodeMessage",
-      "message": { "type": "state", "machine": { "id": "cx-1'; DROP TABLE nodes; --", "state": "running" } }
+      "message": {
+        "type": "state",
+        "machine": {
+          "id": "cx-1'; DROP TABLE nodes; --",
+          "state": "running"
+        }
+      }
     },
     {
       "name": "an unknown runtime",
       "model": "NodeMessage",
-      "message": { "type": "facts", "facts": { "arch": "amd64", "runtime": "lxc", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1, "diskFreeGb": 1 } }
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "lxc",
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
+          "cpus": 1,
+          "memoryMb": 1,
+          "diskFreeGb": 1
+        }
+      }
     },
     {
       "name": "an unknown arch",
       "model": "NodeMessage",
-      "message": { "type": "facts", "facts": { "arch": "mips", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1, "diskFreeGb": 1 } }
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "mips",
+          "runtime": "docker",
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
+          "cpus": 1,
+          "memoryMb": 1,
+          "diskFreeGb": 1
+        }
+      }
     },
     {
       "name": "an unknown message type",
       "model": "NodeMessage",
-      "message": { "type": "exec", "argv": ["sh"] }
+      "message": {
+        "type": "exec",
+        "argv": [
+          "sh"
+        ]
+      }
     },
     {
       "name": "a result with a made-up id",
       "model": "NodeMessage",
-      "message": { "type": "result", "id": "../../x", "ok": true }
+      "message": {
+        "type": "result",
+        "id": "../../x",
+        "ok": true
+      }
     },
     {
       "name": "an op outside the fixed set",
       "model": "WorkerMessage",
-      "message": { "type": "op", "id": "op-k2j4h5", "name": "exec", "args": { "argv": ["sh"] } }
+      "message": {
+        "type": "op",
+        "id": "op-k2j4h5",
+        "name": "exec",
+        "args": {
+          "argv": [
+            "sh"
+          ]
+        }
+      }
     },
     {
       "name": "a public key that isn't 32 bytes",
       "model": "NodeJoin",
-      "message": { "token": "cxj_abcdefghijklmnopqrstuvwxyz234567abcdefgh", "publicKey": "AAAA", "version": "v1", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1, "diskFreeGb": 1 } }
+      "message": {
+        "token": "cxj_abcdefghijklmnopqrstuvwxyz234567abcdefgh",
+        "publicKey": "AAAA",
+        "version": "v1",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "docker",
+          "isolation": {
+            "firewall": "unchecked",
+            "unisolated": false
+          },
+          "cpus": 1,
+          "memoryMb": 1,
+          "diskFreeGb": 1
+        }
+      }
+    },
+    {
+      "name": "too many tickets at once",
+      "model": "NodeMessage",
+      "message": {
+        "type": "tickets",
+        "id": "tk-a",
+        "sandbox": "cx-abc123",
+        "count": 9
+      }
+    },
+    {
+      "name": "tickets for something that isn't a sandbox",
+      "model": "NodeMessage",
+      "message": {
+        "type": "tickets",
+        "id": "tk-a",
+        "sandbox": "../nodes",
+        "count": 1
+      }
+    },
+    {
+      "name": "an exec with no argv",
+      "model": "StreamToAgent",
+      "message": {
+        "exec": {
+          "argv": [],
+          "stdin": false,
+          "stderr": true
+        }
+      }
+    },
+    {
+      "name": "two opens in one",
+      "model": "StreamToAgent",
+      "message": {
+        "exec": {
+          "argv": [
+            "true"
+          ],
+          "stdin": false,
+          "stderr": true
+        },
+        "tcp": {
+          "port": 22,
+          "splice": true
+        }
+      }
+    },
+    {
+      "name": "a user with a shell in it",
+      "model": "StreamToAgent",
+      "message": {
+        "exec": {
+          "argv": [
+            "true"
+          ],
+          "user": "root; rm -rf /",
+          "stdin": false,
+          "stderr": true
+        }
+      }
+    },
+    {
+      "name": "no credit",
+      "model": "StreamFromAgent",
+      "message": {
+        "credit": {
+          "ch": 1,
+          "n": 0
+        }
+      }
+    },
+    {
+      "name": "a port out of range",
+      "model": "StreamToAgent",
+      "message": {
+        "tcp": {
+          "port": 70000,
+          "splice": false
+        }
+      }
+    },
+    {
+      "name": "an exit code past 255",
+      "model": "StreamFromAgent",
+      "message": {
+        "exit": 256
+      }
+    },
+    {
+      "name": "stdout eof from the object",
+      "model": "StreamToAgent",
+      "message": {
+        "eof": 1
+      }
     }
-  ]
+  ],
+  "window": 4194304,
+  "streamClose": {
+    "lost": 4404,
+    "badTicket": 4401,
+    "badMessage": 4400,
+    "heartbeat": 4408
+  }
 }

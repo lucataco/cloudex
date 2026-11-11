@@ -131,6 +131,9 @@ export type NodeMachine = z.infer<typeof NodeMachine>;
 
 const OpId = z.string().regex(/^op-[a-z0-9]{1,32}$/, "an op id");
 
+const TicketRequestId = z.string().regex(/^tk-[a-z0-9]{1,32}$/, "a ticket request id");
+const SandboxId = z.string().regex(/^cx-[a-z0-9]{6}$/, "a sandbox id");
+
 // Agent to Worker, as JSON text frames. Besides these, the agent sends "ping"
 // every 10 s, which the Node object answers "pong" without waking.
 export const NodeHello = z.object({
@@ -150,12 +153,28 @@ export const NodeResult = z.object({
   value: z.record(z.string(), z.unknown()).optional(),
   error: z.string().max(2000).optional(),
 });
-export const NodeMessage = z.discriminatedUnion("type", [NodeHello, NodeFactsMessage, NodeStateMessage, NodeResult]);
+// Stream tickets (M3): the agent asks for count of them for one sandbox, to
+// open stream sockets to it (StreamOpen below). The Node object answers with
+// NodeTickets.
+export const STREAM_TICKETS_MAX = 8;
+export const NodeTicketRequest = z.object({
+  type: z.literal("tickets"),
+  id: TicketRequestId,
+  sandbox: SandboxId,
+  count: z.number().int().min(1).max(STREAM_TICKETS_MAX),
+});
+export const NodeMessage = z.discriminatedUnion("type", [NodeHello, NodeFactsMessage, NodeStateMessage, NodeResult, NodeTicketRequest]);
 export type NodeMessage = z.infer<typeof NodeMessage>;
 
 // Worker to agent. The set of ops is fixed: none of them runs anything on the
 // host. M2 has ping (an empty answer, for round trips) and facts (fresh facts).
-export const NodeOpName = z.enum(["ping", "facts"]);
+// M3 adds, for development machines only (a container the agent was told to
+// adopt with --dev-machine; M5 replaces these with real machines):
+// - adopt {sandbox}: the dev machine runs this sandbox from now on; answers
+//   {address}, the machine's address on the host;
+// - release {sandbox}: it doesn't any more (the container stays);
+// - streams {sandbox, count}: open that many more spare stream sockets.
+export const NodeOpName = z.enum(["ping", "facts", "adopt", "release", "streams"]);
 export type NodeOpName = z.infer<typeof NodeOpName>;
 export const NodeOp = z.object({
   type: z.literal("op"),
@@ -163,5 +182,100 @@ export const NodeOp = z.object({
   name: NodeOpName,
   args: z.record(z.string(), z.unknown()),
 });
-export const WorkerMessage = z.discriminatedUnion("type", [NodeOp]);
+// The answer to NodeTicketRequest: tickets for stream sockets (see StreamOpen).
+// An empty list, with error, when the Node object won't issue them.
+export const NodeTickets = z.object({
+  type: z.literal("tickets"),
+  id: TicketRequestId,
+  tickets: z.array(z.string().max(512)).max(STREAM_TICKETS_MAX),
+  error: z.string().max(500).optional(),
+});
+export const WorkerMessage = z.discriminatedUnion("type", [NodeOp, NodeTickets]);
 export type WorkerMessage = z.infer<typeof WorkerMessage>;
+
+// ---------------------------------------------------------------- streams (M3)
+//
+// A stream is a WebSocket the agent opens to GET /v1/node/streams/:sandbox/:stream
+// with the header x-cx-ticket: a ticket the Node object issued over the
+// control socket, good for that node, sandbox and stream id once, for 60 s.
+// The Worker checks it without D1, and the sandbox's object accepts it only if
+// its record names that node and it hasn't seen the stream id before. It is
+// then parked as a spare until the object needs one, and opens it with one
+// StreamOpen text frame.
+//
+// Afterwards:
+// - Binary frames start with a channel byte: 0 is stdin, a request body or a
+//   message to the machine; 1 is stdout, a response body or a message from
+//   the machine; 2 is stderr. A preview's WebSocket uses 3 (to the machine)
+//   and 4 (from it) for text messages.
+// - Text frames are JSON control, StreamToAgent and StreamFromAgent, one key
+//   each, or "cx-hb", which the agent sends every 15 s and the object answers
+//   "cx-hb-ok" without waking.
+// - After {"ok": true} to a tcp open with splice, the stream carries the
+//   connection's bytes as they are, in binary frames with no channel byte
+//   (ssh, whose own windows bound it, so the object can hibernate).
+// - Every other channel has a window of STREAM_WINDOW bytes: a sender sends no
+//   more than the receiver has granted with credit, and the window starts full.
+export const STREAM_WINDOW = 4 << 20;
+export const StreamChannel = { stdin: 0, stdout: 1, stderr: 2, textIn: 3, textOut: 4 } as const;
+// Close codes on a stream socket, besides 1000.
+export const StreamClose = {
+  lost: 4404, // the object holding the stream restarted, or its other half went
+  badTicket: 4401,
+  badMessage: 4400,
+  heartbeat: 4408, // no heartbeat for 45 s
+} as const;
+
+const Pty = z.object({ cols: z.number().int().min(1).max(1000), rows: z.number().int().min(1).max(1000) });
+const HeaderList = z.array(z.tuple([z.string().max(256), z.string().max(16384)])).max(200);
+
+export const StreamExec = z.object({
+  argv: z.array(z.string().max(1 << 20)).min(1).max(4096),
+  cwd: z.string().max(4096).optional(),
+  env: z.record(z.string().max(256), z.string().max(1 << 16)).optional(),
+  user: z.string().regex(/^[0-9a-z_-]{1,32}(:[0-9a-z_-]{1,32})?$/).optional(),
+  pty: Pty.optional(),
+  stdin: z.boolean(), // whether stdin comes on channel 0 (else it's closed at once)
+  stderr: z.boolean(), // whether stderr is wanted on channel 2
+});
+export const StreamTcp = z.object({ port: z.number().int().min(1).max(65535), splice: z.boolean() });
+export const StreamHttp = z.object({
+  port: z.number().int().min(1).max(65535),
+  method: z.string().regex(/^[A-Z]{1,16}$/),
+  path: z.string().max(16384),
+  headers: HeaderList,
+  body: z.boolean(), // whether a body follows on channel 0
+});
+export const StreamOpen = z.union([
+  z.object({ exec: StreamExec }).strict(),
+  z.object({ tcp: StreamTcp }).strict(),
+  z.object({ http: StreamHttp }).strict(),
+]);
+export type StreamOpen = z.infer<typeof StreamOpen>;
+
+const Credit = z.object({ ch: z.number().int().min(0).max(4), n: z.number().int().min(1).max(1 << 30) });
+const WsClose = z.object({ code: z.number().int().min(1000).max(4999), reason: z.string().max(123) });
+
+// The object to the agent, after the open.
+export const StreamToAgent = z.union([
+  StreamOpen,
+  z.object({ resize: Pty }).strict(),
+  z.object({ signal: z.number().int().min(1).max(64) }).strict(),
+  z.object({ eof: z.literal(0) }).strict(), // no more stdin or body
+  z.object({ credit: Credit }).strict(),
+  z.object({ close: WsClose }).strict(),
+]);
+export type StreamToAgent = z.infer<typeof StreamToAgent>;
+
+// The agent to the object.
+export const StreamFromAgent = z.union([
+  z.object({ ok: z.literal(true) }).strict(), // started, or connected
+  z.object({ refused: z.string().max(64) }).strict(), // nothing listens: the address tried
+  z.object({ error: z.string().max(2000) }).strict(), // couldn't start
+  z.object({ status: z.object({ code: z.number().int().min(100).max(599), headers: HeaderList }) }).strict(),
+  z.object({ eof: z.union([z.literal(1), z.literal(2)]) }).strict(),
+  z.object({ exit: z.number().int().min(-1).max(255) }).strict(),
+  z.object({ credit: Credit }).strict(),
+  z.object({ close: WsClose }).strict(),
+]);
+export type StreamFromAgent = z.infer<typeof StreamFromAgent>;

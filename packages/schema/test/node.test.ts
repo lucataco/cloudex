@@ -3,20 +3,37 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { NODE_PROTOCOL, NodeClose, NodeJoin, NodeJoined, NodeMessage, NodeName, NodeResult, WorkerMessage } from "../src/node.ts";
+import {
+  NODE_PROTOCOL,
+  NodeClose,
+  NodeJoin,
+  NodeJoined,
+  NodeMessage,
+  NodeName,
+  NodeResult,
+  STREAM_WINDOW,
+  StreamClose,
+  StreamFromAgent,
+  StreamToAgent,
+  WorkerMessage,
+} from "../src/node.ts";
 
 type Example = { name: string; model: keyof typeof MODELS; message: unknown };
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/node/protocol.json", import.meta.url), "utf8")) as {
   protocol: number;
   close: Record<string, number>;
+  streamClose: Record<string, number>;
+  window: number;
   valid: Example[];
   invalid: Example[];
 };
-const MODELS = { NodeJoin, NodeJoined, NodeMessage, WorkerMessage };
+const MODELS = { NodeJoin, NodeJoined, NodeMessage, WorkerMessage, StreamToAgent, StreamFromAgent };
 
 test("the protocol version and close codes are the ones in the fixture", () => {
   assert.equal(fixture.protocol, NODE_PROTOCOL);
   assert.deepEqual(fixture.close, NodeClose);
+  assert.deepEqual(fixture.streamClose, StreamClose);
+  assert.equal(fixture.window, STREAM_WINDOW);
 });
 
 test("every valid example parses, unchanged", () => {
