@@ -13,7 +13,8 @@
 # VERIFY_NODE_MACHINE_IMAGE (the installer's --machine-image), VERIFY_NODE_DEPLOY=1 (N07,
 # which runs cloudex deploy with $CLOUDFLARE_API_TOKEN), VERIFY_NODE_LONG=1 (N12's 30 idle
 # minutes, and with VERIFY_NODE_DEPLOY=1 N13's deploy during an scp), VERIFY_NODE_REBOOT=1
-# (N23 reboots the host), and with VERIFY_NODE_DEPLOY=1, N44's deploy during a node save.
+# (N23 reboots the host), and with VERIFY_NODE_DEPLOY=1, N44's deploy during a node save;
+# VERIFY_NODE_PARTS (default "m3 m4 m5 m6") runs only those milestones' checks after the install.
 # VERIFY_NODE=<node> (v0.2.2): the lifecycle, connect, inside, agents, tokens, dashboard, sdk
 # and browser areas make their sandboxes on that node, which must be online (cloudex node
 # add, then its installer), instead of on Cloudflare; what isn't on nodes yet (forks, sizes
@@ -1393,7 +1394,13 @@ node_m6() {
 
 	# N39: the cloudex command inside, and stop from inside.
 	local i1 i2 i3="" stin=""
-	i1=$("$CX" exec "$S6" -- 'cloudex info --json' 2>/dev/null | jq -r .id)
+	local e39=""
+	for _ in 1 2; do
+		i1=$("$CX" exec "$S6" -- 'cloudex info --json' 2>"$work/e39" | jq -r .id 2>/dev/null)
+		[[ $i1 == "$S6ID" ]] && break
+		e39="$e39 first try: $(head -c 200 "$work/e39");"
+		sleep 3
+	done
 	i2=$("$CX" exec "$S6" -- 'cloudex set --idle 45m --json' 2>/dev/null | jq -r .idleMinutes)
 	if [[ -n $ZONE ]]; then
 		"$CX" exec -d "$S6" -- 'mkdir -p /tmp/n39 && echo n39 >/tmp/n39/index.html && cd /tmp/n39 && exec python3 -m http.server 8125' >/dev/null 2>&1
@@ -1407,7 +1414,7 @@ node_m6() {
 	t39=$(since "$t39")
 	local kept39
 	kept39=$("$CX" resume "$S6" >/dev/null 2>&1; "$CX" exec "$S6" -- 'cat ~/n39' 2>/dev/null)
-	OUT="info: $i1; set --idle: $i2; host: ${i3:-no preview domain}; stopped from inside after $t39 s ($stin); its file after resume: $kept39" CODE=""
+	OUT="info: $i1${e39:+ ($e39)}; set --idle: $i2; host: ${i3:-no preview domain}; stopped from inside after $t39 s ($stin); its file after resume: $kept39" CODE=""
 	ok N39 "$(m6_desc N39)" [ "$i1" = "$S6ID" -a "$i2" = 45 -a \( -z "$ZONE" -o "$i3" = n39 \) -a "$stin" = stopped -a "$kept39" = n39 ]
 
 	# N40: activity from inside (a background command pings cloudex.internal
@@ -1430,7 +1437,10 @@ node_m6() {
 	t41=$(now_s)
 	cx new --from "$P-n6s" --name "$P-n6cf" --no-use
 	mv1=$(since "$t41")
+	local e41=""
+	[[ $CODE != 0 ]] && e41=" (new said: $(grep -m1 '^error' <<<"$ERR" | head -c 200))"
 	cf1=$(field '.[0].placement.provider')
+	[[ -n $cf1 ]] || cf1=$("$CX" info "$P-n6cf" --json 2>/dev/null | jq -r .placement.provider)
 	f41a=$("$CX" exec "$P-n6cf" -- 'cat ~/n41 /opt/n41; ls /usr/local/share/ca-certificates; grep -c "Cloudex: provider hosts" /etc/hosts' 2>/dev/null | tr '\n' ' ')
 	"$CX" exec "$P-n6cf" -- 'echo back >> ~/n41' >/dev/null 2>&1
 	cx save "$P-n6cf" "$P-n6c"
@@ -1441,8 +1451,8 @@ node_m6() {
 	nb1=$(field '.[0].placement.node.name')
 	f41b=$("$CX" exec "$P-n6b2" -- 'cat ~/n41 /opt/n41; ls /usr/local/share/ca-certificates; grep -c "^[0-9.]* api.anthropic.com$" /etc/hosts' 2>/dev/null | tr '\n' ' ')
 	local listed
-	listed=$("$CX" saves 2>/dev/null | grep -E "^$P-n6[sc] " | awk '{print $1, $NF}' | sort | tr '\n' ' ')
-	OUT="node save made on $sv1, started on $cf1 in $mv1 s: $f41a; Cloudflare save made on $sv2, started on node $nb1 in $mv2 s: $f41b; saves: $listed" CODE=""
+	listed=$("$CX" saves --json=false 2>/dev/null | grep -E "^$P-n6[sc] " | awk '{print $1, $NF}' | sort | tr '\n' ' ')
+	OUT="node save made on $sv1, started on $cf1 in $mv1 s$e41: $f41a; Cloudflare save made on $sv2, started on node $nb1 in $mv2 s: $f41b; saves: $listed" CODE=""
 	local cfwant="moved sys cloudflare-containers-ca.crt 0 " ndwant="moved back sys cloudex-node-ca.crt 1 "
 	[[ -z $providers ]] && cfwant="moved sys 0 " ndwant="moved back sys 0 "
 	ok N41 "$(m6_desc N41)" [ "$sv1" = "$N" -a "$cf1" = cloudflare -a "$f41a" = "$cfwant" -a "$sv2" = cloudflare -a "$nb1" = "$N" -a "$f41b" = "$ndwant" \
@@ -1500,6 +1510,9 @@ forged-source 000"
 	# N43: the agent's listening sockets, from its own network namespace.
 	local l43 bad43
 	l43=$(node_sh "docker run --rm --network container:cloudex-node --entrypoint ss $(node_sh "docker inspect $MC -f '{{.Config.Image}}'") -Hltn" 2>/dev/null | awk '{print $4}' | sort | tr '\n' ' ')
+	# 127.0.0.11 is Docker's embedded DNS resolver, which dockerd runs in every
+	# container's namespace on a user network; it isn't the agent's.
+	l43=$(tr ' ' '\n' <<<"$l43" | grep . | grep -v '^127\.0\.0\.11:' | tr '\n' ' ')
 	bad43=$(tr ' ' '\n' <<<"$l43" | grep . | grep -vE '^10\.|^172\.' ; tr ' ' '\n' <<<"$l43" | grep . | grep -vE ':(80|443)$'; for a in $ctl; do tr ' ' '\n' <<<"$l43" | grep -F "$a:"; done)
 	OUT="listening: $l43" CODE=""
 	ok N43 "$(m6_desc N43)" [ -n "$(grep -F "$own:80" <<<"$l43")" -a -n "$(grep -F "$own:443" <<<"$l43")" -a -z "$bad43" ]
@@ -1670,10 +1683,13 @@ if want node; then
 			fi
 
 			M3_SANDBOX="" M3_ID="" REBOOTED=""
-			node_m3
-			node_m4
-			node_m5
-			node_m6
+			# VERIFY_NODE_PARTS picks the milestones' checks to run after the
+			# install (default all): m3 m4 m5 m6.
+			parts=" ${VERIFY_NODE_PARTS:-m3 m4 m5 m6} "
+			if [[ $parts == *" m3 "* ]]; then node_m3; else m3_skip "not in VERIFY_NODE_PARTS"; fi
+			if [[ $parts == *" m4 "* ]]; then node_m4; else m4_skip "not in VERIFY_NODE_PARTS" "N18 N19 N20 N21 N22 N23 N24"; fi
+			if [[ $parts == *" m5 "* ]]; then node_m5; else m5_skip "not in VERIFY_NODE_PARTS"; fi
+			if [[ $parts == *" m6 "* ]]; then node_m6; else m6_skip "not in VERIFY_NODE_PARTS"; fi
 			[[ -n $M3_SANDBOX ]] && "$CX" delete "$M3_SANDBOX" --yes >/dev/null 2>&1
 			left=$(node_sh "docker ps -aq --filter label=build.cloudex.role=machine | wc -l; docker network ls -q --filter label=build.cloudex.role=machine | wc -l" | tr '\n' ' ')
 			# N35: a node with a sandbox is removed only with --force, which
