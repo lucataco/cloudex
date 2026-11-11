@@ -159,3 +159,26 @@ test("a sandbox deleted with --force while the index still lists it isn't report
   assert.deepEqual(plan.reports, []);
   assert.deepEqual(plan.orphans, []);
 });
+
+// 2026-11-12 review, W4: a running sandbox on a node that stays offline.
+test("a sandbox whose node stays offline asks its node less and less often, at most every 6 hours", async () => {
+  const { offlineAlarm, nodeRetryAt, NODE_RETRY_MAX_MS } = await import("../src/placement.ts");
+  const t0 = 1_000_000_000;
+  let down: { since: number; tries?: number; retryAt?: number } | null = { since: t0 };
+  let now = t0;
+  let asks = 0;
+  const end = t0 + 48 * 3600_000;
+  while (now < end) {
+    const plan = offlineAlarm(down, now, 60_000);
+    if (plan.ask) {
+      asks++; // and the node is still offline: nodeOp's 503
+      const tries: number = (down!.tries ?? 0) + 1;
+      down = { since: t0, tries, retryAt: nodeRetryAt(now, tries) };
+    }
+    now = plan.next;
+  }
+  assert.ok(asks <= 12, `asked ${asks} times in 48 hours`);
+  assert.ok(asks >= 6, `but it does keep trying (${asks})`);
+  assert.equal(nodeRetryAt(0, 30), NODE_RETRY_MAX_MS);
+  assert.equal(offlineAlarm(null, 5, 60_000).ask, true);
+});

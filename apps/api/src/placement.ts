@@ -33,6 +33,24 @@ export function seenText(ms: number | null | undefined): string {
 
 export const offlineMessage = (name: string, lastSeenAt: number | null | undefined) => `node ${name} is offline (${seenText(lastSeenAt)})`;
 
+// While a sandbox's node is offline its alarm doesn't ask the node's object
+// each minute: it tries again 10 minutes after it went down, then after 20,
+// 40 and so on, at most every 6 hours (2026-11-12 review, W4). The node
+// coming back says so itself (Sandbox.nodeReport), so nothing waits for this.
+export const NODE_RETRY_FIRST_MS = 10 * 60_000;
+export const NODE_RETRY_MAX_MS = 6 * 3600_000;
+export function nodeRetryAt(lastTryAt: number, tries: number): number {
+  return lastTryAt + Math.min(NODE_RETRY_FIRST_MS * 2 ** Math.min(tries, 16), NODE_RETRY_MAX_MS);
+}
+
+// The alarm of a running sandbox whose node is offline: whether it may ask
+// the node's object now, and when it runs next.
+export function offlineAlarm(down: { since: number; retryAt?: number } | null, now: number, everyMs: number): { ask: boolean; next: number } {
+  if (!down) return { ask: true, next: now + everyMs };
+  const retryAt = down.retryAt ?? nodeRetryAt(down.since, 0);
+  return now < retryAt ? { ask: false, next: Math.max(retryAt, now + everyMs) } : { ask: true, next: now + everyMs };
+}
+
 export const removedMessage = (name: string) => `node ${name} was removed (cloudex node rm), so its sandboxes can't run any more; delete this one`;
 
 export type Placer = { ownOnly: boolean };

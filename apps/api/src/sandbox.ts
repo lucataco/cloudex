@@ -89,7 +89,10 @@ import {
 } from "./settings";
 import type { NodeEgressInfo } from "./nodeegress";
 import { NodeStreams } from "./nodestream";
-import { type MachineReport, machineAction, nodeIsolation, offlineMessage, removedMessage } from "./placement";
+import { type MachineReport, machineAction, nodeIsolation, nodeRetryAt, offlineAlarm, offlineMessage, removedMessage } from "./placement";
+
+// A sandbox's node is offline since since; tries failed asks since, and the next is at retryAt (nodeRetryAt).
+type NodeDown = { since: number; lastSeenAt: number | null; tries?: number; retryAt?: number };
 import { tokenAlive } from "./tokens";
 import { CREDENTIAL_ENDED, LINK_HEADER, TOKEN_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
@@ -283,7 +286,7 @@ export class Sandbox extends DurableObject<Env> {
   // Set while the node is known to be offline (its Node object said so, or
   // an op found it so), so that the alarm doesn't keep asking it; cleared by
   // the next sign that it's back. Advisory: requests try the node anyway.
-  private nodeDown: { since: number; lastSeenAt: number | null } | null = null;
+  private nodeDown: NodeDown | null = null;
   // Set once its node was removed (cloudex node rm --force): it can't run again.
   private nodeGone = false;
   private get compute(): Compute {
@@ -313,7 +316,7 @@ export class Sandbox extends DurableObject<Env> {
     void ctx.blockConcurrencyWhile(async () => {
       this.record = await ctx.storage.get<SandboxRecord>("sandbox");
       this.place(await ctx.storage.get<NodePlacement>("node"));
-      this.nodeDown = (await ctx.storage.get<{ since: number; lastSeenAt: number | null }>("nodeDown")) ?? null;
+      this.nodeDown = (await ctx.storage.get<NodeDown>("nodeDown")) ?? null;
       this.nodeGone = Boolean(this.onNode) && (await ctx.storage.get<string>("revokedNode")) === this.onNode?.placement.node;
       this.lastActivity = (await ctx.storage.get<number>("lastActivity")) ?? Date.now();
       // Nothing that held a save grant survives a restart.
@@ -2127,7 +2130,7 @@ export class Sandbox extends DurableObject<Env> {
     return offlineMessage(p.name, lastSeenAt);
   }
 
-  private async setNodeDown(down: { since: number; lastSeenAt: number | null } | null) {
+  private async setNodeDown(down: NodeDown | null) {
     if (down === null && this.nodeDown === null) return;
     this.nodeDown = down;
     if (down) await this.ctx.storage.put("nodeDown", down);
@@ -2150,7 +2153,9 @@ export class Sandbox extends DurableObject<Env> {
       if (status === 503) {
         const seen = /last seen (\d{4}-\d\d-\d\dT[\d:.]+Z)/.exec(why)?.[1];
         const lastSeenAt = seen ? Date.parse(seen) : (this.nodeDown?.lastSeenAt ?? null);
-        await this.setNodeDown({ since: this.nodeDown?.since ?? Date.now(), lastSeenAt });
+        // Each failed try puts the next one further off (nodeRetryAt).
+        const tries = this.nodeDown ? (this.nodeDown.tries ?? 0) + 1 : 0;
+        await this.setNodeDown({ since: this.nodeDown?.since ?? Date.now(), lastSeenAt, tries, retryAt: nodeRetryAt(Date.now(), tries) });
         fail(503, /offline/.test(why) ? this.offline(lastSeenAt) : `node ${p.name}: ${why}`);
       }
       // An agent's own refusal ("[502] the node's agent answered: ...").
@@ -2287,10 +2292,12 @@ export class Sandbox extends DurableObject<Env> {
   // whose token was revoked end, and idle stop and stop from inside run as
   // on Cloudflare. There's no 6-hour limit. While the node is offline
   // nothing here can act (its machine keeps running there), so it doesn't
-  // keep asking; after 10 minutes it tries once more.
+  // keep asking: it tries again after 10 minutes, then less and less often
+  // (nodeRetryAt), and sleeps until then; the node coming back wakes it.
   private async alarmOnNode(r: SandboxRecord, stopRequested: boolean) {
     await this.nodeAlarm();
-    const down = this.nodeDown !== null && Date.now() - this.nodeDown.since < 10 * 60_000;
+    const plan = offlineAlarm(this.nodeDown, Date.now(), ALARM_EVERY_MS);
+    const down = !plan.ask;
     if (!down && (stopRequested || this.idle())) {
       try {
         const stopped = await this.exclusive(async () => {
@@ -2313,7 +2320,7 @@ export class Sandbox extends DurableObject<Env> {
       }).catch((e) => console.error(`[${r.id}] ${message(e)}`));
     }
     if (this.record?.state !== "running") return;
-    await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+    await this.ctx.storage.setAlarm(down ? plan.next : Date.now() + ALARM_EVERY_MS);
   }
 
   // From the node's Node object (node.ts): the node went offline or came
@@ -2324,8 +2331,14 @@ export class Sandbox extends DurableObject<Env> {
     const p = this.onNode?.placement;
     if (!p || p.node !== node || !this.record || this.removing) return;
     if (!rep.online) {
-      await this.setNodeDown({ since: this.nodeDown?.since ?? Date.now(), lastSeenAt: rep.lastSeenAt });
+      const since = this.nodeDown?.since ?? Date.now();
+      await this.setNodeDown({ since, lastSeenAt: rep.lastSeenAt, tries: this.nodeDown?.tries ?? 0, retryAt: this.nodeDown?.retryAt ?? nodeRetryAt(since, 0) });
       return;
+    }
+    if (this.nodeDown && this.record.state === "running") {
+      // Back: the alarm, asleep until the next try, runs again each minute.
+      const at = await this.ctx.storage.getAlarm();
+      if (at === null || at > Date.now() + ALARM_EVERY_MS) await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
     }
     await this.setNodeDown(null);
     const machine = rep.machine;
