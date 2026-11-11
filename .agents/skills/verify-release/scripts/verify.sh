@@ -824,6 +824,8 @@ node_m3() {
 	OUT="left after a terminal closed: $h1; after the client dropped an exec: $h2; after the agent died mid-exec and came back: $h3; a ticket as issued, replayed, altered, for another stream: $probe_codes" CODE=""
 	ok N16 "$(m3_desc N16)" [ "$h1" = 0 -a "$h2" = 0 -a "$h3" = 0 -a "$probe_codes" = "101 401 401 401" ]
 
+	# A dev machine outlives its sandbox (until M4), so what the checks started goes first.
+	in_m 'pkill -f "[v]r-app.js"; true' >/dev/null
 	"$CX" delete "$NM" --yes >/dev/null 2>&1
 }
 if want node; then
