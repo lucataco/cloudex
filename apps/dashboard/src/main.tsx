@@ -9,6 +9,7 @@ import { api, version, whoAmI } from "./api";
 import { Link, match, navigate, useLocation } from "./router";
 import { Access } from "./pages/access";
 import { Login } from "./pages/login";
+import { Nodes } from "./pages/nodes";
 import { Saves } from "./pages/saves";
 import { SandboxPage } from "./pages/sandbox";
 import { Sandboxes } from "./pages/sandboxes";
@@ -33,6 +34,7 @@ function Shell() {
   if (path === "/") page = <Sandboxes me={me} />;
   else if (s) page = <SandboxPage ref_={s.ref!} me={me} />;
   else if (path === "/saves") page = <Saves me={me} />;
+  else if (path === "/nodes" && me.role === "admin") page = <Nodes />;
   else if (path === "/access") page = <Access me={me} />;
   else page = <p class="muted">There's no page at {path}.</p>;
 
@@ -56,6 +58,7 @@ function Shell() {
         <nav>
           {nav("/", "Sandboxes", path === "/" || !!s)}
           {nav("/saves", "Saves", path === "/saves")}
+          {me.role === "admin" ? nav("/nodes", "Nodes", path === "/nodes") : null}
           {me.role === "admin" ? nav("/access", "Access", path === "/access") : null}
         </nav>
         <div class="who">

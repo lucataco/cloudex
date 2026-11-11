@@ -3,7 +3,7 @@ import type { HostLink, Me, Sandbox, SandboxSettings } from "@cloudex/schema";
 import { useState } from "preact/hooks";
 import { del, get, patch, post, sb } from "../api";
 import { Link, match, navigate, useLocation } from "../router";
-import { Act, Cmd, Copy, Loading, Problem, State, ago, bytes, usePoll, when } from "../ui";
+import { Act, Cmd, Copy, ISOLATION_TEXT, Loading, Problem, State, ago, bytes, limitsText, onNode, usePoll, when, whereText } from "../ui";
 import { Agents } from "./agents";
 import { Commands } from "./commands";
 import { Desktop } from "./desktop";
@@ -61,7 +61,12 @@ export function SandboxPage(props: { ref_: string; me: Me }) {
       {tab === "" ? <Overview box={box} me={props.me} reload={s.reload} /> : null}
       {tab !== "" && tab !== "terminal" && !running ? <NotRunning box={box} reload={s.reload} /> : null}
       {running && tab === "desktop" ? <Desktop box={box} /> : null}
-      {running && tab === "agents" ? <Agents box={box} me={props.me} /> : null}
+      {running && tab === "agents" && onNode(box) ? (
+        <section class="card">
+          <p>Agents need the deployment's provider keys, which don't reach sandboxes on nodes yet. Start agents in a sandbox on Cloudflare.</p>
+        </section>
+      ) : null}
+      {running && tab === "agents" && !onNode(box) ? <Agents box={box} me={props.me} /> : null}
       {running && tab === "commands" ? <Commands box={box} me={props.me} /> : null}
       {running && tab === "files" ? <Files box={box} me={props.me} /> : null}
     </>
@@ -106,16 +111,38 @@ function Overview(props: { box: Sandbox; me: Me; reload: () => unknown }) {
         <dl class="facts">
           <dt>Id</dt>
           <dd class="mono">{box.id}</dd>
-          <dt>Size</dt>
-          <dd class="mono">{box.size}</dd>
+          <dt>Runs on</dt>
+          <dd class={onNode(box) && !box.placement?.node?.online ? "problem-text" : ""}>
+            {onNode(box) ? `node ${whereText(box)}` : "Cloudflare"}
+            {onNode(box) && box.placement?.node?.state === "offline" ? `, last seen ${ago(box.placement.node.lastSeenAt)}` : ""}
+          </dd>
+          {box.isolation ? (
+            <>
+              <dt>Isolation</dt>
+              <dd>{ISOLATION_TEXT[box.isolation] ?? box.isolation}</dd>
+            </>
+          ) : null}
+          {onNode(box) ? (
+            <>
+              <dt>Machine</dt>
+              <dd class="mono">{limitsText(box)}</dd>
+            </>
+          ) : (
+            <>
+              <dt>Size</dt>
+              <dd class="mono">{box.size}</dd>
+            </>
+          )}
           <dt>Made</dt>
           <dd title={when(box.createdAt)}>{ago(box.createdAt)}</dd>
           <dt>{box.state === "running" ? "Started" : "Stopped"}</dt>
           <dd>{ago(box.state === "running" ? box.startedAt : box.stoppedAt)}</dd>
-          <dt>Last save</dt>
-          <dd>
-            {box.savedAt ? `${ago(box.savedAt)}, ${bytes(box.savedBytes)}` : "–"}
-          </dd>
+          {onNode(box) ? null : (
+            <>
+              <dt>Last save</dt>
+              <dd>{box.savedAt ? `${ago(box.savedAt)}, ${bytes(box.savedBytes)}` : "–"}</dd>
+            </>
+          )}
           {box.backupAt ? (
             <>
               <dt>Backup</dt>
@@ -169,7 +196,13 @@ function Overview(props: { box: Sandbox; me: Me; reload: () => unknown }) {
         )}
       </section>
       {write ? <Links box={box} /> : null}
-      {write ? <ForkAndSave box={box} me={props.me} /> : null}
+      {write && !onNode(box) ? <ForkAndSave box={box} me={props.me} /> : null}
+      {write && onNode(box) ? (
+        <section class="card">
+          <h2>Fork and save</h2>
+          <p class="muted small">Forks and named saves of a sandbox on a node aren't available yet. Copy what you need with cloudex cp.</p>
+        </section>
+      ) : null}
     </div>
   );
 }

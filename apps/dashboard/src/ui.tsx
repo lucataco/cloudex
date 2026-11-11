@@ -1,5 +1,6 @@
 // Pieces every page uses: formatting, polling, status lights, buttons that
 // show their call is running, and the error line.
+import type { Sandbox } from "@cloudex/schema";
 import type { ComponentChildren } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 
@@ -174,3 +175,38 @@ export const SIZE_NOTE: Record<string, string> = {
 };
 
 export const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+// Where a sandbox runs (v0.2.2): Cloudflare, or a node by name, with whether
+// it's offline or was removed. A node's name and everything about it come
+// from outside the deployment's code, so all of it is shown as text only.
+export function whereText(s: Sandbox): string {
+  const n = s.placement?.provider === "node" ? s.placement.node : undefined;
+  if (s.placement?.provider !== "node") return "Cloudflare";
+  if (!n) return "a node";
+  if (n.state === null || n.state === "revoked") return `${n.name} (removed)`;
+  return n.online ? n.name : `${n.name} (offline)`;
+}
+
+export const onNode = (s: Sandbox) => s.placement?.provider === "node";
+
+export const ISOLATION_TEXT: Record<string, string> = {
+  vm: "VM (Cloudflare)",
+  sysbox: "Sysbox",
+  docker: "plain Docker: trusted code only",
+  none: "none: testing only",
+};
+
+// What a node's machines run under, from its own report.
+export function nodeIsolationText(n: { runtime: string | null; isolation: { firewall: string; unisolated: boolean } | null }): string {
+  if (!n.isolation) return "–";
+  if (n.isolation.unisolated) return ISOLATION_TEXT.none!;
+  if (n.isolation.firewall === "fail") return "self-test failing: runs no sandboxes";
+  if (n.isolation.firewall === "unchecked") return "self-test not run yet";
+  return n.runtime === "sysbox" ? ISOLATION_TEXT.sysbox! : ISOLATION_TEXT.docker!;
+}
+
+export function limitsText(s: Sandbox): string {
+  const p = s.placement;
+  if (!p || p.cpus === undefined || p.memoryMb === undefined) return "–";
+  return `${p.cpus} CPU${p.cpus === 1 ? "" : "s"}, ${(p.memoryMb / 1024).toFixed(1)} GiB`;
+}
