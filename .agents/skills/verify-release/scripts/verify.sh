@@ -1962,10 +1962,12 @@ node_review_worker() {
 	local fkst
 	fkst="the fake agent $(node_sh "docker inspect $fk -f '{{.State.Status}}'" 2>/dev/null || echo gone), its last lines: $(grep -v '^{' <<<"$l56" | tail -3 | tr '\n' ' ')"
 	l56=$(grep '^{' <<<"$l56")
-	"$CX" delete "$P-n56" --yes >/dev/null 2>&1
+	# The real agent deletes the sandbox (the fake one may have gone: an edge
+	# reset ends it), so that N35 finds only its own.
 	node_sh "docker rm -f $fk" >/dev/null 2>&1
 	start_agent
 	wait_state "$N" online 30 >/dev/null
+	"$CX" delete "$P-n56" --yes >/dev/null 2>&1 || "$CX" delete "$P-n56" --yes --force >/dev/null 2>&1
 	ov=$(jq -c 'select(.kind == "overrun")' <<<"$l56" | head -1) ch=$(jq -c 'select(.kind == "channel")' <<<"$l56" | head -1) sp=$(jq -c 'select(.kind == "splice")' <<<"$l56" | head -1)
 	OUT="sandbox on the fake agent: ${s56:-none} ${ERR:0:120}; overrun $ov; channel $ch; splice $sp; $fkst" CODE=""
 	ok N56 "$(review_desc N56)" [ "$(jq -r .closeCode <<<"$ov")" = 4400 -a "$(jq -r '.sentBytes < 32*1048576' <<<"$ov")" = true \
