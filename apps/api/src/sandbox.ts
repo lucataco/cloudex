@@ -74,6 +74,7 @@ import {
   getSave,
   readManifest,
   recordSave,
+  saveProvenance,
   saveView,
 } from "./saves";
 import {
@@ -161,7 +162,8 @@ type CreateInput = {
   files?: Record<string, string>;
   repo?: string | Repo;
 };
-export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?: StoredSettings };
+// madeOn: the node the source's disk came from, if any (saveProvenance).
+export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?: StoredSettings; madeOn?: { id: string; name: string } };
 // What a node's Node object tells a sandbox on it (v0.2.2 M5): whether the
 // node is online, and with a report, its machine's state.
 export type NodeReport = { online: boolean; lastSeenAt: number | null; machine?: MachineReport };
@@ -482,6 +484,9 @@ export class Sandbox extends DurableObject<Env> {
       }
       // The same for a named save, which is restored again until then.
       if (save) await this.ctx.storage.put("fromSave", save);
+      // Where its disk came from, for the saves it makes (2026-11-12 review, W7).
+      const madeOn = save?.node ?? from?.madeOn;
+      if (madeOn) await this.ctx.storage.put("madeOn", madeOn);
       try {
         await this.boot(from?.snapshot, undefined, save);
       } catch (e) {
@@ -574,6 +579,11 @@ export class Sandbox extends DurableObject<Env> {
 
   // The disk a fork starts from: a fresh save of a running sandbox, which keeps
   // running (the filesystem freezes for a moment), or a stopped one's last save.
+  private async madeOn(): Promise<{ madeOn?: { id: string; name: string } }> {
+    const m = await this.ctx.storage.get<{ id: string; name: string }>("madeOn");
+    return m ? { madeOn: m } : {};
+  }
+
   async forkPoint(): Promise<ForkSource> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
@@ -588,7 +598,7 @@ export class Sandbox extends DurableObject<Env> {
         );
         console.log(`[${r.id}] saved ${snap.size} bytes for a fork in ${Date.now() - t0} ms`);
         this.touch();
-        return { sandbox: r.id, snapshot: { id: snap.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
+        return { sandbox: r.id, snapshot: { id: snap.id }, settings: await this.ctx.storage.get<StoredSettings>("settings"), ...(await this.madeOn()) };
       }
       if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
       const snapshot = await this.ctx.storage.get<{ id: string }>("snapshot");
@@ -597,7 +607,7 @@ export class Sandbox extends DurableObject<Env> {
       if (Date.now() - touched > SAVE_LIFETIME_MS) {
         fail(409, `${r.name ?? r.id}'s save has expired; resume it (which restores its backup), then fork it`);
       }
-      return { sandbox: r.id, snapshot: { id: snapshot.id }, settings: await this.ctx.storage.get<StoredSettings>("settings") };
+      return { sandbox: r.id, snapshot: { id: snapshot.id }, settings: await this.ctx.storage.get<StoredSettings>("settings"), ...(await this.madeOn()) };
     });
   }
 
@@ -1093,7 +1103,7 @@ export class Sandbox extends DurableObject<Env> {
         createdAt: t0,
         ms: Date.now() - t0,
         settings: await this.ctx.storage.get<StoredSettings>("settings"),
-        ...(this.onNode ? { node: { id: this.onNode.placement.node, name: this.onNode.placement.name } } : {}),
+        ...saveProvenance(this.onNode ? { id: this.onNode.placement.node, name: this.onNode.placement.name } : null, await this.ctx.storage.get<{ id: string; name: string }>("madeOn")),
       };
       const replaced = await recordSave(this.env.DB, bucket, m);
       console.log(`[${r.id}] saved as ${name} (${s.kind}, ${s.files} paths, ${s.bytes} bytes) in ${m.ms} ms`);

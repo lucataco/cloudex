@@ -46,6 +46,15 @@ export interface SaveManifest {
   node?: { id: string; name: string };
 }
 
+// The node a new save names (Save.node): the one it's made on, or, for a
+// sandbox on Cloudflare whose disk came from a node's save (or a fork of
+// one), that node: content a node wrote stays marked as the node's through
+// saves and forks on Cloudflare (2026-11-12 review, W7).
+export function saveProvenance(on: { id: string; name: string } | null, madeOn: { id: string; name: string } | undefined): { node?: { id: string; name: string } } {
+  const node = on ?? madeOn;
+  return node ? { node } : {};
+}
+
 // What the save script prints, last.
 export type SaveSummary = Pick<SaveManifest, "kind" | "image" | "parts" | "bytes" | "rawBytes" | "files" | "home" | "deleted">;
 

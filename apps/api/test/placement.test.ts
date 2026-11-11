@@ -182,3 +182,15 @@ test("a sandbox whose node stays offline asks its node less and less often, at m
   assert.equal(nodeRetryAt(0, 30), NODE_RETRY_MAX_MS);
   assert.equal(offlineAlarm(null, 5, 60_000).ask, true);
 });
+
+// 2026-11-12 review, W7: a save's provenance survives a trip through Cloudflare.
+test("a save names the node it was made on, or the node its sandbox's disk came from", async () => {
+  await import("./d1.ts");
+  const { saveProvenance } = await import("../src/saves.ts");
+  const a = { id: "nd-aaaa1111", name: "box-a" };
+  const b = { id: "nd-bbbb2222", name: "box-b" };
+  assert.deepEqual(saveProvenance(null, undefined), {});
+  assert.deepEqual(saveProvenance(b, undefined), { node: b });
+  assert.deepEqual(saveProvenance(null, a), { node: a }, "on Cloudflare, started from a's save");
+  assert.deepEqual(saveProvenance(b, a), { node: b }, "made on b: b put it there last");
+});
