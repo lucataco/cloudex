@@ -436,9 +436,18 @@ func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client
 				return err
 			}
 			shown := display(cmd.Context(), client, r)
-			fmt.Fprintf(cmd.ErrOrStderr(), "%s %s...\n", doing, shown)
 			ctx, cancel := context.WithTimeout(cmd.Context(), lifecycleTimeout)
 			defer cancel()
+			saying := doing
+			if use == "stop" {
+				// A sandbox on a node keeps its disk there: nothing is saved.
+				gctx, gcancel := context.WithTimeout(ctx, 15*time.Second)
+				if s, err := client.Get(gctx, r); err == nil && s.OnNode() != nil {
+					saying = "Stopping"
+				}
+				gcancel()
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s %s...\n", saying, shown)
 			s, err := call(client, ctx, r)
 			if err != nil {
 				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -467,6 +476,9 @@ func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client
 func newStopCmd(opts *options) *cobra.Command {
 	return lifecycleCmd(opts, "stop", "Save a sandbox's disk and stop it", "Saving and stopping",
 		(*api.Client).Stop, func(s *api.Sandbox) string {
+			if s.State == "stopped" && s.OnNode() != nil {
+				return "is stopped; its disk stays on node " + clean(s.OnNode().Name)
+			}
 			if s.State == "stopped" {
 				return "is stopped; its disk is saved"
 			}

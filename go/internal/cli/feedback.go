@@ -272,8 +272,14 @@ func describeCommand(ran *cobra.Command, args []string) (string, []string) {
 // API failing on its own side. (Crashes say so themselves.)
 func looksLikeABug(err error) bool {
 	var apiErr *api.Error
-	return errors.As(err, &apiErr) && apiErr.Status >= 500
+	if !errors.As(err, &apiErr) || apiErr.Status < 500 {
+		return false
+	}
+	// Not available yet (501), and a node that's offline, are no bugs.
+	return apiErr.Status != 501 && !nodeOffline.MatchString(apiErr.Message)
 }
+
+var nodeOffline = regexp.MustCompile(`^node \S+ is offline \(`)
 
 var (
 	previewHost  = regexp.MustCompile(`(?i)(\d{1,5})-(cx-[a-z0-9]{6})-[a-z0-9]{10}\b`)

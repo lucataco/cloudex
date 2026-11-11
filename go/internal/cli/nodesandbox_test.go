@@ -183,3 +183,19 @@ func TestDoctorWarnsAboutNodesWithoutFailing(t *testing.T) {
 		t.Errorf("a node problem is a warning, not a fix: %q (code %d)", out, code)
 	}
 }
+
+func TestAnOfflineNodeOrSomethingNotOnNodesYetIsNoBugToReport(t *testing.T) {
+	withFakeAPI(t, map[string]string{
+		"POST /v1/sandboxes/n1/exec": `!503 {"error":"node box is offline (last seen 2026-11-11 14:02 UTC)"}`,
+		"POST /v1/sandboxes/n1/fork": `!501 {"error":"forks aren't available for a sandbox on a node yet; copy what you need with cloudex cp, or start a new sandbox on the node"}`,
+		"POST /v1/sandboxes/n1/stop": `!503 {"error":"the deployment's storage didn't answer"}`,
+	})
+	for _, args := range [][]string{{"exec", "n1", "--", "true"}, {"fork", "n1"}} {
+		if code, _, errOut := run(t, args...); code == 0 || strings.Contains(errOut, "feedback --last-error") {
+			t.Errorf("%v: code %d, stderr %q", args, code, errOut)
+		}
+	}
+	if _, _, errOut := run(t, "stop", "n1"); !strings.Contains(errOut, "feedback --last-error") {
+		t.Errorf("another 503 should still suggest a report: %q", errOut)
+	}
+}

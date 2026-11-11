@@ -18,7 +18,7 @@ import (
 )
 
 func newRunCmd(opts *options) *cobra.Command {
-	var name, size, from, dir, workdir string
+	var name, size, from, dir, workdir, on string
 	idle, timeout := 30*time.Minute, time.Duration(0)
 	var envPairs, envFiles, outs []string
 	var noUpload, keep, keepOnFailure bool
@@ -60,9 +60,12 @@ func newRunCmd(opts *options) *cobra.Command {
 			if from != "" && (len(envFiles) > 0) {
 				return errors.New("--env-file doesn't go with --from; use --env")
 			}
+			if from != "" && on != "" {
+				return errors.New("--on doesn't go with --from yet: sandboxes on nodes can't start from a fork or a save in this version")
+			}
 			r := &runner{cmd: cmd, opts: opts, line: commandLine(command), keep: keep, keepOnFailure: keepOnFailure}
 			return r.run(runSpec{
-				name: name, size: size, from: from, dir: dir, workdir: workdir, idle: idle, timeout: timeout,
+				name: name, size: size, from: from, on: on, dir: dir, workdir: workdir, idle: idle, timeout: timeout,
 				envPairs: envPairs, envFiles: envFiles, outs: outs, upload: !noUpload,
 				idleSet: cmd.Flags().Changed("idle"),
 			})
@@ -71,6 +74,7 @@ func newRunCmd(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&from, "from", "", "start from this named save, or a fork of this sandbox")
 	cmd.Flags().StringVar(&name, "name", "", "a name for the sandbox (default: none)")
 	cmd.Flags().StringVar(&size, "size", "", "standard-1, standard-2 (default), standard-3 or standard-4")
+	cmd.Flags().StringVar(&on, "on", "", "run it on this node (your own Docker host; see cloudex node) instead of Cloudflare")
 	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop the sandbox after this long without activity, if it's kept")
 	cmd.Flags().Var(durationFlag{&timeout}, "timeout", "stop the command after this long, such as 30m (default: no limit)")
 	cmd.Flags().StringVar(&dir, "dir", ".", "the directory to copy into the sandbox")
@@ -85,11 +89,11 @@ func newRunCmd(opts *options) *cobra.Command {
 }
 
 type runSpec struct {
-	name, size, from, dir, workdir string
-	idle, timeout                  time.Duration
-	idleSet                        bool
-	envPairs, envFiles, outs       []string
-	upload                         bool
+	name, size, from, on, dir, workdir string
+	idle, timeout                      time.Duration
+	idleSet                            bool
+	envPairs, envFiles, outs           []string
+	upload                             bool
 }
 
 type runner struct {
@@ -247,7 +251,7 @@ func (r *runner) start(ctx context.Context, spec runSpec, env map[string]string)
 		idle = &minutes
 	}
 	if spec.from == "" {
-		req := api.CreateRequest{Name: spec.name, Size: spec.size, IdleMinutes: idle}
+		req := api.CreateRequest{Name: spec.name, Size: spec.size, IdleMinutes: idle, Node: spec.on}
 		if len(env) > 0 {
 			req.Env = env
 		}
