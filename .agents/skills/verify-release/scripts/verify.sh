@@ -1206,6 +1206,8 @@ node_m5() {
 	S5BID=$(field .id)
 	cx new --on "$N" --name "$S5D" --no-use
 	S5DID=$(field .id)
+	local e5d=""
+	[[ $CODE != 0 ]] && e5d="making it failed: $(grep -m1 '^error' <<<"$ERR" | head -c 200); "
 
 	# N30: stop and resume, timed as the CLI sees them.
 	"$CX" exec "$S5B" -- 'echo n30 > ~/n30; sudo sh -c "echo sys > /opt/n30"' >/dev/null 2>&1
@@ -1323,7 +1325,7 @@ node_m5() {
 	n27files=$("$CX" resume "$S5B" >/dev/null 2>&1; "$CX" exec "$S5B" -- 'cat ~/n27' 2>/dev/null)
 	OUT="$S5B after the node came back: $sbst; notice: $("$CX" info "$S5B" --json 2>/dev/null | jq -r '.notice // "none"' | head -c 120); after resume: $n27files" CODE=""
 	ok N27 "$(m5_desc N27)" [ "$sbst" = stopped -a "$n27files" = n27 ]
-	OUT="without --force: $d1; with --force: $d2; pending on the node: $pend; its container and network after the node came back: $after" CODE=""
+	OUT="${e5d}without --force: $d1; with --force: $d2; pending on the node: $pend; its container and network after the node came back: $after" CODE=""
 	ok N28 "$(m5_desc N28)" [ "${d1:0:6}" = "code 1" -a -n "$(grep "can't be removed now" <<<"$d1")" -a "$d2" = "code 0" -a "$pend" = "[\"$S5DID\"]" -a "$after" = "0 0 " ]
 	OUT="online: '$w_on'; offline: '$w_off'" CODE=""
 	ok N31 "$(m5_desc N31)" [ -n "$(grep -E "^[* ]? ?$S5ID $S5 running $N - " <<<"$w_on")" -a -n "$(grep -E "^[* ]? ?$S5ID $S5 running $N \\(offline\\) - " <<<"$w_off")" ]
@@ -1349,7 +1351,7 @@ M6_CHECKS=("N36 with fake keys, claude -p, codex exec and opencode run on a node
 	"N38 a node machine sees the node CA's certificate for api.anthropic.com; certificates that CA signs for any other name (the API's host, github.com, pypi.org, example.com, a provider's subdomain) fail there with openssl, curl, Python and Node"
 	"N39 the cloudex command inside a node machine: info, set and host work, and stop from inside stops it, keeping its disk"
 	"N40 guest activity reaches the deployment: a background command's pings keep a sandbox with --idle 2m running, and /save-on-term is answered on the node"
-	"N41 a named save made on a node starts on Cloudflare with its files, and one made there starts back on the node, and saves says where each was made"
+	"N41 a named save made on a node starts on Cloudflare with its files, and one made there starts back on the node, and saves names the node for both (the second's content came from it)"
 	"N42 a machine with NET_ADMIN can't reach another machine's agent address or forge its source, finds nothing on the agent's control address, can't use the agent as a proxy or for another sandbox's API, gets no backups or saves without a grant, and a body over 100 MB is refused"
 	"N43 the agent listens only on its machine networks' addresses, on 80 and 443: never on 0.0.0.0 or its control address"
 	"N44 a deploy during a save of a node sandbox ends cleanly: the sandbox keeps running, and the save either finished or left no objects in R2")
@@ -1470,7 +1472,7 @@ node_m6() {
 	f41a=$("$CX" exec "$P-n6cf" -- 'cat ~/n41 /opt/n41; ls /usr/local/share/ca-certificates; grep -c "Cloudex: provider hosts" /etc/hosts' 2>/dev/null | tr '\n' ' ')
 	"$CX" exec "$P-n6cf" -- 'echo back >> ~/n41' >/dev/null 2>&1
 	cx save "$P-n6cf" "$P-n6c"
-	sv2=$(field '.node // "cloudflare"')
+	sv2=$(field '.node.name // "cloudflare"')
 	t41=$(now_s)
 	cx new --from "$P-n6c" --on "$N" --name "$P-n6b2" --no-use
 	mv2=$(since "$t41")
@@ -1481,8 +1483,10 @@ node_m6() {
 	OUT="node save made on $sv1, started on $cf1 in $mv1 s$e41: $f41a; Cloudflare save made on $sv2, started on node $nb1 in $mv2 s: $f41b; saves: $listed" CODE=""
 	local cfwant="moved sys cloudflare-containers-ca.crt 0 " ndwant="moved back sys cloudex-node-ca.crt 1 "
 	[[ -z $providers ]] && cfwant="moved sys 0 " ndwant="moved back sys 0 "
-	ok N41 "$(m6_desc N41)" [ "$sv1" = "$N" -a "$cf1" = cloudflare -a "$f41a" = "$cfwant" -a "$sv2" = cloudflare -a "$nb1" = "$N" -a "$f41b" = "$ndwant" \
-		-a "$listed" = "$P-n6c cloudflare $P-n6s $N " ]
+	# The second save was made on Cloudflare, from the node's: it still names
+	# the node its content came from (review W7).
+	ok N41 "$(m6_desc N41)" [ "$sv1" = "$N" -a "$cf1" = cloudflare -a "$f41a" = "$cfwant" -a "$sv2" = "$N" -a "$nb1" = "$N" -a "$f41b" = "$ndwant" \
+		-a "$listed" = "$P-n6c $N $P-n6s $N " ]
 	"$CX" delete "$P-n6cf" --yes >/dev/null 2>&1
 	"$CX" delete "$P-n6b2" --yes >/dev/null 2>&1
 	"$CX" saves rm "$P-n6c" --yes >/dev/null 2>&1
@@ -1536,11 +1540,15 @@ forged-source 000"
 	# N43: the agent's listening sockets, from its own network namespace.
 	local l43 bad43
 	l43=$(node_sh "docker run --rm --network container:cloudex-node --entrypoint ss $(node_sh "docker inspect $MC -f '{{.Config.Image}}'") -Hltn" 2>/dev/null | awk '{print $4}' | sort | tr '\n' ' ')
+	# A listener bound to its network's interface (review H4) shows as addr%eth1:port.
+	local bound43
+	bound43=$(tr ' ' '\n' <<<"$l43" | grep -c '%')
+	l43=$(sed -E 's/%[^: ]+:/:/g' <<<"$l43")
 	# 127.0.0.11 is Docker's embedded DNS resolver, which dockerd runs in every
 	# container's namespace on a user network; it isn't the agent's.
 	l43=$(tr ' ' '\n' <<<"$l43" | grep . | grep -v '^127\.0\.0\.11:' | tr '\n' ' ')
 	bad43=$(tr ' ' '\n' <<<"$l43" | grep . | grep -vE '^10\.|^172\.' ; tr ' ' '\n' <<<"$l43" | grep . | grep -vE ':(80|443)$'; for a in $ctl; do tr ' ' '\n' <<<"$l43" | grep -F "$a:"; done)
-	OUT="listening: $l43" CODE=""
+	OUT="listening: $l43($bound43 bound to their network's interface)" CODE=""
 	ok N43 "$(m6_desc N43)" [ -n "$(grep -F "$own:80" <<<"$l43")" -a -n "$(grep -F "$own:443" <<<"$l43")" -a -z "$bad43" ]
 
 	# N44: a deploy during a node save.
@@ -1611,8 +1619,10 @@ agent_listens_on() {
 	node_sh "$NODE_SUDO cat /proc/\$(docker inspect cloudex-node -f '{{.State.Pid}}')/net/tcp" | awk -v h="$hex" '$4 == "0A" && index($2, h ":") == 1' | wc -l | tr -d ' '
 }
 # Saves the host's iptables(-nft) rules and arms their restore (with the firewall unit's) in $1 s.
+# (NODE_DIR names $HOME, which is root's own in a command root runs: the
+# timed restore gets the path as it is here.)
 fw_save() {
-	node_sh "sudo iptables-save > $NODE_DIR/ipt4 && sudo ip6tables-save > $NODE_DIR/ipt6 && sudo systemd-run --quiet --unit cx-verify-restore-$P --on-active=$1 /bin/sh -c 'iptables-restore < $NODE_DIR/ipt4; ip6tables-restore < $NODE_DIR/ipt6; systemctl restart cloudex-node-firewall.service'"
+	node_sh "d=$NODE_DIR; sudo iptables-save > \$d/ipt4 && sudo ip6tables-save > \$d/ipt6 && sudo systemd-run --quiet --unit cx-verify-restore-$P --on-active=$1 /bin/sh -c \"iptables-restore < \$d/ipt4; ip6tables-restore < \$d/ipt6; systemctl restart cloudex-node-firewall.service\""
 }
 fw_restore() {
 	node_sh "sudo iptables-restore < $NODE_DIR/ipt4 && sudo ip6tables-restore < $NODE_DIR/ipt6 && sudo systemctl restart cloudex-node-firewall.service"
@@ -1739,7 +1749,7 @@ node_review_host() {
 		runtime=$("$CX" node info "$N" --json 2>/dev/null | jq -r .runtime)
 		vip=$(node_sh "docker inspect $bmc -f '{{(index .NetworkSettings.Networks \"$bmc\").IPAddress}}'")
 		vbr=$(node_sh "docker network inspect $bmc -f '{{index .Options \"com.docker.network.bridge.name\"}}'")
-		node_sh "sudo sh -c 'timeout 15 tcpdump -n -i $vbr -c 20 udp and src host 1.1.1.1 > $NODE_DIR/h6cap 2>/dev/null &'"
+		node_sh "d=$NODE_DIR; sudo sh -c \"timeout 15 tcpdump -n -i $vbr -c 20 udp and src host 1.1.1.1 > \$d/h6cap 2> \$d/h6err &\""
 		sleep 2
 		if [[ $runtime == sysbox ]]; then
 			"$CX" cp "$here/host-review.py" "$P-h6a:host-review.py" >/dev/null 2>&1
@@ -1752,9 +1762,11 @@ node_review_host() {
 		fi
 		sleep 14
 		cap=$(node_sh "sudo cat $NODE_DIR/h6cap | grep -c '1.1.1.1.53 >'")
+		local listening
+		listening=$(node_sh "sudo cat $NODE_DIR/h6err" | grep -c "listening on $vbr")
 		drops=$(node_sh "sudo nft list chain inet cloudex forward" | grep "isn't on the bridge" | grep -o 'packets [0-9]*' | awk '{print $2}')
-		OUT="on $runtime, as $vip ($bmc on $vbr): $sp; answers on that bridge: $cap; the firewall's drop counted $drops" CODE=""
-		ok N50 "$(review_host_desc N50)" [ -n "$(grep 'sent 5 from' <<<"$sp")" -a "$cap" = 0 -a "${drops:-0}" -ge 5 ]
+		OUT="on $runtime, as $vip ($bmc on $vbr): $sp; tcpdump on that bridge listening: $listening, answers it saw: $cap; the firewall's drop counted $drops" CODE=""
+		ok N50 "$(review_host_desc N50)" [ -n "$(grep 'sent 5 from' <<<"$sp")" -a "$listening" = 1 -a "$cap" = 0 -a "${drops:-0}" -ge 5 ]
 		"$CX" delete "$P-h6a" --yes >/dev/null 2>&1
 	else
 		skip N50 "$(review_host_desc N50)" "couldn't make its sandbox: ${ERR:0:200}"
@@ -1915,16 +1927,16 @@ node_review_r3() {
 # and down an ssh splice nobody reads. Needs the node installed ($N online)
 # and $AIMG; starts the agent again at the end. With CLOUDFLARE_API_TOKEN,
 # N55 also counts D1's write queries in the flood's minutes (analytics).
-REVIEW_WORKER_CHECKS=("N55 a node that floods its control socket (facts, state and ticket requests for a sandbox that isn't its own, then a second hello) is cut off: no tickets for another's sandbox, the second hello closes the socket, and D1 sees at most a few writes"
+REVIEW_WORKER_CHECKS=("N55 a node that floods its control socket (facts, state and ticket requests for a sandbox that isn't its own, then a second hello) is cut off: no tickets for another's sandbox, the second hello closes the socket, and D1 and the Sandbox objects see at most a few writes and requests"
 	"N56 a node whose streams misbehave is cut off without the Sandbox object buffering it: an exec's output past its credit, a frame on a channel nothing reads, and an ssh splice nobody reads each close with 4400")
 review_worker_skip() { for c in "${REVIEW_WORKER_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
 review_desc() { for c in "${REVIEW_WORKER_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
 d1_writes() {
 	local w
-	for _ in 1 2 3; do
+	for _ in 1 2 3 4 5; do
 		w=$(d1_writes_once "$@")
 		[[ $w =~ ^[0-9]+$ ]] && break
-		sleep 20
+		sleep 30
 	done
 	echo "$w"
 }
@@ -1938,10 +1950,29 @@ d1_writes_once() {
 	q='query($acc:String!,$db:String!,$from:Time!,$to:Time!){viewer{accounts(filter:{accountTag:$acc}){d1AnalyticsAdaptiveGroups(limit:1000,filter:{databaseId:$db,datetimeMinute_geq:$from,datetimeMinute_leq:$to}){sum{writeQueries}}}}}'
 	jq -n --arg q "$q" --arg acc "$acc" --arg db "$db" --arg from "$1" --arg to "$2" '{query:$q, variables:{acc:$acc, db:$db, from:$from, to:$to}}' |
 		curl -s https://api.cloudflare.com/client/v4/graphql -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' --data @- |
-		jq -r 'if .data.viewer.accounts[0] then [.data.viewer.accounts[0].d1AnalyticsAdaptiveGroups[]?.sum.writeQueries] | add // 0 else "unknown" end'
+		jq -r 'if .data.viewer.accounts[0] then [.data.viewer.accounts[0].d1AnalyticsAdaptiveGroups[]?.sum.writeQueries] | add // 0 else "unknown (\(.errors // [] | map(.message) | join("; ") | .[0:120]))" end'
+}
+# Requests to one Durable Object class of the deployment's Worker from $1 to
+# $2 (ISO minutes), from the GraphQL analytics, with a few tries.
+do_requests() {
+	local acc ns q r
+	for _ in 1 2 3 4 5; do
+		cf_fresh
+		acc=$(cf_account)
+		ns=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$acc/workers/durable_objects/namespaces?per_page=100" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" |
+			jq -r --arg w "$(jq -r .name "$repo/apps/api/wrangler.jsonc" 2>/dev/null || echo cloudex-api)" --arg c "$3" '[.result[]? | select(.script == $w and .class == $c)][0].id // empty')
+		q='query($acc:String!,$ns:String!,$from:Time!,$to:Time!){viewer{accounts(filter:{accountTag:$acc}){durableObjectsInvocationsAdaptiveGroups(limit:1000,filter:{namespaceId:$ns,datetimeMinute_geq:$from,datetimeMinute_leq:$to}){sum{requests}}}}}'
+		r=unknown
+		[[ -n $acc && -n $ns ]] && r=$(jq -n --arg q "$q" --arg acc "$acc" --arg ns "$ns" --arg from "$1" --arg to "$2" '{query:$q, variables:{acc:$acc, ns:$ns, from:$from, to:$to}}' |
+			curl -s https://api.cloudflare.com/client/v4/graphql -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' --data @- |
+			jq -r 'if .data.viewer.accounts[0] then [.data.viewer.accounts[0].durableObjectsInvocationsAdaptiveGroups[]?.sum.requests] | add // 0 else "unknown" end')
+		[[ $r =~ ^[0-9]+$ ]] && break
+		sleep 30
+	done
+	echo "$r"
 }
 node_review_worker() {
-	local other f55 t0 t1 w55 fk s56 l56 ov ch sp
+	local other f55 t0 t1 w55 r55 fk s56 l56 ov ch sp
 	if [[ $(node_state "$N") != online ]]; then
 		review_worker_skip "the node isn't online"
 		return
@@ -1953,14 +1984,17 @@ node_review_worker() {
 	t0=$(date -u +%Y-%m-%dT%H:%M:00Z)
 	f55=$(probe flood --other "$other" --count 300)
 	t1=$(date -u -v+1M +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d '+1 min' +%Y-%m-%dT%H:%M:00Z)
-	w55="not counted (no CLOUDFLARE_API_TOKEN)"
+	w55="not counted (no CLOUDFLARE_API_TOKEN)" r55=$w55
 	if [[ -n ${CLOUDFLARE_API_TOKEN:-} ]]; then
 		sleep 150 # the analytics lag
 		w55=$(d1_writes "$t0" "$t1")
+		# Every Sandbox object's requests in those minutes: the 300 states and
+		# 300 ticket requests for another's sandbox must wake none (W1).
+		r55=$(do_requests "$t0" "$t1" Sandbox)
 	fi
-	OUT="flood: ${f55:-nothing}; D1 write queries in $t0..$t1: $w55" CODE=""
+	OUT="flood: ${f55:-nothing}; in $t0..$t1, D1 write queries: $w55, requests to Sandbox objects: $r55" CODE=""
 	ok N55 "$(review_desc N55)" [ "$(jq -r .ticketsGiven <<<"$f55")" = 0 -a -n "$(jq -r .ticketError <<<"$f55" | grep "isn't a sandbox on this node")" \
-		-a "$(jq -r .secondHello <<<"$f55")" = 4400 -a \( -z "${CLOUDFLARE_API_TOKEN:-}" -o "$(awk -v w="$w55" 'BEGIN { print (w ~ /^[0-9]+$/ && w <= 30) }')" = 1 \) ]
+		-a "$(jq -r .secondHello <<<"$f55")" = 4400 -a \( -z "${CLOUDFLARE_API_TOKEN:-}" -o "$(awk -v w="$w55" -v r="$r55" 'BEGIN { print (w ~ /^[0-9]+$/ && w <= 30 && r ~ /^[0-9]+$/ && r <= 30) }')" = 1 \) ]
 	# N56: the fake agent, with the node's identity, and a sandbox on it.
 	fk=$P-fake
 	node_sh "docker run -d --name $fk -v cloudex-node:/var/lib/cloudex-node $AIMG probe fake-agent --splice --for 8m" >/dev/null 2>&1
