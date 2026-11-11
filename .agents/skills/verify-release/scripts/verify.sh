@@ -1771,7 +1771,7 @@ node_review_host() {
 		node_sh "sudo rm -f $fill"
 		sleep 3
 		notice=$("$CX" info "$P-h2" --json 2>/dev/null | jq -r '.state + ": " + (.notice // "")')
-		OUT="floor $floor GB; the machine stopped ${took:+after $took s}${took:-only at the safety stop of this check}, the least free was $least GB; the sandbox: ${notice:0:240}" CODE=""
+		OUT="floor $floor GB; the machine stopped $([ -n "$took" ] && echo "after $took s" || echo "only at the safety stop of this check"), the least free was $least GB; the sandbox: ${notice:0:240}" CODE=""
 		ok N46 "$(review_host_desc N46)" [ -n "$took" -a "$(awk -v l="$least" -v f="$floor" 'BEGIN { print (l >= f - 1.5) }')" = 1 \
 			-a -n "$(grep '^stopped: .*under its floor' <<<"$notice")" ]
 		"$CX" delete "$P-h2" --yes >/dev/null 2>&1
@@ -1884,7 +1884,7 @@ node_review_r3() {
 		stat52=$(in_agent status 2>/dev/null | head -1)
 		node_sh "$NODE_SUDO bash $NODE_DIR/node-install.sh ${inst[*]}" >"$work/o" 2>&1
 		again52="installer exit $?: $(grep -o 'was removed from its deployment.*Uninstall first (--uninstall)' "$work/o" | head -1)"
-		OUT="$rm52; the machine stopped ${st52:-: no, not within 60 s}${st52:+ after $st52 s}, its file: ${file52:-gone}; status: ${stat52:0:160}; $again52" CODE=""
+		OUT="$rm52; the machine stopped $([ -n "$st52" ] && echo "after $st52 s" || echo "not within 60 s"), its file: ${file52:-gone}; status: ${stat52:0:160}; $again52" CODE=""
 		ok N52 "$(review_host_desc N52)" [ -n "$st52" -a "$file52" = kept -a -n "$(grep 'REMOVED' <<<"$stat52")" -a -n "$(grep '^installer exit [1-9]: was removed.*--uninstall' <<<"$again52")" ]
 		"$CX" delete "$P-r3s" --yes >/dev/null 2>&1
 	fi
@@ -1948,7 +1948,7 @@ node_review_worker() {
 		-a "$(jq -r .secondHello <<<"$f55")" = 4400 -a \( -z "${CLOUDFLARE_API_TOKEN:-}" -o "$(awk -v w="$w55" 'BEGIN { print (w ~ /^[0-9]+$/ && w <= 30) }')" = 1 \) ]
 	# N56: the fake agent, with the node's identity, and a sandbox on it.
 	fk=$P-fake
-	node_sh "docker run -d --rm --name $fk -v cloudex-node:/var/lib/cloudex-node $AIMG probe fake-agent --splice --for 8m" >/dev/null 2>&1
+	node_sh "docker run -d --name $fk -v cloudex-node:/var/lib/cloudex-node $AIMG probe fake-agent --splice --for 8m" >/dev/null 2>&1
 	wait_state "$N" online 30 >/dev/null
 	cx new --on "$N" --name "$P-n56" --no-use
 	s56=$(field .state)
@@ -1958,13 +1958,16 @@ node_review_worker() {
 		(sleep 60 | timeout 60 "$CX" proxy "$P-n56" 22 | sleep 55) >/dev/null 2>&1
 	fi
 	sleep 3
-	l56=$(node_sh "docker logs $fk 2>/dev/null" | grep '^{')
+	l56=$(node_sh "docker logs $fk 2>&1")
+	local fkst
+	fkst="the fake agent $(node_sh "docker inspect $fk -f '{{.State.Status}}'" 2>/dev/null || echo gone), its last lines: $(grep -v '^{' <<<"$l56" | tail -3 | tr '\n' ' ')"
+	l56=$(grep '^{' <<<"$l56")
 	"$CX" delete "$P-n56" --yes >/dev/null 2>&1
 	node_sh "docker rm -f $fk" >/dev/null 2>&1
 	start_agent
 	wait_state "$N" online 30 >/dev/null
 	ov=$(jq -c 'select(.kind == "overrun")' <<<"$l56" | head -1) ch=$(jq -c 'select(.kind == "channel")' <<<"$l56" | head -1) sp=$(jq -c 'select(.kind == "splice")' <<<"$l56" | head -1)
-	OUT="sandbox on the fake agent: ${s56:-none} ${ERR:0:120}; overrun $ov; channel $ch; splice $sp" CODE=""
+	OUT="sandbox on the fake agent: ${s56:-none} ${ERR:0:120}; overrun $ov; channel $ch; splice $sp; $fkst" CODE=""
 	ok N56 "$(review_desc N56)" [ "$(jq -r .closeCode <<<"$ov")" = 4400 -a "$(jq -r '.sentBytes < 32*1048576' <<<"$ov")" = true \
 		-a "$(jq -r .closeCode <<<"$ch")" = 4400 -a "$(jq -r .closeCode <<<"$sp")" = 4400 -a "$(jq -r '.sentBytes < 64*1048576' <<<"$sp")" = true ]
 }
