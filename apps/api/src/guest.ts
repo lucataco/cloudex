@@ -274,8 +274,8 @@ def call(method, path="", body=None, quiet=False, timeout=120):
         if quiet:
             return None
         if platform().get("node"):
-            die("the cloudex command doesn't work yet in a sandbox on a node: it can't reach the Cloudex API from here. "
-                "Use cloudex on your own computer instead")
+            die("can't reach the Cloudex API from this sandbox through its node's agent: %s. "
+                "Is the node online (cloudex node list, on your own computer)?" % getattr(e, "reason", e))
         die("can't reach the Cloudex API from this sandbox: %s" % getattr(e, "reason", e))
 
 
@@ -700,7 +700,8 @@ put() { # put PATH KEY MODE: write a file from the input, replacing it whole
   jq -j --arg k "$2" '.[$k]' <<<"$in" >"$1.new" && chmod "$3" "$1.new" && mv "$1.new" "$1"
 }
 install -d -m 755 /usr/local/lib/cloudex /etc/claude-code /etc/cloudex
-# $3 is "node" on a node (v0.2.2), where cloudex.internal doesn't answer yet.
+# $3 is "node" on a node (v0.2.2), where cloudex.internal is the node's agent
+# and there's no 6-hour limit.
 jq -n --arg v "$(jq -r .version <<<"$in")" --arg z "$zone" --arg w "$3" '{version: $v, zone: $z, node: ($w == "node")}' >/etc/cloudex/platform.json
 put /usr/local/lib/cloudex/relay.py relay 755
 # A cloudex installed in the sandbox by its user stays; ours carries the mark

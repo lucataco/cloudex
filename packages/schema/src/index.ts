@@ -167,11 +167,17 @@ export type SandboxSettings = z.infer<typeof SandboxSettings>;
 // of a running sandbox, which keeps running, or the last save of a stopped one.
 // With count above 1 and a name, the forks are named <name>-1, <name>-2 and so
 // on. Size and idle minutes default to the original's.
+// node, cpus and memoryMb (v0.2.2 M6): start them on that node, as
+// CreateSandbox does; only from a named save (POST /v1/saves/{name}/sandboxes),
+// since forks are made from Cloudflare's disk snapshots.
 export const ForkRequest = z.object({
   name: Name.optional(),
   count: z.number().int().min(1).max(10).default(1),
   size: SandboxSize.optional(),
   idleMinutes: z.number().int().min(0).max(360).optional(),
+  node: z.string().min(1).max(64).optional(),
+  cpus: z.number().min(0.25).max(1024).optional(),
+  memoryMb: z.number().int().min(512).max(16 * 1024 * 1024).optional(),
 });
 export type ForkRequest = z.input<typeof ForkRequest>;
 
@@ -201,6 +207,10 @@ export const Save = z.object({
   bytes: z.number().int(), // its size in R2, compressed
   createdAt: z.number().int(),
   ms: z.number().int(), // how long making it took
+  // The node it was made on (v0.2.2 M6), by name as it was then, and id;
+  // null for a save made on Cloudflare. A save from a node holds whatever
+  // that node put in it: treat it like code from that node.
+  node: z.object({ id: z.string(), name: z.string() }).nullable().optional(),
   // Only in the answer to a new save: whether it replaced an earlier save of the name.
   replaced: z.boolean().optional(),
 });

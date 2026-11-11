@@ -132,6 +132,8 @@ const MIGRATIONS = [
   "ALTER TABLE tokens ADD COLUMN ends_at INTEGER",
   // v0.2.2: the node a sandbox runs on; null on Cloudflare.
   "ALTER TABLE sandboxes ADD COLUMN node TEXT",
+  // v0.2.2 M6: the node a named save was made on, as JSON {id, name}; null on Cloudflare.
+  "ALTER TABLE saves ADD COLUMN node TEXT",
 ];
 
 async function migrate(db: D1Database) {

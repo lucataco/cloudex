@@ -69,6 +69,7 @@ import { HEADERS, issueJoinToken, readCapped, useJoinToken, verifyJoinSignature,
 import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodePublicKey, revokeNode } from "./nodes";
 import { placeOn, refused } from "./placement";
 import { locationHint } from "./nodestate";
+import { cachedKey, nodeEgress } from "./nodeegress";
 import { readTicket } from "./nodestream";
 import { notFromDashboard, readSession, sessionCookie, sessionName } from "./session";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
@@ -252,6 +253,19 @@ app.get("/v1/node/streams/:sandbox/:stream", async (c) => {
   return c.env.SANDBOX.getByName(t.sandbox).fetch(new Request("http://sandbox/node-stream", c.req.raw));
 });
 
+// What a sandbox on a node sends to cloudex.internal and to the AI providers,
+// passed on by its node's agent (nodeegress.ts, v0.2.2 M6): signed by the
+// node, bound to one of its sandboxes, then handled by Egress as a Cloudflare
+// container's request is.
+const egressKey = (env: Env) => cachedKey((id) => nodePublicKey(env.DB, id));
+app.all("/v1/node/egress", (c) =>
+  nodeEgress(c.req.raw, {
+    publicKeyOf: egressKey(c.env),
+    info: (sandbox) => c.env.SANDBOX.getByName(sandbox).nodeEgress(),
+    egress: (props) => c.executionCtx.exports.Egress({ props }),
+  }),
+);
+
 // Every other /v1 route: the admin key or a token as the bearer, or the
 // dashboard's session cookie.
 app.use("/v1/*", async (c, next) => {
@@ -346,27 +360,30 @@ async function sandbox(env: Env, ref: string) {
   return s;
 }
 
+// On a node (v0.2.2 M5): it must be online, pass its self-test and allow
+// the caller (placement.ts). Its Sandbox object is made near the node, a
+// hint that counts only when an object is created (M0 Q3).
+async function placeOnNode(
+  env: Env,
+  who: Who,
+  o: { node?: string; cpus?: number; memoryMb?: number; size: SandboxSize },
+): Promise<{ on?: NodeChoice; hint: DurableObjectLocationHint | null }> {
+  if (!o.node && (o.cpus !== undefined || o.memoryMb !== undefined)) {
+    fail(400, "cpus and memoryMb go with node: on Cloudflare, pick a size instead");
+  }
+  if (!o.node) return { hint: null };
+  const found = await findNode(env.DB, o.node);
+  if (!found) fail(404, `no node named ${o.node}`);
+  const n = await live(env, found, true);
+  const placed = placeOn(n, { ownOnly: who.kind === "token" && who.token.ownOnly }, { size: o.size, cpus: o.cpus, memoryMb: o.memoryMb });
+  if (refused(placed)) fail(placed.status as 400, placed.error);
+  return { on: { node: n.id, name: n.name, cpus: placed.cpus, memoryMb: placed.memoryMb }, hint: n.locationHint as DurableObjectLocationHint | null };
+}
+
 app.post("/v1/sandboxes", async (c) => {
   const body = await c.req.text();
   const { node, cpus, memoryMb, ...input } = CreateSandbox.parse(body ? JSON.parse(body) : {});
-  if (!node && (cpus !== undefined || memoryMb !== undefined)) {
-    return c.json({ error: "cpus and memoryMb go with node: on Cloudflare, pick a size instead" }, 400);
-  }
-  // On a node (v0.2.2 M5): it must be online, pass its self-test and allow
-  // the caller (placement.ts). Its Sandbox object is made near the node, a
-  // hint that counts only when an object is created (M0 Q3).
-  let on: NodeChoice | undefined;
-  let hint: DurableObjectLocationHint | null = null;
-  if (node) {
-    const found = await findNode(c.env.DB, node);
-    if (!found) return c.json({ error: `no node named ${node}` }, 404);
-    const n = await live(c.env, found, true);
-    const who = c.get("who");
-    const placed = placeOn(n, { ownOnly: who.kind === "token" && who.token.ownOnly }, { size: input.size, cpus, memoryMb });
-    if (refused(placed)) return c.json({ error: placed.error }, placed.status as 400);
-    on = { node: n.id, name: n.name, cpus: placed.cpus, memoryMb: placed.memoryMb };
-    hint = n.locationHint as DurableObjectLocationHint | null;
-  }
+  const { on, hint } = await placeOnNode(c.env, c.get("who"), { node, cpus, memoryMb, size: input.size });
   if (input.name && (await nameTaken(c.env.DB, input.name))) {
     return c.json({ error: `the name ${input.name} is taken` }, 409);
   }
@@ -556,14 +573,15 @@ function startCopies(
   of: string,
   from?: ForkSource,
   save?: SaveManifest,
+  place: { on?: NodeChoice; hint: DurableObjectLocationHint | null } = { hint: null },
 ) {
   return Promise.all(
     names.map(async (name) => {
       const id = newSandboxId();
-      const copy = env.SANDBOX.getByName(id);
+      const copy = env.SANDBOX.getByName(id, place.hint ? { locationHint: place.hint } : undefined);
       await setOwner(env.DB, id, who);
       try {
-        return await copy.create(id, { name, ...opts }, from, save);
+        return await copy.create(id, { name, ...opts }, from, save, place.on);
       } catch (e) {
         console.error(`[${id}] start from ${of} failed: ${errorStatus(e).message}`);
         return await copy.get();
@@ -576,6 +594,9 @@ function startCopies(
 app.post("/v1/sandboxes/:ref/fork", async (c) => {
   const body = await c.req.text();
   const input = ForkRequest.parse(body ? JSON.parse(body) : {});
+  if (input.node || input.cpus !== undefined || input.memoryMb !== undefined) {
+    fail(400, "a fork starts where Cloudflare keeps its disk snapshots, so not on a node: save the sandbox (cloudex save), then start sandboxes from the save on the node (cloudex new --from <save> --on <node>)");
+  }
   const ref = c.req.param("ref");
   const names = await copyNames(c.env, input);
   const { stub } = await sandbox(c.env, ref);
@@ -622,9 +643,10 @@ app.post("/v1/saves/:name/sandboxes", async (c) => {
   const save = await namedSave(c.env, c.req.param("name"));
   const manifest = await readManifest(bucket(c.env), save.id);
   if (!manifest) fail(409, `the save ${save.name} was saved over or deleted just now; try again`);
+  const place = await placeOnNode(c.env, c.get("who"), { node: input.node, cpus: input.cpus, memoryMb: input.memoryMb, size: input.size ?? save.size });
   const names = await copyNames(c.env, input);
   const opts = { size: input.size ?? save.size, idleMinutes: input.idleMinutes ?? save.idleMinutes };
-  return c.json(await startCopies(c.env, c.get("who"), names, opts, `the save ${save.name}`, undefined, manifest), 201);
+  return c.json(await startCopies(c.env, c.get("who"), names, opts, `the save ${save.name}`, undefined, manifest, place), 201);
 });
 
 // The desktop: POST starts it (installing it the first time) or resizes it; DELETE stops it.

@@ -13,10 +13,18 @@
 //
 // So do HTTPS requests to AI providers whose keys the deployment holds
 // (keys.ts): the real key goes in here, on the way out.
+//
+// A sandbox on a node (v0.2.2 M6) reaches this too, through its node's agent
+// and the signed route /v1/node/egress (index.ts), which binds each request to
+// one sandbox on that node and passes node: the node's id. Then the run's
+// token is required for the self API, never skipped; R2 backups, which nodes
+// don't make, are refused; and /save-on-term (which the agent answers itself)
+// says nothing was saved.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { backupBucket, partKey } from "./backup";
 import { PROVIDERS, providerForHost, providerKey, UnreadableKey } from "./keys";
 import { SAVE_PATH, saveObjectKey } from "./saves";
+import { withoutKey } from "./redact";
 import { selfApi } from "./self";
 import { sameSecret } from "./util";
 
@@ -27,7 +35,10 @@ const BACKUP_PART = /^\/backup\/(\d{1,15})\/(\d{1,6})$/;
 
 // selfToken: the run's token for the API a sandbox has for itself, which runs
 // started before it existed don't have.
-export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: string }> {
+// node: set when the request came from a node's agent (v0.2.2 M6).
+export type EgressProps = { id: string; selfToken?: string; node?: string };
+
+export class Egress extends WorkerEntrypoint<Env, EgressProps> {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const provider = providerForHost(url.hostname);
@@ -37,8 +48,13 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
     if (req.headers.has("origin") || req.headers.has("sec-fetch-site")) {
       return Response.json({ error: "cloudex.internal doesn't answer web pages" }, { status: 403 });
     }
-    const { id, selfToken } = this.ctx.props;
+    const { id, selfToken, node } = this.ctx.props;
     if (url.pathname.startsWith("/v1/")) {
+      // From a node, a run without a token (which can't happen: every start
+      // makes one) gets nothing, rather than the API without a check.
+      if (node && !selfToken) {
+        return Response.json({ error: "this sandbox's run has no token for its own API; restart it" }, { status: 403 });
+      }
       // Only with the run's token, which the cloudex command reads from a file
       // in the sandbox, so that an app there that fetches URLs for its
       // visitors can't be made to hand out the sandbox's links.
@@ -49,7 +65,10 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
     }
 
     const part = BACKUP_PART.exec(url.pathname);
-    if (part) return this.object(req, partKey(id, part[1]!, part[2]!));
+    if (part) {
+      if (node) return new Response("a sandbox on a node keeps its disk there and makes no backups\n", { status: 501 });
+      return this.object(req, partKey(id, part[1]!, part[2]!));
+    }
 
     const sandbox = this.env.SANDBOX.getByName(id);
     const save = SAVE_PATH.exec(url.pathname);
@@ -64,6 +83,7 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
     if (req.method !== "POST") return new Response("not found", { status: 404 });
     switch (url.pathname) {
       case "/save-on-term":
+        if (node) return Response.json({ saved: false });
         return Response.json(await sandbox.guestTerm());
       case "/activity":
         await sandbox.ping();
@@ -113,6 +133,9 @@ export class Egress extends WorkerEntrypoint<Env, { id: string; selfToken?: stri
       await res.body?.cancel();
       return answer(401, "authentication_error", `${spec.label} rejected the key stored with cloudex keys set ${name}. Set a working one with: cloudex keys set ${name}`);
     }
+    // A refusal that quotes the key it was sent (some providers echo a bad
+    // key in their error) never reaches the sandbox with it.
+    if (added && res.status >= 400) return withoutKey(res, (await providerKey(this.env, name).catch(() => null)) ?? "");
     return res;
   }
 

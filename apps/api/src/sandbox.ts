@@ -87,6 +87,7 @@ import {
   store,
   view,
 } from "./settings";
+import type { NodeEgressInfo } from "./nodeegress";
 import { NodeStreams } from "./nodestream";
 import { type MachineReport, machineAction, nodeIsolation, offlineMessage, removedMessage } from "./placement";
 import { tokenAlive } from "./tokens";
@@ -168,17 +169,16 @@ export type NodeChoice = { node: string; name: string; cpus: number; memoryMb: n
 // port's current link was first handed out, null once revoked.
 type Links = { epoch: number; ports: Record<string, { gen: number; at: number | null }> };
 type ExecInput = { cmd: string; root: boolean; cwd?: string; timeoutSec: number };
+// Which named save's objects the guest may read or write now, and until when.
+type SaveGrant = { id: string; mode: "read" | "write"; until?: number };
 
 export const NO_SUCH_SANDBOX = "no such sandbox";
 
 // What a sandbox on a node can't do yet in v0.2.2 (research/v0.2.2-plan.md):
-// forks are built on Cloudflare's disk snapshots; named saves and agents need
-// cloudex.internal and provider keys on the node, which come with M6.
+// forks are built on Cloudflare's disk snapshots. A named save does the same
+// job: save it, then start new sandboxes from the save, on the node or not.
 export const FORK_ON_NODE =
-  "forks aren't available for a sandbox on a node yet; copy what you need with cloudex cp, or start a new sandbox on the node";
-export const SAVE_ON_NODE = "named saves of a sandbox on a node aren't available yet; copy what you need out with cloudex cp";
-export const AGENTS_ON_NODE =
-  "agents need the deployment's provider keys, which don't reach sandboxes on nodes yet; start agents in a sandbox on Cloudflare";
+  "forks aren't available for a sandbox on a node yet; save it (cloudex save <sandbox> <name>), then start new sandboxes from the save with cloudex new --from <name> [--on <node>]";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
 
@@ -316,6 +316,8 @@ export class Sandbox extends DurableObject<Env> {
       this.nodeDown = (await ctx.storage.get<{ since: number; lastSeenAt: number | null }>("nodeDown")) ?? null;
       this.nodeGone = Boolean(this.onNode) && (await ctx.storage.get<string>("revokedNode")) === this.onNode?.placement.node;
       this.lastActivity = (await ctx.storage.get<number>("lastActivity")) ?? Date.now();
+      // Nothing that held a save grant survives a restart.
+      await this.dropLeftGrant();
       // After an eviction or deploy, reattach the exit watcher to a running box.
       // (A node's machine has no watcher here: its exits come from its Node
       // object, nodeReport.)
@@ -425,12 +427,12 @@ export class Sandbox extends DurableObject<Env> {
 
   // With from, the sandbox is a fork and starts from that save (see forkPoint);
   // with save, it starts from that named save.
-  // With on, it runs on that node (v0.2.2 M5), which POST /v1/sandboxes chose
-  // and checked; never with from or save in v0.2.2.
+  // With on, it runs on that node (v0.2.2 M5), which POST /v1/sandboxes (or
+  // a start from a named save, M6) chose and checked; never with from.
   async create(id: string, input: CreateInput, from?: ForkSource, save?: SaveManifest, on?: NodeChoice): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       if (this.record) fail(409, `${id} already exists`);
-      if (on && (from || save)) fail(501, "a sandbox on a node can't start from a fork or a save yet");
+      if (on && from) fail(501, FORK_ON_NODE);
       // A fork gets the original's settings, and a sandbox started from a save
       // the settings saved with it; checked before anything is kept.
       const settings =
@@ -856,10 +858,10 @@ export class Sandbox extends DurableObject<Env> {
     await this.ctx.storage.delete("stopRequested");
     await this.update({ state: "starting", error: null, notice: null });
     let providers: (keyof typeof PROVIDERS)[] = [];
-    // Provider keys don't reach a node's machines in v0.2.2 yet (M6): none
-    // are set up there, and KEYS_SCRIPT clears any placeholders.
+    // On a node (v0.2.2 M6) the providers' calls go through its agent, which
+    // passes them to the Worker (nodeegress.ts), so the keys stay here too.
     try {
-      if (!this.onNode) providers = (await listKeys(this.env.DB)).map((k) => k.provider);
+      providers = (await listKeys(this.env.DB)).map((k) => k.provider);
     } catch (e) {
       console.error(`[${r.id}] reading provider keys failed: ${message(e)}`);
     }
@@ -870,8 +872,8 @@ export class Sandbox extends DurableObject<Env> {
     try {
       if (this.onNode) {
         // The node's agent makes the machine (once) and starts it, and
-        // answers once its entrypoint is ready.
-        await this.startOnNode(r);
+        // answers once its entrypoint is ready, or holds for a restore.
+        await this.startOnNode(r, Boolean(restore));
       } else {
         c.start({
           snapshot,
@@ -889,7 +891,7 @@ export class Sandbox extends DurableObject<Env> {
       await this.ctx.storage.put("selfToken", selfToken);
       const egress = this.ctx.exports.Egress({ props: { id: r.id, selfToken } });
       await c.route(egress, providers.map((p) => PROVIDERS[p].host));
-      const held = this.onNode ? false : await this.waitReady(t0, Boolean(restore));
+      const held = this.onNode ? Boolean(restore) && (await this.heldOnNode()) : await this.waitReady(t0, Boolean(restore));
       if (restore) {
         restoreNotice = await this.restoreSave(restore, held);
         if (held) {
@@ -899,13 +901,29 @@ export class Sandbox extends DurableObject<Env> {
       }
       if (afterReady) await afterReady();
       // After any restore of /home, which holds Claude Code's settings. Also run
-      // with no providers, to clear placeholders a save may still hold.
+      // with no providers, to clear placeholders a save may still hold. On a
+      // node the agent's CA comes with its start (an agent from before M6
+      // has none, and its machines get no keys).
+      const nodeCa = this.onNode?.ca ?? null;
+      if (this.onNode && !nodeCa && providers.length > 0) {
+        keysProblem = `node ${this.onNode.placement.name}'s agent is older than the deployment and can't pass provider calls on; update it (run its installer again)`;
+        providers = [];
+      }
       try {
         await this.runScript(
           KEYS_SCRIPT,
-          [providers.join(" "), PROVIDERS.anthropic.placeholder, PROVIDERS.openai.placeholder, c.caPath, ...placeholderVars(providers)],
+          [
+            providers.join(" "),
+            PROVIDERS.anthropic.placeholder,
+            PROVIDERS.openai.placeholder,
+            c.caPath,
+            this.onNode ? "node" : "",
+            providers.map((p) => PROVIDERS[p].host).join(" "),
+            ...placeholderVars(providers),
+          ],
           "setting up provider keys",
           60_000,
+          nodeCa && providers.length > 0 ? nodeCa : undefined,
         );
       } catch (e) {
         keysProblem = message(e);
@@ -1002,7 +1020,7 @@ export class Sandbox extends DurableObject<Env> {
       throw new Error(`the save ${m.name} it starts from has been deleted or saved over since`);
     }
     const t0 = Date.now();
-    await this.ctx.storage.put("saveGrant", { id: m.id, mode: "read" });
+    await this.ctx.storage.put("saveGrant", { id: m.id, mode: "read", until: Date.now() + RESTORE_SAVE_TIMEOUT_MS } satisfies SaveGrant);
     let scope: string;
     try {
       const args = [HELPER, m.id, String(m.parts), m.image ?? "", String(m.home), held ? "held" : "running"];
@@ -1026,11 +1044,10 @@ export class Sandbox extends DurableObject<Env> {
   async saveAs(name: string, id: string): Promise<Save> {
     return this.exclusive(async () => {
       const r = this.mustRun();
-      if (this.onNode) fail(501, SAVE_ON_NODE);
       const bucket = backupBucket(this.env);
       if (!bucket) fail(501, "named saves need an R2 bucket, and this deployment has none: turn R2 on in the Cloudflare dashboard, then run cloudex deploy");
       const t0 = Date.now();
-      await this.ctx.storage.put("saveGrant", { id, mode: "write" });
+      await this.ctx.storage.put("saveGrant", { id, mode: "write", until: Date.now() + NAMED_SAVE_TIMEOUT_MS } satisfies SaveGrant);
       let out: string;
       try {
         out = await this.runScript(SAVE_SCRIPT, [HELPER, id], `saving ${r.name ?? r.id}`, NAMED_SAVE_TIMEOUT_MS);
@@ -1068,6 +1085,7 @@ export class Sandbox extends DurableObject<Env> {
         createdAt: t0,
         ms: Date.now() - t0,
         settings: await this.ctx.storage.get<StoredSettings>("settings"),
+        ...(this.onNode ? { node: { id: this.onNode.placement.node, name: this.onNode.placement.name } } : {}),
       };
       const replaced = await recordSave(this.env.DB, bucket, m);
       console.log(`[${r.id}] saved as ${name} (${s.kind}, ${s.files} paths, ${s.bytes} bytes) in ${m.ms} ms`);
@@ -1078,8 +1096,39 @@ export class Sandbox extends DurableObject<Env> {
   // Whether this sandbox may read or write a named save's objects now: only
   // while this object restores or makes that save (egress.ts asks).
   async saveAccess(id: string): Promise<"read" | "write" | null> {
-    const grant = await this.ctx.storage.get<{ id: string; mode: "read" | "write" }>("saveGrant");
+    const grant = await this.ctx.storage.get<SaveGrant>("saveGrant");
+    if (grant?.until !== undefined && Date.now() > grant.until) return null;
     return grant?.id === id ? grant.mode : null;
+  }
+
+  // A grant left by a save or restore that a restart of this object cut off
+  // (a deploy, an eviction): nobody is left to finish it, so it goes, and
+  // so do a cut save's objects, which no manifest names (v0.2.2 M6; risk 5).
+  private async dropLeftGrant() {
+    const grant = await this.ctx.storage.get<SaveGrant>("saveGrant");
+    if (!grant) return;
+    await this.ctx.storage.delete("saveGrant");
+    const bucket = backupBucket(this.env);
+    if (grant.mode === "write" && bucket) {
+      await deleteSaveObjects(bucket, grant.id).catch((e) => console.error(`deleting the cut save ${grant.id}: ${message(e)}`));
+    }
+    console.log(`[${this.record?.id}] dropped the ${grant.mode} grant of the save ${grant.id}, which a restart cut off`);
+  }
+
+  // For the route that takes a node's guest traffic (nodeegress.ts): which
+  // node this sandbox is on, its run's token for its own API, its state, and
+  // whether its node was removed. Asked for every request, so that a stop, a
+  // new run's token or a removal counts at once.
+  async nodeEgress(): Promise<NodeEgressInfo | null> {
+    const r = this.record;
+    if (!r || this.removing) return null;
+    const p = this.onNode?.placement;
+    return {
+      node: p?.node ?? null,
+      selfToken: (await this.ctx.storage.get<string>("selfToken")) ?? null,
+      state: r.state,
+      revoked: Boolean(p) && this.nodeGone,
+    };
   }
 
   private async save() {
@@ -1466,7 +1515,6 @@ export class Sandbox extends DurableObject<Env> {
   // on standard input. Returns the script's JSON.
   async agentOp(op: string, args: string[], prompt?: string, waitSec = 0): Promise<unknown> {
     const r = this.mustRun();
-    if (this.onNode && (op === "start" || op === "send")) fail(501, AGENTS_ON_NODE);
     try {
       const out = await this.asGuest([AGENT_BOOT, AGENT_SCRIPT, op, ...args], `agent ${op}`, (waitSec + 60) * 1000, prompt);
       const why = new TextDecoder().decode(out.stderr).trim().split("\n").pop() ?? "";
@@ -2108,7 +2156,10 @@ export class Sandbox extends DurableObject<Env> {
 
   // Makes the machine if it isn't there yet, and starts it; the agent answers
   // once its entrypoint is ready, with its address.
-  private async startOnNode(r: SandboxRecord) {
+  // With hold (a start from a named save), the machine is made to hold for
+  // the restore, and this start holds; a later start of the same machine
+  // doesn't (the agent lets it go).
+  private async startOnNode(r: SandboxRecord, hold = false) {
     const p = this.onNode!.placement;
     const made = await this.nodeOp(
       "create",
@@ -2117,11 +2168,15 @@ export class Sandbox extends DurableObject<Env> {
         ...(this.env.NODE_IMAGE ? { image: this.env.NODE_IMAGE } : {}),
         ...(p.cpus !== undefined ? { cpus: p.cpus } : {}),
         ...(p.memoryMb !== undefined ? { memoryMb: p.memoryMb } : {}),
+        ...(hold ? { hold: true } : {}),
       },
       // The agent waits up to a minute for its first self-test after it starts.
       120_000,
     );
-    const answer = await this.nodeOp("start", { sandbox: r.id }, 150_000);
+    const answer = await this.nodeOp("start", { sandbox: r.id, ...(hold ? { hold: true } : {}) }, 150_000);
+    // The node CA its machines trust for the providers' hosts (M6).
+    const ca = typeof answer.ca === "string" && answer.ca.length < 16_384 && answer.ca.startsWith("-----BEGIN CERTIFICATE-----") ? answer.ca : null;
+    if (this.onNode) this.onNode.ca = ca;
     const address = typeof answer.address === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(answer.address) ? answer.address : null;
     if (!address) fail(502, `node ${p.name}'s agent didn't say where the machine is`);
     if (address !== p.address) {
@@ -2133,6 +2188,13 @@ export class Sandbox extends DurableObject<Env> {
     if (made.created === true && r.startedAt !== null) {
       await this.update({ notice: `Its machine was gone from node ${p.name}, so it started over from the image, without its files.` });
     }
+  }
+
+  // Whether a node's machine started for a restore is holding for it (its
+  // image is new enough to hold), as waitReady says on Cloudflare.
+  private async heldOnNode(): Promise<boolean> {
+    const p = await withTimeout(this.compute.exec(["sh", "-c", BOOT_CHECK]), 60_000, "readiness check");
+    return (await p.exitCode) === 3;
   }
 
   // Stops the machine (docker stop), keeping its disk.
@@ -2166,7 +2228,10 @@ export class Sandbox extends DurableObject<Env> {
     if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
     const p = this.onNode!.placement;
     if ((await this.ctx.storage.get<string>("revokedNode")) === p.node) fail(410, removedMessage(p.name));
-    await this.boot();
+    // One made from a named save that never finished starting restores it
+    // again; after that its disk is its own.
+    const save = r.startedAt === null ? await this.ctx.storage.get<SaveManifest>("fromSave") : undefined;
+    await this.boot(undefined, undefined, save ? ((await this.currentSave(save)) ?? save) : undefined);
     await this.startHook();
     return this.shown();
   }

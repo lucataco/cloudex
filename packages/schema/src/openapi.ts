@@ -279,7 +279,8 @@ export function openapi(version: string) {
           description:
             "A running sandbox is saved first and keeps running. Forks that fail to start are " +
             "returned in state error, with the reason; resuming one tries again. Not available for a sandbox on a " +
-            "node yet (501).",
+            "node yet (501); and forks can't be made on a node (node, cpus and memoryMb are a 400): save the sandbox, " +
+            "then start sandboxes from the save there.",
           requestBody: body("ForkRequest", false),
           responses: { 201: ok("The forks", { type: "array", items: ref("Sandbox") }) },
         }),
@@ -290,8 +291,8 @@ export function openapi(version: string) {
           description:
             "The save holds every file that differs from the sandbox image, and the sandbox's settings, in the " +
             "deployment's R2 bucket until it's deleted. The sandbox keeps running. A save of a taken name " +
-            "replaces that save once it's done. Takes about 15 seconds per GB of changes. Not available for a sandbox " +
-            "on a node yet (501).",
+            "replaces that save once it's done. Takes about 15 seconds per GB of changes. A save of a sandbox on a node " +
+            "goes up over the node's own line, and records the node (see Save.node).",
           requestBody: body("CreateSave"),
           responses: { 201: ok("The save", ref("Save")) },
         }),
@@ -318,7 +319,9 @@ export function openapi(version: string) {
             "Each restores the save onto a fresh sandbox before anything in it starts. Size and idle minutes " +
             "default to the saved sandbox's. Onto a newer sandbox image, only /home is restored, and the " +
             "sandbox's notice says so. Ones that fail to start are returned in state error, with the reason; " +
-            "resuming one tries again.",
+            "resuming one tries again. With node (and cpus and memoryMb), they start on that node, as createSandbox " +
+            "places them: a save from a node starts on Cloudflare, and one from Cloudflare on a node, which moves a " +
+            "sandbox between them (with a new id and new preview links).",
           requestBody: body("ForkRequest", false),
           responses: { 201: ok("The new sandboxes", { type: "array", items: ref("Sandbox") }) },
         }),
@@ -498,7 +501,7 @@ export function openapi(version: string) {
           description:
             "Runs the agent with no terminal, as the cloudex user in a login shell, so it uses provider keys. " +
             "Answers at once; follow it with the events. The agent and its conversation live on the sandbox's disk. " +
-            "Not available for a sandbox on a node yet, where provider keys don't reach (501); nor is sending one a message.",
+            "On a node, the provider calls go through the node's agent to the deployment, which adds the key.",
           requestBody: body("StartAgent"),
           responses: { 201: agent },
         }),

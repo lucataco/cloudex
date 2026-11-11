@@ -195,13 +195,40 @@ export async function providerKey(env: Env, provider: Provider): Promise<string 
 
 // Run as root after each start. $1 is the providers with keys, space-separated
 // (possibly none); $2 the Anthropic and $3 the OpenAI placeholder; $4 the path
-// of the platform's interception certificate (Compute.caPath); the rest
-// NAME=placeholder for every variable of those providers (placeholderVars).
-// Trusts that certificate, which appears once interception is on, and writes
-// the placeholders where login shells (ssh, exec, agents) see them.
+// of the certificate that intercepted calls are signed with (Compute.caPath);
+// $5 "node" on a node (v0.2.2 M6), where that certificate, the node CA, comes
+// on stdin and $6, those providers' hosts, are pointed at the node's agent
+// (cloudex.internal) in /etc/hosts; the rest NAME=placeholder for every
+// variable of those providers (placeholderVars). Trusts that certificate,
+// which on Cloudflare appears once interception is on, and only that one of
+// the two (a save made on one and restored on the other brings the other's),
+// and writes the placeholders where login shells (ssh, exec, agents) see them.
 export const KEYS_SCRIPT = String.raw`
 set -euo pipefail
 providers=" $1 "
+mode=$5
+hosts=$6
+store=/usr/local/share/ca-certificates
+cf_ca=$store/cloudflare-containers-ca.crt
+node_ca=$store/cloudex-node-ca.crt
+# The CA this start trusts for provider calls ($1, a file in the store, or
+# none) and no other of the two.
+trust() {
+  local changed=
+  for f in "$cf_ca" "$node_ca"; do
+    if [ "$f" != "$1" ] && [ -e "$f" ]; then rm -f "$f"; changed=1; fi
+  done
+  if [ -n "$1" ] && ! cmp -s "$2" "$1"; then cp "$2" "$1"; changed=1; fi
+  [ -z "$changed" ] || update-ca-certificates >/dev/null 2>&1
+}
+# On a node, /etc/hosts is the machine's own (a bind mount Docker writes), so
+# it is rewritten in place, and only when it holds the block.
+hb="# Cloudex: provider hosts at the node's agent, rewritten at each start" he="# Cloudex: end of provider hosts"
+if grep -qxF "$hb" /etc/hosts 2>/dev/null; then
+  kept=$(sed "/^$hb\$/,/^$he\$/d" /etc/hosts)
+  printf '%s
+' "$kept" >/etc/hosts
+fi
 profile=/etc/profile.d/cloudex-keys.sh
 # Codex opens on a sign-in screen, even with CODEX_API_KEY set, unless it has
 # a login. With an OpenAI key and no login of its own (ChatGPT or a key given
@@ -222,16 +249,33 @@ esac
 begin="# Cloudex: placeholder provider keys, rewritten at each start" end="# Cloudex: end"
 sed -i "/^$begin\$/,/^$end\$/d" /etc/environment
 [ -z "$(tail -c1 /etc/environment)" ] || echo >>/etc/environment
-if [ -z "$1" ]; then rm -f "$profile"; exit 0; fi
 ca=$4
-for _ in $(seq 150); do [ -s "$ca" ] && break; sleep 0.1; done
-[ -s "$ca" ] || { echo "the platform's interception certificate didn't appear" >&2; exit 1; }
-cp "$ca" /usr/local/share/ca-certificates/cloudflare-containers-ca.crt
-update-ca-certificates >/dev/null 2>&1
+if [ -z "$1" ]; then
+  rm -f "$profile"
+  if [ "$mode" = node ]; then trust ""; elif [ -e "$node_ca" ]; then rm -f "$node_ca"; update-ca-certificates >/dev/null 2>&1; fi
+  exit 0
+fi
+if [ "$mode" = node ]; then
+  install -d -m 755 "$(dirname "$ca")"
+  cat >"$ca.new"
+  grep -q "BEGIN CERTIFICATE" "$ca.new" || { rm -f "$ca.new"; echo "the node's agent gave no CA" >&2; exit 1; }
+  mv "$ca.new" "$ca"
+  addr=$(getent hosts cloudex.internal | awk '{print $1; exit}')
+  [ -n "$addr" ] || { echo "cloudex.internal has no address in this machine" >&2; exit 1; }
+  kept=$(cat /etc/hosts)
+  { printf '%s
+%s
+' "$kept" "$hb"; for h in $hosts; do echo "$addr $h"; done; echo "$he"; } >/etc/hosts
+  trust "$node_ca" "$ca"
+else
+  for _ in $(seq 150); do [ -s "$ca" ] && break; sleep 0.1; done
+  [ -s "$ca" ] || { echo "the platform's interception certificate didn't appear" >&2; exit 1; }
+  trust "$cf_ca" "$ca"
+fi
 bundle=/etc/ssl/certs/ca-certificates.crt
 # NAME=value pairs; none has a space.
 vars="NODE_EXTRA_CA_CERTS=$bundle SSL_CERT_FILE=$bundle REQUESTS_CA_BUNDLE=$bundle"
-shift 4
+shift 6
 vars="$vars $*"
 {
   echo "# Written by Cloudex at each start. These keys are placeholders: the real"

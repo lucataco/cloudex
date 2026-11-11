@@ -42,6 +42,8 @@ export interface SaveManifest {
   createdAt: number;
   ms: number;
   settings?: StoredSettings;
+  // The node it was made on (v0.2.2 M6); absent on Cloudflare.
+  node?: { id: string; name: string };
 }
 
 // What the save script prints, last.
@@ -76,7 +78,18 @@ type Row = {
   bytes: number;
   created_at: number;
   ms: number;
+  node?: string | null;
 };
+
+function nodeOf(text: string | null | undefined): Save["node"] {
+  if (!text) return null;
+  try {
+    const n = JSON.parse(text) as { id?: unknown; name?: unknown };
+    return typeof n.id === "string" && typeof n.name === "string" ? { id: n.id, name: n.name } : null;
+  } catch {
+    return null;
+  }
+}
 
 const fromRow = (r: Row): Save => ({
   name: r.name,
@@ -90,6 +103,7 @@ const fromRow = (r: Row): Save => ({
   bytes: r.bytes,
   createdAt: r.created_at,
   ms: r.ms,
+  node: nodeOf(r.node),
 });
 
 export const saveView = (m: SaveManifest): Save => ({
@@ -104,6 +118,7 @@ export const saveView = (m: SaveManifest): Save => ({
   bytes: m.bytes,
   createdAt: m.createdAt,
   ms: m.ms,
+  node: m.node ?? null,
 });
 
 // Writes a finished save's manifest, then points its name at it, in one
@@ -121,13 +136,14 @@ export async function recordSave(db: D1Database, bucket: R2Bucket, m: SaveManife
     db.prepare("SELECT id FROM saves WHERE name = ?").bind(m.name),
     db
       .prepare(
-        `INSERT INTO saves (name, id, sandbox, kind, size, idle_minutes, files, raw_bytes, bytes, created_at, ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO saves (name, id, sandbox, kind, size, idle_minutes, files, raw_bytes, bytes, created_at, ms, node)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET id = excluded.id, sandbox = excluded.sandbox, kind = excluded.kind,
            size = excluded.size, idle_minutes = excluded.idle_minutes, files = excluded.files,
-           raw_bytes = excluded.raw_bytes, bytes = excluded.bytes, created_at = excluded.created_at, ms = excluded.ms`,
+           raw_bytes = excluded.raw_bytes, bytes = excluded.bytes, created_at = excluded.created_at, ms = excluded.ms,
+           node = excluded.node`,
       )
-      .bind(m.name, m.id, m.sandbox, m.kind, m.size, m.idleMinutes, m.files, m.rawBytes, m.bytes, m.createdAt, m.ms),
+      .bind(m.name, m.id, m.sandbox, m.kind, m.size, m.idleMinutes, m.files, m.rawBytes, m.bytes, m.createdAt, m.ms, m.node ? JSON.stringify(m.node) : null),
   ]).catch(async (e) => {
     await deleteSaveObjects(bucket, m.id).catch(() => {});
     throw e;

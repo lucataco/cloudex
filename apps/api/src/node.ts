@@ -27,7 +27,8 @@
 //   429, so a broken or hostile agent can't keep this object and D1 busy.
 //
 // - After hello comes welcome (M4): the image the deployment's machines run
-//   (NODE_IMAGE), which the agent pulls and checks against its own list.
+//   (NODE_IMAGE), which the agent pulls and checks against its own list; and
+//   (M6) the provider hosts its node CA is limited to.
 //
 // - Sandboxes on the node (M5). On hello it reconciles: each sandbox the
 //   index has on the node hears its machine's state (Sandbox.nodeReport),
@@ -55,6 +56,7 @@ import {
 import { BAD_SIGNATURE, rememberNonce } from "./nodeauth";
 import { issueTicket } from "./nodestream";
 import { sandboxesOnNode } from "./db";
+import { PROVIDERS } from "./keys";
 import { mirrorNode } from "./nodes";
 import { type ControlSocket, lastSign, newest, pick } from "./nodestate";
 import { type MachineReport, reconcilePlan } from "./placement";
@@ -317,7 +319,10 @@ export class Node extends DurableObject<Env> {
         await this.ctx.storage.put("hello", hello);
         await mirrorNode(this.env.DB, id, { state: "online", lastSeenAt: now, version: m.version, protocol: m.protocol, facts: m.facts });
         if (this.env.NODE_IMAGE) {
-          const welcome: WorkerMessage = { type: "welcome", image: this.env.NODE_IMAGE };
+          // providers (M6): the hosts the node CA is limited to, every one the
+          // deployment could hold a key for, so that a key set later works
+          // without a new CA.
+          const welcome: WorkerMessage = { type: "welcome", image: this.env.NODE_IMAGE, providers: Object.values(PROVIDERS).map((p) => p.host) };
           try {
             ws.send(JSON.stringify(welcome));
           } catch {}

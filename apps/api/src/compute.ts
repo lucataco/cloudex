@@ -182,7 +182,11 @@ const NO_BODY = new Set([101, 204, 205, 304]);
 
 export class NodeCompute implements Compute {
   readonly kind = "node";
-  readonly caPath = "/etc/cloudex/node-ca.crt"; // M6
+  // The node CA (v0.2.2 M6): the agent ends its machines' TLS to the AI
+  // providers with it, and gives its certificate with each start (ca), which
+  // KEYS_SCRIPT writes here and trusts.
+  readonly caPath = "/etc/cloudex/node-ca.crt";
+  ca: string | null = null;
   // Never a container of this object's: what runs on the node is the node's
   // Node object's to report (sandbox.ts nodeReport), so the checks that ask
   // Cloudflare's binding whether a box is left over stay out of it.
@@ -205,7 +209,9 @@ export class NodeCompute implements Compute {
     return new Promise(() => {});
   }
   async route() {
-    // cloudex.internal and provider calls on a node go through its agent (M6).
+    // On a node, cloudex.internal and the providers' hosts are the agent's
+    // own listeners (go/internal/node/egress.go), which pass requests on to
+    // the Worker's /v1/node/egress (nodeegress.ts), and so to Egress.
   }
   async keepAlive() {
     // A node has no platform timer, and no 6-hour limit.
