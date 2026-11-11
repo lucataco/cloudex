@@ -734,15 +734,12 @@ async function live(env: Env, n: ApiNode): Promise<ApiNode> {
   }
 }
 
-// The command that installs a node's agent with its join token, from the
-// image of the deployment's own version.
+// The command that installs a node's agent with its join token: the
+// installer (scripts/node-install.sh, published at https://cloudex.build/node)
+// run as root, with the agent image of the deployment's own version.
 function installCommand(origin: string, token: string) {
   const tag = VERSION === "dev" ? "edge" : VERSION;
-  return (
-    "docker run -d --name cloudex-node --restart unless-stopped " +
-    "-v /var/run/docker.sock:/var/run/docker.sock -v cloudex-node:/var/lib/cloudex-node " +
-    `ghcr.io/lucataco/cloudex-node:${tag} run --join ${token} --api ${origin}`
-  );
+  return `curl -fsSL https://cloudex.build/node | sudo bash -s -- --api ${origin} --token ${token} --version ${tag}`;
 }
 
 app.post("/v1/nodes", async (c) => {
@@ -758,10 +755,11 @@ app.get("/v1/nodes", async (c) => c.json(await Promise.all((await listNodeRows(c
 app.get("/v1/nodes/:node", async (c) => {
   const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")));
   if (n.state !== "online") return c.json(n);
+  const image = (await c.env.NODE.getByName(n.id).status().catch(() => null))?.hello?.facts.image;
   const t0 = Date.now();
   try {
     await c.env.NODE.getByName(n.id).op("ping", {}, 5000);
-    return c.json({ ...n, rttMs: Date.now() - t0 });
+    return c.json({ ...n, rttMs: Date.now() - t0, ...(image ? { image } : {}) });
   } catch (e) {
     console.error(`[${n.id}] ping: ${errorStatus(e).message}`);
     return c.json(n);
@@ -791,20 +789,33 @@ app.delete("/v1/nodes/:node", async (c) => {
   return c.json({ revoked: n.id });
 });
 
-// v0.2.2 M3's development path, for admins only (rules.ts leaves it to its
-// default): a sandbox on a node whose agent runs with --dev-machine, on that
-// container. Placing sandboxes on nodes for real is M5's POST /v1/sandboxes.
+// The development path (v0.2.2 M3, M4), for admins only (rules.ts leaves it
+// to its default): a sandbox on a node, whose machine the node's agent makes
+// with its Docker runtime and starts at once. stop and start below drive its
+// machine. Placing sandboxes on nodes for real is M5's POST /v1/sandboxes.
+const DevSandbox = z.object({
+  name: Name.optional(),
+  cpus: z.number().min(0.25).max(1024).optional(),
+  memoryMb: z.number().int().min(512).max(16 * 1024 * 1024).optional(),
+});
+
 app.post("/v1/nodes/:node/dev-sandboxes", async (c) => {
   const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")));
   if (n.state !== "online") fail(503, `node ${n.name} is ${n.state}`);
   const text = await c.req.text();
-  const { name } = z.object({ name: Name.optional() }).parse(text ? JSON.parse(text) : {});
+  const { name, cpus, memoryMb } = DevSandbox.parse(text ? JSON.parse(text) : {});
   if (name && (await nameTaken(c.env.DB, name))) return c.json({ error: `the name ${name} is taken` }, 409);
   const id = newSandboxId();
   await setOwner(c.env.DB, id, c.get("who"));
   const hint = n.locationHint as DurableObjectLocationHint | null;
-  const s = await c.env.SANDBOX.getByName(id, hint ? { locationHint: hint } : undefined).adoptDev(id, n.id, name ?? null);
+  const s = await c.env.SANDBOX.getByName(id, hint ? { locationHint: hint } : undefined).createDev(id, n.id, name ?? null, { cpus, memoryMb });
   return c.json(s, 201);
+});
+
+app.post("/v1/nodes/:node/dev-sandboxes/:ref/:action{stop|start}", async (c) => {
+  const s = await resolve(c.env, c.req.param("ref"));
+  if (!s) fail(404, `no sandbox named ${c.req.param("ref")}`);
+  return c.json(await s.stub.devLifecycle(c.req.param("action") as "stop" | "start"));
 });
 
 // A development sandbox's node streams (spares and open ones) and where its

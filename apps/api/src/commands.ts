@@ -62,8 +62,17 @@ def fail(code, message):
 
 
 def boot_id():
-    with open("/proc/sys/kernel/random/boot_id") as f:
-        return f.read().strip()
+    # This start of the machine: the entrypoint's id (v0.2.2), else the
+    # kernel's, which under Docker is the host's and outlives a restart.
+    for p in ("/run/cloudex-boot", "/proc/sys/kernel/random/boot_id"):
+        try:
+            with open(p) as f:
+                v = f.read().strip()
+            if v:
+                return v
+        except OSError:
+            pass
+    return ""
 
 
 def path(cid, name=""):

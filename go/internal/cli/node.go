@@ -57,8 +57,9 @@ func newNodeCmd(opts *options) *cobra.Command {
 			}
 			w := cmd.OutOrStdout()
 			fmt.Fprintf(w, "Added node %s (%s). On it, as root, with Docker running, run:\n\n  %s\n\n", n.Node.Name, n.Node.ID, n.Install)
-			fmt.Fprintf(w, "Or run the agent as a plain process:\n\n  cloudex-node run --join %s --api %s --state-dir <a directory of its own>\n\n", n.JoinToken, client.BaseURL)
-			fmt.Fprintf(w, "The token works once, until %s. Then cloudex node list shows %s online.\n", time.UnixMilli(n.ExpiresAt).Format("15:04"), n.Node.Name)
+			fmt.Fprintf(w, "The token works once, until %s. The installer sets up a firewall for the node's\n", time.UnixMilli(n.ExpiresAt).Format("15:04"))
+			fmt.Fprintf(w, "machines, starts the agent, and checks the isolation; then cloudex node list shows\n%s online.\n\n", n.Node.Name)
+			fmt.Fprintln(w, plainDockerWarning(n.Node.Name))
 			return nil
 		},
 	})
@@ -84,17 +85,19 @@ func newNodeCmd(opts *options) *cobra.Command {
 	})
 
 	var devName string
+	var devCPUs float64
+	var devMemory int
 	dev := &cobra.Command{
 		Use:    "dev-sandbox <node>",
 		Hidden: true,
-		Short:  "Development only (v0.2.2 M3): a sandbox on the container a node's agent runs with --dev-machine",
+		Short:  "Development only (v0.2.2 M3, M4): a sandbox on a node, whose agent makes and starts its machine",
 		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, client, err := opts.load()
 			if err != nil {
 				return err
 			}
-			s, err := client.CreateDevSandbox(cmd.Context(), args[0], devName)
+			s, err := client.CreateDevSandbox(cmd.Context(), args[0], devName, devCPUs, devMemory)
 			if err != nil {
 				return err
 			}
@@ -102,7 +105,28 @@ func newNodeCmd(opts *options) *cobra.Command {
 		},
 	}
 	dev.Flags().StringVar(&devName, "name", "", "a name for the sandbox")
+	dev.Flags().Float64Var(&devCPUs, "cpus", 0, "its CPUs (default 1)")
+	dev.Flags().IntVar(&devMemory, "memory-mb", 0, "its memory in MiB (default 6144, or half the host's)")
 	cmd.AddCommand(dev)
+	for _, action := range []string{"stop", "start"} {
+		cmd.AddCommand(&cobra.Command{
+			Use:    "dev-" + action + " <node> <sandbox>",
+			Hidden: true,
+			Short:  "Development only (v0.2.2 M4): " + action + " a development sandbox's machine",
+			Args:   cobra.ExactArgs(2),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				_, client, err := opts.load()
+				if err != nil {
+					return err
+				}
+				s, err := client.DevSandboxLifecycle(cmd.Context(), args[0], args[1], action)
+				if err != nil {
+					return err
+				}
+				return writeJSON(cmd.OutOrStdout(), s)
+			},
+		})
+	}
 	cmd.AddCommand(&cobra.Command{
 		Use:    "dev-streams <node> <sandbox>",
 		Hidden: true,
@@ -206,6 +230,21 @@ func printNode(cmd *cobra.Command, n *api.Node) error {
 	row("Host", fmt.Sprintf("%s, %s CPUs, %s memory, %s disk free", orDash(n.Arch), intOrDash(n.CPUs), memory(n.MemoryMB), disk(n.DiskFreeGB)))
 	row("Runtime", orDash(n.Runtime))
 	row("Isolation", isolationLabel(n))
+	if n.Isolation != nil && n.Isolation.CheckedAt != nil {
+		row("Self-test", ago(*n.Isolation.CheckedAt))
+	}
+	if n.Isolation != nil {
+		for _, f := range n.Isolation.Failed {
+			row("  failed", clean(f))
+		}
+	}
+	if n.Image != nil {
+		img := clean(n.Image.Ref) + ", " + n.Image.State
+		if n.Image.Progress != nil && n.Image.State == "pulling" {
+			img += fmt.Sprintf(" (%.0f%%)", *n.Image.Progress*100)
+		}
+		row("Image", img)
+	}
 	where := orDash(n.Colo)
 	if n.LocationHint != nil {
 		where += ", sandboxes in " + *n.LocationHint
@@ -219,21 +258,34 @@ func printNode(cmd *cobra.Command, n *api.Node) error {
 	return tw.Flush()
 }
 
-// isolationLabel says how machines on the node are kept apart, as far as M2
-// knows: the firewall self-test comes with the Docker runtime.
+// isolationLabel says how machines on the node are kept apart: by the
+// runtime, when the agent's firewall self-test passes ("docker" is plain
+// Docker, for trusted code only); none on a node that joined with
+// --unisolated, for testing.
 func isolationLabel(n *api.Node) string {
 	switch {
 	case n.Isolation == nil:
 		return "-"
 	case n.Isolation.Unisolated:
 		return "none (testing)"
+	case n.Isolation.Firewall == "pass" && n.Runtime != nil && *n.Runtime == "docker":
+		return "docker (trusted code only)"
 	case n.Isolation.Firewall == "pass":
 		return orDash(n.Runtime)
 	case n.Isolation.Firewall == "fail":
-		return "failing"
+		return "failing (no machines)"
 	default:
 		return "unchecked"
 	}
+}
+
+// plainDockerWarning is what node add says, and what new --on will say on a
+// plain-Docker node (v0.2.2 M5).
+func plainDockerWarning(node string) string {
+	return "If the host has no Sysbox, machines on " + node + " run under plain Docker. Root in a machine\n" +
+		"is root on " + node + " if code escapes the container, and from there its LAN and tailnet\n" +
+		"are in reach. Use such a node only for code you trust. With Sysbox installed before the\n" +
+		"agent, root in a machine is an unprivileged user on the host."
 }
 
 func seen(n *api.Node) string {

@@ -91,10 +91,14 @@ import { NodeStreams } from "./nodestream";
 import { tokenAlive } from "./tokens";
 import { CREDENTIAL_ENDED, LINK_HEADER, TOKEN_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
-// Exits 0 once the entrypoint is ready in this boot, and 3 while it holds for
-// a restore (CLOUDEX_HOLD).
+// Exits 0 once the entrypoint is ready in this start of the machine, and 3
+// while it holds for a restore (CLOUDEX_HOLD). The start's id is the one the
+// entrypoint writes to /run/cloudex-boot (v0.2.2), or the kernel's boot_id
+// for an image from before: under Docker, boot_id is the host's and the same
+// after every restart (N9). go/internal/node/runtime.go's ReadyCheck is the same.
 const BOOT_CHECK =
-  'b=$(cat /proc/sys/kernel/random/boot_id); [ "$(cat /run/cloudex-ready 2>/dev/null)" = "$b" ] && exit 0; ' +
+  "b=$(cat /run/cloudex-boot 2>/dev/null) || b=$(cat /proc/sys/kernel/random/boot_id); " +
+  '[ "$(cat /run/cloudex-ready 2>/dev/null)" = "$b" ] && exit 0; ' +
   '[ "$(cat /run/cloudex-held 2>/dev/null)" = "$b" ] && exit 3; exit 1';
 const READY_TIMEOUT_MS = 10 * 60_000; // a host without the image pulls it first
 const SAVE_TIMEOUT_MS = 15 * 60_000; // 15 GiB took 179 s in the spikes
@@ -280,7 +284,7 @@ export class Sandbox extends DurableObject<Env> {
   private place(p: NodePlacement | undefined) {
     this.onNode = p
       ? new NodeCompute(this.streams, p, async () => {
-          await this.env.NODE.getByName(p.node).op("release", { sandbox: this.record?.id ?? "" }, 10_000);
+          await this.env.NODE.getByName(p.node).op("delete", { sandbox: this.record?.id ?? "" }, 60_000);
         })
       : undefined;
   }
@@ -1979,14 +1983,24 @@ export class Sandbox extends DurableObject<Env> {
     }
   }
 
-  // M3's development path (POST /v1/nodes/{node}/dev-sandboxes, admins only):
-  // a sandbox whose machine is a container the node's agent was told to adopt
-  // with --dev-machine. It runs from the start and can't be stopped, saved or
-  // forked; deleting it releases the container, which stays on the node.
-  async adoptDev(id: string, node: string, name: string | null): Promise<SandboxRecord> {
+  // The development path (POST /v1/nodes/{node}/dev-sandboxes, admins only;
+  // v0.2.2 M3, and since M4 a real machine): the node's agent makes the
+  // machine with its Docker runtime and starts it. It can't be saved or
+  // forked, and the sandbox's own stop and resume answer 501 until M5;
+  // devLifecycle stops and starts its machine. Deleting it removes the
+  // machine and its network.
+  async createDev(id: string, node: string, name: string | null, size: { cpus?: number; memoryMb?: number }): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       if (this.record) fail(409, `${id} already exists`);
-      const answer = (await this.env.NODE.getByName(node).op("adopt", { sandbox: id }, 15_000)) as Record<string, unknown>;
+      const stub = this.env.NODE.getByName(node);
+      await stub.op("create", { sandbox: id, ...(this.env.NODE_IMAGE ? { image: this.env.NODE_IMAGE } : {}), ...size }, 60_000);
+      let answer: Record<string, unknown>;
+      try {
+        answer = (await stub.op("start", { sandbox: id }, 120_000)) as Record<string, unknown>;
+      } catch (e) {
+        await (stub.op("delete", { sandbox: id }, 60_000) as Promise<unknown>).catch(() => {});
+        throw e;
+      }
       const address = typeof answer.address === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(answer.address) ? answer.address : null;
       if (!address) fail(502, "the node's agent didn't say where the machine is");
       const placement: NodePlacement = { node, address, dev: true };
@@ -2004,13 +2018,35 @@ export class Sandbox extends DurableObject<Env> {
         savedAt: null,
         savedBytes: null,
         error: null,
-        notice: "A development machine on a node (v0.2.2 M3): it can't be stopped, saved or forked.",
+        notice: "A development sandbox on a node (v0.2.2): it can't be saved or forked yet.",
       };
       this.place(placement);
       await this.ctx.storage.put("node", placement);
       await this.ctx.storage.put("selfToken", crypto.randomUUID());
       await this.update({});
       await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+      return this.mustRecord();
+    });
+  }
+
+  // Stops or starts a development sandbox's machine (its disk stays).
+  async devLifecycle(action: "stop" | "start"): Promise<SandboxRecord> {
+    return this.exclusive(async () => {
+      const p = this.onNode?.placement;
+      if (!p || !this.record) fail(404, "this sandbox isn't on a node");
+      const stub = this.env.NODE.getByName(p.node);
+      if (action === "stop") {
+        this.streams.closeAll(1000, "the machine stopped");
+        await stub.op("stop", { sandbox: this.record.id }, 60_000);
+        await this.update({ state: "stopped", stoppedAt: Date.now() });
+      } else {
+        const answer = (await stub.op("start", { sandbox: this.record.id }, 120_000)) as Record<string, unknown>;
+        if (typeof answer.address === "string" && answer.address !== p.address) {
+          this.place({ ...p, address: answer.address });
+          await this.ctx.storage.put("node", { ...p, address: answer.address });
+        }
+        await this.update({ state: "running", startedAt: Date.now(), error: null });
+      }
       return this.mustRecord();
     });
   }

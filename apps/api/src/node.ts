@@ -13,7 +13,8 @@
 //   Anything else closes the socket (4400). hello and facts are kept here and
 //   copied to D1, which lists nodes.
 // - op() sends a request to the agent and waits for its answer. Ops are short
-//   (ping, facts, and M3's adopt, release and streams); a restart of this
+//   (ping, facts, M3's streams, and M4's create, start, stop and delete, which
+//   wait at most for a machine's entrypoint, and selftest); a restart of this
 //   object loses its waiters, and their callers get an error. Nothing long
 //   runs as an op: an exec has a stream socket of its own (nodestream.ts),
 //   whose loss the agent sees and acts on.
@@ -24,6 +25,9 @@
 // - revoke() refuses the node from now on and closes its socket (4003).
 // - A node may connect at most CONNECTS_PER_MINUTE times a minute; more get
 //   429, so a broken or hostile agent can't keep this object and D1 busy.
+//
+// - After hello comes welcome (M4): the image the deployment's machines run
+//   (NODE_IMAGE), which the agent pulls and checks against its own list.
 //
 // Later milestones add reconciling machines on hello (M5) and the tombstones of
 // machines deleted while the node was offline.
@@ -199,6 +203,12 @@ export class Node extends DurableObject<Env> {
         const hello: Hello = { version: m.version, protocol: m.protocol, facts: m.facts, machines: m.machines, at: now };
         await this.ctx.storage.put("hello", hello);
         await mirrorNode(this.env.DB, id, { state: "online", lastSeenAt: now, version: m.version, protocol: m.protocol, facts: m.facts });
+        if (this.env.NODE_IMAGE) {
+          const welcome: WorkerMessage = { type: "welcome", image: this.env.NODE_IMAGE };
+          try {
+            ws.send(JSON.stringify(welcome));
+          } catch {}
+        }
         return;
       }
       case "facts": {

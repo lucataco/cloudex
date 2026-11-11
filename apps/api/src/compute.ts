@@ -4,9 +4,10 @@
 // - CloudflareCompute: a Cloudflare container owned by the Durable Object.
 // - NodeCompute (v0.2.2 M3): a machine on a node, a user's own Docker host,
 //   reached through stream sockets its agent opens into this object
-//   (nodestream.ts). In M3 that's only a development machine: a container
-//   started by hand that the agent adopts (POST /v1/nodes/{node}/dev-sandboxes),
-//   so the lifecycle calls (start, snapshot, stop) answer 501 until M5.
+//   (nodestream.ts). Until M5 that's only a development sandbox (POST
+//   /v1/nodes/{node}/dev-sandboxes), whose machine the agent makes with its
+//   Docker runtime (M4), so the lifecycle calls here (start, snapshot) answer
+//   501 until M5.
 //
 // Each call keeps the shape of the platform call it stands for. Deadlines stay
 // with the caller (sandbox.ts), except where noted.
@@ -170,7 +171,7 @@ export class CloudflareCompute implements Compute {
 export type NodePlacement = { node: string; address: string; dev: true };
 
 const notYet = (what: string): never =>
-  fail(501, `${what} isn't available for a sandbox on a node yet (v0.2.2 M3 runs only development machines); delete it instead`);
+  fail(501, `${what} isn't available for a sandbox on a node yet (v0.2.2 runs only development sandboxes there until M5); delete it instead`);
 
 // A preview's request headers, as the node's agent sends them on.
 function headerList(req: Request): [string, string][] {
@@ -189,8 +190,8 @@ export class NodeCompute implements Compute {
   constructor(
     private readonly streams: NodeStreams,
     readonly placement: NodePlacement,
-    // Tells the node's agent the machine no longer runs this sandbox.
-    private readonly release: () => Promise<void>,
+    // Has the node's agent remove the machine and its network.
+    private readonly remove: () => Promise<void>,
   ) {}
 
   get guestAddress() {
@@ -215,7 +216,7 @@ export class NodeCompute implements Compute {
   }
   async destroy() {
     this.streams.closeAll(1000, "the sandbox was deleted");
-    await withTimeout(this.release(), 10_000, "releasing the machine").catch((e) => console.error(`release: ${e instanceof Error ? e.message : e}`));
+    await withTimeout(this.remove(), 60_000, "removing the machine").catch((e) => console.error(`removing the machine: ${e instanceof Error ? e.message : e}`));
   }
 
   async exec(argv: string[], o: ExecOpts = {}): Promise<Proc> {

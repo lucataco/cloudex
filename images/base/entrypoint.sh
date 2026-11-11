@@ -7,9 +7,17 @@ set -u
 log() { echo "[cloudex] $(date +%s.%N) $*" | tee -a /var/log/cloudex.log; }
 log "entrypoint start sandbox=${CLOUDEX_SANDBOX:-?}"
 
+# An id for this start of the machine. Readiness and background commands are
+# tied to it: the kernel's boot_id would do on Cloudflare, but under Docker it
+# is the host's, the same after every restart. /run is a tmpfs, so the file
+# can't outlive one.
+BOOT=$(cat /proc/sys/kernel/random/uuid)
+printf '%s\n' "$BOOT" > /run/cloudex-boot
+
 # The platform's hostname is the 64-character instance ID, which is too long for
-# a DNS label and breaks tools such as Python's http.server.
-[ -n "${CLOUDEX_SANDBOX:-}" ] && hostname "${CLOUDEX_SANDBOX}"
+# a DNS label and breaks tools such as Python's http.server. On a node, Docker
+# has set it already, and changing it needs a capability machines don't have.
+[ -n "${CLOUDEX_SANDBOX:-}" ] && [ "$(hostname)" != "${CLOUDEX_SANDBOX}" ] && hostname "${CLOUDEX_SANDBOX}"
 
 # The platform hands over / owned by another uid, which tools that check the
 # owners of a path's parents refuse; Claude Code then turns its messaging off.
@@ -19,7 +27,7 @@ log "entrypoint start sandbox=${CLOUDEX_SANDBOX:-?}"
 # the save onto the disk, so that nothing runs from the image's files
 # meanwhile. It gives up after 30 minutes.
 if [ "${CLOUDEX_HOLD:-}" = 1 ]; then
-  cat /proc/sys/kernel/random/boot_id > /run/cloudex-held
+  printf '%s\n' "$BOOT" > /run/cloudex-held
   log "held for a restore"
   for _ in $(seq 3600); do
     [ -e /run/cloudex-go ] && break
@@ -66,7 +74,7 @@ trap on_term TERM INT
 
 /usr/local/bin/cloudex-keepalive >>/var/log/cloudex.log 2>&1 &
 
-cat /proc/sys/kernel/random/boot_id > /run/cloudex-ready
+printf '%s\n' "$BOOT" > /run/cloudex-ready
 log "ready"
 while :; do
   sleep 3600 &

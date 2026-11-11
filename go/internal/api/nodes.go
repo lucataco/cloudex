@@ -27,11 +27,21 @@ type Node struct {
 	Machines     int            `json:"machines"`
 	RevokedAt    *int64         `json:"revokedAt"`
 	RTTMs        *int64         `json:"rttMs,omitempty"`
+	Image        *NodeImage     `json:"image,omitempty"`
 }
 
 type NodeIsolation struct {
-	Firewall   string `json:"firewall"` // pass, fail or unchecked
-	Unisolated bool   `json:"unisolated"`
+	Firewall   string   `json:"firewall"` // pass, fail or unchecked
+	Unisolated bool     `json:"unisolated"`
+	CheckedAt  *int64   `json:"checkedAt,omitempty"`
+	Failed     []string `json:"failed,omitempty"`
+}
+
+// NodeImage is the machine image on a node, and whether it has it.
+type NodeImage struct {
+	Ref      string   `json:"ref"`
+	State    string   `json:"state"` // present, pulling, missing or refused
+	Progress *float64 `json:"progress,omitempty"`
 }
 
 // NewNode is a node as added: the token its agent joins with, once, before
@@ -70,16 +80,29 @@ func (c *Client) DeleteNode(ctx context.Context, ref string, force bool) (map[st
 	return out, c.do(ctx, http.MethodDelete, path, nil, &out)
 }
 
-// CreateDevSandbox is v0.2.2 M3's development path, for admins: a sandbox on
-// the container a node's agent runs with --dev-machine (cloudex node
-// dev-sandbox, hidden). M5 places sandboxes on nodes for real.
-func (c *Client) CreateDevSandbox(ctx context.Context, node, name string) (*Sandbox, error) {
-	body := map[string]string{}
+// CreateDevSandbox is the development path (v0.2.2 M3, M4), for admins: a
+// sandbox on a node, whose machine the node's agent makes and starts (cloudex
+// node dev-sandbox, hidden). M5 places sandboxes on nodes for real. cpus and
+// memoryMB are optional (0).
+func (c *Client) CreateDevSandbox(ctx context.Context, node, name string, cpus float64, memoryMB int) (*Sandbox, error) {
+	body := map[string]any{}
 	if name != "" {
 		body["name"] = name
 	}
+	if cpus > 0 {
+		body["cpus"] = cpus
+	}
+	if memoryMB > 0 {
+		body["memoryMb"] = memoryMB
+	}
 	var s Sandbox
 	return &s, c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(node)+"/dev-sandboxes", body, &s)
+}
+
+// DevSandboxLifecycle stops or starts a development sandbox's machine.
+func (c *Client) DevSandboxLifecycle(ctx context.Context, node, ref, action string) (*Sandbox, error) {
+	var s Sandbox
+	return &s, c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(node)+"/dev-sandboxes/"+url.PathEscape(ref)+"/"+action, nil, &s)
 }
 
 // DevSandboxStreams says how many spare and open node streams a development
