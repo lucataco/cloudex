@@ -15,11 +15,19 @@
       "images": { "base": { "dockerfile": "../../images/base/Dockerfile" } }
     }
   ],
+  // NODE: one Node object per node (node.ts), which holds its agent's control
+  // socket. Declared through exports, so a deployment from before nodes gets the
+  // new class on its next deploy with no migration step. cloudex deploy's
+  // workerMetadata (go/internal/deploy) must declare the same; a test there checks.
   "durable_objects": {
-    "bindings": [{ "name": "SANDBOX", "class_name": "Sandbox" }]
+    "bindings": [
+      { "name": "SANDBOX", "class_name": "Sandbox" },
+      { "name": "NODE", "class_name": "Node" }
+    ]
   },
   "exports": {
-    "Sandbox": { "type": "durable-object", "storage": "sqlite" }
+    "Sandbox": { "type": "durable-object", "storage": "sqlite" },
+    "Node": { "type": "durable-object", "storage": "sqlite" }
   },
   // No database_id: wrangler creates the database on first deploy.
   "d1_databases": [{ "binding": "DB", "database_name": "cloudex" }],
@@ -28,6 +36,9 @@
   "r2_buckets": [{ "binding": "BACKUPS", "bucket_name": "cloudex-backups" }],
   // PREVIEW_ZONE: a zone in this account that serves preview links
   // (https://<port>-<id>-<token>.<zone>). Empty turns preview links off.
-  "vars": { "PREVIEW_ZONE": "" }
+  // NODE_IMAGE: the sandbox image nodes pull, as its published reference with
+  // its digest (ghcr.io/lucataco/cloudex-base:<tag>@sha256:...). cloudex deploy
+  // sets it; empty here.
+  "vars": { "PREVIEW_ZONE": "", "NODE_IMAGE": "" }
   // Secrets: ADMIN_KEY (wrangler secret put ADMIN_KEY). Locally, put it in .dev.vars.
 }

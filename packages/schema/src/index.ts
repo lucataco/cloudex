@@ -574,3 +574,6 @@ export const StartSession = z.union([
   z.object({ device_code: z.string().min(1).max(200) }),
 ]);
 export type StartSession = z.input<typeof StartSession>;
+
+// Nodes (node.ts): the API's records and the agent's messages.
+export * from "./node.ts";

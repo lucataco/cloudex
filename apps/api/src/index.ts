@@ -28,6 +28,12 @@ import {
   UpdateSandbox,
   UpdateSettings,
   type Health,
+  CreateNode,
+  type NewNode,
+  type Node as ApiNode,
+  NodeJoin,
+  type NodeJoined,
+  NODE_PROTOCOL,
 } from "@cloudex/schema";
 import { z } from "zod";
 import { openapi } from "@cloudex/schema/openapi";
@@ -58,6 +64,10 @@ import {
   waitingDevices,
 } from "./tokens";
 import { serveDashboard } from "./dashboard";
+import { CONNECT } from "./node";
+import { HEADERS, issueJoinToken, readCapped, useJoinToken, verifyJoinSignature, verifyNodeRequest } from "./nodeauth";
+import { addNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodePublicKey, revokeNode } from "./nodes";
+import { locationHint } from "./nodestate";
 import { notFromDashboard, readSession, sessionCookie, sessionName } from "./session";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, keyRefusal, listKeys, setKey } from "./keys";
@@ -76,9 +86,11 @@ import {
   newSaveId,
   previewToken,
   sameSecret,
+  withTimeout,
 } from "./util";
 
 export { Sandbox } from "./sandbox";
+export { Node } from "./node";
 export { Egress } from "./egress";
 
 
@@ -169,6 +181,59 @@ app.delete("/v1/auth/session", async (c) => {
   if (who?.kind === "token" && who.token.kind === "session") await revokeToken(c.env.DB, who.token.id);
   c.header("set-cookie", sessionCookie(null));
   return c.json({ signedOut: true });
+});
+
+// The node agent's two routes (nodeauth.ts). They take no bearer token and no
+// cookie, only the node's signature, so they come before the middleware below;
+// and that middleware never takes a node's signature. Before a caller has
+// proven it holds a node's key, it costs at most a 16 KiB body, a signature
+// check and one D1 read or write, never a socket or a Durable Object.
+const JOIN_BODY_MAX = 16_384;
+
+app.post("/v1/node/join", async (c) => {
+  const text = await readCapped(c.req.raw, JOIN_BODY_MAX);
+  if (text === null) return c.json({ error: `a join is at most ${JOIN_BODY_MAX} bytes` }, 413);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return c.json({ error: "the body isn't JSON" }, 400);
+  }
+  const parsed = NodeJoin.safeParse(raw);
+  if (!parsed.success) {
+    const i = parsed.error.issues[0];
+    return c.json({ error: `${i?.path.join(".") || "body"}: ${i?.message}` }, 400);
+  }
+  const j = parsed.data;
+  const refusal = await verifyJoinSignature(c.req.raw, j.publicKey);
+  if (refusal) return c.json({ error: refusal.error }, refusal.status);
+  const nodeId = await useJoinToken(c.env.DB, j.token);
+  const node = nodeId && (await joinNode(c.env.DB, nodeId, j));
+  if (!node) {
+    return c.json({ error: "unauthorized: that join token is unknown, used or expired (each works once, for 30 minutes); cloudex node add <name> makes a new one" }, 401);
+  }
+  return c.json({ node } satisfies NodeJoined);
+});
+
+app.get("/v1/node/connect", async (c) => {
+  if (c.req.header("upgrade")?.toLowerCase() !== "websocket") return c.json({ error: "the node's control socket is a WebSocket" }, 426);
+  const protocol = c.req.header(HEADERS.protocol) ?? "";
+  if (protocol !== String(NODE_PROTOCOL)) {
+    return c.json(
+      { error: `this deployment speaks node protocol ${NODE_PROTOCOL} and the agent ${protocol || "doesn't say"}: install the agent of the deployment's version (${VERSION})` },
+      426,
+    );
+  }
+  const v = await verifyNodeRequest(c.req.raw, (id) => nodePublicKey(c.env.DB, id));
+  if (!("signed" in v)) return c.json({ error: v.error }, v.status);
+  const cf = (c.req.raw as { cf?: { colo?: unknown; continent?: unknown; longitude?: unknown } }).cf;
+  const fwd = new Request("http://node/connect", c.req.raw);
+  fwd.headers.set(CONNECT.node, v.signed.node);
+  fwd.headers.set(CONNECT.nonce, v.signed.nonce);
+  fwd.headers.set(CONNECT.colo, typeof cf?.colo === "string" ? cf.colo.slice(0, 8) : "");
+  fwd.headers.set(CONNECT.continent, typeof cf?.continent === "string" ? cf.continent.slice(0, 4) : "");
+  fwd.headers.set(CONNECT.hint, locationHint(cf) ?? "");
+  return c.env.NODE.getByName(v.signed.node).fetch(fwd);
 });
 
 // Every other /v1 route: the admin key or a token as the bearer, or the
@@ -639,6 +704,71 @@ app.patch("/v1/sandboxes/:ref/settings", async (c) => {
   const change = UpdateSettings.parse(await c.req.json());
   const ref = c.req.param("ref");
   return c.json(await newMethod(ref, (await sandbox(c.env, ref)).stub.updateSettings(change)));
+});
+
+// Nodes (nodes.ts, node.ts): adding and removing are for admins (rules.ts).
+// D1 has what each agent last reported; whether it's online is its Node
+// object's to say.
+async function live(env: Env, n: ApiNode): Promise<ApiNode> {
+  if (n.state !== "online" && n.state !== "offline") return n;
+  try {
+    const s = await withTimeout(env.NODE.getByName(n.id).status(), 3000, "the node's status");
+    return { ...n, state: s.online ? "online" : "offline", lastSeenAt: s.lastSeenAt ?? n.lastSeenAt };
+  } catch (e) {
+    console.error(`[${n.id}] status: ${errorStatus(e).message}`);
+    return n;
+  }
+}
+
+// The command that installs a node's agent with its join token, from the
+// image of the deployment's own version.
+function installCommand(origin: string, token: string) {
+  const tag = VERSION === "dev" ? "edge" : VERSION;
+  return (
+    "docker run -d --name cloudex-node --restart unless-stopped " +
+    "-v /var/run/docker.sock:/var/run/docker.sock -v cloudex-node:/var/lib/cloudex-node " +
+    `ghcr.io/lucataco/cloudex-node:${tag} run --join ${token} --api ${origin}`
+  );
+}
+
+app.post("/v1/nodes", async (c) => {
+  const { name } = CreateNode.parse(await c.req.json());
+  const node = await addNode(c.env.DB, name);
+  const { token, expiresAt } = await issueJoinToken(c.env.DB, node.id);
+  const origin = new URL(c.req.url).origin;
+  return c.json({ node, joinToken: token, expiresAt, install: installCommand(origin, token) } satisfies NewNode, 201);
+});
+
+app.get("/v1/nodes", async (c) => c.json(await Promise.all((await listNodeRows(c.env.DB)).map((n) => live(c.env, n)))));
+
+app.get("/v1/nodes/:node", async (c) => {
+  const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")));
+  if (n.state !== "online") return c.json(n);
+  const t0 = Date.now();
+  try {
+    await c.env.NODE.getByName(n.id).op("ping", {}, 5000);
+    return c.json({ ...n, rttMs: Date.now() - t0 });
+  } catch (e) {
+    console.error(`[${n.id}] ping: ${errorStatus(e).message}`);
+    return c.json(n);
+  }
+});
+
+app.delete("/v1/nodes/:node", async (c) => {
+  const n = await mustFindNode(c.env.DB, c.req.param("node"));
+  // A node that never joined, or was revoked, is forgotten.
+  if (n.state === "revoked" || n.state === "pending") {
+    await forgetNode(c.env.DB, n.id);
+    return c.json({ deleted: n.id });
+  }
+  const force = ["1", "true"].includes(c.req.query("force") ?? "");
+  if (n.machines > 0 && !force) {
+    fail(409, `node ${n.name} still has ${n.machines} sandbox${n.machines === 1 ? "" : "es"}: delete ${n.machines === 1 ? "it" : "them"} first, or remove the node anyway with --force`);
+  }
+  // D1 first, so its key stops working at once; then the socket closes.
+  await revokeNode(c.env.DB, n.id);
+  await c.env.NODE.getByName(n.id).revoke();
+  return c.json({ revoked: n.id });
 });
 
 // AI provider keys (keys.ts). Keys are write-only: listing shows a hint.

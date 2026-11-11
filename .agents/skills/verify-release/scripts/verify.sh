@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Checks what Cloudex ships against a live deployment, the way a user runs it.
-#   verify.sh [area...]    areas: setup lifecycle connect inside agents tokens dashboard browser sdk (default: all)
+#   verify.sh [area...]    areas: setup lifecycle connect inside agents tokens dashboard browser sdk node (default: all)
 # Env: CLOUDEX_BIN (default: cloudex on PATH), CLOUDEX_CONFIG_DIR (the deployment to use,
 # default ~/.config/cloudex), VERIFY_OUT (results directory), VERIFY_KEEP=1 keeps sandboxes,
 # VERIFY_BROWSERS (browser area: "chrome", the default, "firefox", or both), CHROME and FIREFOX
 # (where they are, when not in the usual places), VERIFY_AGENTS=1 (the browser's agent turn
-# without the agents area).
+# without the agents area). The node area: VERIFY_NODE_SSH (a command prefix that runs a
+# command on the host for the agent, such as "ssh box"; without it the area is a SKIP),
+# VERIFY_NODE_AGENT (cloudex-node's path on that host, if it's there; else it's built for
+# linux/$VERIFY_NODE_ARCH, default amd64, and copied over), VERIFY_NODE_DEPLOY=1 (N07, which
+# runs cloudex deploy with $CLOUDFLARE_API_TOKEN).
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
 set -uo pipefail
 
@@ -67,13 +71,20 @@ cleanup() {
 	for c in $("$CX" tokens approve --json 2>/dev/null | jq -r --arg p "$P-" '.[]? | select(.name | startswith($p)) | .userCode'); do
 		"$CX" tokens deny "$c" >/dev/null 2>&1
 	done
+	# Nodes: revoked by the first rm, forgotten by the second. The agent on the
+	# host and its directory go too; nothing else there is touched.
+	for n in $("$CX" node list --json 2>/dev/null | jq -r --arg p "$P-" '.[]? | select(.name | startswith($p)) | .name'); do
+		"$CX" node rm "$n" --yes --force >/dev/null 2>&1
+		"$CX" node rm "$n" --yes >/dev/null 2>&1
+	done
+	[[ -n ${NODE_DIR:-} ]] && node_stop_all
 	echo "results: $results"
 }
 trap cleanup EXIT
 
 want() { [[ $# -eq 0 || " ${areas[*]} " == *" $1 "* ]]; }
 areas=("$@")
-[[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents tokens dashboard browser sdk)
+[[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents tokens dashboard browser sdk node)
 echo "Cloudex verify: $("$CX" version --json 2>/dev/null | jq -r '.version // empty' 2>/dev/null) against $API_URL, prefix $P, areas: ${areas[*]}"
 
 A=$P-a
@@ -575,6 +586,136 @@ if want browser; then
 		fails=$((fails + after - before))
 		[[ $rc != 0 && $after == "$before" ]] && fail "B-$b" "the browser checks in $b ran to the end" "run.mjs exited $rc"
 	done
+fi
+
+# ---------------------------------------------------------------- node
+# Nodes (v0.2.2 M2): the agent, cloudex-node, joins with a token and keeps its
+# control socket open. It runs as a plain process on the host VERIFY_NODE_SSH
+# reaches, in ~/.cloudex-verify-<prefix> with its own state directory, and
+# needs no Docker and no root yet. Each probe runs there too, with the node's
+# own key (cloudex-node probe).
+NODE_DIR=""
+node_sh() { "${NODE_SSH[@]}" "$*" </dev/null; }
+node_stop_all() {
+	node_sh "[ -f $NODE_DIR/pid ] && kill \$(cat $NODE_DIR/pid) 2>/dev/null; rm -rf $NODE_DIR" >/dev/null 2>&1
+}
+now_s() { perl -MTime::HiRes=time -e 'printf "%.2f", time'; }
+since() { awk -v a="$1" -v b="$(now_s)" 'BEGIN { printf "%.2f", b - a }'; }
+node_state() { "$CX" node list --json 2>/dev/null | jq -r --arg n "$1" '.[] | select(.name == $n) | .state'; }
+# wait_state NAME STATE SECONDS: polls until the node is in STATE; sets WAITED.
+wait_state() {
+	local t0
+	t0=$(now_s)
+	while :; do
+		[[ $(node_state "$1") == "$2" ]] && { WAITED=$(since "$t0"); return 0; }
+		[[ $(awk -v w="$(since "$t0")" -v m="$3" 'BEGIN { print (w > m) }') == 1 ]] && { WAITED=$(since "$t0"); return 1; }
+		sleep 0.25
+	done
+}
+if want node; then
+	if [[ -z ${VERIFY_NODE_SSH:-} ]]; then
+		skip N00 "the node area" "set VERIFY_NODE_SSH to a command that runs a command on a host for the agent, such as 'ssh box'"
+	else
+		read -ra NODE_SSH <<<"$VERIFY_NODE_SSH"
+		NODE_DIR="\$HOME/.cloudex-verify-$P"
+		agent="$NODE_DIR/cloudex-node"
+		ok_up=1
+		if [[ -n ${VERIFY_NODE_AGENT:-} ]]; then
+			node_sh "mkdir -p $NODE_DIR && cp '$VERIFY_NODE_AGENT' $agent" >/dev/null 2>&1 || ok_up=0
+		elif (cd "$repo/go" && CGO_ENABLED=0 GOOS=linux GOARCH=${VERIFY_NODE_ARCH:-amd64} go build -o "$work/cloudex-node" ./cmd/cloudex-node) 2>"$work/e"; then
+			"${NODE_SSH[@]}" "mkdir -p $NODE_DIR && cat > $agent && chmod 755 $agent" <"$work/cloudex-node" >/dev/null 2>&1 || ok_up=0
+		else
+			ok_up=0
+		fi
+		if [[ $ok_up == 0 ]] || ! node_sh "$agent --version" >/dev/null 2>&1; then
+			fail N00 "the agent runs on the node host" "couldn't put cloudex-node on it with: $VERIFY_NODE_SSH"
+		else
+			N=$P-n
+			probe() { node_sh "$agent --state-dir $NODE_DIR/state probe $*" 2>/dev/null | head -1; }
+			start_agent() { node_sh "cd $NODE_DIR && (nohup $agent run --state-dir $NODE_DIR/state $* </dev/null >>$NODE_DIR/agent.log 2>&1 & echo \$! > $NODE_DIR/pid)"; }
+
+			# A token that was withdrawn (its pending node removed), or never made.
+			cx node add "$P-w" --json
+			wtok=$(field .joinToken)
+			cx node rm "$P-w" --yes
+			c1=$(probe join --api "$API_URL" --token "$wtok")
+			c2=$(probe join --api "$API_URL" --token "cxj_$(printf 'a%.0s' $(seq 40))")
+			OUT="withdrawn $c1, made up $c2" CODE=""
+			ok N01 "a join token that was withdrawn or never made gets a 401 (an expired one: unit tests)" [ "$c1" = 401 -a "$c2" = 401 ]
+
+			cx node add "$N" --json
+			tok=$(field .joinToken) nid=$(field .node.id)
+			t0=$(now_s)
+			start_agent --join "$tok" --api "$API_URL"
+			wait_state "$N" online 30
+			up=$WAITED
+			cx node info "$N"
+			facts=$([ "$(field .id)" = "$nid" -a "$(field .protocol)" = 1 -a "$(field '.cpus > 0')" = true -a "$(field '.rttMs >= 0')" = true ] && echo yes)
+			OUT="online $up s after the agent started ($(since "$t0") s with the ssh round trip); info: ${OUT:0:300}" CODE=""
+			ok N04 "node list shows the node online within 2 s of the agent starting, and info its facts and a round trip" \
+				[ "$(awk -v w="$up" 'BEGIN { print (w <= 2) }')" = 1 -a "$facts" = yes ]
+
+			c=$(probe join --api "$API_URL" --token "$tok")
+			OUT="got $c" CODE=""
+			ok N02 "a join token that was used gets a 401" is "$c" 401
+
+
+			# Kill it as docker kill would: no goodbye.
+			node_sh "kill -9 \$(cat $NODE_DIR/pid)" >/dev/null 2>&1
+			wait_state "$N" offline 75
+			gone=$?
+			OUT="offline after $WAITED s" CODE=""
+			ok N05 "node list shows the node offline within 70 s of the agent being killed" [ "$gone" = 0 ]
+
+			# With the agent down, so that the first use of the replayed nonce
+			# replaces nothing.
+			bad=$(probe connect --fault badsig) skewed=$(probe connect --fault skew) replay=$(probe connect --fault replay)
+			badmsg=$(probe connect --fault badmsg)
+			OUT="bad signature $bad, clock 120 s behind $skewed, reused nonce $replay, a message outside the protocol closed with $badmsg" CODE=""
+			ok N03 "a connect with a bad signature, a skewed clock or a reused nonce gets a 401, and a bad message closes it" \
+				[ "$bad" = 401 -a "$skewed" = 401 -a "$replay" = 401 -a "$badmsg" = 4400 ]
+
+			start_agent
+			wait_state "$N" online 30
+			OUT="online again after $WAITED s" CODE=""
+			ok N06 "the agent comes back by itself, as the same node, without a new token" [ "$(node_state "$N")" = online ]
+			if [[ ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
+				# Poll while a deploy runs; the longest run of offline answers counts.
+				("$CX" deploy --yes --skip-check >"$work/deploy.log" 2>&1; echo $? >"$work/deploy.rc") &
+				dpid=$!
+				worst=0 down_since=""
+				while kill -0 "$dpid" 2>/dev/null || [[ -n $down_since ]]; do
+					s=$(node_state "$N")
+					if [[ $s == online ]]; then
+						down_since=""
+						kill -0 "$dpid" 2>/dev/null || break
+					elif [[ -z $down_since ]]; then
+						down_since=$(now_s)
+					else
+						worst=$(awk -v a="$worst" -v b="$(since "$down_since")" 'BEGIN { print (b > a ? b : a) }')
+						[[ $(awk -v w="$worst" 'BEGIN { print (w > 120) }') == 1 ]] && break
+					fi
+					sleep 0.5
+				done
+				wait "$dpid"
+				OUT="deploy exit $(cat "$work/deploy.rc"), longest offline ${worst} s" CODE=""
+				ok N07 "a cloudex deploy doesn't show the node offline for more than 5 s" \
+					[ "$(cat "$work/deploy.rc")" = 0 -a "$(awk -v w="$worst" 'BEGIN { print (w <= 5) }')" = 1 ]
+			else
+				skip N07 "a cloudex deploy doesn't show the node offline for more than 5 s" "set VERIFY_NODE_DEPLOY=1 (and CLOUDFLARE_API_TOKEN) to redeploy during the check"
+			fi
+
+			cx node rm "$N" --yes
+			sleep 2
+			st=$(node_state "$N")
+			log=$(node_sh "tail -5 $NODE_DIR/agent.log" 2>/dev/null)
+			again=$(probe connect --fault none)
+			OUT="state $st, connect $again, agent: ${log: -200}" CODE=""
+			ok N08 "after node rm the agent is disconnected, its next connect is refused, and the node shows revoked" \
+				[ "$st" = revoked -a "$again" = 401 -a -n "$(grep 'removed from the deployment' <<<"$log")" ]
+			node_stop_all
+		fi
+	fi
 fi
 
 # ---------------------------------------------------------------- sdk

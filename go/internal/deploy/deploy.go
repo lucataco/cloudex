@@ -199,7 +199,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
-	image, err := copyImage(ctx, cf, account.ID, o.Image, log)
+	image, nodeImage, err := copyImage(ctx, cf, account.ID, o.Image, log)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +237,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
-	md := workerMetadata(meta.CompatibilityDate, meta.CompatibilityFlags, image, dbID, zone, key, backups)
+	md := workerMetadata(meta.CompatibilityDate, meta.CompatibilityFlags, image, nodeImage, dbID, zone, key, backups)
 	if err := installWorker(ctx, cf, account.ID, md, worker, zoneID, zone, log); err != nil {
 		return nil, err
 	}
@@ -323,11 +323,12 @@ func (k registryKeychain) Resolve(r authn.Resource) (authn.Authenticator, error)
 }
 
 // copyImage copies the published image into the account's registry and returns
-// its digest-pinned reference there.
-func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, log func(string, ...any)) (string, error) {
+// its digest-pinned reference there, and the published reference pinned to the
+// same digest, which nodes pull (NODE_IMAGE).
+func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, log func(string, ...any)) (string, string, error) {
 	srcRef, err := name.ParseReference(src)
 	if err != nil {
-		return "", fmt.Errorf("bad image reference %q: %w", src, err)
+		return "", "", fmt.Errorf("bad image reference %q: %w", src, err)
 	}
 	tag := srcRef.Identifier()
 	if strings.HasPrefix(tag, "sha256:") {
@@ -336,11 +337,11 @@ func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, 
 	dst := fmt.Sprintf("%s/%s/%s:%s", registryHost, account, imageRepo, tag)
 	user, pass, err := cf.RegistryCredentials(ctx, account, 30)
 	if err != nil {
-		return "", stepError("registry credentials", permContainers, err)
+		return "", "", stepError("registry credentials", permContainers, err)
 	}
 	dstRef, err := name.ParseReference(dst)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	platform := remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"})
 	opts := []remote.Option{
@@ -354,21 +355,31 @@ func copyImage(ctx context.Context, cf *cloudflare.Client, account, src string, 
 	// index or carries attestations.
 	desc, err := readImage(srcRef, remote.WithContext(ctx), platform)
 	if err != nil {
-		return "", fmt.Errorf("reading the sandbox image: %w", err)
+		return "", "", fmt.Errorf("reading the sandbox image: %w", err)
 	}
 	img, err := desc.Image()
 	if err != nil {
-		return "", fmt.Errorf("the sandbox image has no linux/amd64 variant: %w", err)
+		return "", "", fmt.Errorf("the sandbox image has no linux/amd64 variant: %w", err)
 	}
 	if err := writeImage(ctx, dstRef, img, opts, log); err != nil {
-		return "", fmt.Errorf("copying the sandbox image: %w", err)
+		return "", "", fmt.Errorf("copying the sandbox image: %w", err)
 	}
 	digest, err := img.Digest()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	log("Image copied in %s", time.Since(t0).Round(time.Second))
-	return fmt.Sprintf("%s/%s/%s@%s", registryHost, account, imageRepo, digest), nil
+	return fmt.Sprintf("%s/%s/%s@%s", registryHost, account, imageRepo, digest), nodeImageRef(srcRef, digest.String()), nil
+}
+
+// nodeImageRef is the published image, by its tag when it has one, pinned to
+// the linux/amd64 image's digest: ghcr.io/lucataco/cloudex-base:v0.2.2@sha256:...
+func nodeImageRef(src name.Reference, digest string) string {
+	repo := src.Context().Name()
+	if tag, ok := src.(name.Tag); ok {
+		return repo + ":" + tag.TagStr() + "@" + digest
+	}
+	return repo + "@" + digest
 }
 
 // readImage reads the source image without credentials, so a stale docker
@@ -495,14 +506,20 @@ func installWorker(ctx context.Context, cf *cloudflare.Client, account string, m
 
 // workerMetadata describes the API Worker for the Workers upload API: what
 // wrangler sends for the configuration in apps/api/wrangler.jsonc.
-func workerMetadata(compatDate string, flags []string, image, dbID, zone, key string, backups bool) map[string]any {
+//
+// The Durable Object classes are declared in exports, which needs no migration:
+// a deployment from before a class gets it on its next upload. Keep the
+// bindings and exports in step with wrangler.jsonc (TestWorkerMetadataMatchesWrangler).
+func workerMetadata(compatDate string, flags []string, image, nodeImage, dbID, zone, key string, backups bool) map[string]any {
 	if flags == nil {
 		flags = []string{}
 	}
 	bindings := []map[string]any{
 		{"type": "durable_object_namespace", "name": "SANDBOX", "class_name": "Sandbox"},
+		{"type": "durable_object_namespace", "name": "NODE", "class_name": "Node"},
 		{"type": "d1", "name": "DB", "id": dbID},
 		{"type": "plain_text", "name": "PREVIEW_ZONE", "text": zone},
+		{"type": "plain_text", "name": "NODE_IMAGE", "text": nodeImage},
 		{"type": "secret_text", "name": "ADMIN_KEY", "text": key},
 	}
 	if backups {
@@ -513,7 +530,10 @@ func workerMetadata(compatDate string, flags []string, image, dbID, zone, key st
 		"bindings":            bindings,
 		"compatibility_date":  compatDate,
 		"compatibility_flags": flags,
-		"exports":             map[string]any{"Sandbox": map[string]any{"type": "durable-object", "storage": "sqlite"}},
+		"exports": map[string]any{
+			"Sandbox": map[string]any{"type": "durable-object", "storage": "sqlite"},
+			"Node":    map[string]any{"type": "durable-object", "storage": "sqlite"},
+		},
 		"containers": []any{map[string]any{
 			"name":       containerName,
 			"class_name": "Sandbox",

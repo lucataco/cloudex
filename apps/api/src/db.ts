@@ -1,7 +1,8 @@
 // D1 is only the index behind `cloudex list` and name lookups. Each Sandbox
 // Durable Object owns its own state and writes its row here when it changes.
 // It also holds the names of named saves (saves.ts), the provider keys, and
-// access tokens with the sandboxes each one made (tokens.ts).
+// access tokens with the sandboxes each one made (tokens.ts), and the nodes
+// with their join tokens (nodes.ts).
 import type { Sandbox } from "@cloudex/schema";
 
 const SCHEMA = [
@@ -89,6 +90,36 @@ const SCHEMA = [
     created_by TEXT NOT NULL,
     expires_at INTEGER NOT NULL
   )`,
+  // Nodes (nodes.ts): a user's own hosts that run sandboxes. public_key is the
+  // agent's Ed25519 key, set when it joins and cleared when it's revoked. The
+  // rest mirrors what the agent last reported, which its Node object writes.
+  `CREATE TABLE IF NOT EXISTS nodes (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    public_key TEXT,
+    state TEXT NOT NULL,
+    last_seen_at INTEGER,
+    version TEXT,
+    protocol INTEGER,
+    arch TEXT,
+    runtime TEXT,
+    isolation TEXT,
+    cpus INTEGER,
+    memory_mb INTEGER,
+    disk_free_gb REAL,
+    colo TEXT,
+    continent TEXT,
+    location_hint TEXT,
+    created_at INTEGER NOT NULL,
+    revoked_at INTEGER
+  )`,
+  // A node's join token: its SHA-256, never the token. Used once, within 30 minutes.
+  `CREATE TABLE IF NOT EXISTS node_joins (
+    token_hash TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER
+  )`,
 ];
 
 // Changes to tables made by an earlier version, each run once per isolate. A
@@ -98,6 +129,8 @@ const MIGRATIONS = [
   "ALTER TABLE tokens ADD COLUMN parent TEXT",
   // v0.2.1: the end a device approval set for a session, past which it isn't renewed.
   "ALTER TABLE tokens ADD COLUMN ends_at INTEGER",
+  // v0.2.2: the node a sandbox runs on; null on Cloudflare.
+  "ALTER TABLE sandboxes ADD COLUMN node TEXT",
 ];
 
 async function migrate(db: D1Database) {
@@ -151,18 +184,20 @@ const fromRow = (r: Row): Sandbox => ({
   error: r.error,
 });
 
-export async function upsertSandbox(db: D1Database, s: Sandbox) {
+// node: the node it runs on (nodes.ts), which a sandbox keeps for life. A
+// record that doesn't say leaves the column as it was.
+export async function upsertSandbox(db: D1Database, s: Sandbox & { node?: string | null }) {
   await ensureSchema(db);
   await db
     .prepare(
-      `INSERT INTO sandboxes (id, name, size, state, idle_minutes, created_at, updated_at, started_at, stopped_at, saved_at, saved_bytes, error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO sandboxes (id, name, size, state, idle_minutes, created_at, updated_at, started_at, stopped_at, saved_at, saved_bytes, error, node)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET name = excluded.name, size = excluded.size, state = excluded.state,
          idle_minutes = excluded.idle_minutes, updated_at = excluded.updated_at, started_at = excluded.started_at,
          stopped_at = excluded.stopped_at, saved_at = excluded.saved_at, saved_bytes = excluded.saved_bytes,
-         error = excluded.error`,
+         error = excluded.error, node = COALESCE(excluded.node, sandboxes.node)`,
     )
-    .bind(s.id, s.name, s.size, s.state, s.idleMinutes, s.createdAt, s.updatedAt, s.startedAt, s.stoppedAt, s.savedAt, s.savedBytes, s.error)
+    .bind(s.id, s.name, s.size, s.state, s.idleMinutes, s.createdAt, s.updatedAt, s.startedAt, s.stoppedAt, s.savedAt, s.savedBytes, s.error, s.node ?? null)
     .run();
 }
 

@@ -51,6 +51,7 @@ import {
   UpdateSandbox,
   UpdateSettings,
 } from "./index.ts";
+import { CreateNode, NewNode, Node, NodeJoin, NodeJoined } from "./node.ts";
 
 // Request bodies are described as sent (defaults make fields optional);
 // responses as returned.
@@ -76,6 +77,8 @@ const requests = {
   DeviceDeny,
   CreateLoginLink,
   StartSession,
+  CreateNode,
+  NodeJoin,
 };
 const responses = {
   Sandbox,
@@ -102,6 +105,9 @@ const responses = {
   DeviceToken,
   DeviceRequest,
   LoginLink,
+  Node,
+  NewNode,
+  NodeJoined,
   Error: ApiError,
 };
 
@@ -515,6 +521,54 @@ export function openapi(version: string) {
         parameters: [sandboxRef, agentRef],
         post: op("interruptAgent", "Stop an agent's running turn and drop its queued messages", {
           responses: { 200: agent },
+        }),
+      },
+      "/v1/nodes": {
+        post: op("createNode", "Add a node: your own Docker host that runs sandboxes (admins only)", {
+          description:
+            "Answers the node and a join token, which works once, for 30 minutes, and the command that installs " +
+            "the agent with it. Adding a name that is still pending (never joined) or revoked gives it a new token; " +
+            "a name in use is a 409.",
+          requestBody: body("CreateNode"),
+          responses: { 201: ok("The node, its join token and the install command", ref("NewNode")) },
+        }),
+        get: op("listNodes", "List the nodes, with whether each is online now", {
+          responses: { 200: ok("The nodes", { type: "array", items: ref("Node") }) },
+        }),
+      },
+      "/v1/nodes/{node}": {
+        parameters: [{ name: "node", in: "path", required: true, description: "The node's name or id (nd-xxxxxxxx)", schema: { type: "string" } }],
+        get: op("getNode", "Get a node; while it's online, with a round trip to its agent", {
+          responses: { 200: ok("The node", ref("Node")) },
+        }),
+        delete: op("deleteNode", "Remove a node: its key stops working and its agent is disconnected (admins only)", {
+          description:
+            "The node stays listed as revoked; removing a revoked node forgets it. A node that still has sandboxes " +
+            "is refused (409) unless force is set.",
+          parameters: [{ name: "force", in: "query", description: "Remove it even though it has sandboxes", schema: { type: "boolean", default: false } }],
+          responses: { 200: ok("Revoked or forgotten", { type: "object", properties: { revoked: { type: "string" }, deleted: { type: "string" } } }) },
+        }),
+      },
+      "/v1/node/join": {
+        post: op("joinNode", "The node agent's first call: trade a join token for its place, with its public key", {
+          security: [],
+          description:
+            "For the cloudex-node agent, not for clients. Signed with the new key (see connectNode). The token works " +
+            "once, for 30 minutes; one that is unknown, used or expired is a 401.",
+          requestBody: body("NodeJoin"),
+          responses: { 200: ok("The node it joined as", ref("NodeJoined")) },
+        }),
+      },
+      "/v1/node/connect": {
+        get: op("connectNode", "The node agent's control WebSocket", {
+          security: [],
+          description:
+            "For the cloudex-node agent, not for clients. Headers: x-cx-node (its id), x-cx-ts (unix seconds), " +
+            "x-cx-nonce (32 hex digits), x-cx-protocol, and x-cx-sig: Ed25519 in base64 over " +
+            "METHOD\\nPATH?QUERY\\nSANDBOX\\nTS\\nNONCE, with SANDBOX empty. 60 s of clock skew are allowed, and a nonce " +
+            "works once. A bad signature, a skewed clock, a reused nonce, or a removed or unknown node is a 401; " +
+            "another protocol is a 426.",
+          responses: { 101: { description: "Switching to the WebSocket" } },
         }),
       },
       "/v1/keys": {

@@ -7,7 +7,8 @@ import test from "node:test";
 import { openapi } from "@cloudex/schema/openapi";
 import { RULES, ruleFor } from "../src/rules.ts";
 
-const PUBLIC = new Set(["health", "openapi", "startDeviceLogin", "pollDeviceLogin", "startSession", "endSession"]);
+// joinNode and connectNode take a node's signature, not a key (nodeauth.ts).
+const PUBLIC = new Set(["health", "openapi", "startDeviceLogin", "pollDeviceLogin", "startSession", "endSession", "joinNode", "connectNode"]);
 const ADMIN_ONLY = new Set([
   "listKeys",
   "setKey",
@@ -18,6 +19,8 @@ const ADMIN_ONLY = new Set([
   "listDeviceLogins",
   "approveDeviceLogin",
   "denyDeviceLogin",
+  "createNode",
+  "deleteNode",
 ]);
 
 // /v1/sandboxes/{ref}/tcp/{port} as a request would have it.

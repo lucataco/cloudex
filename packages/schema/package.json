@@ -8,7 +8,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./openapi": "./src/openapi.ts",
-    "./paths": "./src/paths.ts"
+    "./paths": "./src/paths.ts",
+    "./node": "./src/node.ts"
   },
   "scripts": {
     "typecheck": "tsc -p .",
