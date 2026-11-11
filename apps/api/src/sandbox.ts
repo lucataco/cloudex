@@ -2022,8 +2022,15 @@ export class Sandbox extends DurableObject<Env> {
     this.streams.closeAll(4003, "the node was removed");
   }
 
-  // Counts of this sandbox's node streams, for the release checks.
-  async nodeStreams(): Promise<{ spares: number; open: number } | null> {
-    return this.onNode ? this.streams.count() : null;
+  // Counts of this sandbox's node streams, and the colo this object runs in,
+  // for the release checks and measurements (GET /v1/nodes/{node}/dev-sandboxes/{id}).
+  async nodeStreams(): Promise<{ spares: number; open: number; colo: string; objectId: string } | null> {
+    if (!this.onNode) return null;
+    let colo = "?";
+    try {
+      const t = await (await fetch("https://www.cloudflare.com/cdn-cgi/trace")).text();
+      colo = /^colo=(\w+)$/m.exec(t)?.[1] ?? "?";
+    } catch {}
+    return { ...this.streams.count(), colo, objectId: this.ctx.id.toString() };
   }
 }

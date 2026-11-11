@@ -81,3 +81,10 @@ func (c *Client) CreateDevSandbox(ctx context.Context, node, name string) (*Sand
 	var s Sandbox
 	return &s, c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(node)+"/dev-sandboxes", body, &s)
 }
+
+// DevSandboxStreams says how many spare and open node streams a development
+// sandbox has, and where its object runs (the release checks).
+func (c *Client) DevSandboxStreams(ctx context.Context, node, ref string) (map[string]any, error) {
+	var out map[string]any
+	return out, c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(node)+"/dev-sandboxes/"+url.PathEscape(ref), nil, &out)
+}

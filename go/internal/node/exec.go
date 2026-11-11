@@ -33,9 +33,10 @@ type Target struct {
 
 // Handler runs what a stream opens, against a machine.
 type Handler struct {
-	Docker *Docker
-	Log    *log.Logger
-	Debug  bool
+	Docker  *Docker
+	Log     *log.Logger
+	Debug   bool
+	running *execRegistry
 }
 
 func (h *Handler) debugf(format string, args ...any) {
@@ -131,20 +132,24 @@ func (h *Handler) exec(s *Stream, m Target, e StreamExec) {
 	if e.Pty != nil {
 		size = &[2]int{e.Pty.Rows, e.Pty.Cols}
 	}
+	t0 := time.Now()
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	id, err := h.Docker.ExecCreate(cctx, m.Container, ExecConfig{
 		AttachStdin: e.Stdin, AttachStdout: true, AttachStderr: e.Stderr || e.Pty != nil,
 		Tty: e.Pty != nil, Cmd: e.Argv, Env: env, WorkingDir: e.Cwd, User: e.User, ConsoleSize: size,
 	})
 	var hj *Hijacked
+	tCreated := time.Now()
 	if err == nil {
 		hj, err = h.Docker.ExecStart(cctx, id, e.Pty != nil, size)
 	}
+	tStarted := time.Now()
 	cancel()
 	if err != nil {
 		h.fail(s, err.Error())
 		return
 	}
+	h.running.add(RunningExec{Tag: tag, Container: m.Container, ExecID: id, Pty: e.Pty != nil, Since: time.Now().UnixMilli()})
 	// Without stdin attached, the connection's write side stays open: the
 	// daemon takes a half-close as the client leaving, and stops copying the
 	// output it hasn't sent yet.
@@ -265,8 +270,10 @@ func (h *Handler) exec(s *Stream, m Target, e StreamExec) {
 					break
 				}
 			}
+			h.running.remove(tag)
 			s.Send(StreamMsg{Exit: intp(code)})
-			h.debugf("exec %s: exit %d sent", short(id), code)
+			h.debugf("exec %s: exit %d sent; created in %v, started in %v, exit sent %v after the start", short(id), code,
+				tCreated.Sub(t0).Round(time.Millisecond), tStarted.Sub(tCreated).Round(time.Millisecond), time.Since(tStarted).Round(time.Millisecond))
 			exitSent, exited, drained = true, nil, outDone
 		case <-drained:
 			s.Close(1000, "exited")
@@ -308,6 +315,7 @@ func (h *Handler) hangUp(m Target, id, tag string, e StreamExec) {
 		sig = 1
 	}
 	go func() {
+		defer h.running.remove(tag)
 		sid := h.signal(m, tag, sig)
 		if sid == 0 {
 			return

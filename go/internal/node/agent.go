@@ -155,7 +155,7 @@ func (a *Agent) handler() *Handler {
 	a.poolMu.Lock()
 	defer a.poolMu.Unlock()
 	if a.hand == nil {
-		a.hand = &Handler{Docker: a.docker(), Log: a.Log, Debug: a.Debug}
+		a.hand = &Handler{Docker: a.docker(), Log: a.Log, Debug: a.Debug, running: newExecRegistry(a.State)}
 	}
 	return a.hand
 }
@@ -253,6 +253,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.pools = map[string]*pool{}
 	a.poolMu.Unlock()
 	if len(a.DevMachines) > 0 {
+		go a.handler().hangUpLeftovers(a.State)
 		go a.startPools()
 	}
 	var down time.Time

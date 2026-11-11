@@ -807,6 +807,15 @@ app.post("/v1/nodes/:node/dev-sandboxes", async (c) => {
   return c.json(s, 201);
 });
 
+// A development sandbox's node streams (spares and open ones) and where its
+// object runs, for the release checks.
+app.get("/v1/nodes/:node/dev-sandboxes/:ref", async (c) => {
+  const s = await resolve(c.env, c.req.param("ref"));
+  const out = s ? await s.stub.nodeStreams() : null;
+  if (!out) fail(404, `no sandbox on a node named ${c.req.param("ref")}`);
+  return c.json(out);
+});
+
 // AI provider keys (keys.ts). Keys are write-only: listing shows a hint.
 app.get("/v1/keys", async (c) => c.json(await listKeys(c.env.DB)));
 

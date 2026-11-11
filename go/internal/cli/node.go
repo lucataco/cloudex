@@ -103,6 +103,23 @@ func newNodeCmd(opts *options) *cobra.Command {
 	}
 	dev.Flags().StringVar(&devName, "name", "", "a name for the sandbox")
 	cmd.AddCommand(dev)
+	cmd.AddCommand(&cobra.Command{
+		Use:    "dev-streams <node> <sandbox>",
+		Hidden: true,
+		Short:  "Development only (v0.2.2 M3): a dev sandbox's spare and open node streams, and its object's colo",
+		Args:   cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, client, err := opts.load()
+			if err != nil {
+				return err
+			}
+			out, err := client.DevSandboxStreams(cmd.Context(), args[0], args[1])
+			if err != nil {
+				return err
+			}
+			return writeJSON(cmd.OutOrStdout(), out)
+		},
+	})
 
 	var force, yes bool
 	rm := &cobra.Command{

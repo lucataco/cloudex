@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -287,6 +288,31 @@ func newProbe(state func() node.State) *cobra.Command {
 	}
 	connect.Flags().StringVar(&fault, "fault", "none", "none, badsig, skew, replay or badmsg")
 
+	var sandbox string
+	stream := &cobra.Command{
+		Use:   "stream",
+		Short: "Get a stream ticket for --sandbox over the control socket, then open a stream with it, again (a replay), with it altered, and for another stream id; print the four statuses",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			s := state()
+			id, err := s.Identity()
+			if err != nil || id == nil {
+				return fmt.Errorf("not joined: %v", err)
+			}
+			key, err := s.Key()
+			if err != nil {
+				return err
+			}
+			codes, err := node.ProbeStreams(cmd.Context(), id.APIURL, id.ID, key, version, sandbox)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), strings.Trim(fmt.Sprint(codes), "[]"))
+			return nil
+		},
+	}
+	stream.Flags().StringVar(&sandbox, "sandbox", "", "a sandbox on this node")
+
 	var apiURL, token string
 	join := &cobra.Command{
 		Use:   "join",
@@ -310,6 +336,6 @@ func newProbe(state func() node.State) *cobra.Command {
 	}
 	join.Flags().StringVar(&apiURL, "api", "", "the deployment's URL")
 	join.Flags().StringVar(&token, "token", "", "the join token")
-	probe.AddCommand(connect, join)
+	probe.AddCommand(connect, join, stream)
 	return probe
 }

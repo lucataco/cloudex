@@ -280,7 +280,7 @@ export class NodeCompute implements Compute {
       http: { port, method: req.method, path: url.pathname + url.search, headers: headerList(req), body: req.body !== null },
     });
     if (req.body) void req.body.pipeTo(f.writable(StreamChannel.stdin)).catch(() => {});
-    const m = await (await this.streams.answered(f)).opened;
+    const m = await (await this.streams.answered(f, false)).opened;
     if ("refused" in m) {
       throw new NotListening(m.refused, `The container is not listening in the TCP address ${m.refused}:${port}`);
     }

@@ -9,7 +9,9 @@
 # command on the host for the agent, such as "ssh box"; without it the area is a SKIP),
 # VERIFY_NODE_AGENT (cloudex-node's path on that host, if it's there; else it's built for
 # linux/$VERIFY_NODE_ARCH, default amd64, and copied over), VERIFY_NODE_DEPLOY=1 (N07, which
-# runs cloudex deploy with $CLOUDFLARE_API_TOKEN).
+# runs cloudex deploy with $CLOUDFLARE_API_TOKEN), VERIFY_NODE_DEV_MACHINE (a running
+# container on that host for N09-N16, the agent's --dev-machine), VERIFY_NODE_LONG=1 (N12's
+# 30 idle minutes, and with VERIFY_NODE_DEPLOY=1 N13's deploy during an scp).
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
 set -uo pipefail
 
@@ -35,7 +37,7 @@ ZONE=$(jq -r '.previewZone // empty' "$CLOUDEX_CONFIG_DIR/config.json")
 fails=0
 
 note() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4//$'\n'/ }" >>"$results"; }
-pass() { printf '\033[32mPASS\033[0m %-5s %s\n' "$1" "$2"; note "$1" PASS "$2" ""; }
+pass() { printf '\033[32mPASS\033[0m %-5s %s\n' "$1" "$2"; note "$1" PASS "$2" "${3:-}"; }
 fail() { printf '\033[31mFAIL\033[0m %-5s %s: %s\n' "$1" "$2" "$3"; note "$1" FAIL "$2" "$3"; fails=$((fails + 1)); }
 skip() { printf '\033[33mSKIP\033[0m %-5s %s: %s\n' "$1" "$2" "$3"; note "$1" SKIP "$2" "$3"; }
 
@@ -50,7 +52,8 @@ cx() {
 ok() {
 	local id=$1 desc=$2
 	shift 2
-	if "$@" >/dev/null 2>&1; then pass "$id" "$desc"; else fail "$id" "$desc" "code=$CODE out=${OUT:0:300} err=${ERR:0:300}"; fi
+	# A check that set OUT itself (CODE="") keeps it in results.tsv when it passes too.
+	if "$@" >/dev/null 2>&1; then pass "$id" "$desc" "$([ -z "${CODE-x}" ] && echo "$OUT")"; else fail "$id" "$desc" "code=$CODE out=${OUT:0:300} err=${ERR:0:300}"; fi
 }
 is() { [[ $1 == "$2" ]]; }
 has() { [[ $1 == *"$2"* ]]; }
@@ -612,9 +615,221 @@ wait_state() {
 		sleep 0.25
 	done
 }
+# Streams and exec over the link (v0.2.2 M3, N09-N16), against a development
+# machine: a running container on the node host, named by
+# VERIFY_NODE_DEV_MACHINE, which the agent adopts for one sandbox
+# (cloudex-node run --dev-machine; POST /v1/nodes/{node}/dev-sandboxes, for
+# admins). Without it they are a SKIP. N12 takes 30 minutes (VERIFY_NODE_LONG=1),
+# and N13 a deploy and up to 6 minutes (VERIFY_NODE_DEPLOY=1 and VERIFY_NODE_LONG=1);
+# both read Durable Object analytics with $CLOUDFLARE_API_TOKEN.
+M3_CHECKS=("N09 exec over the link: exit codes, stdout and stderr, the user, cwd, and a round trip p50 under 150 ms"
+	"N10 data each way: 256 MiB with scp, 90 MiB with cp, and a preview's body and WebSocket, unchanged"
+	"N11 a reader at 2.5 MiB/s keeps the machine's output within 16 MiB of it, and keystrokes in another ssh session stay under 200 ms"
+	"N12 an idle ssh session holds for 30 minutes, and its Sandbox object is active under 60 s in that time"
+	"N13 a deploy during a busy scp ends the machine's side of it when it ends the client's"
+	"N14 exec --timeout 2s -- sleep 10 exits 124, and the sleep is gone"
+	"N15 the dashboard terminal on a node: a shell and its exit code, tmux across reconnects, resize, htop and vim"
+	"N16 nothing is left on the machine after a terminal closes, a client drops an exec, or the agent dies mid-exec; and a stream ticket works once")
+m3_skip() { for c in "${M3_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
+m3_desc() { for c in "${M3_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
+# Active seconds of one Durable Object from $1 to $2 (ISO times), from the GraphQL analytics.
+do_active() {
+	local acc q
+	acc=$(curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id')
+	q='query($acc:String!,$from:Time!,$to:Time!,$ids:[String!]){viewer{accounts(filter:{accountTag:$acc}){durableObjectsPeriodicGroups(limit:1000,filter:{datetimeMinute_geq:$from,datetimeMinute_leq:$to,objectId_in:$ids}){sum{activeTime}}}}}'
+	jq -n --arg q "$q" --arg acc "$acc" --arg from "$1" --arg to "$2" --arg id "$3" '{query:$q, variables:{acc:$acc, from:$from, to:$to, ids:[$id]}}' |
+		curl -s https://api.cloudflare.com/client/v4/graphql -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' --data @- |
+		jq -r '[.data.viewer.accounts[0].durableObjectsPeriodicGroups[]?.sum.activeTime] | add // 0 | . / 1e6'
+}
+node_m3() {
+	if [[ -z $DEV ]]; then
+		m3_skip "set VERIFY_NODE_DEV_MACHINE to a running container on the node host for the agent to adopt (SKILL.md, node area)"
+		return
+	fi
+	local NM=$P-m key M_ID ssh_cfg big ok_all why
+	key=$(jq -r .apiKey "$src_cfg/config.json")
+	cx node dev-sandbox "$N" --name "$NM"
+	M_ID=$(field .id)
+	if [[ $CODE != 0 || -z $M_ID ]]; then
+		m3_skip "couldn't make a sandbox on the node's dev machine: ${ERR:0:200}"
+		return
+	fi
+	nck() { CLOUDEX_API_KEY=$key node "$here/node-check.mjs" "$API_URL" "$M_ID" "$@" >"$work/o" 2>&1; CODE=$?; OUT=$(cat "$work/o"); }
+	in_m() { "$CX" exec "$NM" -- "$1" 2>/dev/null; }
+	ssh_cfg=$work/ssh_config_m
+	"$CX" ssh-config >"$ssh_cfg" 2>/dev/null
+
+	# N09: exec's semantics, and the round trip.
+	cx exec "$NM" -- 'echo out-$((6*7)); echo err >&2; exit 3'
+	local e1="code $CODE out $OUT err $ERR"
+	ok_all=$([ "$CODE" = 3 -a "$OUT" = out-42 -a "$ERR" = err ] && echo yes)
+	cx exec "$NM" --root -- 'whoami; pwd'
+	local e2=$OUT
+	[ "$(tr '\n' ' ' <<<"$OUT")" = "root /root " ] || ok_all=""
+	cx exec "$NM" --cwd /tmp -- 'whoami; pwd'
+	local e3=$OUT
+	[ "$(tr '\n' ' ' <<<"$OUT")" = "cloudex /tmp " ] || ok_all=""
+	nck rtt 100
+	local rtt=$OUT p50
+	p50=$(jq -r .p50 <<<"$rtt" 2>/dev/null)
+	OUT="[$e1] [$(tr '\n' ' ' <<<"$e2")] [$(tr '\n' ' ' <<<"$e3")] round trips: $rtt" CODE=""
+	ok N09 "$(m3_desc N09)" [ "$ok_all" = yes -a -n "$p50" -a "${p50:-999}" -lt 150 ]
+
+	# N10: data each way, unchanged.
+	big=$work/big256
+	head -c 268435456 /dev/urandom >"$big"
+	local a b c d up down cup cdown pv=""
+	a=$(now_ms)
+	scp -F "$ssh_cfg" -o BatchMode=yes -q "$big" "$NM.cloudex:/tmp/vr-big" 2>"$work/e"
+	b=$(now_ms)
+	scp -F "$ssh_cfg" -o BatchMode=yes -q "$NM.cloudex:/tmp/vr-big" "$big.back" 2>>"$work/e"
+	c=$(now_ms)
+	up=$(awk -v ms=$((b - a)) 'BEGIN { printf "%.1f", 256000 / ms }') down=$(awk -v ms=$((c - b)) 'BEGIN { printf "%.1f", 256000 / ms }')
+	ok_all=$(cmp -s "$big" "$big.back" && echo yes)
+	head -c 94371840 "$big" >"$big.90"
+	a=$(now_ms)
+	"$CX" cp "$big.90" "$NM:/tmp/vr-90" >/dev/null 2>>"$work/e"
+	b=$(now_ms)
+	"$CX" cp "$NM:/tmp/vr-90" "$big.90.back" >/dev/null 2>>"$work/e"
+	c=$(now_ms)
+	cup=$(awk -v ms=$((b - a)) 'BEGIN { printf "%.1f", 90000 / ms }') cdown=$(awk -v ms=$((c - b)) 'BEGIN { printf "%.1f", 90000 / ms }')
+	cmp -s "$big.90" "$big.90.back" || ok_all=""
+	if [[ -n $ZONE ]]; then
+		"$CX" cp "$here/node-app.js" "$NM:vr-app.js" >/dev/null 2>&1
+		"$CX" exec "$NM" -d -- 'node vr-app.js 3000' >/dev/null 2>&1
+		sleep 2
+		local link want
+		link=$("$CX" host "$NM" 3000 --json 2>/dev/null | jq -r .url)
+		want="posted:94371840:$(md5sum <"$big.90" 2>/dev/null | cut -d' ' -f1)"
+		[[ $want == posted:94371840: ]] && want="posted:94371840:$(md5 -q "$big.90")"
+		local g po w
+		g=$(curl -s --max-time 30 "$link/a?b=1") po=$(curl -s --max-time 120 -X POST --data-binary @"$big.90" "$link/p")
+		CLOUDEX_API_KEY=$key node "$here/node-check.mjs" "$API_URL" "$M_ID" ws 3000 "$link" >"$work/o" 2>&1
+		w=$(cat "$work/o")
+		pv="; preview GET '$g', POST '${po:0:60}', WebSocket $w"
+		[[ $g == "hello-preview /a?b=1" && $po == "$want" && $w == *'"ok":true'* ]] || ok_all=""
+	else
+		pv="; no preview domain, so no preview checks"
+	fi
+	OUT="scp 256 MiB up $up MB/s, down $down MB/s; cp 90 MiB up $cup MB/s, down $cdown MB/s$pv; $(head -c 300 "$work/e")" CODE=""
+	ok N10 "$(m3_desc N10)" [ "$ok_all" = yes ]
+	rm -f "$big.back" "$big.90" "$big.90.back"
+
+	# N11: a slow reader, and keystrokes meanwhile.
+	rm -f "$work/slow"
+	curl -s -H "authorization: Bearer $key" --limit-rate 2500k -o "$work/slow" "$API_URL/v1/sandboxes/$M_ID/files/content?path=/tmp/vr-big" &
+	local cpid=$! aheads="" worst=0 got pos
+	python3 "$here/keys.py" "$NM.cloudex" 300 "$ssh_cfg" >"$work/keys" 2>&1 &
+	local kpid=$!
+	for t in 10 20; do
+		sleep 10
+		got=$(wc -c <"$work/slow" 2>/dev/null || echo 0)
+		pos=$("$CX" exec "$NM" -- 'p=$(pgrep -x cat | head -1); [ -n "$p" ] && grep ^pos /proc/$p/fdinfo/3 | tr -dc 0-9' 2>/dev/null)
+		local ahead=$(((${pos:-0} - got) / 1048576))
+		aheads="$aheads t=${t}s: the client has $((got / 1048576)) MiB, cat is $ahead MiB ahead;"
+		((ahead > worst)) && worst=$ahead
+		[[ -z $pos ]] && worst=999
+	done
+	kill "$cpid" 2>/dev/null
+	wait "$cpid" 2>/dev/null
+	wait "$kpid"
+	local keys kmax
+	keys=$(cat "$work/keys") kmax=$(jq -r '.max | floor' <"$work/keys" 2>/dev/null)
+	OUT="$aheads keystrokes $keys" CODE=""
+	ok N11 "$(m3_desc N11)" [ "$worst" -le 16 -a -n "$kmax" -a "${kmax:-999}" -lt 200 ]
+
+	# N12: an idle ssh session for 30 minutes, and the object's active time.
+	if [[ ${VERIFY_NODE_LONG:-} == 1 && -n ${CLOUDFLARE_API_TOKEN:-} ]]; then
+		local oid from to act alive
+		oid=$("$CX" node dev-streams "$N" "$NM" 2>/dev/null | jq -r .objectId)
+		from=$(date -u -v+1M +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d '+1 min' +%Y-%m-%dT%H:%M:00Z)
+		alive=$(python3 "$here/keys.py" "$NM.cloudex" 0 "$ssh_cfg" --idle 1800 2>/dev/null | jq -r .alive)
+		to=$(date -u -v-2M +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d '-2 min' +%Y-%m-%dT%H:%M:00Z)
+		sleep 120 # the analytics lag
+		act=$(do_active "$from" "$to" "$oid")
+		OUT="session alive after 30 min: $alive; active ${act} s from $from to $to" CODE=""
+		ok N12 "$(m3_desc N12)" [ "$alive" = true -a "$(awk -v a="$act" 'BEGIN { print (a < 60) }')" = 1 ]
+	else
+		skip N12 "$(m3_desc N12)" "takes 30 minutes: set VERIFY_NODE_LONG=1 and CLOUDFLARE_API_TOKEN"
+	fi
+
+	# N13: a deploy during a busy scp: the machine's side ends with the client's.
+	if [[ ${VERIFY_NODE_DEPLOY:-} == 1 && ${VERIFY_NODE_LONG:-} == 1 ]]; then
+		local base spid t_cut t_gone n
+		base=$(node_sh "docker exec $DEV sh -c 'pgrep -c -f \"^sshd: cloudex\" || true'")
+		scp -F "$ssh_cfg" -o BatchMode=yes -q -l 4000 "$big" "$NM.cloudex:/tmp/vr-slow" 2>/dev/null &
+		spid=$!
+		sleep 5
+		"$CX" deploy --yes --skip-check >"$work/deploy2.log" 2>&1
+		t_cut="" t_gone=""
+		for _ in $(seq 1 420); do
+			[[ -z $t_cut ]] && ! kill -0 "$spid" 2>/dev/null && t_cut=$(now_ms)
+			n=$(node_sh "docker exec $DEV sh -c 'pgrep -c -f \"^sshd: cloudex\" || true'")
+			[[ -z $t_gone && ${n:-9} -le ${base:-0} ]] && t_gone=$(now_ms)
+			[[ -n $t_cut && -n $t_gone ]] && break
+			sleep 1
+		done
+		kill "$spid" 2>/dev/null
+		OUT="scp ended at $t_cut, the machine's ssh session at $t_gone (sessions before: $base)" CODE=""
+		local lag=999
+		[[ -n $t_cut && -n $t_gone ]] && lag=$(((t_gone - t_cut) / 1000))
+		ok N13 "$(m3_desc N13)" [ "$lag" -le 5 ]
+	else
+		skip N13 "$(m3_desc N13)" "needs a deploy and up to 6 minutes: set VERIFY_NODE_DEPLOY=1 and VERIFY_NODE_LONG=1"
+	fi
+	rm -f "$big"
+
+	# N14: exec's timeout.
+	cx exec "$NM" --timeout 2s -- 'sleep 10.0914'
+	local tcode=$CODE left
+	sleep 1
+	left=$(in_m 'ps -eo args | grep -c "[s]leep 10.0914"')
+	OUT="exit $tcode, $left left" CODE=""
+	ok N14 "$(m3_desc N14)" [ "$tcode" = 124 -a "$left" = 0 ]
+
+	# N15: the terminal.
+	local t1 t2 t3 t4 t5
+	CLOUDEX_API_KEY=$key node "$here/term-check.mjs" "$API_URL" "$M_ID" echo >"$work/o" 2>&1 && t1=ok
+	t1="echo ${t1:-$(cat "$work/o")}"
+	CLOUDEX_API_KEY=$key node "$here/term-check.mjs" "$API_URL" "$M_ID" tmux >"$work/o" 2>&1 && t2=ok
+	t2="tmux ${t2:-$(cat "$work/o")}"
+	nck resize && t3=ok
+	t3="resize ${t3:-$OUT}"
+	nck tui && t4=ok
+	t4="htop and vim ${t4:-$OUT}"
+	OUT="$t1; $t2; $t3; $t4" CODE=""
+	ok N15 "$(m3_desc N15)" [ "$t1$t2$t3$t4" = "echo oktmux okresize okhtop and vim ok" ]
+
+	# N16: clean-up when either side drops, and tickets.
+	local h1 h2 h3 probe_codes
+	nck hangup 30.0916
+	sleep 15
+	h1=$(in_m 'ps -eo args | grep -c "[s]leep 30.0916"')
+	("$CX" exec "$NM" -- 'sleep 30.0917' >/dev/null 2>&1 &
+		echo $! >"$work/cli.pid"
+		wait 2>/dev/null) 2>/dev/null &
+	sleep 4
+	kill -9 "$(cat "$work/cli.pid")" 2>/dev/null
+	sleep 20
+	h2=$(in_m 'ps -eo args | grep -c "[s]leep 30.0917"')
+	("$CX" exec "$NM" -- 'sleep 60.0918' >/dev/null 2>&1 &)
+	sleep 4
+	node_sh "kill -9 \$(cat $NODE_DIR/pid)" >/dev/null 2>&1
+	probe_codes=$(node_sh "$agent --state-dir $NODE_DIR/state probe stream --sandbox $M_ID" 2>/dev/null | head -1)
+	start_agent
+	wait_state "$N" online 30
+	sleep 15
+	h3=$(in_m 'ps -eo args | grep -c "[s]leep 60.0918"')
+	OUT="left after a terminal closed: $h1; after the client dropped an exec: $h2; after the agent died mid-exec and came back: $h3; a ticket as issued, replayed, altered, for another stream: $probe_codes" CODE=""
+	ok N16 "$(m3_desc N16)" [ "$h1" = 0 -a "$h2" = 0 -a "$h3" = 0 -a "$probe_codes" = "101 401 401 401" ]
+
+	"$CX" delete "$NM" --yes >/dev/null 2>&1
+}
 if want node; then
 	if [[ -z ${VERIFY_NODE_SSH:-} ]]; then
 		skip N00 "the node area" "set VERIFY_NODE_SSH to a command that runs a command on a host for the agent, such as 'ssh box'"
+		m3_skip "no node host: set VERIFY_NODE_SSH"
 	else
 		read -ra NODE_SSH <<<"$VERIFY_NODE_SSH"
 		NODE_DIR="\$HOME/.cloudex-verify-$P"
@@ -632,7 +847,8 @@ if want node; then
 		else
 			N=$P-n
 			probe() { node_sh "$agent --state-dir $NODE_DIR/state probe $*" 2>/dev/null | head -1; }
-			start_agent() { node_sh "cd $NODE_DIR && (nohup $agent run --state-dir $NODE_DIR/state $* </dev/null >>$NODE_DIR/agent.log 2>&1 & echo \$! > $NODE_DIR/pid)"; }
+			DEV=${VERIFY_NODE_DEV_MACHINE:-}
+			start_agent() { node_sh "cd $NODE_DIR && (nohup $agent run --state-dir $NODE_DIR/state ${DEV:+--dev-machine $DEV} $* </dev/null >>$NODE_DIR/agent.log 2>&1 & echo \$! > $NODE_DIR/pid)"; }
 
 			# A token that was withdrawn (its pending node removed), or never made.
 			cx node add "$P-w" --json
@@ -712,6 +928,7 @@ if want node; then
 				skip N07 "a cloudex deploy doesn't show the node offline for more than 5 s" "set VERIFY_NODE_DEPLOY=1 (and CLOUDFLARE_API_TOKEN) to redeploy during the check"
 			fi
 
+			node_m3
 			cx node rm "$N" --yes
 			sleep 2
 			st=$(node_state "$N")

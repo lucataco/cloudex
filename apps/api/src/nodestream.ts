@@ -132,10 +132,12 @@ class Inbox {
   private owed = 0;
   cancelled = false;
 
-  constructor(
-    private readonly credit: (n: number) => void,
-    private readonly settled: () => void,
-  ) {
+  private readonly credit: (n: number) => void;
+  private readonly settled: () => void;
+
+  constructor(credit: (n: number) => void, settled: () => void) {
+    this.credit = credit;
+    this.settled = settled;
     this.readable = new ReadableStream<Uint8Array>(
       {
         pull: async (c) => {
@@ -228,17 +230,22 @@ export class Framed {
   private early: StreamFromAgent | null = null;
   private exit: { resolve: (n: number) => void; reject: (e: Error) => void; promise: Promise<number> };
   private closed = false;
+  // The agent's reason, when it couldn't start what was opened.
+  private failure: string | null = null;
   // A WebSocket relay of a preview, which gets messages, not bytes.
   onWsMessage: ((data: string | ArrayBuffer) => void) | null = null;
   onWsClose: ((code: number, reason: string) => void) | null = null;
   readonly opened: Promise<StreamFromAgent>;
   exitCode: number | null = null;
 
-  constructor(
-    readonly id: string,
-    private readonly ws: WebSocket,
-    private readonly forget: () => void,
-  ) {
+  readonly id: string;
+  private readonly ws: WebSocket;
+  private readonly forget: () => void;
+
+  constructor(id: string, ws: WebSocket, forget: () => void) {
+    this.id = id;
+    this.ws = ws;
+    this.forget = forget;
     for (let ch = 0; ch <= 4; ch++) {
       this.inbox.push(new Inbox((n) => this.control({ credit: { ch, n } }), () => queueMicrotask(() => this.maybeDone())));
       this.outbox.push(new Outbox());
@@ -320,6 +327,7 @@ export class Framed {
       this.answer.resolve(m);
       this.answer = null;
     } else this.early ??= m;
+    if ("error" in m) this.failure = m.error;
     if ("refused" in m || "error" in m) this.end(1000, "done");
   }
 
@@ -349,7 +357,11 @@ export class Framed {
     for (const o of this.outbox) o.kill(e);
     this.answer?.reject(e);
     this.answer = null;
-    this.exit.reject(new StreamGone(`the node's stream closed before the command exited (${code}${reason ? ` ${reason}` : ""})`));
+    this.exit.reject(
+      this.failure !== null
+        ? new Error(`[502] the node couldn't start it: ${this.failure}`)
+        : new StreamGone(`the node's stream closed before the command exited (${code}${reason ? ` ${reason}` : ""})`),
+    );
     this.onWsClose?.(code === 1000 ? 1000 : 1011, reason);
   }
 }
@@ -378,7 +390,11 @@ export class NodeStreams {
   private asked = 0;
   private seenReady = false;
 
-  constructor(private readonly h: StreamHost) {}
+  private readonly h: StreamHost;
+
+  constructor(h: StreamHost) {
+    this.h = h;
+  }
 
   private get ctx() {
     return this.h.ctx;
@@ -472,23 +488,27 @@ export class NodeStreams {
   }
 
   // Opens a framed stream: an exec, an HTTP exchange or a TCP connection.
-  // It waits for the agent's answer, except for HTTP, whose answer comes
-  // after the request's body, which the caller sends first.
+  // It waits for the agent's answer only for TCP. An HTTP answer comes after
+  // the request's body, which the caller sends first; an exec's stdin and
+  // output can flow at once, which saves a round trip to the node on every
+  // exec, and a failure to start comes as its exit code's rejection.
   async open(o: StreamOpen): Promise<Framed> {
     this.reap();
     const { ws, id } = await this.take("proc");
     const f = new Framed(id, ws, () => this.framed.delete(id));
     this.framed.set(id, f);
     f.control(o);
-    if ("http" in o) return f;
+    if ("http" in o || "exec" in o) return f;
     return this.answered(f);
   }
 
-  // The agent's answer to an open, within OPEN_ANSWER_MS.
-  async answered(f: Framed): Promise<Framed> {
+  // The agent's answer to an open, within OPEN_ANSWER_MS; with no deadline
+  // for HTTP, whose answer may come after a long body or a long poll, as it
+  // may from a container (a dead node ends it through the heartbeat).
+  async answered(f: Framed, deadline = true): Promise<Framed> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`[504] the node's agent didn't answer within ${OPEN_ANSWER_MS / 1000} s`)), OPEN_ANSWER_MS);
+      if (deadline) timer = setTimeout(() => reject(new Error(`[504] the node's agent didn't answer within ${OPEN_ANSWER_MS / 1000} s`)), OPEN_ANSWER_MS);
     });
     try {
       const m = await Promise.race([f.opened, late]);
