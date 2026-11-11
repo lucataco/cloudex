@@ -28,6 +28,16 @@ export const NodeClose = {
 // The most a control message may be, in bytes (UTF-16 code units on the Worker).
 export const NODE_MESSAGE_MAX = 65_536;
 
+// Text a node writes that people read (its self-test's findings, its
+// agent's errors): control characters other than newline and tab, and
+// bidirectional overrides, become "?", so that it can't move a terminal's
+// cursor, set its title or reorder what's shown (2026-11-12 review, W3). The
+// CLI cleans what it prints again.
+// eslint-disable-next-line no-control-regex
+const CONTROLS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+export const stripControls = (s: string) => s.replace(CONTROLS, "?");
+const NodeText = (max: number) => z.string().max(max).overwrite(stripControls);
+
 export const NodeId = z.string().regex(/^nd-[a-z0-9]{8}$/, "a node id, nd-xxxxxxxx");
 
 export const NodeState = z.enum(["pending", "online", "offline", "revoked"]);
@@ -44,7 +54,7 @@ export const NodeIsolation = z.object({
   firewall: z.enum(["pass", "fail", "unchecked"]),
   unisolated: z.boolean(),
   checkedAt: z.number().int().min(0).optional(),
-  failed: z.array(z.string().max(200)).max(16).optional(),
+  failed: z.array(NodeText(200)).max(16).optional(),
 });
 export type NodeIsolation = z.infer<typeof NodeIsolation>;
 
@@ -54,7 +64,7 @@ export const AgentVersion = z.string().regex(/^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$
 // pulling (progress from 0 to 1), missing, or refused (not on the node's
 // list of allowed images).
 export const NodeImage = z.object({
-  ref: z.string().max(400),
+  ref: NodeText(400),
   state: z.enum(["present", "pulling", "missing", "refused"]),
   progress: z.number().min(0).max(1).optional(),
 });
@@ -168,7 +178,7 @@ export const NodeHello = z.object({
   version: AgentVersion,
   facts: NodeFacts,
   machines: z.array(NodeMachine).max(1000),
-  machinesError: z.string().max(500).optional(),
+  machinesError: NodeText(500).optional(),
 });
 export const NodeFactsMessage = z.object({ type: z.literal("facts"), facts: NodeFacts });
 export const NodeStateMessage = z.object({ type: z.literal("state"), machine: NodeMachine });
@@ -178,7 +188,7 @@ export const NodeResult = z.object({
   id: OpId,
   ok: z.boolean(),
   value: z.record(z.string(), z.unknown()).optional(),
-  error: z.string().max(2000).optional(),
+  error: NodeText(2000).optional(),
 });
 // Stream tickets (M3): the agent asks for count of them for one sandbox, to
 // open stream sockets to it (StreamOpen below). The Node object answers with
@@ -305,7 +315,7 @@ export const StreamOpen = z.union([
 export type StreamOpen = z.infer<typeof StreamOpen>;
 
 const Credit = z.object({ ch: z.number().int().min(0).max(4), n: z.number().int().min(1).max(1 << 30) });
-const WsClose = z.object({ code: z.number().int().min(1000).max(4999), reason: z.string().max(123) });
+const WsClose = z.object({ code: z.number().int().min(1000).max(4999), reason: NodeText(123) });
 
 // The object to the agent, after the open.
 export const StreamToAgent = z.union([
@@ -321,8 +331,8 @@ export type StreamToAgent = z.infer<typeof StreamToAgent>;
 // The agent to the object.
 export const StreamFromAgent = z.union([
   z.object({ ok: z.literal(true) }).strict(), // started, or connected
-  z.object({ refused: z.string().max(64) }).strict(), // nothing listens: the address tried
-  z.object({ error: z.string().max(2000) }).strict(), // couldn't start
+  z.object({ refused: NodeText(64) }).strict(), // nothing listens: the address tried
+  z.object({ error: NodeText(2000) }).strict(), // couldn't start
   z.object({ status: z.object({ code: z.number().int().min(100).max(599), headers: HeaderList }) }).strict(),
   z.object({ eof: z.union([z.literal(1), z.literal(2)]) }).strict(),
   z.object({ exit: z.number().int().min(-1).max(255) }).strict(),

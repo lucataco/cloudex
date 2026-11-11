@@ -178,7 +178,7 @@ func (r *runner) run(spec runSpec) (err error) {
 	}
 	r.say("%s is running (%s), after %s", box.Label(), box.Size, time.Since(t0).Round(100*time.Millisecond))
 	if box.Notice != nil && *box.Notice != "" {
-		r.say("%s", *box.Notice)
+		r.say("%s", api.CleanText(*box.Notice))
 	}
 	id := box.ID
 	if archive != nil {
@@ -283,7 +283,7 @@ func (r *runner) start(ctx context.Context, spec runSpec, env map[string]string)
 	}
 	s := &list[0]
 	if s.State != "running" {
-		return s, fmt.Errorf("%s didn't start: %s", s.Label(), deref(s.Error))
+		return s, fmt.Errorf("%s didn't start: %s", s.Label(), api.CleanText(deref(s.Error)))
 	}
 	if len(env) > 0 {
 		change := api.SettingsChange{Env: map[string]*string{}}

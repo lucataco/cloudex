@@ -9,6 +9,8 @@ import {
   EGRESS_ROUTE,
   NODE_PROTOCOL,
   NodeClose,
+  NodeHello,
+  NodeIsolation,
   NodeJoin,
   NodeJoined,
   NodeMessage,
@@ -75,4 +77,18 @@ test("the egress route and its limits are the ones in the fixture (M6)", () => {
   assert.equal(fixture.egress.activityEverySec, EGRESS_ACTIVITY_SEC);
   // Save and backup parts (backup.ts PART) fit under the edge's limit.
   assert.ok(fixture.egress.savePartMax <= EGRESS_BODY_MAX);
+});
+
+// 2026-11-12 review, W3: what a node writes for people to read loses its control characters.
+test("a node's text loses its control characters, but keeps newlines and tabs", () => {
+  const evil = "fail\u001b[2J\u001b]0;pwned\u0007 ‮exe.txt\nnext\tline";
+  const r = NodeResult.parse({ type: "result", id: "op-abc", ok: false, error: evil });
+  assert.equal(r.error, "fail?[2J?]0;pwned? ?exe.txt\nnext\tline");
+  const iso = NodeIsolation.parse({ firewall: "fail", unisolated: false, failed: [evil] });
+  assert.ok(!/[\u001b\u0007‮]/.test(iso.failed![0]!));
+  const out = StreamFromAgent.parse({ error: "\u001b[31mred" });
+  assert.deepEqual(out, { error: "?[31mred" });
+  const h = NodeHello.parse({ type: "hello", protocol: 1, version: "v1", facts: { arch: "amd64", runtime: "docker", isolation: { firewall: "pass", unisolated: false }, cpus: 1, memoryMb: 1, diskFreeGb: 1, image: { ref: "x\u001b", state: "present" } }, machines: [], machinesError: "\u0000" });
+  assert.equal(h.machinesError, "?");
+  assert.equal(h.facts.image?.ref, "x?");
 });

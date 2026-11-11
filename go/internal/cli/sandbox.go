@@ -235,7 +235,7 @@ func newNewCmd(opts *options) *cobra.Command {
 				fmt.Fprintf(cmd.OutOrStdout(), "%s is running (%s).\n", s.Label(), s.Size)
 			}
 			if s.Notice != nil && *s.Notice != "" {
-				fmt.Fprintln(cmd.OutOrStdout(), *s.Notice)
+				fmt.Fprintln(cmd.OutOrStdout(), api.CleanText(*s.Notice))
 			}
 			if !noUse {
 				fmt.Fprintln(cmd.OutOrStdout(), "It is now the current sandbox. Connect with: cloudex ssh")
@@ -400,10 +400,10 @@ func printSandbox(w io.Writer, s *api.Sandbox) {
 		fmt.Fprintf(tw, "Provider keys\t%s, added on the way out\n", strings.Join(s.ProviderKeys, ", "))
 	}
 	if s.Notice != nil {
-		fmt.Fprintf(tw, "Note\t%s\n", *s.Notice)
+		fmt.Fprintf(tw, "Note\t%s\n", clean(*s.Notice))
 	}
 	if s.Error != nil {
-		fmt.Fprintf(tw, "Error\t%s\n", *s.Error)
+		fmt.Fprintf(tw, "Error\t%s\n", clean(*s.Error))
 	}
 	tw.Flush()
 }
@@ -475,10 +475,10 @@ func lifecycleCmd(opts *options, use, short, doing string, call func(*api.Client
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s %s.\n", s.Label(), done(s))
 			if s.Error != nil {
-				fmt.Fprintln(cmd.OutOrStdout(), *s.Error)
+				fmt.Fprintln(cmd.OutOrStdout(), api.CleanText(*s.Error))
 			}
 			if use == "resume" && s.Notice != nil {
-				fmt.Fprintln(cmd.OutOrStdout(), *s.Notice)
+				fmt.Fprintln(cmd.OutOrStdout(), api.CleanText(*s.Notice))
 			}
 			if use == "stop" && s.BackupError != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Backing up /home failed, so only the save has it: %s\n", *s.BackupError)

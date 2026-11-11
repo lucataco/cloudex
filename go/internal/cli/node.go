@@ -288,7 +288,7 @@ func disk(gb *float64) string {
 // changing its colors: the API checks it, and this doesn't trust that.
 func clean(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) {
 			return '?'
 		}
 		return r

@@ -259,7 +259,7 @@ func runStartFromSave(cmd *cobra.Command, opts *options, name string, req api.Fo
 			fmt.Fprintf(out, "%s is running (%s), from the save %s.\n", s.Label(), s.Size, name)
 		}
 		if s.Notice != nil && *s.Notice != "" {
-			fmt.Fprintln(out, *s.Notice)
+			fmt.Fprintln(out, api.CleanText(*s.Notice))
 		}
 		if !noUse {
 			fmt.Fprintln(out, "It is now the current sandbox. Connect with: cloudex ssh")
@@ -284,7 +284,7 @@ func printStarted(w io.Writer, list []api.Sandbox) {
 		}
 		state := s.State
 		if s.Error != nil {
-			state += ": " + *s.Error
+			state += ": " + clean(*s.Error)
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", s.ID, name, state)
 	}
