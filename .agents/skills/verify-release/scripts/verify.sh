@@ -7,11 +7,13 @@
 # (where they are, when not in the usual places), VERIFY_AGENTS=1 (the browser's agent turn
 # without the agents area). The node area: VERIFY_NODE_SSH (a command prefix that runs a
 # command on the host for the agent, such as "ssh box"; without it the area is a SKIP),
-# VERIFY_NODE_AGENT (cloudex-node's path on that host, if it's there; else it's built for
-# linux/$VERIFY_NODE_ARCH, default amd64, and copied over), VERIFY_NODE_DEPLOY=1 (N07, which
-# runs cloudex deploy with $CLOUDFLARE_API_TOKEN), VERIFY_NODE_DEV_MACHINE (a running
-# container on that host for N09-N16, the agent's --dev-machine), VERIFY_NODE_LONG=1 (N12's
-# 30 idle minutes, and with VERIFY_NODE_DEPLOY=1 N13's deploy during an scp).
+# VERIFY_NODE_SUDO=1 (passwordless sudo there: the installer runs as root with the
+# firewall; without it, --unisolated, and the root-only checks SKIP), VERIFY_NODE_AGENT_IMAGE
+# (the agent's image, if the host has it; else it's built there from this checkout),
+# VERIFY_NODE_MACHINE_IMAGE (the installer's --machine-image), VERIFY_NODE_DEPLOY=1 (N07,
+# which runs cloudex deploy with $CLOUDFLARE_API_TOKEN), VERIFY_NODE_LONG=1 (N12's 30 idle
+# minutes, and with VERIFY_NODE_DEPLOY=1 N13's deploy during an scp), VERIFY_NODE_REBOOT=1
+# (N23 reboots the host).
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
 set -uo pipefail
 
@@ -592,15 +594,26 @@ if want browser; then
 fi
 
 # ---------------------------------------------------------------- node
-# Nodes (v0.2.2 M2): the agent, cloudex-node, joins with a token and keeps its
-# control socket open. It runs as a plain process on the host VERIFY_NODE_SSH
-# reaches, in ~/.cloudex-verify-<prefix> with its own state directory, and
-# needs no Docker and no root yet. Each probe runs there too, with the node's
-# own key (cloudex-node probe).
+# Nodes (v0.2.2): the agent, cloudex-node, joins with a token and keeps its
+# control socket open (M2, N01-N08); streams and exec over the link (M3,
+# N09-N16); the Docker runtime, the firewall, the self-test and the installer
+# (M4, N17-N25). It runs on the host VERIFY_NODE_SSH reaches, as the
+# installer sets it up: scripts/node-install.sh, as root with
+# VERIFY_NODE_SUDO=1 (passwordless sudo there), else --unisolated (testing
+# only: no firewall, and the root-only checks are a SKIP). The agent's image
+# is VERIFY_NODE_AGENT_IMAGE if the host has it, else built there from this
+# checkout. The installer's --uninstall runs at the end, and N25 compares the
+# host with how it was before.
 NODE_DIR=""
+NODE_UP=""
 node_sh() { "${NODE_SSH[@]}" "$*" </dev/null; }
 node_stop_all() {
-	node_sh "[ -f $NODE_DIR/pid ] && kill \$(cat $NODE_DIR/pid) 2>/dev/null; rm -rf $NODE_DIR" >/dev/null 2>&1
+	if [[ -n $NODE_UP ]]; then
+		node_sh "$NODE_SUDO bash $NODE_DIR/node-install.sh --uninstall --yes --keep-images" >/dev/null 2>&1
+		NODE_UP=""
+	fi
+	[[ -n ${NODE_BUILT:-} ]] && node_sh "docker rmi $AIMG" >/dev/null 2>&1
+	node_sh "rm -rf $NODE_DIR" >/dev/null 2>&1
 }
 now_s() { perl -MTime::HiRes=time -e 'printf "%.2f", time'; }
 since() { awk -v a="$1" -v b="$(now_s)" 'BEGIN { printf "%.2f", b - a }'; }
@@ -615,13 +628,24 @@ wait_state() {
 		sleep 0.25
 	done
 }
-# Streams and exec over the link (v0.2.2 M3, N09-N16), against a development
-# machine: a running container on the node host, named by
-# VERIFY_NODE_DEV_MACHINE, which the agent adopts for one sandbox
-# (cloudex-node run --dev-machine; POST /v1/nodes/{node}/dev-sandboxes, for
-# admins). Without it they are a SKIP. N12 takes 30 minutes (VERIFY_NODE_LONG=1),
-# and N13 a deploy and up to 6 minutes (VERIFY_NODE_DEPLOY=1 and VERIFY_NODE_LONG=1);
-# both read Durable Object analytics with $CLOUDFLARE_API_TOKEN.
+# wait_iso T: waits (up to 3 minutes) for the node's self-test to have a
+# result from after T (ms), as when the agent restarts; prints the firewall.
+wait_iso() {
+	local f
+	for _ in $(seq 1 90); do
+		f=$("$CX" node info "$N" --json 2>/dev/null | jq -r --argjson t "$1" 'select((.isolation.checkedAt // 0) > $t and .isolation.firewall != "unchecked") | .isolation.firewall')
+		[[ -n $f ]] && { echo "$f"; return 0; }
+		sleep 2
+	done
+	return 1
+}
+# The host's view, for N25: Docker's objects without the build.cloudex labels, and the firewall.
+host_snapshot() {
+	node_sh "docker ps -a --format '{{.Names}}|{{.Labels}}' | awk -F'|' '\$2 !~ /build[.]cloudex[.]/ {print \$1}' | sort;
+		echo ---; docker network ls --format '{{.Name}}|{{.Labels}}' | awk -F'|' '\$2 !~ /build[.]cloudex[.]/ {print \$1}' | sort;
+		echo ---; docker volume ls --format '{{.Name}}|{{.Labels}}' | awk -F'|' '\$2 !~ /build[.]cloudex[.]/ {print \$1}' | sort;
+		echo ---; ${NODE_SUDO:+sudo nft list tables | sort}"
+}
 M3_CHECKS=("N09 exec over the link: exit codes, stdout and stderr, the user, cwd, and a round trip p50 under 150 ms"
 	"N10 data each way: 256 MiB with scp, 90 MiB with cp, and a preview's body and WebSocket, unchanged"
 	"N11 a reader at 2.5 MiB/s keeps the machine's output within 16 MiB of it, and keystrokes in another ssh session stay under 200 ms"
@@ -630,8 +654,18 @@ M3_CHECKS=("N09 exec over the link: exit codes, stdout and stderr, the user, cwd
 	"N14 exec --timeout 2s -- sleep 10 exits 124, and the sleep is gone"
 	"N15 the dashboard terminal on a node: a shell and its exit code, tmux across reconnects, resize, htop and vim"
 	"N16 nothing is left on the machine after a terminal closes, a client drops an exec, or the agent dies mid-exec; and a stream ticket works once")
+M4_CHECKS=("N17 the installer, as root: the firewall unit is loaded, the agent comes online and passes its self-test, a throwaway machine boots, and node info shows the runtime, the isolation and the image"
+	"N18 from inside a machine: the internet and DNS answer; the host's addresses, its gateway and DNS, Docker's bridges, the tailnet range, metadata, another machine and the agent's other addresses don't"
+	"N19 with route-changing rights (the self-test's NET_ADMIN probe, now): routes through the agent reach nothing, a forged source address finishes no handshake, and the agent takes nothing from another network for a machine"
+	"N20 a machine's container has exactly its flags and limits (docker inspect); inside, root has Docker's default capabilities less NET_RAW, MKNOD and SETFCAP, no Docker socket, read-only /proc/sys and /sys, no devices, raw sockets or mknod, no IPv6 outside lo; and a restart gives it a new start id"
+	"N21 the firewall survives systemctl restart docker: its table is loaded, the self-test passes, and a machine started again reaches the internet"
+	"N22 a restart of the agent leaves its machines running, and exec works again within 10 s"
+	"N23 after the host reboots: the firewall is loaded, the agent is back with its self-test passing, the machine is stopped with its disk, and it starts again with its files"
+	"N24 a node whose self-test fails refuses new machines and says why; with --unisolated (testing only) it runs them and shows isolation none"
+	"N25 nothing on the host changed outside the build.cloudex labels, and the uninstaller removes the agent, its machines, networks, volume and firewall")
 m3_skip() { for c in "${M3_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
-m3_desc() { for c in "${M3_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
+m4_skip() { for c in "${M4_CHECKS[@]}"; do [[ -z $2 || " $2 " == *" ${c%% *} "* ]] && skip "${c%% *}" "${c#* }" "$1"; done; }
+m3_desc() { for c in "${M3_CHECKS[@]}" "${M4_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
 # Active seconds of one Durable Object from $1 to $2 (ISO times), from the GraphQL analytics.
 do_active() {
@@ -642,19 +676,25 @@ do_active() {
 		curl -s https://api.cloudflare.com/client/v4/graphql -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' --data @- |
 		jq -r '[.data.viewer.accounts[0].durableObjectsPeriodicGroups[]?.sum.activeTime] | add // 0 | . / 1e6'
 }
+# The agent's own commands, in its container (it holds the node's key and the socket).
+in_agent() { node_sh "docker exec cloudex-node cloudex-node $*"; }
+# One-off runs of the agent's image with the node's volume, while the agent is stopped.
+probe() { node_sh "docker run --rm -v cloudex-node:/var/lib/cloudex-node $AIMG probe $*" 2>/dev/null | head -1; }
+start_agent() { node_sh "docker start cloudex-node" >/dev/null 2>&1; }
+kill_agent() { node_sh "docker kill cloudex-node" >/dev/null 2>&1; }
+
+# Streams and exec over the link (M3), against a sandbox whose machine the
+# agent makes (POST /v1/nodes/{node}/dev-sandboxes, for admins, until M5).
 node_m3() {
-	if [[ -z $DEV ]]; then
-		m3_skip "set VERIFY_NODE_DEV_MACHINE to a running container on the node host for the agent to adopt (SKILL.md, node area)"
-		return
-	fi
-	local NM=$P-m key M_ID ssh_cfg big ok_all why
+	local NM=$P-m key M_ID ssh_cfg big ok_all why MC
 	key=$(jq -r .apiKey "$src_cfg/config.json")
 	cx node dev-sandbox "$N" --name "$NM"
 	M_ID=$(field .id)
 	if [[ $CODE != 0 || -z $M_ID ]]; then
-		m3_skip "couldn't make a sandbox on the node's dev machine: ${ERR:0:200}"
+		m3_skip "couldn't make a sandbox on the node: ${ERR:0:200}"
 		return
 	fi
+	MC=cloudex-$M_ID
 	nck() { CLOUDEX_API_KEY=$key node "$here/node-check.mjs" "$API_URL" "$M_ID" "$@" >"$work/o" 2>&1; CODE=$?; OUT=$(cat "$work/o"); }
 	in_m() { "$CX" exec "$NM" -- "$1" 2>/dev/null; }
 	ssh_cfg=$work/ssh_config_m
@@ -704,7 +744,12 @@ node_m3() {
 		want="posted:94371840:$(md5sum <"$big.90" 2>/dev/null | cut -d' ' -f1)"
 		[[ $want == posted:94371840: ]] && want="posted:94371840:$(md5 -q "$big.90")"
 		local g po w
-		g=$(curl -s --max-time 30 "$link/a?b=1") po=$(curl -s --max-time 120 -X POST --data-binary @"$big.90" "$link/p")
+		for _ in $(seq 1 15); do
+			g=$(curl -s --max-time 30 "$link/a?b=1")
+			[[ $g == hello-preview* ]] && break
+			sleep 1
+		done
+		po=$(curl -s --max-time 120 -X POST --data-binary @"$big.90" "$link/p")
 		CLOUDEX_API_KEY=$key node "$here/node-check.mjs" "$API_URL" "$M_ID" ws 3000 "$link" >"$work/o" 2>&1
 		w=$(cat "$work/o")
 		pv="; preview GET '$g', POST '${po:0:60}', WebSocket $w"
@@ -757,7 +802,7 @@ node_m3() {
 	# N13: a deploy during a busy scp: the machine's side ends with the client's.
 	if [[ ${VERIFY_NODE_DEPLOY:-} == 1 && ${VERIFY_NODE_LONG:-} == 1 ]]; then
 		local base spid t_cut t_gone n
-		base=$(node_sh "docker exec $DEV sh -c 'pgrep -c -f \"^sshd: cloudex\" || true'")
+		base=$(node_sh "docker exec $MC sh -c 'pgrep -c -f \"^sshd: cloudex\" || true'")
 		scp -F "$ssh_cfg" -o BatchMode=yes -q -l 4000 "$big" "$NM.cloudex:/tmp/vr-slow" 2>/dev/null &
 		spid=$!
 		sleep 5
@@ -765,7 +810,7 @@ node_m3() {
 		t_cut="" t_gone=""
 		for _ in $(seq 1 420); do
 			[[ -z $t_cut ]] && ! kill -0 "$spid" 2>/dev/null && t_cut=$(now_ms)
-			n=$(node_sh "docker exec $DEV sh -c 'pgrep -c -f \"^sshd: cloudex\" || true'")
+			n=$(node_sh "docker exec $MC sh -c 'pgrep -c -f \"^sshd: cloudex\" || true'")
 			[[ -z $t_gone && ${n:-9} -le ${base:-0} ]] && t_gone=$(now_ms)
 			[[ -n $t_cut && -n $t_gone ]] && break
 			sleep 1
@@ -815,71 +860,291 @@ node_m3() {
 	h2=$(in_m 'ps -eo args | grep -c "[s]leep 30.0917"')
 	("$CX" exec "$NM" -- 'sleep 60.0918' >/dev/null 2>&1 &)
 	sleep 4
-	node_sh "kill -9 \$(cat $NODE_DIR/pid)" >/dev/null 2>&1
-	probe_codes=$(node_sh "$agent --state-dir $NODE_DIR/state probe stream --sandbox $M_ID" 2>/dev/null | head -1)
+	kill_agent
+	probe_codes=$(probe stream --sandbox "$M_ID")
 	start_agent
 	wait_state "$N" online 30
 	sleep 15
 	h3=$(in_m 'ps -eo args | grep -c "[s]leep 60.0918"')
 	OUT="left after a terminal closed: $h1; after the client dropped an exec: $h2; after the agent died mid-exec and came back: $h3; a ticket as issued, replayed, altered, for another stream: $probe_codes" CODE=""
 	ok N16 "$(m3_desc N16)" [ "$h1" = 0 -a "$h2" = 0 -a "$h3" = 0 -a "$probe_codes" = "101 401 401 401" ]
-
-	# A dev machine outlives its sandbox (until M4), so what the checks started goes first.
 	in_m 'pkill -f "[v]r-app.js"; true' >/dev/null
-	"$CX" delete "$NM" --yes >/dev/null 2>&1
+	M3_SANDBOX=$NM M3_ID=$M_ID
 }
+
+# The Docker runtime, the firewall and the self-test (M4), against the
+# sandbox node_m3 made ($M3_SANDBOX) and a second one.
+node_m4() {
+	local NM=${M3_SANDBOX:-} MID=${M3_ID:-} M2=$P-m2 M2ID MC ok_all detail
+	if [[ -z $NM ]]; then
+		m4_skip "no sandbox on the node (N09's failed)" "N18 N19 N20 N21 N22 N23 N24"
+		return
+	fi
+	MC=cloudex-$MID
+	wait_iso 0
+	cx node dev-sandbox "$N" --name "$M2" --cpus 0.5 --memory-mb 1024
+	M2ID=$(field .id)
+
+	# N18: the matrix from inside a real machine, through the product's exec.
+	local hostinfo src gw dns tail agentaddrs m2ip targets plan res
+	hostinfo=$(node_sh "ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1; ip -4 route show default | awk '{print \$3; exit}';
+		awk '/^nameserver [0-9.]+\$/ {print \$2}' /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null | grep -v '^127\.' | sort -u | tr '\n' ' '; echo;
+		ip -4 -o addr show | awk '{print \$4}' | cut -d/ -f1 | grep -E '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' | tr '\n' ' '; echo;
+		docker inspect cloudex-node -f '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$v.IPAddress}}={{\$v.Gateway}} {{end}}'; echo;
+		docker inspect cloudex-$M2ID -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}';
+		ip -4 -o addr show docker0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1")
+	{ read -r src; read -r gw; read -r dns; read -r tail; read -r agentaddrs; read -r m2ip; read -r docker0; } <<<"$hostinfo"
+	local own_gw="" own_agent=""
+	own_agent=$(node_sh "docker inspect $MC -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'" | awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 - 1}')
+	own_gw=$(awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 - 1}' <<<"$own_agent")
+	local steps="[]" n=0
+	addt() { steps=$(jq -c --arg id "$1" --arg h "$2" --argjson p "$3" '. + [{id: $id, kind: "tcp", host: $h, port: $p}]' <<<"$steps"); }
+	addu() { steps=$(jq -c --arg id "$1" --arg h "$2" '. + [{id: $id, kind: "udp53", host: $h}]' <<<"$steps"); }
+	addt "open internet 1.1.1.1:443" 1.1.1.1 443
+	steps=$(jq -c '. + [{id: "open DNS example.com", kind: "dns", name: "example.com"}]' <<<"$steps")
+	addu "open DNS 1.1.1.1" 1.1.1.1
+	[[ -n $src ]] && for p in 22 80 443; do addt "closed the host $src:$p" "$src" "$p"; done
+	[[ -n $gw ]] && { addt "closed the LAN gateway $gw:80" "$gw" 80; addt "closed the LAN gateway $gw:53" "$gw" 53; addu "closed LAN gateway DNS $gw udp" "$gw"; }
+	for d in $dns; do
+		case $d in 10.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 192.168.* | 100.*) ;; *) continue ;; esac # a public resolver is the internet
+		addt "closed host DNS $d:53" "$d" 53; addu "closed host DNS $d udp" "$d"
+	done
+	for t in $tail; do addt "closed host tailnet address $t:22" "$t" 22; done
+	addt "closed tailnet 100.100.100.100:53" 100.100.100.100 53
+	addt "closed metadata 169.254.169.254:80" 169.254.169.254 80
+	addt "closed the host on the machine gateway $own_gw:22" "$own_gw" 22
+	[[ -n $docker0 ]] && addt "closed the host on docker0 $docker0:22" "$docker0" 22
+	[[ -n $m2ip ]] && addt "closed another machine $m2ip:22" "$m2ip" 22
+	for pair in $agentaddrs; do
+		local ip=${pair%%=*} g=${pair#*=}
+		[[ $ip == "$own_agent" || -z $ip ]] && continue
+		addt "closed the agent at $ip:22" "$ip" 22
+		[[ -n $g && $g != "$own_gw" ]] && addt "closed the host at $g:22" "$g" 22
+	done
+	"$CX" cp "$repo/go/internal/node/probe.py" "$NM:/tmp/vr-probe.py" >/dev/null 2>&1
+	res=$("$CX" exec "$NM" --root -- "python3 /tmp/vr-probe.py \"\$(echo $(printf '[%s]' "$steps" | base64 | tr -d '\n') | base64 -d)\"" 2>"$work/e")
+	local bad="" all=""
+	for id in $(jq -r '.[].id | @base64' <<<"$steps"); do
+		id=$(base64 -d <<<"$id")
+		local got
+		got=$(jq -r --arg k "$id" '.[$k] // "missing"' <<<"$res" 2>/dev/null)
+		all="$all $id=$got;"
+		case $id in
+		open*) [[ $got == open* || $got == resolved* || $got == answered ]] || bad="$bad $id=$got;" ;;
+		closed*) [[ $got == timeout || $got == unreachable ]] || bad="$bad $id=$got;" ;;
+		esac
+	done
+	OUT="${bad:+FAILED:$bad }all:$all" CODE=""
+	if [[ -n $NODE_SUDO ]]; then
+		ok N18 "$(m3_desc N18)" [ -z "$bad" -a -n "$res" ]
+	else
+		skip N18 "$(m3_desc N18)" "the node runs --unisolated (no VERIFY_NODE_SUDO=1), so there is no firewall to test; what was reached: ${bad:0:300}"
+	fi
+
+	# N19: the self-test's NET_ADMIN probe, run now.
+	in_agent selftest >"$work/selftest.json" 2>"$work/e"
+	local nchecks nbad
+	nchecks=$(jq '[.checks[] | select(.name | startswith("NET_ADMIN") or startswith("the agent tells"))] | length' "$work/selftest.json" 2>/dev/null)
+	nbad=$(jq -r '[.checks[] | select((.name | startswith("NET_ADMIN") or startswith("the agent tells")) and (.ok | not)) | "\(.name): \(.got)"] | join("; ")' "$work/selftest.json" 2>/dev/null)
+	OUT="runtime $(jq -r .runtime "$work/selftest.json" 2>/dev/null), $nchecks checks: $(jq -r '[.checks[] | select(.name | startswith("NET_ADMIN") or startswith("the agent tells")) | "\(.name) -> \(.got)"] | join("; ")' "$work/selftest.json" 2>/dev/null)" CODE=""
+	cp "$work/selftest.json" "$out/node-selftest.json" 2>/dev/null
+	if [[ -n $NODE_SUDO ]]; then
+		ok N19 "$(m3_desc N19)" [ "${nchecks:-0}" -ge 6 -a -z "$nbad" -a "$(jq -r .pass "$work/selftest.json" 2>/dev/null)" = true ]
+	else
+		skip N19 "$(m3_desc N19)" "the node runs --unisolated; failed: ${nbad:0:300}"
+	fi
+
+	# N20: the container's flags, and what root can do inside.
+	local insp inside boot1 boot2
+	insp=$(node_sh "docker inspect $MC -f '{{json .HostConfig}}'")
+	local hc_ok
+	hc_ok=$(jq -r '[.Privileged == false, (.CapAdd // [] | length) == 0, .CapDrop == ["NET_RAW","MKNOD","SETFCAP"], (.Binds // [] | length) == 0,
+		(.Mounts // [] | length) == 0, (.Devices // [] | length) == 0, .PidMode == "", .IpcMode == "private", .UsernsMode == "",
+		(.NetworkMode | startswith("cloudex-cx-")), .RestartPolicy.Name == "no", .PidsLimit == 4096, .Memory > 0, .NanoCpus > 0,
+		.Tmpfs["/run"] != null, (.SecurityOpt // [] | map(select(test("unconfined|privileged"))) | length) == 0] | all' <<<"$insp" 2>/dev/null)
+	inside=$("$CX" exec "$NM" --root -- "python3 /tmp/vr-probe.py \"\$(echo $(printf '[[{"id":"i","kind":"inside"}]]' | base64 | tr -d '\n') | base64 -d)\"" 2>/dev/null | jq -r .i 2>/dev/null)
+	local runtime
+	runtime=$(jq -r .runtime "$work/selftest.json" 2>/dev/null)
+	local in_ok
+	if [[ $runtime == sysbox ]]; then
+		in_ok=$(jq -r '[(.uidMap | startswith("0 0 ") | not), .dockerSocket == false, (.sysrqWrite | startswith("denied")), (.ipv6Addresses | length) == 0] | all' <<<"$inside" 2>/dev/null)
+	else
+		in_ok=$(jq -r '[.capEff == "00000000200405fb", .dockerSocket == false, (.procSysWrite | startswith("denied")), (.sysWrite | startswith("denied")),
+			(.sysrqWrite | startswith("denied")), (.kcoreRead | startswith("denied")), (.rawSocket | startswith("denied")), (.packetSocket | startswith("denied")),
+			(.mknod | startswith("denied")), .mount == "denied", .routeChange == "denied", (.ipv6Addresses | length) == 0, .ipv6 == false] | all' <<<"$inside" 2>/dev/null)
+	fi
+	boot1=$(in_m 'cat /run/cloudex-boot')
+	"$CX" node dev-stop "$N" "$NM" >/dev/null 2>&1
+	"$CX" node dev-start "$N" "$NM" >/dev/null 2>&1
+	boot2=$(in_m 'cat /run/cloudex-boot')
+	OUT="flags ok: $hc_ok ($(jq -c '{Privileged,CapDrop,PidsLimit,Memory,NanoCpus,Tmpfs,NetworkMode,Runtime}' <<<"$insp" 2>/dev/null)); inside ($runtime) ok: $in_ok ($inside); start ids $boot1 then $boot2" CODE=""
+	ok N20 "$(m3_desc N20)" [ "$hc_ok" = true -a "$in_ok" = true -a -n "$boot1" -a -n "$boot2" -a "$boot1" != "$boot2" ]
+
+	# N21: a Docker restart.
+	if [[ -n $NODE_SUDO ]]; then
+		node_sh "sudo systemctl restart docker" >/dev/null 2>&1
+		wait_state "$N" online 120
+		local tbl st net
+		tbl=$(node_sh "sudo nft list table inet cloudex >/dev/null && echo loaded")
+		st=$(in_agent selftest 2>/dev/null | jq -r .pass)
+		"$CX" node dev-start "$N" "$NM" >/dev/null 2>&1
+		net=$(in_m "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://example.com")
+		OUT="table: ${tbl:-missing}; self-test pass: $st; the machine's https after starting it again: $net" CODE=""
+		ok N21 "$(m3_desc N21)" [ "$tbl" = loaded -a "$st" = true -a "$net" = 200 ]
+	else
+		skip N21 "$(m3_desc N21)" "needs root on the node host (VERIFY_NODE_SUDO=1)"
+	fi
+
+	# N22: the agent restarts; the machine doesn't.
+	local t0 before after works
+	before=$(node_sh "docker inspect $MC -f '{{.State.StartedAt}}'")
+	node_sh "docker restart cloudex-node" >/dev/null 2>&1
+	t0=$(now_s)
+	works=""
+	for _ in $(seq 1 40); do
+		[[ $(in_m 'echo alive') == alive ]] && { works=$(since "$t0"); break; }
+		sleep 0.5
+	done
+	after=$(node_sh "docker inspect $MC -f '{{.State.StartedAt}}'")
+	OUT="machine started at $before, and at $after after the agent's restart; exec works again after ${works:-never} s" CODE=""
+	ok N22 "$(m3_desc N22)" [ -n "$works" -a "$before" = "$after" -a "$(awk -v w="${works:-99}" 'BEGIN { print (w <= 10) }')" = 1 ]
+
+	# N23: a reboot of the host.
+	if [[ ${VERIFY_NODE_REBOOT:-} == 1 && -n $NODE_SUDO ]]; then
+		in_m 'echo vr-reboot-$$ > ~/vr-reboot.txt; sync; cat ~/vr-reboot.txt' >"$work/mark"
+		node_sh "sudo systemctl reboot" >/dev/null 2>&1
+		REBOOTED=1
+		sleep 20
+		local back="" t1
+		t1=$(now_s)
+		for _ in $(seq 1 120); do
+			node_sh true >/dev/null 2>&1 && { back=$(since "$t1"); break; }
+			sleep 5
+		done
+		wait_state "$N" online 300
+		local on=$WAITED tbl2 iso mstate files
+		tbl2=$(node_sh "sudo nft list table inet cloudex >/dev/null && echo loaded")
+		for _ in $(seq 1 60); do
+			iso=$("$CX" node info "$N" --json 2>/dev/null | jq -r '.isolation.firewall')
+			[[ $iso != unchecked ]] && break
+			sleep 2
+		done
+		mstate=$(node_sh "docker inspect $MC -f '{{.State.Status}}'")
+		"$CX" node dev-start "$N" "$NM" >/dev/null 2>&1
+		files=$(in_m 'cat ~/vr-reboot.txt')
+		OUT="ssh back after ${back:-never} s; the node online $on s later; table: ${tbl2:-missing}; isolation: $iso; the machine: $mstate; its file after start: $files (was $(cat "$work/mark"))" CODE=""
+		ok N23 "$(m3_desc N23)" [ "$tbl2" = loaded -a "$iso" = pass -a "$mstate" = exited -a -n "$files" -a "$files" = "$(cat "$work/mark")" ]
+	else
+		skip N23 "$(m3_desc N23)" "reboots the host: set VERIFY_NODE_REBOOT=1 (and VERIFY_NODE_SUDO=1)"
+	fi
+
+	# N24: a failing self-test refuses machines; --unisolated runs them.
+	if [[ -n $NODE_SUDO ]]; then
+		# Without the firewall's table, the agent's self-test (it runs one
+		# when it starts) fails, and the node refuses a new machine.
+		local f1 r1 f2 t
+		node_sh "sudo nft delete table inet cloudex" >/dev/null 2>&1
+		t=$(now_ms)
+		node_sh "docker restart cloudex-node" >/dev/null 2>&1
+		f1=$(wait_iso "$t")
+		f1="$f1, failed: $("$CX" node info "$N" --json 2>/dev/null | jq -r '.isolation.failed // [] | length') checks"
+		cx node dev-sandbox "$N" --name "$P-m3"
+		r1="code $CODE: ${ERR:0:240}"
+		[[ $CODE == 0 ]] && "$CX" delete "$P-m3" --yes >/dev/null 2>&1
+		node_sh "sudo systemctl restart cloudex-node-firewall.service" >/dev/null 2>&1
+		t=$(now_ms)
+		node_sh "docker restart cloudex-node" >/dev/null 2>&1
+		f2=$(wait_iso "$t")
+		OUT="without the table: isolation $f1 (state, failed checks); a new machine: $r1; with it again: $f2" CODE=""
+		ok N24 "$(m3_desc N24)" [ "${f1%%,*}" = fail -a "${r1:0:6}" != "code 0" -a -n "$(grep -i 'self-test fails' <<<"$r1")" -a "$f2" = pass ]
+	else
+		local iso
+		wait_iso 0 >/dev/null
+		iso=$("$CX" node info "$N" --json 2>/dev/null | jq -r '[.isolation.unisolated, .isolation.firewall] | join(" ")')
+		OUT="unisolated, firewall: $iso; machines ran in N09-N22 above (node list labels such a node none (testing): CLI unit tests)" CODE=""
+		ok N24 "$(m3_desc N24)" [ "$iso" = "true fail" ]
+	fi
+	"$CX" delete "$M2" --yes >/dev/null 2>&1
+}
+
 if want node; then
 	if [[ -z ${VERIFY_NODE_SSH:-} ]]; then
 		skip N00 "the node area" "set VERIFY_NODE_SSH to a command that runs a command on a host for the agent, such as 'ssh box'"
 		m3_skip "no node host: set VERIFY_NODE_SSH"
+		m4_skip "no node host: set VERIFY_NODE_SSH" ""
 	else
 		read -ra NODE_SSH <<<"$VERIFY_NODE_SSH"
 		NODE_DIR="\$HOME/.cloudex-verify-$P"
-		agent="$NODE_DIR/cloudex-node"
-		ok_up=1
-		if [[ -n ${VERIFY_NODE_AGENT:-} ]]; then
-			node_sh "mkdir -p $NODE_DIR && cp '$VERIFY_NODE_AGENT' $agent" >/dev/null 2>&1 || ok_up=0
-		elif (cd "$repo/go" && CGO_ENABLED=0 GOOS=linux GOARCH=${VERIFY_NODE_ARCH:-amd64} go build -o "$work/cloudex-node" ./cmd/cloudex-node) 2>"$work/e"; then
-			"${NODE_SSH[@]}" "mkdir -p $NODE_DIR && cat > $agent && chmod 755 $agent" <"$work/cloudex-node" >/dev/null 2>&1 || ok_up=0
-		else
-			ok_up=0
+		NODE_SUDO=""
+		[[ ${VERIFY_NODE_SUDO:-} == 1 ]] && NODE_SUDO=sudo
+		AIMG=${VERIFY_NODE_AGENT_IMAGE:-cloudex-node:verify-$P}
+		ok_up=1 why=""
+		if node_sh "docker container inspect cloudex-node" >/dev/null 2>&1; then
+			ok_up=0 why="the host runs a node agent already (cloudex-node); the checks install their own"
+		elif [[ -z ${VERIFY_NODE_AGENT_IMAGE:-} ]]; then
+			# Built there from this checkout, with images/node/Dockerfile.
+			if (cd "$repo" && COPYFILE_DISABLE=1 tar czf "$work/node-src.tgz" go images/node) &&
+				"${NODE_SSH[@]}" "mkdir -p $NODE_DIR/src && tar xzf - -C $NODE_DIR/src 2>/dev/null && cd $NODE_DIR/src && docker build -q -f images/node/Dockerfile --build-arg VERSION=verify-$P -t $AIMG . >/dev/null" <"$work/node-src.tgz" 2>"$work/e"; then
+				NODE_BUILT=1
+			else
+				ok_up=0 why="couldn't build the agent's image there: $(tail -3 "$work/e")"
+			fi
+		elif ! node_sh "docker image inspect $AIMG" >/dev/null 2>&1; then
+			ok_up=0 why="the host has no image $AIMG"
 		fi
-		if [[ $ok_up == 0 ]] || ! node_sh "$agent --version" >/dev/null 2>&1; then
-			fail N00 "the agent runs on the node host" "couldn't put cloudex-node on it with: $VERIFY_NODE_SSH"
+		[[ $ok_up == 1 ]] && { "${NODE_SSH[@]}" "mkdir -p $NODE_DIR && cat > $NODE_DIR/node-install.sh" <"$repo/scripts/node-install.sh" || ok_up=0; }
+		if [[ $ok_up == 0 ]]; then
+			fail N00 "the agent's image and the installer are on the node host" "${why:-could not copy them with: $VERIFY_NODE_SSH}"
 		else
 			N=$P-n
-			probe() { node_sh "$agent --state-dir $NODE_DIR/state probe $*" 2>/dev/null | head -1; }
-			DEV=${VERIFY_NODE_DEV_MACHINE:-}
-			start_agent() { node_sh "cd $NODE_DIR && (nohup $agent run --state-dir $NODE_DIR/state ${DEV:+--dev-machine $DEV} $* </dev/null >>$NODE_DIR/agent.log 2>&1 & echo \$! > $NODE_DIR/pid)"; }
+			BEFORE=$(host_snapshot)
 
 			# A token that was withdrawn (its pending node removed), or never made.
 			cx node add "$P-w" --json
 			wtok=$(field .joinToken)
 			cx node rm "$P-w" --yes
-			c1=$(probe join --api "$API_URL" --token "$wtok")
-			c2=$(probe join --api "$API_URL" --token "cxj_$(printf 'a%.0s' $(seq 40))")
+			c1=$(node_sh "docker run --rm $AIMG probe join --api $API_URL --token $wtok" 2>/dev/null | head -1)
+			c2=$(node_sh "docker run --rm $AIMG probe join --api $API_URL --token cxj_$(printf 'a%.0s' $(seq 40))" 2>/dev/null | head -1)
 			OUT="withdrawn $c1, made up $c2" CODE=""
 			ok N01 "a join token that was withdrawn or never made gets a 401 (an expired one: unit tests)" [ "$c1" = 401 -a "$c2" = 401 ]
 
+			# The installer (N17), then N04 from the agent's own log.
 			cx node add "$N" --json
 			tok=$(field .joinToken) nid=$(field .node.id)
+			inst=(--api "$API_URL" --token "$tok" --agent-image "$AIMG")
+			[[ -n ${VERIFY_NODE_MACHINE_IMAGE:-} ]] && inst+=(--machine-image "$VERIFY_NODE_MACHINE_IMAGE")
+			[[ -z $NODE_SUDO ]] && inst+=(--unisolated)
 			t0=$(now_s)
-			start_agent --join "$tok" --api "$API_URL"
+			node_sh "$NODE_SUDO bash $NODE_DIR/node-install.sh ${inst[*]}" >"$work/install.log" 2>&1
+			irc=$?
+			itook=$(since "$t0")
+			NODE_UP=1
+			cp "$work/install.log" "$out/node-install.log"
 			wait_state "$N" online 30
-			up=$WAITED
+			up_ms=$(node_sh "docker logs cloudex-node 2>&1" | sed -n 's/.*connected in \([0-9.]*\)\(m*s\).*/\1 \2/p' | head -1)
 			cx node info "$N"
 			facts=$([ "$(field .id)" = "$nid" -a "$(field .protocol)" = 1 -a "$(field '.cpus > 0')" = true -a "$(field '.rttMs >= 0')" = true ] && echo yes)
-			OUT="online $up s after the agent started ($(since "$t0") s with the ssh round trip); info: ${OUT:0:300}" CODE=""
+			OUT="the agent connected in $up_ms after it started; info: ${OUT:0:300}" CODE=""
+			upsec=$(awk -v v="${up_ms% *}" -v u="${up_ms#* }" 'BEGIN { print (u == "ms" ? v / 1000 : v) }')
 			ok N04 "node list shows the node online within 2 s of the agent starting, and info its facts and a round trip" \
-				[ "$(awk -v w="$up" 'BEGIN { print (w <= 2) }')" = 1 -a "$facts" = yes ]
+				[ -n "$up_ms" -a "$(awk -v w="${upsec:-99}" 'BEGIN { print (w <= 2) }')" = 1 -a "$facts" = yes ]
+			info=$("$CX" node info "$N" --json 2>/dev/null)
+			OUT="installer exit $irc in $itook s; $(grep -E 'throwaway|ready in|online' "$work/install.log" | tr '\n' ' ' | head -c 300); node: $(jq -c '{runtime, isolation, image}' <<<"$info")" CODE=""
+			if [[ -n $NODE_SUDO ]]; then
+				tbl=$(node_sh "systemctl is-enabled cloudex-node-firewall.service; sudo nft list table inet cloudex >/dev/null && echo loaded" | tr '\n' ' ')
+				OUT="$OUT; firewall: $tbl"
+				ok N17 "$(m3_desc N17)" [ "$irc" = 0 -a "$(awk -v w="$itook" 'BEGIN { print (w <= 600) }')" = 1 -a "$tbl" = "enabled loaded " \
+					-a "$(jq -r .isolation.firewall <<<"$info")" = pass -a "$(jq -r .image.state <<<"$info")" = present -a -n "$(grep 'a machine started and was ready' "$work/install.log")" ]
+			else
+				skip N17 "$(m3_desc N17)" "needs root on the node host (VERIFY_NODE_SUDO=1); the --unisolated install: $OUT"
+			fi
 
-			c=$(probe join --api "$API_URL" --token "$tok")
+			c=$(node_sh "docker run --rm $AIMG probe join --api $API_URL --token $tok" 2>/dev/null | head -1)
 			OUT="got $c" CODE=""
 			ok N02 "a join token that was used gets a 401" is "$c" 401
 
-
-			# Kill it as docker kill would: no goodbye.
-			node_sh "kill -9 \$(cat $NODE_DIR/pid)" >/dev/null 2>&1
+			# Kill it as docker kill does: no goodbye.
+			kill_agent
 			wait_state "$N" offline 75
 			gone=$?
 			OUT="offline after $WAITED s" CODE=""
@@ -897,6 +1162,11 @@ if want node; then
 			wait_state "$N" online 30
 			OUT="online again after $WAITED s" CODE=""
 			ok N06 "the agent comes back by itself, as the same node, without a new token" [ "$(node_state "$N")" = online ]
+			# It runs its self-test again at start; machines wait for it.
+			for _ in $(seq 1 60); do
+				[[ $("$CX" node info "$N" --json 2>/dev/null | jq -r --argjson t "$(($(now_ms) - 120000))" '(.isolation.checkedAt // 0) > $t') == true ]] && break
+				sleep 2
+			done
 			if [[ ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
 				# Poll while a deploy runs; the longest run of offline answers counts.
 				("$CX" deploy --yes --skip-check >"$work/deploy.log" 2>&1; echo $? >"$work/deploy.rc") &
@@ -930,15 +1200,38 @@ if want node; then
 				skip N07 "a cloudex deploy doesn't show the node offline for more than 5 s" "set VERIFY_NODE_DEPLOY=1 (and CLOUDFLARE_API_TOKEN) to redeploy during the check"
 			fi
 
+			M3_SANDBOX="" M3_ID="" REBOOTED=""
 			node_m3
+			node_m4
+			[[ -n $M3_SANDBOX ]] && "$CX" delete "$M3_SANDBOX" --yes >/dev/null 2>&1
+			left=$(node_sh "docker ps -aq --filter label=build.cloudex.role=machine | wc -l; docker network ls -q --filter label=build.cloudex.role=machine | wc -l" | tr '\n' ' ')
 			cx node rm "$N" --yes
 			sleep 2
 			st=$(node_state "$N")
-			log=$(node_sh "tail -5 $NODE_DIR/agent.log" 2>/dev/null)
+			log=$(node_sh "docker logs --tail 5 cloudex-node 2>&1")
+			kill_agent
 			again=$(probe connect --fault none)
 			OUT="state $st, connect $again, agent: ${log: -200}" CODE=""
 			ok N08 "after node rm the agent is disconnected, its next connect is refused, and the node shows revoked" \
 				[ "$st" = revoked -a "$again" = 401 -a -n "$(grep 'removed from the deployment' <<<"$log")" ]
+
+			# N25: the host as it was, outside the labels; then the uninstaller.
+			MID_RUN=$(host_snapshot)
+			node_sh "$NODE_SUDO bash $NODE_DIR/node-install.sh --uninstall --yes --keep-images" >"$work/uninstall.log" 2>&1
+			urc=$?
+			NODE_UP=""
+			AFTER=$(host_snapshot)
+			leftover=$(node_sh "docker ps -aq --filter label=build.cloudex.node | wc -l; docker network ls -q --filter label=build.cloudex.node | wc -l; docker volume ls -q --filter name=^cloudex-node\$ | wc -l; ls /etc/systemd/system/cloudex-node-firewall.service /etc/cloudex-node 2>/dev/null | wc -l" | tr '\n' ' ')
+			# A reboot (N23) lets the host's own services rebuild their nftables
+			# tables (a VPN's, for one) differently; then only Docker's objects,
+			# and the absence of inet cloudex, count.
+			cut_nft() { if [[ -n ${REBOOTED:-} ]]; then awk '/^---$/ { n++ } n < 3'; else cat; fi; }
+			nb=$(diff <(grep -v 'inet cloudex' <<<"$BEFORE" | cut_nft) <(grep -v 'inet cloudex' <<<"$MID_RUN" | cut_nft) | head -5)
+			na=$(diff <(cut_nft <<<"$BEFORE") <(cut_nft <<<"$AFTER") | head -5)
+			grep -q 'inet cloudex' <<<"$AFTER" && na="$na; inet cloudex is still loaded"
+			[[ -n ${REBOOTED:-} ]] && na="${na:-no change in the Docker objects, and no inet cloudex (the nftables tables were compared only without a reboot)}"
+			OUT="machines and networks after deleting the sandboxes: $left; outside the labels during the run: ${nb:-no change}; uninstall exit $urc; left by it (containers, networks, volume, unit files): $leftover; before and after: ${na:-no change}" CODE=""
+			ok N25 "$(m3_desc N25)" [ "$left" = "0 0 " -a -z "$nb" -a "$urc" = 0 -a "$leftover" = "0 0 0 0 " -a \( -z "$na" -o -n "$(grep '^no change in the Docker' <<<"$na")" \) ]
 			node_stop_all
 		fi
 	fi
