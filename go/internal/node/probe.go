@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -38,7 +39,8 @@ func ProbeStreams(ctx context.Context, api, nodeID string, key ed25519.PrivateKe
 		b, _ := json.Marshal(v)
 		return c.Write(dctx, websocket.MessageText, b)
 	}
-	if err := write(NewHello(version, HostFacts(false), nil)); err != nil {
+	// A probe sees no machines: it says so, so that none is taken for gone.
+	if err := write(HelloError(version, HostFacts(false), errors.New("a probe, which lists no machines"))); err != nil {
 		return nil, err
 	}
 	if err := write(TicketRequest{Type: "tickets", ID: "tk-probe", Sandbox: sandbox, Count: 1}); err != nil {

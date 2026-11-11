@@ -541,7 +541,9 @@ func (a *Agent) reply(op Op, r Result) {
 // says so, so that no sandbox is taken for gone.
 func (a *Agent) hello() Hello {
 	if a.Runtime == nil {
-		return NewHello(a.Version, a.facts(), nil)
+		// Without a runtime (a probe, or an agent run outside its container)
+		// it can't see the machines: an empty list would take them for gone.
+		return HelloError(a.Version, a.facts(), errors.New("this agent runs without a machine runtime, so it can't list the machines"))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

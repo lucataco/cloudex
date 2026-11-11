@@ -158,7 +158,8 @@ func TestTheAgentSaysHelloAndAnswersOps(t *testing.T) {
 	f.mu.Lock()
 	h := f.hellos[0]
 	f.mu.Unlock()
-	if h.Protocol != Protocol || h.Version != "test" || h.Machines == nil {
+	// An agent without a runtime can't list machines, and says so.
+	if h.Protocol != Protocol || h.Version != "test" || h.Machines == nil || h.MachinesError == "" {
 		t.Errorf("hello %+v", h)
 	}
 	// Pongs keep it connected, and status.json says so.
