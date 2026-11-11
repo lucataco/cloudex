@@ -166,7 +166,7 @@ function NewSandbox(props: { onMade: (s: Sandbox) => void }) {
         {usable.length ? (
           <label>
             Where
-            <select value={where} onChange={(e) => (setWhere(e.currentTarget.value), setFrom(""))}>
+            <select value={where} onChange={(e) => setWhere(e.currentTarget.value)}>
               <option value="">Cloudflare</option>
               {usable.map((n) => (
                 <option value={n.id} key={n.id}>
@@ -191,11 +191,12 @@ function NewSandbox(props: { onMade: (s: Sandbox) => void }) {
         ) : null}
         <label>
           Start from
-          <select value={from} disabled={!!node} onChange={(e) => setFrom(e.currentTarget.value)}>
+          <select value={from} onChange={(e) => setFrom(e.currentTarget.value)}>
             <option value="">a fresh image</option>
             {(saves.data ?? []).map((v) => (
               <option value={v.name} key={v.name}>
-                the save {v.name} ({bytes(v.bytes)})
+                the save {v.name} ({bytes(v.bytes)}
+                {v.node ? `, made on node ${v.node.name}` : ""})
               </option>
             ))}
           </select>
@@ -207,7 +208,13 @@ function NewSandbox(props: { onMade: (s: Sandbox) => void }) {
           machine is root on that host if code escapes the container. Use it only for code you trust.
         </p>
       ) : null}
-      {node ? <p class="muted small">On a node, a stopped sandbox keeps its disk there. Forks, named saves and agents aren't available on nodes yet.</p> : null}
+      {node ? <p class="muted small">On a node, a stopped sandbox keeps its disk there. Forks aren't available on nodes yet: save a sandbox, then start new ones from the save.</p> : null}
+      {saves.data?.find((v) => v.name === from)?.node ? (
+        <p class="note small">
+          The save {from} was made on node {saves.data.find((v) => v.name === from)!.node!.name}: it holds whatever that node put in it. Treat it like code from
+          that node.
+        </p>
+      ) : null}
       <Act run={make} onError={setError} kind="primary" busy="Starting… (about 10 s)">
         Start it
       </Act>

@@ -1,5 +1,5 @@
 // /saves: named saves, new sandboxes from one, and deleting one.
-import type { Me, Sandbox, Save } from "@cloudex/schema";
+import type { Me, Node, Sandbox, Save } from "@cloudex/schema";
 import { Fragment } from "preact";
 import { useState } from "preact/hooks";
 import { del, get, post } from "../api";
@@ -49,6 +49,7 @@ export function Saves(props: { me: Me }) {
                   <td class="mono small">
                     {v.sandbox}
                     {v.kind === "home" ? " (home only)" : ""}
+                    {v.node ? <span class="muted"> on node {v.node.name}</span> : null}
                   </td>
                   <td>{v.files.toLocaleString()}</td>
                   <td>
@@ -96,12 +97,17 @@ function FromSave(props: { save: Save }) {
   const [name, setName] = useState("");
   const [count, setCount] = useState("1");
   const [size, setSize] = useState(props.save.size);
+  const [where, setWhere] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // From the index, as the Nodes page reads them (pages/nodes.tsx says why).
+  const nodes = usePoll(() => get<Node[]>("/v1/nodes?live=false").catch(() => [] as Node[]), []);
+  const usable = (nodes.data ?? []).filter((n) => n.state === "online" || n.state === "offline");
   const start = async () => {
     const made = await post<Sandbox[]>(`/v1/saves/${encodeURIComponent(props.save.name)}/sandboxes`, {
       ...(name ? { name } : {}),
       count: Number(count),
       size,
+      ...(where ? { node: where } : {}),
     });
     navigate(made.length === 1 ? `/s/${made[0]!.name ?? made[0]!.id}` : "/");
   };
@@ -123,6 +129,21 @@ function FromSave(props: { save: Save }) {
           ))}
         </select>
       </label>
+      {usable.length ? (
+        <label>
+          Where
+          <select value={where} onChange={(e) => setWhere(e.currentTarget.value)}>
+            <option value="">Cloudflare</option>
+            {usable.map((n) => (
+              <option value={n.id} key={n.id}>
+                node {n.name}
+                {n.state === "online" ? "" : " (offline)"}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
+      {props.save.node ? <p class="note small">Made on node {props.save.node.name}: it holds whatever that node put in it. Treat it like code from that node.</p> : null}
       <div>
         <Act run={start} onError={setError} kind="primary" busy="Starting…">
           Start

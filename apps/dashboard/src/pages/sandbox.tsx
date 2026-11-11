@@ -61,12 +61,7 @@ export function SandboxPage(props: { ref_: string; me: Me }) {
       {tab === "" ? <Overview box={box} me={props.me} reload={s.reload} /> : null}
       {tab !== "" && tab !== "terminal" && !running ? <NotRunning box={box} reload={s.reload} /> : null}
       {running && tab === "desktop" ? <Desktop box={box} /> : null}
-      {running && tab === "agents" && onNode(box) ? (
-        <section class="card">
-          <p>Agents need the deployment's provider keys, which don't reach sandboxes on nodes yet. Start agents in a sandbox on Cloudflare.</p>
-        </section>
-      ) : null}
-      {running && tab === "agents" && !onNode(box) ? <Agents box={box} me={props.me} /> : null}
+      {running && tab === "agents" ? <Agents box={box} me={props.me} /> : null}
       {running && tab === "commands" ? <Commands box={box} me={props.me} /> : null}
       {running && tab === "files" ? <Files box={box} me={props.me} /> : null}
     </>
@@ -196,13 +191,7 @@ function Overview(props: { box: Sandbox; me: Me; reload: () => unknown }) {
         )}
       </section>
       {write ? <Links box={box} /> : null}
-      {write && !onNode(box) ? <ForkAndSave box={box} me={props.me} /> : null}
-      {write && onNode(box) ? (
-        <section class="card">
-          <h2>Fork and save</h2>
-          <p class="muted small">Forks and named saves of a sandbox on a node aren't available yet. Copy what you need with cloudex cp.</p>
-        </section>
-      ) : null}
+      {write ? <ForkAndSave box={box} me={props.me} /> : null}
     </div>
   );
 }
@@ -314,22 +303,28 @@ function ForkAndSave(props: { box: Sandbox; me: Me }) {
   const [note, setNote] = useState<string | null>(null);
   return (
     <section class="card">
-      <h2>Fork and save</h2>
-      <p class="muted small">A fork is a new sandbox with a copy of this one's disk. A named save is a copy kept to start new sandboxes from.</p>
-      <div class="row">
-        <input placeholder="name of the fork (optional)" value={forkName} onInput={(e) => setForkName(e.currentTarget.value.trim())} />
-        <Act
-          run={async () => {
-            const made = await post<Sandbox[]>(`${sb(props.box.id)}/fork`, forkName ? { name: forkName } : {});
-            navigate(`/s/${made[0]!.name ?? made[0]!.id}`);
-          }}
-          onError={setError}
-          busy="Forking…"
-          disabled={props.box.state !== "running"}
-        >
-          Fork
-        </Act>
-      </div>
+      <h2>{onNode(props.box) ? "Save" : "Fork and save"}</h2>
+      <p class="muted small">
+        {onNode(props.box)
+          ? "A named save is a copy of this sandbox's disk, kept to start new sandboxes from, on Cloudflare or a node. Forks aren't available on nodes yet."
+          : "A fork is a new sandbox with a copy of this one's disk. A named save is a copy kept to start new sandboxes from."}
+      </p>
+      {onNode(props.box) ? null : (
+        <div class="row">
+          <input placeholder="name of the fork (optional)" value={forkName} onInput={(e) => setForkName(e.currentTarget.value.trim())} />
+          <Act
+            run={async () => {
+              const made = await post<Sandbox[]>(`${sb(props.box.id)}/fork`, forkName ? { name: forkName } : {});
+              navigate(`/s/${made[0]!.name ?? made[0]!.id}`);
+            }}
+            onError={setError}
+            busy="Forking…"
+            disabled={props.box.state !== "running"}
+          >
+            Fork
+          </Act>
+        </div>
+      )}
       {props.me.ownOnly ? null : (
         <div class="row">
           <input placeholder="save name" value={saveName} onInput={(e) => setSaveName(e.currentTarget.value.trim())} />
