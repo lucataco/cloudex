@@ -608,8 +608,14 @@ func (r *Runtime) MachineCheck(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !judge("open", out["net"], n) || !judge("resolved", out["dns"], n) || !judge("closed", out["host"], n) || !judge("closed", out["meta"], n) {
-		return "", fmt.Errorf("from inside the machine: internet %s, DNS %s, the host %s, metadata %s", out["net"], out["dns"], out["host"], out["meta"])
+	if !judge("open", out["net"], n) || !judge("resolved", out["dns"], n) {
+		return "", fmt.Errorf("from inside the machine: internet %s, DNS %s", out["net"], out["dns"])
+	}
+	if r.Unisolated {
+		return fmt.Sprintf("a machine started and was ready in %v; from inside it the internet and DNS answer, and, with no firewall (--unisolated), the host %s and metadata %s", ready.Round(10*time.Millisecond), out["host"], out["meta"]), nil
+	}
+	if !judge("closed", out["host"], n) || !judge("closed", out["meta"], n) {
+		return "", fmt.Errorf("from inside the machine: the host %s, metadata %s", out["host"], out["meta"])
 	}
 	return fmt.Sprintf("a machine started and was ready in %v; from inside it the internet and DNS answer, and the host and metadata don't", ready.Round(10*time.Millisecond)), nil
 }
