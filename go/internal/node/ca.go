@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io/fs"
 	"math/big"
+	"net"
 	"os"
 	"regexp"
 	"slices"
@@ -119,6 +120,9 @@ func NewCA(nodeID string, hosts []string, now time.Time) (*CA, error) {
 		PermittedDNSDomainsCritical: true,
 		PermittedDNSDomains:         hosts,
 		ExcludedDNSDomains:          excluded,
+		// DNS constraints say nothing about IP addresses: without these, a
+		// certificate for any address would verify (review H9).
+		ExcludedIPRanges: []*net.IPNet{{IP: net.IPv4zero.To4(), Mask: net.CIDRMask(0, 32)}, {IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -190,6 +194,10 @@ func (c *CA) sign(host string, now time.Time) (*tls.Certificate, error) {
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		// Only SignAnyForTest gets here with an address (Leaf takes the CA's hosts).
+		tmpl.DNSNames, tmpl.IPAddresses = nil, []net.IP{ip}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, &key.PublicKey, c.key)
 	if err != nil {
@@ -296,7 +304,7 @@ func (s State) EnsureCA(nodeID string, hosts []string) (*CA, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if have, err := s.LoadCA(); err == nil && have != nil && slices.Equal(have.Hosts, want) && have.Cert.NotAfter.After(time.Now().Add(30*24*time.Hour)) {
+	if have, err := s.LoadCA(); err == nil && have != nil && slices.Equal(have.Hosts, want) && have.Cert.NotAfter.After(time.Now().Add(30*24*time.Hour)) && len(have.Cert.ExcludedIPRanges) == 2 {
 		return have, false, nil
 	}
 	c, err := NewCA(nodeID, want, time.Now())

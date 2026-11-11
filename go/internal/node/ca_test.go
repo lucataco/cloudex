@@ -50,7 +50,8 @@ func TestCAServesOnlyItsHosts(t *testing.T) {
 	}
 	// ...and one signed with its key anyway (a stolen key) fails verification:
 	// the name constraints hold, including for subdomains of a provider host.
-	for _, h := range []string{"github.com", "pypi.org", "cloudex-api.catacolabs.workers.dev", "x.api.anthropic.com", "anthropic.com", "example.com", "registry.npmjs.org"} {
+	// Review H9: and so does one for an IP address, which DNS constraints alone don't cover.
+	for _, h := range []string{"github.com", "pypi.org", "cloudex-api.catacolabs.workers.dev", "x.api.anthropic.com", "anthropic.com", "example.com", "registry.npmjs.org", "1.1.1.1", "10.250.0.2", "2606:4700::1111"} {
 		p, err := ca.SignAnyForTest(h)
 		if err != nil {
 			t.Fatal(err)
