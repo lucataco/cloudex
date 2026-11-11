@@ -134,6 +134,27 @@ type Status struct {
 	Version    string `json:"version"`
 	// The last self-test's result (M4).
 	Isolation *Isolation `json:"isolation,omitempty"`
+	// Revoked: the deployment said this node was removed (review R3).
+	Revoked bool `json:"revoked,omitempty"`
+}
+
+// LastSubnet is the machine network handed out last (netalloc.go).
+func (s State) LastSubnet() netip.Prefix {
+	var v struct {
+		Subnet string `json:"subnet"`
+	}
+	if b, err := os.ReadFile(s.path("subnet.json")); err == nil {
+		json.Unmarshal(b, &v)
+	}
+	p, _ := netip.ParsePrefix(v.Subnet)
+	return p
+}
+
+func (s State) SaveLastSubnet(p netip.Prefix) error {
+	if s.Dir == "" {
+		return nil
+	}
+	return s.write("subnet.json", map[string]string{"subnet": p.String()}, 0o600)
 }
 
 func (s State) SaveStatus(st Status) error {
@@ -181,6 +202,8 @@ type RuntimeConfig struct {
 	Image      string   `json:"image,omitempty"`
 	DockerRoot string   `json:"dockerRoot,omitempty"`
 	Probes     []string `json:"probes,omitempty"`
+	KeepFreeGB float64  `json:"keepFreeGb,omitempty"` // the disk watchdog's floor (guard.go)
+	DiskGB     int      `json:"diskGb,omitempty"`     // a machine's writable layer cap, where the driver has quotas
 }
 
 func (s State) SaveRuntimeConfig(c RuntimeConfig) error {
@@ -231,5 +254,9 @@ func (c RuntimeConfig) Runtime(d *Docker, lg *log.Logger) (*Runtime, error) {
 			return nil, fmt.Errorf("--probe %q: give ip:port, or udp53=ip", p)
 		}
 	}
-	return &Runtime{Docker: d, Pool: pool, Self: c.Self, Allowed: allowed, ImageOverride: c.Image, DockerRoot: c.DockerRoot, HostProbes: c.Probes, Log: lg}, nil
+	if c.KeepFreeGB < 0 || c.DiskGB < 0 {
+		return nil, errors.New("--keep-free-gb and --disk-gb can't be negative")
+	}
+	return &Runtime{Docker: d, Pool: pool, Self: c.Self, Allowed: allowed, ImageOverride: c.Image, DockerRoot: c.DockerRoot, HostProbes: c.Probes, Log: lg,
+		KeepFreeGB: c.KeepFreeGB, DiskGB: c.DiskGB}, nil
 }

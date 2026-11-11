@@ -55,6 +55,9 @@ type Facts struct {
 type Machine struct {
 	ID    string `json:"id"`
 	State string `json:"state"` // running or stopped
+	// Note says why the agent stopped it itself (its disk watchdog, or a
+	// firewall that went missing); the sandbox's notice shows it.
+	Note string `json:"note,omitempty"`
 }
 
 // Join is the body of POST /v1/node/join.

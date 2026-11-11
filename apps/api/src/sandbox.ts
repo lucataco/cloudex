@@ -166,7 +166,8 @@ type CreateInput = {
 export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?: StoredSettings; madeOn?: { id: string; name: string } };
 // What a node's Node object tells a sandbox on it (v0.2.2 M5): whether the
 // node is online, and with a report, its machine's state.
-export type NodeReport = { online: boolean; lastSeenAt: number | null; machine?: MachineReport };
+// note: why the agent stopped the machine itself (its disk watchdog, a missing firewall).
+export type NodeReport = { online: boolean; lastSeenAt: number | null; machine?: MachineReport; note?: string };
 // The node a sandbox is made on, chosen by POST /v1/sandboxes (placement.ts).
 export type NodeChoice = { node: string; name: string; cpus: number; memoryMb: number };
 // Preview links handed out: a version for all of them, which revoking them all
@@ -2367,7 +2368,9 @@ export class Sandbox extends DurableObject<Env> {
             state: "stopped",
             stoppedAt: Date.now(),
             error: null,
-            notice: `Its machine stopped on node ${p.name} without being asked to (the host restarted, it ran out of memory, or it was stopped there). Its disk is kept: resume it.`,
+            notice: rep.note
+              ? `Node ${p.name} stopped its machine: ${rep.note.slice(0, 400)} Its disk is kept.`
+              : `Its machine stopped on node ${p.name} without being asked to (the host restarted, it ran out of memory, or it was stopped there). Its disk is kept: resume it.`,
           });
           return;
         case "mark-missing":

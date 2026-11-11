@@ -99,11 +99,23 @@ var ErrPoolFull = errors.New("the node's machine pool has no free network left")
 
 // NextSubnet is the first /28 of pool that overlaps nothing in used.
 func NextSubnet(pool netip.Prefix, used []netip.Prefix) (netip.Prefix, error) {
+	return NextSubnetAfter(pool, used, netip.Prefix{})
+}
+
+// NextSubnetAfter is the first free /28 of the pool after last, going round:
+// subnets are handed out in turn, so a deleted machine's isn't given to the
+// next one while its old connections may still be tracked (review H8).
+func NextSubnetAfter(pool netip.Prefix, used []netip.Prefix, last netip.Prefix) (netip.Prefix, error) {
 	if err := CheckPool(pool); err != nil {
 		return netip.Prefix{}, err
 	}
 	n := uint32(1) << (SubnetBits - pool.Bits())
-	for i := uint32(0); i < n; i++ {
+	start := uint32(0)
+	if last.IsValid() && last.Bits() == SubnetBits && pool.Contains(last.Addr()) {
+		start = (ipU32(last.Addr())-ipU32(pool.Addr()))>>(32-SubnetBits) + 1
+	}
+	for k := uint32(0); k < n; k++ {
+		i := (start + k) % n
 		cand := netip.PrefixFrom(addN(pool.Addr(), i<<(32-SubnetBits)), SubnetBits)
 		free := true
 		for _, u := range used {
@@ -178,4 +190,9 @@ func HostRoutes(path string) ([]netip.Prefix, error) {
 		out = append(out, netip.PrefixFrom(d, bits).Masked())
 	}
 	return out, sc.Err()
+}
+
+func ipU32(a netip.Addr) uint32 {
+	b := a.As4()
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }

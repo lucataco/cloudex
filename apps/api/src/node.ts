@@ -445,7 +445,7 @@ export class Node extends DurableObject<Env> {
         console.log(`[${id}] machine ${sb} is ${m.machine.state}`);
         this.ctx.waitUntil(
           this.env.SANDBOX.getByName(sb)
-            .nodeReport(id, { online: true, lastSeenAt: now, machine: m.machine.state })
+            .nodeReport(id, { online: true, lastSeenAt: now, machine: m.machine.state, ...(m.machine.note ? { note: m.machine.note } : {}) })
             .catch((e: unknown) => console.error(`[${id}] telling ${sb}: ${errorStatus(e).message}`)),
         );
         return;

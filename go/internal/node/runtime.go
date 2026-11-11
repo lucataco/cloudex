@@ -41,6 +41,15 @@ type Runtime struct {
 	// installer found and the self-test must find closed.
 	HostProbes []string
 	Log        *log.Logger
+	// KeepFreeGB is the floor for Docker's free space (guard.go); DiskGB caps
+	// each machine's writable layer where the storage driver can.
+	KeepFreeGB float64
+	DiskGB     int
+	// Subnet hands out machine networks round-robin over the pool, so a
+	// deleted machine's /28 isn't reused at once (review H8): LastSubnet is
+	// the last one given, kept across restarts with SaveSubnet.
+	LastSubnet func() netip.Prefix
+	SaveSubnet func(netip.Prefix)
 
 	// Called when the facts change, and when a machine starts or stops.
 	OnFacts func()
@@ -55,10 +64,18 @@ type Runtime struct {
 	report  *SelfTestReport
 	dinfo   *DockerInfo
 	infoAt  time.Time
+	notes   map[string]string // why the agent stopped a machine itself, until Docker says it stopped
+	noQuota bool              // the storage driver refused StorageOpt
 }
 
-// MinFreeGB is the free space on Docker's disk below which new machines are refused.
+// MinFreeGB is the least free space on Docker's disk a new machine needs
+// (more when the node's floor is higher: guard.go).
 const MinFreeGB = 10.0
+
+// VerdictMaxAge is how long a self-test's verdict counts without a new one:
+// self-tests that keep failing to run (an error, not a verdict) mustn't leave
+// an old pass standing for ever (review H3).
+var VerdictMaxAge = 2*SelfTestEvery + 10*time.Minute
 
 // DefaultImageRepo is the only image repository allowed unless the installer widens the list.
 const DefaultImageRepo = "ghcr.io/lucataco/cloudex-base"
@@ -336,6 +353,9 @@ func (r *Runtime) isolated() error {
 	defer r.factsMu.Unlock()
 	switch r.iso.Firewall {
 	case "pass":
+		if age := time.Since(time.UnixMilli(r.iso.CheckedAt)); r.iso.CheckedAt > 0 && age > VerdictMaxAge {
+			return fmt.Errorf("this node's last isolation self-test passed %v ago, and none has run since (%s); it runs no new machines until one passes", age.Round(time.Minute), strings.Join(r.iso.Failed, "; "))
+		}
 		return nil
 	case "fail":
 		return fmt.Errorf("this node's isolation self-test fails (%s), so it runs no machines; check its firewall (cloudex-node-firewall.service), or join with --unisolated, for testing only", strings.Join(r.iso.Failed, "; "))
@@ -350,6 +370,13 @@ func (r *Runtime) ready() error {
 	}
 	if r.NodeID == "" {
 		return errors.New("this node hasn't joined")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if i, err := r.dockerInfo(ctx); err == nil && i != nil {
+		if err := DockerTooOld(i.ServerVersion); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -381,8 +408,8 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 	} else if c != nil {
 		return r.describe(c, req.Sandbox), nil
 	}
-	if gb := r.FreeGB(); gb >= 0 && gb < MinFreeGB {
-		return nil, fmt.Errorf("Docker's disk on this node has %.1f GB free; new machines need %.0f", gb, MinFreeGB)
+	if gb := r.FreeGB(); gb >= 0 && gb < r.minFree() {
+		return nil, fmt.Errorf("Docker's disk on this node has %.1f GB free; new machines need %.0f", gb, r.minFree())
 	}
 	if have, err := r.Docker.HasImage(ctx, image); err != nil {
 		return nil, err
@@ -396,6 +423,7 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 	h := MachineHost{NodeID: r.NodeID, Image: image, Sysbox: r.Sysbox(ctx)}
 	if info != nil {
 		h.HostCPU, h.HostMB = info.NCPU, int(info.MemTotal>>20)
+		h.DiskGB = r.diskCap(info)
 	}
 	n, err := r.newNetwork(ctx, req.Sandbox, "machine")
 	if err != nil {
@@ -405,6 +433,17 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 	body, err := MachineSpec(req, h)
 	if err == nil {
 		_, err = r.Docker.ContainerCreate(ctx, n.Name, body)
+		var de *DockerError
+		if h.DiskGB > 0 && errors.As(err, &de) && (strings.Contains(de.Message, "storage-opt") || strings.Contains(de.Message, "quota") || strings.Contains(de.Message, "storage option")) {
+			// The driver can't cap it after all (overlay2 on xfs without pquota):
+			// the disk watchdog is the limit.
+			r.logf("Docker can't cap a machine's disk here (%s); the disk watchdog is the limit", de.Message)
+			r.factsMu.Lock()
+			r.noQuota = true
+			r.factsMu.Unlock()
+			body.HostConfig.StorageOpt = nil
+			_, err = r.Docker.ContainerCreate(ctx, n.Name, body)
+		}
 	}
 	if err != nil {
 		r.removeNetwork(context.Background(), n)
@@ -428,6 +467,27 @@ func (r *Runtime) describe(c *ContainerDetail, sandbox string) *MachineInfo {
 	return &MachineInfo{Address: addr, Container: strings.TrimPrefix(c.Name, "/"), State: state}
 }
 
+// diskCap is the size cap for a new machine's writable layer, where the
+// storage driver has quotas: btrfs, zfs, and overlay2 on xfs (which also
+// needs the pquota mount option; Docker says so at create, and then the cap
+// is dropped). Not overlayfs on ext4, the usual case, nor the containerd
+// image store: there the disk watchdog is the limit.
+func (r *Runtime) diskCap(info *DockerInfo) int {
+	r.factsMu.Lock()
+	no := r.noQuota
+	r.factsMu.Unlock()
+	if r.DiskGB <= 0 || no {
+		return 0
+	}
+	switch {
+	case info.Driver == "btrfs" || info.Driver == "zfs":
+		return r.DiskGB
+	case info.Driver == "overlay2" && info.BackingFS() == "xfs":
+		return r.DiskGB
+	}
+	return 0
+}
+
 // newNetwork makes a network for a sandbox (or a probe) on the next free
 // /28, and attaches the agent at .2.
 func (r *Runtime) newNetwork(ctx context.Context, id, role string) (MachineNet, error) {
@@ -443,8 +503,12 @@ func (r *Runtime) newNetwork(ctx context.Context, id, role string) (MachineNet, 
 			}
 		}
 	}
+	last := netip.Prefix{}
+	if r.LastSubnet != nil {
+		last = r.LastSubnet()
+	}
 	for tries := 0; tries < 4; tries++ {
-		sub, err := NextSubnet(r.Pool, used)
+		sub, err := NextSubnetAfter(r.Pool, used, last)
 		if err != nil {
 			return MachineNet{}, err
 		}
@@ -470,6 +534,9 @@ func (r *Runtime) newNetwork(ctx context.Context, id, role string) (MachineNet, 
 		}
 		if err != nil {
 			return MachineNet{}, err
+		}
+		if r.SaveSubnet != nil {
+			r.SaveSubnet(sub)
 		}
 		if err := r.Docker.NetworkConnect(ctx, n.Name, r.Self, n.Agent.String(), -1000); err != nil {
 			r.Docker.NetworkRemove(context.Background(), n.Name)
@@ -507,6 +574,9 @@ func (r *Runtime) Start(ctx context.Context, sandbox string, hold bool) (*Machin
 	if err := r.isolated(); err != nil {
 		return nil, err
 	}
+	if gb := r.FreeGB(); gb >= 0 && gb < r.keepFree() {
+		return nil, fmt.Errorf("Docker's disk on this node has %.1f GB free, under its floor of %.0f GB, so machines don't start: free space on the host first", gb, r.keepFree())
+	}
 	r.mu.Lock()
 	c, err := r.container(ctx, sandbox)
 	if err == nil && c == nil {
@@ -525,7 +595,7 @@ func (r *Runtime) Start(ctx context.Context, sandbox string, hold bool) (*Machin
 	t0 := time.Now()
 	if !hold && slices.Contains(c.Config.Env, "CLOUDEX_HOLD=1") {
 		// /run is a tmpfs, so the entrypoint's hold finds this at once.
-		if _, code, err := r.Docker.Run(ctx, c.ID, "0", []string{"touch", "/run/cloudex-go"}); err != nil || code != 0 {
+		if _, code, err := r.Docker.Run(ctx, c.ID, "0", []string{"/bin/sh", "-c", ": > /run/cloudex-go"}); err != nil || code != 0 {
 			r.logf("%s: letting a held machine go: exit %d %v", sandbox, code, err)
 		}
 	}
@@ -569,7 +639,7 @@ func (r *Runtime) waitReady(ctx context.Context, id string, limit time.Duration)
 	deadline := time.Now().Add(limit)
 	for {
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, code, err := r.Docker.Run(cctx, id, "0", []string{"sh", "-c", ReadyCheck})
+		_, code, err := r.Docker.Run(cctx, id, "0", []string{"/bin/sh", "-c", ReadyCheck})
 		cancel()
 		if err == nil && (code == 0 || code == 3) {
 			return nil
@@ -678,7 +748,7 @@ func (r *Runtime) Watch(ctx context.Context) {
 			case "start":
 				r.OnState(Machine{ID: id, State: "running"})
 			case "die":
-				r.OnState(Machine{ID: id, State: "stopped"})
+				r.OnState(Machine{ID: id, State: "stopped", Note: r.takeNote(id)})
 			case "oom":
 				r.logf("%s: its machine ran out of memory", id)
 			}

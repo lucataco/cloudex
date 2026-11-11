@@ -32,6 +32,30 @@ type DockerInfo struct {
 	DockerRootDir string                     `json:"DockerRootDir"`
 	Runtimes      map[string]json.RawMessage `json:"Runtimes"`
 	SecurityOpts  []string                   `json:"SecurityOptions"`
+	Driver        string                     `json:"Driver"`
+	DriverStatus  [][2]string                `json:"DriverStatus"`
+}
+
+// BackingFS is the filesystem under the storage driver, as Docker says.
+func (i *DockerInfo) BackingFS() string {
+	for _, kv := range i.DriverStatus {
+		if kv[0] == "Backing Filesystem" {
+			return kv[1]
+		}
+	}
+	return ""
+}
+
+// DockerMajor is the major version of a Docker server version string; 0 when it can't tell.
+func DockerMajor(v string) int {
+	n := 0
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 func (d *Docker) Info(ctx context.Context) (*DockerInfo, error) {
@@ -217,11 +241,25 @@ type ContainerSummary struct {
 	Names  []string          `json:"Names"`
 	State  string            `json:"State"` // running, exited, created, ...
 	Labels map[string]string `json:"Labels"`
+	SizeRw int64             `json:"SizeRw"` // with ContainersSized only
 }
 
 // Containers lists containers, stopped ones too, carrying all the labels.
 func (d *Docker) Containers(ctx context.Context, labels ...string) ([]ContainerSummary, error) {
 	q := "?all=1"
+	if f := labelFilter(labels); f != "" {
+		q += "&" + strings.TrimPrefix(f, "?")
+	}
+	var cs []ContainerSummary
+	err := d.do(ctx, http.MethodGet, "/containers/json"+q, nil, &cs)
+	return cs, err
+}
+
+// ContainersSized is Containers with each one's writable layer's size
+// (SizeRw), which Docker measures on disk, so it's slow: the disk watchdog
+// asks only when space is short.
+func (d *Docker) ContainersSized(ctx context.Context, labels ...string) ([]ContainerSummary, error) {
+	q := "?all=1&size=1"
 	if f := labelFilter(labels); f != "" {
 		q += "&" + strings.TrimPrefix(f, "?")
 	}

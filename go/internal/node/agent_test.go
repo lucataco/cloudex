@@ -251,9 +251,10 @@ func TestTheAgentWaitsAMinuteWhenRefusedOrRevoked(t *testing.T) {
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 	go a2.Run(ctx2)
-	if d := <-waits2; d != RefusedWait {
+	if d := <-waits2; d != RevokedWait {
 		t.Fatalf("waited %v after a revoke", d)
 	}
+	waitFor(t, func() bool { st, _ := a2.State.ReadStatus(); return st != nil && st.Revoked })
 }
 
 func TestJoinIsSignedWithTheKeyItBrings(t *testing.T) {

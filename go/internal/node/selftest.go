@@ -84,6 +84,22 @@ func (r *SelfTestReport) Failed() []string {
 	return out
 }
 
+// Breach says whether a check that must find something closed found it open
+// (or root inside could do what it mustn't): the isolation itself failed,
+// not just the test's reach to the internet.
+func (r *SelfTestReport) Breach() bool {
+	for _, c := range r.Checks {
+		switch c.Want {
+		case "open", "own", "resolved", "answered":
+			continue
+		}
+		if !c.OK {
+			return true
+		}
+	}
+	return false
+}
+
 // CallerNetwork says which machine network a connection to the agent comes
 // from: the one whose agent address took it, and only if the peer's address
 // is inside that network (and isn't the agent's own or the host's). nets are
@@ -117,7 +133,7 @@ type identityListener struct {
 	port int
 	nets []MachineNet
 	mu   sync.Mutex
-	seen []string // took>peer=verdict
+	seen []string          // took>peer=verdict
 	sink *identityListener // where a second address's listener records what it saw
 }
 
@@ -205,6 +221,10 @@ func (r *Runtime) Record(rep *SelfTestReport) {
 		// no verdict, so the last one stands (unchecked at first), with the
 		// reason, and it runs again within a minute.
 		r.iso.Failed = []string{truncate("error: "+rep.Error, 200)}
+		if r.iso.Firewall == "pass" && rep.At-r.iso.CheckedAt > VerdictMaxAge.Milliseconds() {
+			// Too long without a verdict: an old pass no longer counts.
+			r.iso.Firewall = "unchecked"
+		}
 		r.factsMu.Unlock()
 		r.changed()
 		return

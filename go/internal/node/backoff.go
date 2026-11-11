@@ -37,6 +37,10 @@ const BackoffCap = 5 * time.Second
 // at once wouldn't help. Each attempt costs the Worker a D1 read.
 const RefusedWait = 60 * time.Second
 
+// RevokedWait is how long a removed node's agent waits before it asks again
+// (review R3): the answer won't change, but the agent stays up and says so.
+const RevokedWait = 30 * time.Minute
+
 // TooOftenWait is the wait after the deployment says the node connects too
 // often (429; at most 12 connects a minute).
 const TooOftenWait = 15 * time.Second

@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAMachineIsKnownByItsNetworkAndItsSource(t *testing.T) {
@@ -79,5 +80,34 @@ func TestASelfTestThatCouldntRunIsNoVerdict(t *testing.T) {
 	f = Facts{Isolation: r.iso}
 	if f.Isolation.Firewall != "pass" || f.Isolation.CheckedAt != 2 {
 		t.Fatalf("after a pass, then an error: %+v", f.Isolation)
+	}
+	// Review H3: but not for ever. Errors for longer than VerdictMaxAge
+	// after the last verdict leave the node unchecked, refusing machines.
+	r.Record(&SelfTestReport{At: 2 + VerdictMaxAge.Milliseconds() + 1, Error: "Docker didn't answer"})
+	if r.iso.Firewall != "unchecked" {
+		t.Fatalf("an old pass still stands after errors: %+v", r.iso)
+	}
+	if err := r.isolated(); err == nil {
+		t.Fatal("machines without a recent verdict")
+	}
+	// And a pass that's simply old (self-tests stopped running) refuses too.
+	r.Record(&SelfTestReport{At: time.Now().Add(-VerdictMaxAge - time.Minute).UnixMilli(), Pass: true})
+	if err := r.isolated(); err == nil || !strings.Contains(err.Error(), "none has run since") {
+		t.Fatalf("an old pass: %v", err)
+	}
+	r.Record(&SelfTestReport{At: time.Now().UnixMilli(), Pass: true})
+	if err := r.isolated(); err != nil {
+		t.Fatalf("a fresh pass: %v", err)
+	}
+}
+
+func TestABreachIsOnlyAClosedCheckFoundOpen(t *testing.T) {
+	ok := &SelfTestReport{Checks: []Check{{Name: "internet", Want: "open", Got: "timeout"}, {Name: "dns", Want: "resolved", Got: "error"}}}
+	if ok.Breach() {
+		t.Fatal("an unreachable internet is no breach")
+	}
+	bad := &SelfTestReport{Checks: []Check{{Name: "internet", Want: "open", Got: "open", OK: true}, {Name: "metadata", Want: "closed", Got: "open"}}}
+	if !bad.Breach() {
+		t.Fatal("metadata open is a breach")
 	}
 }

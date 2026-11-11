@@ -160,6 +160,9 @@ export const MachineState = z.enum(["running", "stopped"]);
 export const NodeMachine = z.object({
   id: z.string().regex(/^cx-[a-z0-9]{6}$/, "a sandbox id"),
   state: MachineState,
+  // Why the agent itself stopped it (review H2, H3): its disk watchdog, or a
+  // firewall that went missing. Shown in the sandbox's notice.
+  note: NodeText(400).optional(),
 });
 export type NodeMachine = z.infer<typeof NodeMachine>;
 

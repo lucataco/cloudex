@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -51,10 +52,11 @@ func Endpoint(api, route string) (full, signed string, err error) {
 // apiError reads the API's {"error": "..."} answer.
 func apiError(status int, body []byte) error {
 	var e struct {
-		Error string `json:"error"`
+		Error   string `json:"error"`
+		Revoked bool   `json:"revoked"`
 	}
 	if json.Unmarshal(body, &e) == nil && e.Error != "" {
-		return &RefusedError{Status: status, Message: e.Error}
+		return &RefusedError{Status: status, Message: e.Error, Revoked: status == http.StatusGone && e.Revoked}
 	}
 	msg := string(bytes.TrimSpace(body))
 	if len(msg) > 200 {
@@ -67,6 +69,9 @@ func apiError(status int, body []byte) error {
 type RefusedError struct {
 	Status  int
 	Message string
+	// Revoked: the deployment said, to a request signed with this node's own
+	// key, that the node was removed (410 with "revoked": true).
+	Revoked bool
 }
 
 func (e *RefusedError) Error() string { return e.Message }
@@ -328,6 +333,13 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.selfTests(ctx)
 		}()
 		go r.Watch(ctx)
+		r.LastSubnet = a.State.LastSubnet
+		r.SaveSubnet = func(p netip.Prefix) {
+			if err := a.State.SaveLastSubnet(p); err != nil {
+				a.logf("keeping the last subnet: %v", err)
+			}
+		}
+		go r.Guard(ctx, a.kickSelfTest)
 		if ca, err := a.State.LoadCA(); err == nil && ca != nil {
 			a.nodeCA.Store(ca)
 		} else if err != nil {
@@ -358,6 +370,10 @@ func (a *Agent) Run(ctx context.Context) error {
 			if errors.As(err, &refused) && refused.Status == 429 {
 				d = max(d, TooOftenWait) // the Node object limits connects a minute
 			}
+			if errors.As(err, &refused) && refused.Revoked {
+				d = RevokedWait
+				a.revoked(ctx, refused.Message)
+			}
 			attempt++
 			a.logf("connect attempt %d failed after %v: %v; trying again in %v", attempt, time.Since(t0).Round(time.Millisecond), err, d.Round(time.Millisecond))
 			a.setStatus(func(s *Status) {
@@ -365,6 +381,7 @@ func (a *Agent) Run(ctx context.Context) error {
 					s.Since = time.Now().UnixMilli()
 				}
 				s.Connected, s.Attempts, s.LastError = false, attempt, err.Error()
+				s.Revoked = refused != nil && refused.Revoked
 			})
 			if err := a.wait(ctx, d); err != nil {
 				return err
@@ -385,18 +402,37 @@ func (a *Agent) Run(ctx context.Context) error {
 		d := Backoff(0, a.Rand)
 		switch code {
 		case CloseRevoked:
-			d = RefusedWait
+			d = RevokedWait
 			why = "this node was removed from the deployment (cloudex node rm); its key no longer works. Add it again with cloudex node add, then join with the new token"
+			a.revoked(ctx, why)
 		case CloseReplaced:
 			d = ReplacedWait
 			why = "another connection with this node's key took over: is a second agent running with the same state directory?"
 		}
 		a.logf("disconnected: %s; connecting again in %v", why, d.Round(time.Millisecond))
-		a.setStatus(func(s *Status) { s.Connected, s.Since, s.LastError, s.Attempts = false, down.UnixMilli(), why, 0 })
+		a.setStatus(func(s *Status) {
+			s.Connected, s.Since, s.LastError, s.Attempts = false, down.UnixMilli(), why, 0
+			s.Revoked = code == CloseRevoked
+		})
 		if err := a.wait(ctx, d); err != nil {
 			return err
 		}
 	}
+}
+
+// revoked acts on the deployment's word that this node was removed (review
+// R3): a 410 with "revoked" to a connect signed with the node's own key, or
+// close code 4003 on its control socket. Its machines stop, since nothing
+// may run them any more; their disks stay for the installer's --uninstall.
+func (a *Agent) revoked(ctx context.Context, why string) {
+	n := 0
+	if a.Runtime != nil {
+		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		n = a.Runtime.StopAll(sctx, "its node was removed from the deployment (cloudex node rm)")
+		cancel()
+	}
+	a.logf("REVOKED: %s. Stopped %d running machines; their disks stay on this host until you uninstall the agent (node-install.sh --uninstall)", why, n)
+	a.setStatus(func(s *Status) { s.Revoked = true; s.Connected = false; s.LastError = why })
 }
 
 func (a *Agent) dial(ctx context.Context) (*websocket.Conn, error) {
@@ -453,7 +489,7 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 	var lastPong atomic.Int64
 	lastPong.Store(now.UnixMilli())
 	a.setStatus(func(s *Status) {
-		s.Connected, s.Since, s.LastPongAt, s.LastError, s.Attempts = true, now.UnixMilli(), now.UnixMilli(), "", 0
+		s.Connected, s.Since, s.LastPongAt, s.LastError, s.Attempts, s.Revoked = true, now.UnixMilli(), now.UnixMilli(), "", 0, false
 	})
 
 	every, dead := a.PingEvery, a.PongDead
@@ -651,6 +687,14 @@ func (a *Agent) runSelfTest(ctx context.Context) *SelfTestReport {
 	} else {
 		a.logf("isolation self-test FAILED; this node refuses new machines: %s", strings.Join(rep.Failed(), "; "))
 	}
+	if rep.Error == "" && rep.Breach() && !a.Unisolated {
+		// Something a machine mustn't reach answered: the running ones stop
+		// too, not only new ones (review H3).
+		sctx, scancel := context.WithTimeout(ctx, time.Minute)
+		n := a.Runtime.StopAll(sctx, "this node's isolation self-test found the firewall open ("+truncate(strings.Join(rep.Failed(), "; "), 200)+"), so its running machines were stopped. Resume the sandbox once the node's self-test passes again (cloudex node info).")
+		scancel()
+		a.logf("stopped %d running machines while the isolation self-test fails", n)
+	}
 	iso := a.facts().Isolation
 	a.setStatus(func(s *Status) { s.Isolation = &iso })
 	return rep
@@ -725,6 +769,11 @@ func (a *Agent) answer(op Op) Result {
 		return okResult(op.ID, struct{}{})
 	case "delete":
 		a.stopPool(args.Sandbox)
+		// Its listeners and their connections go before its network does
+		// (review H8), not at the next sync.
+		if a.egress != nil {
+			a.egress.Drop(args.Sandbox)
+		}
 		err := r.Delete(ctx, args.Sandbox)
 		a.kickEgress()
 		if err != nil {

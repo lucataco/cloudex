@@ -2,7 +2,7 @@
 // sandboxes for a Cloudex deployment. It dials out to the deployment and keeps
 // a control socket open; the host needs no inbound port.
 //
-//	cloudex-node join --api https://<deployment> --token cxj_...
+//	cloudex-node join --api https://<deployment> --token - < token-file
 //	cloudex-node run [--join cxj_... --api https://<deployment>]
 //	cloudex-node status
 //
@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -73,6 +74,14 @@ func newRoot() *cobra.Command {
 		Short: "Join a deployment with the token cloudex node add printed",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if token == "-" {
+				// On stdin, so that it isn't in the process's arguments (review H9).
+				line, err := bufio.NewReader(io.LimitReader(cmd.InOrStdin(), 4096)).ReadString('\n')
+				if err != nil && line == "" {
+					return fmt.Errorf("reading the join token from stdin: %w", err)
+				}
+				token = strings.TrimSpace(line)
+			}
 			id, err := doJoin(cmd.Context(), state(), apiURL, token, unisolated)
 			if err != nil {
 				return err
@@ -82,7 +91,7 @@ func newRoot() *cobra.Command {
 		},
 	}
 	join.Flags().StringVar(&apiURL, "api", "", "the deployment's URL")
-	join.Flags().StringVar(&token, "token", "", "the join token (cxj_...)")
+	join.Flags().StringVar(&token, "token", "", "the join token (cxj_...), or - to read it from stdin")
 	join.Flags().BoolVar(&unisolated, "unisolated", false, "for testing only: run machines without the firewall's isolation")
 	join.MarkFlagRequired("api")
 	join.MarkFlagRequired("token")
@@ -155,6 +164,8 @@ func newRoot() *cobra.Command {
 	run.Flags().StringVar(&rc.Image, "machine-image", "", "run machines from this image instead of the deployment's (it must be allowed)")
 	run.Flags().StringVar(&rc.DockerRoot, "docker-root", "", "where Docker's data root is mounted read-only, for its free space")
 	run.Flags().StringArrayVar(&rc.Probes, "probe", nil, "an address of the host or its LAN (ip:port, or udp53=ip) the self-test must find closed; repeatable")
+	run.Flags().Float64Var(&rc.KeepFreeGB, "keep-free-gb", node.KeepFreeGB, "below this much free space on Docker's disk, stop the machine that wrote the most; new machines need 5 GB more")
+	run.Flags().IntVar(&rc.DiskGB, "disk-gb", 0, "cap each machine's writable layer at this size, where Docker's storage driver can (btrfs, zfs, overlay2 on xfs with pquota); 0: no cap")
 
 	var asJSON bool
 	var wait time.Duration
@@ -191,6 +202,8 @@ func newRoot() *cobra.Command {
 					fmt.Fprintf(out, "Not joined (no %s/node.json).\n", s.Dir)
 				case up:
 					fmt.Fprintf(out, "%s (%s) is connected to %s since %s.\n", id.Name, id.ID, id.APIURL, time.UnixMilli(st.Since).Format(time.RFC3339))
+				case st != nil && st.Revoked:
+					fmt.Fprintf(out, "%s (%s) was REMOVED from %s (cloudex node rm): its machines were stopped, and their disks stay here until you uninstall the agent (node-install.sh --uninstall).\n", id.Name, id.ID, id.APIURL)
 				case st == nil:
 					fmt.Fprintf(out, "%s (%s) has joined %s, but the agent hasn't run yet.\n", id.Name, id.ID, id.APIURL)
 				case !running:

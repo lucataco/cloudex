@@ -39,6 +39,7 @@ type MachineHost struct {
 	HostMB  int        // the host's memory in MiB
 	Role    string     // machine, probe or check
 	Labels  map[string]string
+	DiskGB  int // the writable layer's size cap, where the storage driver has one; 0: none
 }
 
 // The default size: standard-2's on Cloudflare is 1 vCPU and 6 GiB.
@@ -108,6 +109,10 @@ type HostConfig struct {
 	LogConfig      LogConfig         `json:"LogConfig"`
 	CapAdd         []string          `json:"CapAdd,omitempty"` // probes only (ProbeSpec); never for a machine
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
+	// StorageOpt caps the writable layer ({"size": "50G"}) where the storage
+	// driver can (btrfs, zfs, overlay2 on xfs with pquota); elsewhere the
+	// agent's disk watchdog is the limit (review H2).
+	StorageOpt map[string]string `json:"StorageOpt,omitempty"`
 }
 
 type RestartPolicy struct {
@@ -232,11 +237,19 @@ func MachineSpec(r MachineRequest, h MachineHost) (*CreateBody, error) {
 			// No IPv6 on the machine's interfaces (Docker leaves eth0 without it
 			// on an IPv4 network; this covers any added later), while lo keeps
 			// ::1, which dev servers such as Vite bind by default.
-			Sysctls:   map[string]string{"net.ipv6.conf.default.disable_ipv6": "1"},
-			LogConfig: LogConfig{Type: "json-file", Config: map[string]string{"max-size": "10m", "max-file": "2"}},
+			Sysctls:    map[string]string{"net.ipv6.conf.default.disable_ipv6": "1"},
+			LogConfig:  LogConfig{Type: "json-file", Config: map[string]string{"max-size": "10m", "max-file": "2"}},
+			StorageOpt: storageOpt(h.DiskGB),
 		},
 		Networking: NetworkingConfig{EndpointsConfig: map[string]EndpointConfig{n.Name: endpoint(n.Machine)}},
 	}, nil
+}
+
+func storageOpt(gb int) map[string]string {
+	if gb <= 0 {
+		return nil
+	}
+	return map[string]string{"size": fmt.Sprintf("%dG", gb)}
 }
 
 func endpoint(a netip.Addr) EndpointConfig {
