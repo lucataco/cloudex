@@ -141,6 +141,7 @@ export class Node extends DurableObject<Env> {
   // ones made or started through op() since; for dropping a node's state or
   // ticket request for a sandbox that isn't its own without waking it.
   private members: { ids: Set<string>; loadedAt: number } | null = null;
+  private membersLoading: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -294,16 +295,19 @@ export class Node extends DurableObject<Env> {
 
   // Whether a sandbox is on this node: from memory, or D1's index when it's
   // not there and the copy is older than MEMBERS_FRESH_MS.
+  // One read at a time: messages that arrive while it runs wait for it.
   private async isMember(id: string, sandbox: string, now: number): Promise<boolean> {
     if (this.members?.ids.has(sandbox)) return true;
     if (this.members && now - this.members.loadedAt < MEMBERS_FRESH_MS) return false;
-    try {
-      this.members = { ids: new Set(await sandboxesOnNode(this.env.DB, id)), loadedAt: now };
-    } catch (e) {
-      console.error(`[${id}] listing its sandboxes: ${errorStatus(e).message}`);
-      return false;
-    }
-    return this.members.ids.has(sandbox);
+    this.membersLoading ??= sandboxesOnNode(this.env.DB, id)
+      .then((ids) => {
+        const made = this.members?.loadedAt === 0 ? this.members.ids : new Set<string>();
+        this.members = { ids: new Set([...ids, ...made]), loadedAt: now };
+      })
+      .catch((e) => console.error(`[${id}] listing its sandboxes: ${errorStatus(e).message}`))
+      .finally(() => (this.membersLoading = null));
+    await this.membersLoading;
+    return this.members?.ids.has(sandbox) ?? false;
   }
 
   // The agent's control socket, passed on by the Worker (index.ts) once its

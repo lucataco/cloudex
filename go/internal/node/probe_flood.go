@@ -67,7 +67,7 @@ type FloodReport struct {
 	States        int    `json:"states"`        // state messages sent, for sandboxes that aren't this node's
 	TicketsAsked  int    `json:"ticketsAsked"`  // ticket requests sent, for others' sandbox
 	TicketsGiven  int    `json:"ticketsGiven"`  // tickets the deployment gave for it
-	TicketErrors  string `json:"ticketError"`   // the first refusal's reason
+	TicketErrors  string `json:"ticketError"`   // the refusals' reasons, each once
 	SecondHello   int    `json:"secondHello"`   // the close code after a second hello (0: still open)
 	SecondHelloIn int64  `json:"secondHelloMs"` // how long the close took
 }
@@ -102,8 +102,8 @@ func ProbeFlood(ctx context.Context, api, nodeID string, key ed25519.PrivateKey,
 			if json.Unmarshal(b, &t) == nil && t.Type == "tickets" {
 				mu.Lock()
 				rep.TicketsGiven += len(t.Tickets)
-				if t.Error != "" && rep.TicketErrors == "" {
-					rep.TicketErrors = t.Error
+				if t.Error != "" && !strings.Contains(rep.TicketErrors, t.Error) {
+					rep.TicketErrors = strings.TrimPrefix(rep.TicketErrors+" | "+t.Error, " | ")
 				}
 				mu.Unlock()
 			}

@@ -25,10 +25,12 @@ const NODE = "nd-abcd1234";
 const db = fakeD1();
 // Every statement that writes the nodes table.
 let nodeWrites = 0;
+let memberReads = 0;
 const counted = {
   ...db,
   prepare(sql: string) {
     if (/^\s*UPDATE nodes/i.test(sql)) nodeWrites++;
+    if (/SELECT id FROM sandboxes WHERE node/i.test(sql)) memberReads++;
     return db.prepare(sql);
   },
   batch: db.batch,
@@ -160,7 +162,11 @@ test("state and ticket requests for a sandbox not on the node wake nothing; a fl
   await say(hello);
   await Promise.all(waits);
   woken.length = 0;
-  for (let i = 0; i < 300; i++) await say({ type: "state", machine: { id: "cx-other1", state: "running" } });
+  // Many at once, as they arrive from a socket: D1 is read once for them all.
+  memberReads = 0;
+  await Promise.all(Array.from({ length: 100 }, () => say({ type: "state", machine: { id: "cx-other1", state: "running" } })));
+  assert.equal(memberReads, 1, "one read of the node's sandboxes for a burst");
+  for (let i = 0; i < 200; i++) await say({ type: "state", machine: { id: "cx-other1", state: "running" } });
   for (let i = 0; i < 50; i++) await say({ type: "state", machine: { id: `cx-x${String(i).padStart(5, "0")}`, state: "running" } });
   await Promise.all(waits);
   assert.deepEqual(woken, [], "no other sandbox's object is woken");
