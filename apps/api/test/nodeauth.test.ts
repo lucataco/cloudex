@@ -281,6 +281,10 @@ test("the install command names edge for anything but a release, and pins the di
   // A digest for another tag, or not a digest, isn't used.
   assert.match(cmd("v0.2.3", `v0.2.2@${d}`), / --version v0\.2\.3$/);
   assert.match(cmd("v0.2.2", "v0.2.2@sha256:zz; rm -rf /"), / --version v0\.2\.2$/);
+  // Review H9: the token is in sudo's kept environment, not in any argument.
+  const c = cmd("v0.2.2");
+  assert.match(c, /\| CLOUDEX_JOIN_TOKEN=cxj_t sudo --preserve-env=CLOUDEX_JOIN_TOKEN bash -s -- /);
+  assert.doesNotMatch(c.split("sudo")[1]!, /cxj_t|--token/);
 });
 
 test("only admins see a node's orphans, pending deletes and round trip", () => {

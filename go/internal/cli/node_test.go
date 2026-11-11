@@ -22,10 +22,10 @@ func jsonInt(v int64) string { b, _ := json.Marshal(v); return string(b) }
 func TestNodeAddPrintsTheInstallCommandAndTheToken(t *testing.T) {
 	f := withFakeAPI(t, map[string]string{
 		"POST /v1/nodes": `!201 {"node":` + strings.Replace(node(0), `"state":"online"`, `"state":"pending"`, 1) +
-			`,"joinToken":"cxj_tok","expiresAt":1762819200000,"install":"curl -fsSL https://cloudex.build/node | sudo bash -s -- --api https://x --token cxj_tok --version v0.2.2"}`,
+			`,"joinToken":"cxj_tok","expiresAt":1762819200000,"install":"curl -fsSL https://cloudex.build/node | CLOUDEX_JOIN_TOKEN=cxj_tok sudo --preserve-env=CLOUDEX_JOIN_TOKEN bash -s -- --api https://x --version v0.2.2"}`,
 	})
 	code, out, errOut := run(t, "node", "add", "box")
-	if code != 0 || !strings.Contains(out, "curl -fsSL https://cloudex.build/node | sudo bash -s -- --api https://x --token cxj_tok") ||
+	if code != 0 || !strings.Contains(out, "curl -fsSL https://cloudex.build/node | CLOUDEX_JOIN_TOKEN=cxj_tok sudo --preserve-env=CLOUDEX_JOIN_TOKEN bash -s -- --api https://x") ||
 		!strings.Contains(out, "works once") || !strings.Contains(out, "Root in a machine\nis root on box") || !strings.Contains(out, "only for code you trust") {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}

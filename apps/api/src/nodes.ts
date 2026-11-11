@@ -233,7 +233,9 @@ export function installCommand(origin: string, token: string, version: string, n
   const tag = agentTag(version);
   const [pinnedTag, digest] = nodeAgent.split("@");
   const pin = pinnedTag === tag && /^sha256:[0-9a-f]{64}$/.test(digest ?? "") ? ` --digest ${digest}` : "";
-  return `curl -fsSL https://cloudex.build/node | sudo bash -s -- --api ${origin} --token ${token} --version ${tag}${pin}`;
+  // The token goes in the environment, kept by sudo (--preserve-env), so that
+  // it isn't in sudo's log or any process's arguments (review H9).
+  return `curl -fsSL https://cloudex.build/node | CLOUDEX_JOIN_TOKEN=${token} sudo --preserve-env=CLOUDEX_JOIN_TOKEN bash -s -- --api ${origin} --version ${tag}${pin}`;
 }
 
 // The agent image's tag for a deployment's version: a release's own (v1.2.3),
