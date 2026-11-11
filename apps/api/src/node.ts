@@ -25,6 +25,12 @@
 // - revoke() refuses the node from now on and closes its socket (4003).
 // - A node may connect at most CONNECTS_PER_MINUTE times a minute; more get
 //   429, so a broken or hostile agent can't keep this object and D1 busy.
+// - On a socket (2026-11-12 review): hello comes once (a second closes it);
+//   facts, state and ticket requests are limited to PER_MINUTE each, more are
+//   dropped (tickets refused); facts go to D1 only when they change, at most
+//   every MIRROR_MIN_MS; and a state or ticket request for a sandbox that isn't
+//   on this node (D1's index, re-read at most every MEMBERS_FRESH_MS on a
+//   miss) is dropped without waking that sandbox's object.
 //
 // - After hello comes welcome (M4): the image the deployment's machines run
 //   (NODE_IMAGE), which the agent pulls and checks against its own list; and
@@ -73,7 +79,34 @@ export const CONNECT = {
   skew: "x-cx-internal-skew", // the agent's clock less the Worker's, in seconds, at connect
 } as const;
 
-type Attachment = { gen: number; acceptedAt: number; lastMessageAt: number | null; hello?: boolean };
+// rl: this socket's messages in the current minute, by kind (limits below).
+type Attachment = { gen: number; acceptedAt: number; lastMessageAt: number | null; hello?: boolean; rl?: Counts };
+type Counts = { at: number; facts: number; state: number; tickets: number; dropped: number };
+
+// What one control socket may send in a minute, after its hello (2026-11-12
+// review, W1): an honest agent sends facts when they change (an image pull's
+// progress every 5 s at most), a state per machine start or stop, and a
+// ticket request per spare stream it opens. More is dropped (tickets are
+// refused), so a node can't turn its socket into D1 writes, reconciles or
+// woken Sandbox objects.
+export const PER_MINUTE = { facts: 20, state: 120, tickets: 240 } as const;
+// The facts go to D1 when they change, at most this often; a change in
+// between goes with the next write or the alarm.
+export const MIRROR_MIN_MS = 10_000;
+// How long the list of this node's sandboxes (from D1) is trusted before a
+// state or ticket for a sandbox not on it reads D1 again.
+export const MEMBERS_FRESH_MS = 5_000;
+
+// Counts a message against its socket's limit; false when it's over.
+export function allow(c: Counts | undefined, kind: keyof typeof PER_MINUTE, now: number): { ok: boolean; counts: Counts } {
+  const counts = c && now - c.at < 60_000 ? { ...c } : { at: now, facts: 0, state: 0, tickets: 0, dropped: 0 };
+  if (counts[kind] >= PER_MINUTE[kind]) {
+    counts.dropped++;
+    return { ok: false, counts };
+  }
+  counts[kind]++;
+  return { ok: true, counts };
+}
 
 export type Hello = { version: string; protocol: number; facts: NodeFacts; machines: NodeMachine[]; machinesError?: string; at: number };
 
@@ -104,6 +137,10 @@ type Waiter = { resolve: (v: Record<string, unknown>) => void; reject: (e: Error
 
 export class Node extends DurableObject<Env> {
   private waiters = new Map<string, Waiter>();
+  // The sandboxes on this node, as D1's index had them at loadedAt, plus the
+  // ones made or started through op() since; for dropping a node's state or
+  // ticket request for a sandbox that isn't its own without waking it.
+  private members: { ids: Set<string>; loadedAt: number } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -230,7 +267,43 @@ export class Node extends DurableObject<Env> {
   // without a close is closed, and the node shows offline (current()).
   async alarm() {
     this.current();
+    if (await this.ctx.storage.get<boolean>("mirrorDue")) {
+      const [id, hello] = await Promise.all([this.ctx.storage.get<string>("id"), this.ctx.storage.get<Hello>("hello")]);
+      if (id && hello) await this.mirrorFacts(id, hello.facts, Date.now()).catch((e) => console.error(`[${id}] ${e}`));
+    }
     if (this.sockets().length) await this.ctx.storage.setAlarm(Date.now() + STALE_CHECK_MS);
+  }
+
+  // The facts to D1, when they changed, at most every MIRROR_MIN_MS; a change
+  // sooner is written by the alarm.
+  private async mirrorFacts(id: string, facts: NodeFacts, now: number) {
+    const s = await this.ctx.storage.get(["mirroredFacts", "mirroredAt"]);
+    const text = JSON.stringify(facts);
+    if (s.get("mirroredFacts") === text) return void (await this.ctx.storage.put("mirrorDue", false));
+    const at = (s.get("mirroredAt") as number | undefined) ?? 0;
+    if (now - at < MIRROR_MIN_MS) {
+      await this.ctx.storage.put("mirrorDue", true);
+      const due = at + MIRROR_MIN_MS;
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > due) await this.ctx.storage.setAlarm(due);
+      return;
+    }
+    await this.ctx.storage.put({ mirroredFacts: text, mirroredAt: now, mirrorDue: false });
+    await mirrorNode(this.env.DB, id, { lastSeenAt: now, facts });
+  }
+
+  // Whether a sandbox is on this node: from memory, or D1's index when it's
+  // not there and the copy is older than MEMBERS_FRESH_MS.
+  private async isMember(id: string, sandbox: string, now: number): Promise<boolean> {
+    if (this.members?.ids.has(sandbox)) return true;
+    if (this.members && now - this.members.loadedAt < MEMBERS_FRESH_MS) return false;
+    try {
+      this.members = { ids: new Set(await sandboxesOnNode(this.env.DB, id)), loadedAt: now };
+    } catch (e) {
+      console.error(`[${id}] listing its sandboxes: ${errorStatus(e).message}`);
+      return false;
+    }
+    return this.members.ids.has(sandbox);
   }
 
   // The agent's control socket, passed on by the Worker (index.ts) once its
@@ -301,7 +374,23 @@ export class Node extends DurableObject<Env> {
     const a = ws.deserializeAttachment() as Attachment;
     const m = parsed.data;
     if (!a.hello && m.type !== "hello") return this.close(ws, NodeClose.badMessage, "the first message on a connection is hello");
-    ws.serializeAttachment({ ...a, lastMessageAt: now, hello: a.hello || m.type === "hello" } satisfies Attachment);
+    if (a.hello && m.type === "hello") return this.close(ws, NodeClose.badMessage, "hello comes once on a connection");
+    let rl = a.rl;
+    if (m.type === "facts" || m.type === "state" || m.type === "tickets") {
+      const r = allow(a.rl, m.type, now);
+      rl = r.counts;
+      if (!r.ok) {
+        ws.serializeAttachment({ ...a, lastMessageAt: now, rl } satisfies Attachment);
+        if (r.counts.dropped === 1) console.log(`[${await this.ctx.storage.get<string>("id")}] over ${PER_MINUTE[m.type]} ${m.type} messages a minute; dropping more`);
+        if (m.type === "tickets") {
+          try {
+            ws.send(JSON.stringify({ type: "tickets", id: m.id, tickets: [], error: "too many ticket requests; wait a minute" } satisfies WorkerMessage));
+          } catch {}
+        }
+        return;
+      }
+    }
+    ws.serializeAttachment({ ...a, lastMessageAt: now, hello: a.hello || m.type === "hello", ...(rl ? { rl } : {}) } satisfies Attachment);
     const id = (await this.ctx.storage.get<string>("id"))!;
     switch (m.type) {
       case "hello": {
@@ -316,7 +405,7 @@ export class Node extends DurableObject<Env> {
           ...(m.machinesError ? { machinesError: m.machinesError } : {}),
           at: now,
         };
-        await this.ctx.storage.put("hello", hello);
+        await this.ctx.storage.put({ hello, mirroredFacts: JSON.stringify(m.facts), mirroredAt: now, mirrorDue: false });
         await mirrorNode(this.env.DB, id, { state: "online", lastSeenAt: now, version: m.version, protocol: m.protocol, facts: m.facts });
         if (this.env.NODE_IMAGE) {
           // providers (M6): the hosts the node CA is limited to, every one the
@@ -336,15 +425,19 @@ export class Node extends DurableObject<Env> {
       case "facts": {
         const hello = await this.ctx.storage.get<Hello>("hello");
         if (hello) await this.ctx.storage.put("hello", { ...hello, facts: m.facts });
-        await mirrorNode(this.env.DB, id, { lastSeenAt: now, facts: m.facts });
+        await this.mirrorFacts(id, m.facts, now);
         return;
       }
       case "state": {
         // To the machine's Sandbox object, which acts on it only if its
         // record names this node. Nothing is stored for it here, so a node
         // can't fill this object's storage with made-up machines.
-        console.log(`[${id}] machine ${m.machine.id} is ${m.machine.state}`);
         const sb = m.machine.id;
+        if (!(await this.isMember(id, sb, now))) {
+          console.log(`[${id}] a state for ${sb}, which isn't on this node: dropped`);
+          return;
+        }
+        console.log(`[${id}] machine ${sb} is ${m.machine.state}`);
         this.ctx.waitUntil(
           this.env.SANDBOX.getByName(sb)
             .nodeReport(id, { online: true, lastSeenAt: now, machine: m.machine.state })
@@ -354,8 +447,11 @@ export class Node extends DurableObject<Env> {
       }
       case "tickets": {
         const revoked = await this.ctx.storage.get<boolean>("revoked");
-        const tickets = revoked ? [] : await Promise.all(Array.from({ length: m.count }, () => issueTicket(this.env.ADMIN_KEY, id, m.sandbox, now)));
-        const answer: WorkerMessage = { type: "tickets", id: m.id, tickets, ...(revoked ? { error: "this node was removed" } : {}) };
+        // A ticket for a sandbox that isn't this node's would only wake that
+        // sandbox's object to be refused there.
+        const why = revoked ? "this node was removed" : (await this.isMember(id, m.sandbox, now)) ? null : `${m.sandbox} isn't a sandbox on this node`;
+        const tickets = why ? [] : await Promise.all(Array.from({ length: m.count }, () => issueTicket(this.env.ADMIN_KEY, id, m.sandbox, now)));
+        const answer: WorkerMessage = { type: "tickets", id: m.id, tickets, ...(why ? { error: why } : {}) };
         try {
           ws.send(JSON.stringify(answer));
         } catch {}
@@ -428,6 +524,10 @@ export class Node extends DurableObject<Env> {
       if (w) clearTimeout(w.timer);
       this.waiters.delete(id);
       fail(503, `the node's connection broke: ${e instanceof Error ? e.message : e}`);
+    }
+    if ((name === "create" || name === "start") && typeof args.sandbox === "string") {
+      this.members ??= { ids: new Set(), loadedAt: 0 };
+      this.members.ids.add(args.sandbox);
     }
     const out = await answer;
     // A removed machine is no longer the node's, for the orphans listed in
