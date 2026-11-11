@@ -987,6 +987,7 @@ node_m4() {
 		local tbl st net
 		tbl=$(node_sh "sudo nft list table inet cloudex >/dev/null && echo loaded")
 		st=$(in_agent selftest 2>/dev/null | jq -r .pass)
+		wait_iso 0 >/dev/null # the agent's own, after its restart with Docker's
 		"$CX" node dev-start "$N" "$NM" >/dev/null 2>&1
 		net=$(in_m "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://example.com")
 		OUT="table: ${tbl:-missing}; self-test pass: $st; the machine's https after starting it again: $net" CODE=""
