@@ -156,10 +156,13 @@ type TicketRequest struct {
 	Count   int    `json:"count"`
 }
 
-// Welcome follows the agent's hello: the image the deployment's machines run.
+// Welcome follows the agent's hello: the image the deployment's machines
+// run, and (v0.2.2 M6) the hosts of the AI providers whose HTTPS calls the
+// deployment intercepts, which the node CA is limited to (ca.go).
 type Welcome struct {
-	Type  string `json:"type"` // welcome
-	Image string `json:"image"`
+	Type      string   `json:"type"` // welcome
+	Image     string   `json:"image"`
+	Providers []string `json:"providers,omitempty"`
 }
 
 // Tickets is the answer: each one opens one stream socket, once, within 60 s.

@@ -118,6 +118,7 @@ type identityListener struct {
 	nets []MachineNet
 	mu   sync.Mutex
 	seen []string // took>peer=verdict
+	sink *identityListener // where a second address's listener records what it saw
 }
 
 func (l *identityListener) serve() {
@@ -135,9 +136,13 @@ func (l *identityListener) serve() {
 			if ok {
 				verdict = "machine " + n.Name
 			}
-			l.mu.Lock()
-			l.seen = append(l.seen, fmt.Sprintf("%s<%s=%s", la.Addr(), pa.Addr(), verdict))
-			l.mu.Unlock()
+			rec := l
+			if l.sink != nil {
+				rec = l.sink
+			}
+			rec.mu.Lock()
+			rec.seen = append(rec.seen, fmt.Sprintf("%s<%s=%s", la.Addr(), pa.Addr(), verdict))
+			rec.mu.Unlock()
 			c.SetWriteDeadline(time.Now().Add(time.Second))
 			c.Write([]byte(verdict + "\n"))
 		}()
@@ -283,7 +288,9 @@ func (r *Runtime) selfTest(ctx context.Context, rep *SelfTestReport) error {
 		return errB
 	}
 
-	ln, err := net.Listen("tcp4", "0.0.0.0:0")
+	// The agent's addresses only, one listener each on one port, as its real
+	// listeners (egress.go) bind: never 0.0.0.0.
+	ln, err := net.Listen("tcp4", netip.AddrPortFrom(netA.Agent, 0).String())
 	if err != nil {
 		return err
 	}
@@ -291,6 +298,24 @@ func (r *Runtime) selfTest(ctx context.Context, rep *SelfTestReport) error {
 	il := &identityListener{ln: ln, port: ln.Addr().(*net.TCPAddr).Port, nets: []MachineNet{netA, netB}}
 	go il.serve()
 	port := strconv.Itoa(il.port)
+	var extra []net.Listener
+	listenToo := func(addr string) error {
+		l, err := net.Listen("tcp4", net.JoinHostPort(addr, port))
+		if err != nil {
+			return fmt.Errorf("the self-test's listener on %s: %w", addr, err)
+		}
+		go (&identityListener{ln: l, port: il.port, nets: il.nets, sink: il}).serve()
+		extra = append(extra, l)
+		return nil
+	}
+	defer func() {
+		for _, l := range extra {
+			l.Close()
+		}
+	}()
+	if err := listenToo(netB.Agent.String()); err != nil {
+		return err
+	}
 
 	h := MachineHost{NodeID: r.NodeID, Image: r.Image(), Sysbox: r.Sysbox(ctx), Role: "probe"}
 	mk := func(id string, n MachineNet, netAdmin bool, addr netip.Addr) (string, error) {
@@ -337,6 +362,11 @@ func (r *Runtime) selfTest(ctx context.Context, rep *SelfTestReport) error {
 	selfAddrs, selfGWs, err := r.selfAddrs(ctx, map[string]bool{netA.Name: true, netB.Name: true})
 	if err != nil {
 		return err
+	}
+	for _, a := range selfAddrs {
+		if err := listenToo(a); err != nil {
+			return err
+		}
 	}
 
 	// Probe A: a plain machine.

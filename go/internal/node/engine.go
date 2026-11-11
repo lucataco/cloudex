@@ -282,6 +282,7 @@ type ContainerDetail struct {
 	Config struct {
 		Labels map[string]string `json:"Labels"`
 		Image  string            `json:"Image"`
+		Env    []string          `json:"Env"`
 	} `json:"Config"`
 	HostConfig      json.RawMessage `json:"HostConfig"`
 	NetworkSettings struct {

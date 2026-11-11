@@ -146,6 +146,32 @@ type Agent struct {
 
 	testNow chan struct{} // runs the self-test now
 	testMu  sync.Mutex
+
+	// cloudex.internal and the provider hosts for machines (M6, egress.go),
+	// and the node CA their TLS ends with (ca.go).
+	egress    *Egress
+	egressNow chan struct{}
+	nodeCA    atomic.Pointer[CA]
+}
+
+// CA is the node CA now; nil until the deployment has named its provider hosts.
+func (a *Agent) CA() *CA { return a.nodeCA.Load() }
+
+// setProviders makes sure the node CA covers exactly the deployment's
+// provider hosts (its welcome message), making a new one when they changed.
+func (a *Agent) setProviders(hosts []string) {
+	if len(hosts) == 0 {
+		return
+	}
+	ca, made, err := a.State.EnsureCA(a.ID, hosts)
+	if err != nil {
+		a.logf("the node CA: %v", err)
+		return
+	}
+	if made {
+		a.logf("made the node CA for %d provider hosts (sha256 %s); machines trust it from their next start", len(ca.Hosts), ca.Fingerprint()[:16])
+	}
+	a.nodeCA.Store(ca)
 }
 
 func (a *Agent) docker() *Docker {
@@ -278,6 +304,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		r.Unisolated = a.Unisolated
 		r.OnFacts = func() { a.send(FactsMessage{Type: "facts", Facts: a.facts()}) }
 		r.OnState = func(m Machine) {
+			a.kickEgress()
 			if m.State == "running" {
 				a.startPool(m.ID)
 			} else {
@@ -301,6 +328,18 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.selfTests(ctx)
 		}()
 		go r.Watch(ctx)
+		if ca, err := a.State.LoadCA(); err == nil && ca != nil {
+			a.nodeCA.Store(ca)
+		} else if err != nil {
+			a.logf("the node CA: %v; a new one is made when the deployment names its providers", err)
+		}
+		hc := a.HTTP
+		if hc == nil {
+			hc = &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true, MaxIdleConnsPerHost: 16, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 15 * time.Second}}
+		}
+		a.egress = &Egress{API: a.API, Node: a.ID, Key: a.Key, HTTP: hc, Log: a.Log, Debug: a.Debug, CA: a.CA}
+		a.egressNow = make(chan struct{}, 1)
+		go a.egressLoop(ctx)
 	}
 	var down time.Time
 	attempt := 0
@@ -484,6 +523,9 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 				a.Runtime.SetImage(w.Image)
 				a.kickSelfTest()
 			}
+			if a.Runtime != nil && len(w.Providers) > 0 {
+				a.setProviders(w.Providers)
+			}
 			continue
 		}
 		if head.Type == "tickets" {
@@ -619,6 +661,7 @@ func (a *Agent) answer(op Op) Result {
 	var args struct {
 		Sandbox string `json:"sandbox"`
 		Count   int    `json:"count"`
+		Hold    bool   `json:"hold"`
 	}
 	b, _ := json.Marshal(op.Args)
 	json.Unmarshal(b, &args)
@@ -658,14 +701,19 @@ func (a *Agent) answer(op Op) Result {
 			return errResult(op.ID, "bad arguments: "+err.Error())
 		}
 		m, err := r.Create(ctx, req)
+		a.kickEgress()
 		if err != nil {
 			return errResult(op.ID, err.Error())
 		}
 		return okResult(op.ID, m)
 	case "start":
-		m, err := r.Start(ctx, args.Sandbox)
+		m, err := r.Start(ctx, args.Sandbox, args.Hold)
+		a.kickEgress()
 		if err != nil {
 			return errResult(op.ID, err.Error())
+		}
+		if ca := a.CA(); ca != nil {
+			m.CA = string(ca.PEM)
 		}
 		a.startPool(args.Sandbox)
 		return okResult(op.ID, m)
@@ -677,7 +725,9 @@ func (a *Agent) answer(op Op) Result {
 		return okResult(op.ID, struct{}{})
 	case "delete":
 		a.stopPool(args.Sandbox)
-		if err := r.Delete(ctx, args.Sandbox); err != nil {
+		err := r.Delete(ctx, args.Sandbox)
+		a.kickEgress()
+		if err != nil {
 			return errResult(op.ID, err.Error())
 		}
 		return okResult(op.ID, struct{}{})

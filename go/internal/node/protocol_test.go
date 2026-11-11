@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -28,6 +30,16 @@ type fixture struct {
 		Model   string          `json:"model"`
 		Message json.RawMessage `json:"message"`
 	} `json:"valid"`
+	Egress struct {
+		Route            string `json:"route"`
+		BodyMax          int64  `json:"bodyMax"`
+		ActivityEverySec int    `json:"activityEverySec"`
+		SavePartMax      int64  `json:"savePartMax"`
+		Targets          struct {
+			Valid   []string `json:"valid"`
+			Invalid []string `json:"invalid"`
+		} `json:"targets"`
+	} `json:"egress"`
 }
 
 func loadFixture(t *testing.T) fixture {
@@ -195,6 +207,39 @@ func TestEndpointSignsThePathAsSent(t *testing.T) {
 	for _, bad := range []string{"", "cloudex-api.x.workers.dev", "ftp://x", "https://"} {
 		if _, _, err := Endpoint(bad, "/v1/node/connect"); err == nil {
 			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// The route the agent passes its machines' requests on (M6), its limits, and
+// the targets it sends, as the Worker reads them (nodeegress.ts).
+func TestEgressMatchesTheFixture(t *testing.T) {
+	f := loadFixture(t)
+	e := f.Egress
+	if e.Route != EgressRoute || e.BodyMax != EgressBodyMax || time.Duration(e.ActivityEverySec)*time.Second != ActivityEvery {
+		t.Fatalf("fixture %s %d %ds, Go %s %d %v", e.Route, e.BodyMax, e.ActivityEverySec, EgressRoute, EgressBodyMax, ActivityEvery)
+	}
+	if e.SavePartMax > EgressBodyMax {
+		t.Fatalf("save parts of %d don't fit under %d", e.SavePartMax, EgressBodyMax)
+	}
+	for _, target := range e.Targets.Valid {
+		full, signed, err := EgressURL("https://api.example/", target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u, _ := url.Parse(full)
+		if u.Query().Get("target") != target || u.Path != EgressRoute || signed != u.EscapedPath()+"?"+u.RawQuery {
+			t.Fatalf("%s: %s signed as %s", target, full, signed)
+		}
+	}
+	// What the welcome names is what the CA is limited to.
+	for _, ex := range f.Valid {
+		if ex.Model == "WorkerMessage" && strings.Contains(string(ex.Message), `"providers"`) {
+			var w Welcome
+			json.Unmarshal(ex.Message, &w)
+			if _, err := CleanHosts(w.Providers); err != nil {
+				t.Fatalf("%s: %v", ex.Name, err)
+			}
 		}
 	}
 }

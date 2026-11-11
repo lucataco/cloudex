@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/netip"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -285,6 +286,10 @@ type MachineInfo struct {
 	// already, so the Worker can tell a sandbox whose machine was removed
 	// outside Cloudex that it started over.
 	Created bool `json:"created,omitempty"`
+	// CA is the node CA's certificate (M6), in start's answer, which the
+	// machine trusts for the provider hosts; empty before the deployment has
+	// named them.
+	CA string `json:"ca,omitempty"`
 }
 
 func (r *Runtime) labels(extra ...string) []string {
@@ -489,8 +494,12 @@ func (r *Runtime) removeNetwork(ctx context.Context, n MachineNet) {
 const ReadyCheck = `b=$(cat /run/cloudex-boot 2>/dev/null) || b=$(cat /proc/sys/kernel/random/boot_id); ` +
 	`[ "$(cat /run/cloudex-ready 2>/dev/null)" = "$b" ] && exit 0; [ "$(cat /run/cloudex-held 2>/dev/null)" = "$b" ] && exit 3; exit 1`
 
-// Start starts a sandbox's machine and waits until its entrypoint is ready.
-func (r *Runtime) Start(ctx context.Context, sandbox string) (*MachineInfo, error) {
+// Start starts a sandbox's machine and waits until its entrypoint is ready,
+// or, with hold, holds for a restore (a machine made with hold to start from
+// a named save). A machine made with hold that starts again without it, a
+// resume, carries CLOUDEX_HOLD=1 for life (Docker keeps a container's
+// environment), so it's let go at once.
+func (r *Runtime) Start(ctx context.Context, sandbox string, hold bool) (*MachineInfo, error) {
 	if err := r.ready(); err != nil {
 		return nil, err
 	}
@@ -514,6 +523,12 @@ func (r *Runtime) Start(ctx context.Context, sandbox string) (*MachineInfo, erro
 		return nil, err
 	}
 	t0 := time.Now()
+	if !hold && slices.Contains(c.Config.Env, "CLOUDEX_HOLD=1") {
+		// /run is a tmpfs, so the entrypoint's hold finds this at once.
+		if _, code, err := r.Docker.Run(ctx, c.ID, "0", []string{"touch", "/run/cloudex-go"}); err != nil || code != 0 {
+			r.logf("%s: letting a held machine go: exit %d %v", sandbox, code, err)
+		}
+	}
 	if err := r.waitReady(ctx, c.ID, 90*time.Second); err != nil {
 		return nil, err
 	}
