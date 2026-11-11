@@ -534,8 +534,7 @@ export class NodeStreams {
       return new Response("that ticket was used already\n", { status: 401 });
     }
     this.reap();
-    const spares = this.spares();
-    if (spares.length >= SPARES_MAX) return new Response("this sandbox has enough spare streams\n", { status: 429 });
+    if (this.sparesFull(now)) return new Response("this sandbox has enough spare streams\n", { status: 429 });
     const pair = new WebSocketPair();
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [`n:${t.stream}`]);
@@ -546,6 +545,14 @@ export class NodeStreams {
       w.resolve(server);
     }
     return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  // Whether a new spare would be one too many: only live ones count (a
+  // spare whose connection died, or is closing, can't carry a stream), and
+  // never while a stream waits for one. Counting dead ones refused every new
+  // spare after an edge reset, and execs failed for minutes (2026-11-11).
+  sparesFull(now = Date.now()): boolean {
+    return !this.waiters.length && this.spares().filter((ws) => this.alive(ws, now)).length >= SPARES_MAX;
   }
 
   private attachment(ws: WebSocket): NodeAttachment {

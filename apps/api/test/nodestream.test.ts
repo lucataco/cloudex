@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { STREAM_WINDOW } from "@cloudex/schema/node";
-import { Framed, NodeStreams, OVERRUN_SLACK, SPLICE_AHEAD_MAX, SPLICE_CLIENT_CREDIT, SPLICE_EARLY_MAX, STREAMS_MAX, STREAMS_WAIT, TICKET_TTL_SEC, WS_RELAY_RATE, issueTicket, readTicket, sendable } from "../src/nodestream.ts";
+import { Framed, NodeStreams, OVERRUN_SLACK, SPARES_MAX, SPLICE_AHEAD_MAX, SPLICE_CLIENT_CREDIT, SPLICE_EARLY_MAX, STREAMS_MAX, STREAMS_WAIT, TICKET_TTL_SEC, WS_RELAY_RATE, issueTicket, readTicket, sendable } from "../src/nodestream.ts";
 
 const KEY = "admin-key-for-tests";
 
@@ -316,4 +316,13 @@ test("a sandbox's object holds at most STREAMS_MAX open streams to its node; mor
   } finally {
     STREAMS_WAIT.ms = wait;
   }
+});
+
+test("only live spares count against SPARES_MAX: closing or silent ones don't keep the agent from opening new ones", () => {
+  const { ns, add } = spliceHost();
+  const dead = [];
+  for (let i = 0; i < SPARES_MAX; i++) dead.push(add(`n:${i.toString(16).padStart(4, "0")}`, "spare"));
+  assert.equal(ns.sparesFull(), true);
+  for (const ws of dead) ws.readyState = 2; // closing: their peer went in an edge reset
+  assert.equal(ns.sparesFull(), false);
 });
