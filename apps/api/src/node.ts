@@ -42,7 +42,7 @@ export const CONNECT = {
   hint: "x-cx-internal-hint",
 } as const;
 
-type Attachment = { gen: number; acceptedAt: number; lastMessageAt: number | null };
+type Attachment = { gen: number; acceptedAt: number; lastMessageAt: number | null; hello?: boolean };
 
 export type Hello = { version: string; protocol: number; facts: NodeFacts; machines: NodeMachine[]; at: number };
 
@@ -73,6 +73,7 @@ export class Node extends DurableObject<Env> {
         acceptedAt: a.acceptedAt,
         lastMessageAt: a.lastMessageAt,
         lastPingAt: this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? null,
+        hello: a.hello === true,
       };
     });
   }
@@ -82,12 +83,14 @@ export class Node extends DurableObject<Env> {
     const all = this.sockets();
     const best = newest(all);
     const { use, online, close } = pick(all, now);
+    let alive: ControlSocket<WebSocket> | null = best;
     for (const s of close) {
       const stale = s === best;
+      if (stale) alive = null;
       this.close(s.ws, stale ? NodeClose.stale : NodeClose.replaced, stale ? "no ping for a minute" : "replaced by a newer connection");
       if (stale) void this.wentOffline(lastSign(s));
     }
-    return { use, online };
+    return { use, online, alive };
   }
 
   private close(ws: WebSocket, code: number, reason: string) {
@@ -140,14 +143,15 @@ export class Node extends DurableObject<Env> {
       locationHint: h.get(CONNECT.hint) || null,
     };
     await this.ctx.storage.put({ gen, connectedAt: now, lastSeenAt: now, ...where });
-    await mirrorNode(this.env.DB, id, { state: "online", lastSeenAt: now, ...where }).catch((e) => console.error(`[${id}] ${e}`));
+    // Online once it says hello (nodestate.ts).
+    await mirrorNode(this.env.DB, id, { lastSeenAt: now, ...where }).catch((e) => console.error(`[${id}] ${e}`));
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws: WebSocket, msg: string | ArrayBuffer) {
     const now = Date.now();
-    const { use } = this.current(now);
-    if (use?.ws !== ws) return this.close(ws, NodeClose.replaced, "replaced by a newer connection");
+    const { alive } = this.current(now);
+    if (alive?.ws !== ws) return this.close(ws, NodeClose.replaced, "replaced by a newer connection");
     if (typeof msg !== "string" || msg.length > NODE_MESSAGE_MAX) return this.close(ws, NodeClose.badMessage, "messages are JSON text of at most 64 KiB");
     let parsed;
     try {
@@ -160,9 +164,10 @@ export class Node extends DurableObject<Env> {
       return this.close(ws, NodeClose.badMessage, `bad message: ${i?.path.join(".")}: ${i?.message}`);
     }
     const a = ws.deserializeAttachment() as Attachment;
-    ws.serializeAttachment({ ...a, lastMessageAt: now } satisfies Attachment);
-    const id = (await this.ctx.storage.get<string>("id"))!;
     const m = parsed.data;
+    if (!a.hello && m.type !== "hello") return this.close(ws, NodeClose.badMessage, "the first message on a connection is hello");
+    ws.serializeAttachment({ ...a, lastMessageAt: now, hello: a.hello || m.type === "hello" } satisfies Attachment);
+    const id = (await this.ctx.storage.get<string>("id"))!;
     switch (m.type) {
       case "hello": {
         if (m.protocol !== NODE_PROTOCOL) {
@@ -211,7 +216,7 @@ export class Node extends DurableObject<Env> {
     const a = ws.deserializeAttachment() as Attachment | null;
     if (!a || this.sockets().some((s) => s.ws !== ws && s.open && s.gen > a.gen)) return;
     const ping = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? null;
-    await this.wentOffline(lastSign({ ws, gen: a.gen, open: false, acceptedAt: a.acceptedAt, lastMessageAt: a.lastMessageAt, lastPingAt: ping }));
+    await this.wentOffline(lastSign({ ws, gen: a.gen, open: false, acceptedAt: a.acceptedAt, lastMessageAt: a.lastMessageAt, lastPingAt: ping, hello: a.hello === true }));
   }
 
   // Whether the node is online now, for listing (index.ts).

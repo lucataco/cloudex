@@ -11,6 +11,7 @@ const sock = (name: string, gen: number, o: Partial<ControlSocket<string>> = {})
   acceptedAt: NOW - 120_000,
   lastMessageAt: null,
   lastPingAt: NOW - 5_000,
+  hello: true,
   ...o,
 });
 
@@ -50,6 +51,23 @@ test("a socket counts as alive from its newest sign: accept, message or ping", (
   assert.equal(pick([sock("a", 1, { lastPingAt: NOW - ONLINE_WITHIN_MS })], NOW).online, false);
   assert.equal(pick([], NOW).online, false);
   assert.equal(pick([sock("a", 1, { open: false })], NOW).online, false);
+});
+
+test("a socket that hasn't said hello isn't online yet, and isn't closed for it", () => {
+  // Listing a node the moment it connects would show no protocol or facts.
+  const fresh = sock("new", 2, { acceptedAt: NOW - 100, lastPingAt: null, hello: false });
+  const r = pick([sock("old", 1), fresh], NOW);
+  assert.equal(r.online, false);
+  assert.equal(r.use, null);
+  assert.deepEqual(
+    r.close.map((s) => s.ws),
+    ["old"],
+  );
+  // One that never says hello goes once it's quiet, like any other.
+  assert.deepEqual(
+    pick([sock("mute", 1, { acceptedAt: NOW - 2 * ONLINE_WITHIN_MS, lastPingAt: null, hello: false })], NOW).close.map((s) => s.ws),
+    ["mute"],
+  );
 });
 
 test("the location hint splits continents the way Durable Object regions do", () => {

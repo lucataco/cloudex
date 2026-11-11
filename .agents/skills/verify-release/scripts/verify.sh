@@ -698,9 +698,16 @@ if want node; then
 					sleep 0.5
 				done
 				wait "$dpid"
-				OUT="deploy exit $(cat "$work/deploy.rc"), longest offline ${worst} s" CODE=""
+				# The Worker was replaced once deploy says "API deployed". A token
+				# without DNS Write (wrangler's own login has none) then fails the
+				# later preview DNS step, which has nothing to do with nodes: that
+				# counts as a deploy, and the detail says so.
+				drc=$(cat "$work/deploy.rc")
+				replaced=$(grep -q "API deployed at" "$work/deploy.log" && echo yes)
+				dns_only=$([ "$drc" != 0 ] && [ "$(grep -c '^error:' "$work/deploy.log")" = 1 ] && grep -q '^error: preview DNS record' "$work/deploy.log" && echo yes)
+				OUT="deploy exit $drc$([ -n "$dns_only" ] && echo " after installing the Worker, at the preview DNS record step"), longest offline ${worst} s" CODE=""
 				ok N07 "a cloudex deploy doesn't show the node offline for more than 5 s" \
-					[ "$(cat "$work/deploy.rc")" = 0 -a "$(awk -v w="$worst" 'BEGIN { print (w <= 5) }')" = 1 ]
+					[ "$replaced" = yes -a \( "$drc" = 0 -o "$dns_only" = yes \) -a "$(awk -v w="$worst" 'BEGIN { print (w <= 5) }')" = 1 ]
 			else
 				skip N07 "a cloudex deploy doesn't show the node offline for more than 5 s" "set VERIFY_NODE_DEPLOY=1 (and CLOUDFLARE_API_TOKEN) to redeploy during the check"
 			fi

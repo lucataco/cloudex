@@ -6,9 +6,11 @@
 //
 // - The node's socket is the newest open one by generation, never the first
 //   that getWebSockets() returns.
-// - It's online only while that socket's last sign of life (the agent's
-//   "ping", answered by auto-response without waking the object, or any
-//   message) is under 60 s old. The agent pings every 10 s.
+// - It's online only once the agent has said hello on that socket (so that
+//   anything listing it sees its protocol and facts), and only while the
+//   socket's last sign of life (the agent's "ping", answered by auto-response
+//   without waking the object, or any message) is under 60 s old. The agent
+//   pings every 10 s.
 
 export const ONLINE_WITHIN_MS = 60_000;
 
@@ -21,6 +23,8 @@ export type ControlSocket<W> = {
   acceptedAt: number;
   lastMessageAt: number | null;
   lastPingAt: number | null;
+  // Whether the agent said hello on it.
+  hello: boolean;
 };
 
 export function newest<W>(sockets: ControlSocket<W>[]): ControlSocket<W> | null {
@@ -34,11 +38,13 @@ export const lastSign = (s: ControlSocket<unknown>) => Math.max(s.acceptedAt, s.
 export const fresh = (s: ControlSocket<unknown>, now: number) => now - lastSign(s) < ONLINE_WITHIN_MS;
 
 // The socket to use and whether the node is online, and the sockets to close:
-// every open one but the newest, and the newest too once it's gone quiet.
+// every open one but the newest, and the newest too once it's gone quiet. A
+// newest socket that's alive but hasn't said hello yet is kept, not used.
 export function pick<W>(sockets: ControlSocket<W>[], now: number): { use: ControlSocket<W> | null; online: boolean; close: ControlSocket<W>[] } {
   const best = newest(sockets);
-  const online = best !== null && fresh(best, now);
-  const close = sockets.filter((s) => s.open && (s !== best || !online));
+  const alive = best !== null && fresh(best, now);
+  const online = alive && best.hello;
+  const close = sockets.filter((s) => s.open && (s !== best || !alive));
   return { use: online ? best : null, online, close };
 }
 
