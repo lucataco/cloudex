@@ -187,8 +187,12 @@ func (f *FakeAgent) Run(ctx context.Context) error {
 		defer cancel()
 		return c.Write(wctx, websocket.MessageText, b)
 	}
+	f.mu.Lock()
 	f.waiting = map[string]chan Tickets{}
-	f.sandbox = map[string]bool{}
+	if f.sandbox == nil { // kept across reconnects
+		f.sandbox = map[string]bool{}
+	}
+	f.mu.Unlock()
 	if err := f.send(HelloError(f.Version, probeFacts(4), fmt.Errorf("a probe, which lists no machines"))); err != nil {
 		return err
 	}

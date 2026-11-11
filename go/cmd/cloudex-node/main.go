@@ -494,8 +494,18 @@ func newProbe(state func() node.State) *cobra.Command {
 				},
 				Log: func(format string, args ...any) { fmt.Fprintf(cmd.ErrOrStderr(), format+"\n", args...) },
 			}
-			if err := f.Run(ctx); err != nil && ctx.Err() == nil {
-				return err
+			// Again after a drop (an edge reset ends a control socket now and
+			// then), as the real agent does, until --for is up.
+			for ctx.Err() == nil {
+				err := f.Run(ctx)
+				if ctx.Err() != nil {
+					break
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "connection ended (%v); connecting again\n", err)
+				select {
+				case <-ctx.Done():
+				case <-time.After(time.Second):
+				}
 			}
 			return nil
 		},

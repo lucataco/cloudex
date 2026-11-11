@@ -1619,6 +1619,16 @@ review_new() {
 	[[ $CODE == 0 && -n $RID ]]
 }
 machine_state() { node_sh "docker inspect $1 -f '{{.State.Status}}'" 2>/dev/null; }
+# node_root_once CMD: runs CMD as root on the host, again if the ssh path
+# dropped it (it says so with "done"); sets RAN to when it was sent.
+node_root_once() {
+	for _ in 1 2 3 4 5; do
+		RAN=$(now_s)
+		[[ $(node_sh "sudo $1 && echo done" 2>/dev/null | tail -1) == done ]] && return 0
+		sleep 2
+	done
+	return 1
+}
 # The agent's listening sockets on an address (dotted), from its network namespace.
 agent_listens_on() {
 	local hex
@@ -1642,7 +1652,7 @@ wait_stopped() {
 	local t0
 	t0=$(now_s)
 	while [[ $(awk -v w="$(since "$t0")" -v m="$2" 'BEGIN { print (w > m) }') == 0 ]]; do
-		[[ $(machine_state "$1") != running ]] && { since "$t0"; return 0; }
+		[[ $(machine_state "$1") =~ ^(exited|dead)$ ]] && { since "$t0"; return 0; }
 		sleep 0.5
 	done
 	return 1
@@ -1827,8 +1837,8 @@ node_review_host() {
 		"$CX" exec "$P-h3" -- "nohup python3 host-review.py reach 150 $host_ip:22 $gw:22 169.254.169.254:80 > /home/cloudex/reach.log 2>&1 &" >/dev/null 2>&1
 		fw_save 300
 		sleep 5
-		t1=$(now_s)
-		node_sh "sudo systemctl restart nftables"
+		node_root_once "systemctl restart nftables"
+		t1=$RAN
 		tb1=""
 		for _ in $(seq 1 80); do node_sh "sudo nft list table inet cloudex" >/dev/null 2>&1 && { tb1=$(since "$t1"); break; }; sleep 0.5; done
 		sleep 10
@@ -1844,8 +1854,8 @@ node_review_host() {
 			"$CX" exec "$P-h3" -- "nohup python3 host-review.py reach 90 $host_ip:22 $gw:22 > /home/cloudex/reach2.log 2>&1 &" >/dev/null 2>&1
 		fi
 		sleep 5
-		t2=$(now_s)
-		node_sh "sudo nft flush ruleset"
+		node_root_once "nft flush ruleset"
+		t2=$RAN
 		st2=$(wait_stopped "$RMC" 30)
 		tb2=""
 		for _ in $(seq 1 100); do node_sh "sudo nft list table inet cloudex" >/dev/null 2>&1 && { tb2=$(since "$t2"); break; }; sleep 0.5; done
