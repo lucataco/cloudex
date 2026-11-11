@@ -195,6 +195,15 @@ func (r *Runtime) SelfTest(ctx context.Context) *SelfTestReport {
 func (r *Runtime) Record(rep *SelfTestReport) {
 	r.factsMu.Lock()
 	r.report = rep
+	if rep.Error != "" {
+		// It couldn't run (the image is still being pulled, Docker was busy):
+		// no verdict, so the last one stands (unchecked at first), with the
+		// reason, and it runs again within a minute.
+		r.iso.Failed = []string{truncate("error: "+rep.Error, 200)}
+		r.factsMu.Unlock()
+		r.changed()
+		return
+	}
 	r.iso.CheckedAt = rep.At
 	r.iso.Failed = nil
 	if rep.Pass {
@@ -621,3 +630,10 @@ func (r *Runtime) MachineCheck(ctx context.Context) (string, error) {
 }
 
 var errNoRuntime = errors.New("this agent runs no machines: it has no machine pool (cloudex-node run --pool), or no Docker")
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}

@@ -157,17 +157,20 @@ func newRoot() *cobra.Command {
 
 	var asJSON bool
 	var wait time.Duration
+	var since int64
 	status := &cobra.Command{
 		Use:   "status",
 		Short: "Say whether the agent is connected; exits 1 when it isn't",
 		Long: "Say whether the agent is connected; exits 1 when it isn't. With --wait, waits up to\n" +
 			"that long for it to be connected and to have run its isolation self-test, then\n" +
-			"exits 0 if the self-test passed and 2 if it failed (the installer's step 5).",
+			"exits 0 if the self-test passed and 2 if it failed (the installer's step 5). With\n" +
+			"--since, only a self-test from that time on counts (unix ms): the status file may\n" +
+			"still hold the result of an agent this one replaced.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			s := state()
 			if wait > 0 {
-				return waitReady(cmd, s, wait)
+				return waitReady(cmd, s, wait, since)
 			}
 			id, err := s.Identity()
 			if err != nil {
@@ -203,6 +206,7 @@ func newRoot() *cobra.Command {
 	}
 	status.Flags().BoolVar(&asJSON, "json", false, "print JSON")
 	status.Flags().DurationVar(&wait, "wait", 0, "wait this long for the connection and the self-test's result")
+	status.Flags().Int64Var(&since, "since", 0, "with --wait, count only a self-test from this time on (unix ms)")
 
 	root.AddCommand(join, run, status, newProbe(state), newFirewall(), newPickPool(), newSelfTest(state, &dockerSocket))
 	return root
@@ -228,7 +232,7 @@ func doJoin(ctx context.Context, s node.State, apiURL, token string, unisolated 
 }
 
 // waitReady is status --wait.
-func waitReady(cmd *cobra.Command, s node.State, wait time.Duration) error {
+func waitReady(cmd *cobra.Command, s node.State, wait time.Duration, since int64) error {
 	out := cmd.OutOrStdout()
 	deadline := time.Now().Add(wait)
 	said := ""
@@ -237,7 +241,7 @@ func waitReady(cmd *cobra.Command, s node.State, wait time.Duration) error {
 		st, _ := s.ReadStatus()
 		up := id != nil && st != nil && alive(st.PID) && st.Connected && time.Since(time.UnixMilli(st.LastPongAt)) < node.PongDead
 		iso := (*node.Isolation)(nil)
-		if st != nil {
+		if st != nil && st.Isolation != nil && st.Isolation.CheckedAt >= since {
 			iso = st.Isolation
 		}
 		switch {

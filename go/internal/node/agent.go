@@ -503,11 +503,36 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 			a.logf("ignoring a message it doesn't know: %.200s", data)
 			continue
 		}
-		go func() {
-			if err := send(a.answer(op)); err != nil {
-				a.logf("answering %s %s: %v", op.Name, op.ID, err)
+		go a.reply(op, a.answer(op))
+	}
+}
+
+// AnswerFor is how long the agent keeps trying to deliver an op's answer
+// after the connection it came on dropped (v0.2.2 M5).
+var AnswerFor = 30 * time.Second
+
+// reply sends an op's answer on the control connection that's up now, which
+// may be a newer one than the op came on: a reconnect while a start or create
+// runs (an edge reset, a deploy) mustn't lose the answer, which the Node
+// object still waits for. Op ids are unique, so an answer the Node object
+// isn't waiting for any more is dropped there.
+func (a *Agent) reply(op Op, r Result) {
+	deadline := time.Now().Add(AnswerFor)
+	for {
+		a.ctlMu.Lock()
+		send := a.ctlSend
+		a.ctlMu.Unlock()
+		err := errors.New("not connected")
+		if send != nil {
+			if err = send(r); err == nil {
+				return
 			}
-		}()
+		}
+		if time.Now().After(deadline) || a.runCtx == nil || a.runCtx.Err() != nil {
+			a.logf("answering %s %s: %v", op.Name, op.ID, err)
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 

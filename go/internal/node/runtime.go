@@ -303,6 +303,24 @@ func (r *Runtime) container(ctx context.Context, sandbox string) (*ContainerDeta
 	return r.Docker.ContainerInspect(ctx, cs[0].ID)
 }
 
+// VerdictWait is how long create and start wait for the agent's first
+// self-test, which runs when it starts and takes about 20 s, so that a
+// sandbox resumed just after the agent restarted isn't refused (v0.2.2 M5).
+var VerdictWait = 60 * time.Second
+
+// awaitVerdict waits, up to VerdictWait, until the self-test has a verdict.
+func (r *Runtime) awaitVerdict(ctx context.Context) {
+	deadline := time.Now().Add(VerdictWait)
+	for time.Now().Before(deadline) {
+		r.factsMu.Lock()
+		checked := r.Unisolated || r.iso.Firewall == "pass" || r.iso.Firewall == "fail"
+		r.factsMu.Unlock()
+		if checked || sleepCtx(ctx, 250*time.Millisecond) != nil {
+			return
+		}
+	}
+}
+
 // isolated refuses machines while the self-test doesn't pass, unless the
 // node joined with --unisolated (for testing only).
 func (r *Runtime) isolated() error {
@@ -340,6 +358,7 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 	if !sandboxID.MatchString(req.Sandbox) {
 		return nil, errors.New("not a sandbox id")
 	}
+	r.awaitVerdict(ctx)
 	if err := r.isolated(); err != nil {
 		return nil, err
 	}
@@ -475,6 +494,7 @@ func (r *Runtime) Start(ctx context.Context, sandbox string) (*MachineInfo, erro
 	if err := r.ready(); err != nil {
 		return nil, err
 	}
+	r.awaitVerdict(ctx)
 	if err := r.isolated(); err != nil {
 		return nil, err
 	}

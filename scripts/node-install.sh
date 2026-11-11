@@ -256,6 +256,7 @@ if docker container inspect "$NAME" >/dev/null 2>&1; then
 fi
 DROOT=$(docker info -f '{{.DockerRootDir}}')
 say "starting the agent"
+STARTED_MS=$(($(date +%s) * 1000))
 docker run -d --name "$NAME" --restart unless-stopped --label build.cloudex.agent=1 \
 	--network "$NAME" \
 	--sysctl net.ipv4.ip_forward=0 --sysctl net.ipv4.conf.all.rp_filter=1 --sysctl net.ipv4.conf.default.rp_filter=1 \
@@ -272,7 +273,9 @@ docker run -d --name "$NAME" --restart unless-stopped --label build.cloudex.agen
 
 # ---------------------------------------------------------------- 5. online, isolated
 say "waiting for the agent to connect and pass its isolation self-test (it pulls the machine image first)"
-if ! docker exec "$NAME" cloudex-node status --wait 600s; then
+# Only a self-test of this agent counts: the status file in the volume may
+# still hold the result of the agent it replaced.
+if ! docker exec "$NAME" cloudex-node status --wait 600s --since "$STARTED_MS"; then
 	docker logs --tail 20 "$NAME" >&2 || true
 	if [[ $UNISOLATED == 1 ]]; then
 		warn "as expected without the firewall, the self-test fails; machines still run, because the node joined --unisolated"

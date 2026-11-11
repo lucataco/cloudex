@@ -328,3 +328,35 @@ func statFile(p string) (os.FileMode, error) {
 	}
 	return fi.Mode().Perm(), nil
 }
+
+func TestAnOpsAnswerGoesOnTheConnectionThatsUpWhenItsReady(t *testing.T) {
+	// A start that runs while the connection drops and comes back (an edge
+	// reset): its answer goes on the new connection, which the Node object
+	// still waits on, not on the one the op came on.
+	a := &Agent{runCtx: context.Background()}
+	failing := func(any) error { return errors.New("failed to write msg: the old connection") }
+	a.ctlSend = failing
+	got := make(chan Result, 1)
+	done := make(chan struct{})
+	go func() {
+		a.reply(Op{ID: "op-1", Name: "start"}, Result{Type: "result", ID: "op-1", OK: true})
+		close(done)
+	}()
+	time.Sleep(300 * time.Millisecond)
+	a.ctlMu.Lock()
+	a.ctlSend = nil // between connections
+	a.ctlMu.Unlock()
+	time.Sleep(300 * time.Millisecond)
+	a.ctlMu.Lock()
+	a.ctlSend = func(v any) error { got <- v.(Result); return nil }
+	a.ctlMu.Unlock()
+	select {
+	case r := <-got:
+		if r.ID != "op-1" || !r.OK {
+			t.Fatalf("answer %+v", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer never went")
+	}
+	<-done
+}

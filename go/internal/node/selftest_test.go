@@ -60,3 +60,24 @@ func TestAFailedReportNamesItsChecks(t *testing.T) {
 		t.Fatalf("%v", f)
 	}
 }
+
+func TestASelfTestThatCouldntRunIsNoVerdict(t *testing.T) {
+	r := &Runtime{}
+	// First, while the image is still being pulled: still unchecked (empty
+	// here, which Facts reports as unchecked), with why.
+	r.Record(&SelfTestReport{At: 1, Error: "the machine image: pulling x"})
+	f := Facts{Isolation: r.iso}
+	if f.Isolation.Firewall != "" || len(f.Isolation.Failed) != 1 || !strings.Contains(f.Isolation.Failed[0], "pulling") || f.Isolation.CheckedAt != 0 {
+		t.Fatalf("after an error first: %+v", f.Isolation)
+	}
+	if err := r.isolated(); err == nil || !strings.Contains(err.Error(), "hasn't finished") {
+		t.Fatalf("machines while unchecked: %v", err)
+	}
+	r.Record(&SelfTestReport{At: 2, Pass: true})
+	// A later error keeps the pass it had.
+	r.Record(&SelfTestReport{At: 3, Error: "Docker didn't answer"})
+	f = Facts{Isolation: r.iso}
+	if f.Isolation.Firewall != "pass" || f.Isolation.CheckedAt != 2 {
+		t.Fatalf("after a pass, then an error: %+v", f.Isolation)
+	}
+}
