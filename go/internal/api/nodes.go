@@ -61,18 +61,18 @@ type NewNode struct {
 
 func (c *Client) CreateNode(ctx context.Context, name string) (*NewNode, error) {
 	var n NewNode
-	return &n, c.do(ctx, http.MethodPost, "/v1/nodes", map[string]string{"name": name}, &n)
+	return &n, c.doShort(ctx, http.MethodPost, "/v1/nodes", map[string]string{"name": name}, &n)
 }
 
 func (c *Client) ListNodes(ctx context.Context) ([]Node, error) {
 	var ns []Node
-	return ns, c.do(ctx, http.MethodGet, "/v1/nodes", nil, &ns)
+	return ns, c.doShort(ctx, http.MethodGet, "/v1/nodes", nil, &ns)
 }
 
 // GetNode takes a name or an id.
 func (c *Client) GetNode(ctx context.Context, ref string) (*Node, error) {
 	var n Node
-	return &n, c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(ref), nil, &n)
+	return &n, c.doShort(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(ref), nil, &n)
 }
 
 // DeleteNode revokes a node, or forgets one that is revoked or never joined.

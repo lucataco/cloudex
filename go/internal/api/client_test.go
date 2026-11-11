@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeURL(t *testing.T) {
@@ -97,5 +98,51 @@ func TestAnHTMLErrorPageNamesTheStatusOnce(t *testing.T) {
 		if err == nil || err.Error() != want {
 			t.Errorf("page %q: got %v, want %q", page, err, want)
 		}
+	}
+}
+
+// 2026-11-12 review, W3: what a node wrote reaches the terminal without its
+// control characters.
+func TestAnAPIErrorLosesItsControlCharacters(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte(`{"error":"node vm: the self-test failed\u001b[2J\u001b]0;pwned\u0007 here‮\nsecond line\ttab"}`))
+	}))
+	defer srv.Close()
+	_, err := New(srv.URL, "k").Get(context.Background(), "x")
+	var ae *Error
+	if !errors.As(err, &ae) {
+		t.Fatalf("%v", err)
+	}
+	if strings.ContainsAny(ae.Message, "\x1b\x07‮") || !strings.Contains(ae.Message, "\nsecond line\ttab") {
+		t.Fatalf("%q", ae.Message)
+	}
+}
+
+// 2026-11-12 review, R2: a request for the deployment's records that gets no
+// answer ends; one that starts something in a sandbox may take longer.
+func TestARecordRequestTimesOutButAStartDoesNot(t *testing.T) {
+	old := ShortTimeout
+	ShortTimeout = 300 * time.Millisecond
+	defer func() { ShortTimeout = old }()
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/sandboxes" && r.Method == http.MethodPost {
+			time.Sleep(time.Second)
+			w.Write([]byte(`{"id":"cx-abc123","state":"running"}`))
+			return
+		}
+		<-hold // a connection a deploy cut without closing it
+	}))
+	defer srv.Close()
+	defer close(hold)
+	c := New(srv.URL, "k")
+	t0 := time.Now()
+	_, err := c.ListNodes(context.Background())
+	if err == nil || time.Since(t0) > 5*time.Second || !strings.Contains(err.Error(), "didn't answer within") {
+		t.Fatalf("after %v: %v", time.Since(t0), err)
+	}
+	if s, err := c.Create(context.Background(), CreateRequest{}); err != nil || s.ID != "cx-abc123" {
+		t.Fatalf("a create that takes longer than ShortTimeout: %v", err)
 	}
 }

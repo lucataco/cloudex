@@ -178,6 +178,26 @@ func NormalizeURL(u string) string {
 	return scheme + "://" + host + path
 }
 
+// ShortTimeout bounds the requests that only read or change the
+// deployment's own records (lists, info, tokens, nodes, keys, links): the API
+// answers them in well under a second, so one that hasn't answered in this
+// long was cut without being closed (a deploy, an edge reset), which would
+// otherwise hang the CLI (2026-11-12 review, R2: cloudex node list waited
+// nine minutes during a deploy). Anything that starts, stops, saves or runs
+// something in a sandbox, and every streamed call, has no such limit.
+var ShortTimeout = 60 * time.Second
+
+// doShort is do within ShortTimeout, unless ctx ends sooner.
+func (c *Client) doShort(ctx context.Context, method, path string, body, out any) error {
+	sctx, cancel := context.WithTimeout(ctx, ShortTimeout)
+	defer cancel()
+	err := c.do(sctx, method, path, body, out)
+	if err != nil && ctx.Err() == nil && errors.Is(sctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("the Cloudex API at %s didn't answer within %v; try again (a deploy may have cut the connection)", c.BaseURL, ShortTimeout)
+	}
+	return err
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var rd io.Reader
 	if body != nil {
@@ -236,7 +256,24 @@ func (c *Client) failure(ctx context.Context, res *http.Response, data []byte) *
 		}
 		e.Error += ": update it with cloudex deploy"
 	}
-	return &Error{Status: res.StatusCode, Message: e.Error}
+	return &Error{Status: res.StatusCode, Message: CleanText(e.Error)}
+}
+
+// CleanText keeps text from the deployment, some of which a node wrote (its
+// self-test's findings, its agent's errors), from moving the terminal's
+// cursor, changing its colors or reordering what's shown: control characters
+// other than newline and tab, and bidirectional overrides, become "?"
+// (2026-11-12 review, W3). The Worker strips them too; this doesn't trust it.
+func CleanText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\t':
+			return r
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0), r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
+			return '?'
+		}
+		return r
+	}, s)
 }
 
 var htmlTitle = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
@@ -268,7 +305,7 @@ func plainError(status, body string) string {
 
 func (c *Client) Health(ctx context.Context) (*Health, error) {
 	var h Health
-	return &h, c.do(ctx, http.MethodGet, "/v1/health", nil, &h)
+	return &h, c.doShort(ctx, http.MethodGet, "/v1/health", nil, &h)
 }
 
 func (c *Client) Create(ctx context.Context, r CreateRequest) (*Sandbox, error) {
@@ -278,12 +315,12 @@ func (c *Client) Create(ctx context.Context, r CreateRequest) (*Sandbox, error) 
 
 func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 	var s []Sandbox
-	return s, c.do(ctx, http.MethodGet, "/v1/sandboxes", nil, &s)
+	return s, c.doShort(ctx, http.MethodGet, "/v1/sandboxes", nil, &s)
 }
 
 func (c *Client) Get(ctx context.Context, ref string) (*Sandbox, error) {
 	var s Sandbox
-	return &s, c.do(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref), nil, &s)
+	return &s, c.doShort(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref), nil, &s)
 }
 
 func (c *Client) Stop(ctx context.Context, ref string) (*Sandbox, error) {
@@ -318,7 +355,7 @@ type UpdateRequest struct {
 
 func (c *Client) Update(ctx context.Context, ref string, r UpdateRequest) (*Sandbox, error) {
 	var s Sandbox
-	return &s, c.do(ctx, http.MethodPatch, "/v1/sandboxes/"+url.PathEscape(ref), r, &s)
+	return &s, c.doShort(ctx, http.MethodPatch, "/v1/sandboxes/"+url.PathEscape(ref), r, &s)
 }
 
 // ForkRequest asks for Count new sandboxes starting from a copy of another's
@@ -377,16 +414,16 @@ func (c *Client) SaveAs(ctx context.Context, ref, name string) (*Save, error) {
 
 func (c *Client) ListSaves(ctx context.Context) ([]Save, error) {
 	var saves []Save
-	return saves, c.do(ctx, http.MethodGet, "/v1/saves", nil, &saves)
+	return saves, c.doShort(ctx, http.MethodGet, "/v1/saves", nil, &saves)
 }
 
 func (c *Client) GetSave(ctx context.Context, name string) (*Save, error) {
 	var s Save
-	return &s, c.do(ctx, http.MethodGet, savePath(name), nil, &s)
+	return &s, c.doShort(ctx, http.MethodGet, savePath(name), nil, &s)
 }
 
 func (c *Client) DeleteSave(ctx context.Context, name string) error {
-	return c.do(ctx, http.MethodDelete, savePath(name), nil, nil)
+	return c.doShort(ctx, http.MethodDelete, savePath(name), nil, nil)
 }
 
 // StartFromSave starts sandboxes from a named save, with the options of a
@@ -398,7 +435,7 @@ func (c *Client) StartFromSave(ctx context.Context, name string, r ForkRequest) 
 
 func (c *Client) Settings(ctx context.Context, ref string) (*Settings, error) {
 	var st Settings
-	return &st, c.do(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/settings", nil, &st)
+	return &st, c.doShort(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/settings", nil, &st)
 }
 
 func (c *Client) UpdateSettings(ctx context.Context, ref string, ch SettingsChange) (*Settings, error) {
@@ -415,16 +452,16 @@ type ProviderKey struct {
 
 func (c *Client) ListKeys(ctx context.Context) ([]ProviderKey, error) {
 	var keys []ProviderKey
-	return keys, c.do(ctx, http.MethodGet, "/v1/keys", nil, &keys)
+	return keys, c.doShort(ctx, http.MethodGet, "/v1/keys", nil, &keys)
 }
 
 func (c *Client) SetKey(ctx context.Context, provider, key string) (*ProviderKey, error) {
 	var k ProviderKey
-	return &k, c.do(ctx, http.MethodPut, "/v1/keys/"+url.PathEscape(provider), map[string]string{"key": key}, &k)
+	return &k, c.doShort(ctx, http.MethodPut, "/v1/keys/"+url.PathEscape(provider), map[string]string{"key": key}, &k)
 }
 
 func (c *Client) DeleteKey(ctx context.Context, provider string) error {
-	return c.do(ctx, http.MethodDelete, "/v1/keys/"+url.PathEscape(provider), nil, nil)
+	return c.doShort(ctx, http.MethodDelete, "/v1/keys/"+url.PathEscape(provider), nil, nil)
 }
 
 func (c *Client) Delete(ctx context.Context, ref string) error {
@@ -459,7 +496,7 @@ type HostLink struct {
 
 func (c *Client) Links(ctx context.Context, ref string) ([]HostLink, error) {
 	var out []HostLink
-	return out, c.do(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/hosts", nil, &out)
+	return out, c.doShort(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/hosts", nil, &out)
 }
 
 // RevokedLinks says which ports' links were revoked; All is every link to
@@ -476,7 +513,7 @@ func (c *Client) RevokeLinks(ctx context.Context, ref string, port int) (*Revoke
 		path += "/" + strconv.Itoa(port)
 	}
 	var out RevokedLinks
-	return &out, c.do(ctx, http.MethodDelete, path, nil, &out)
+	return &out, c.doShort(ctx, http.MethodDelete, path, nil, &out)
 }
 
 // Desktop is where a sandbox's desktop is served: the viewer page is Path on
@@ -598,12 +635,12 @@ func (c *Client) StartAgent(ctx context.Context, ref string, r StartAgentRequest
 
 func (c *Client) ListAgents(ctx context.Context, ref string) ([]Agent, error) {
 	var list []Agent
-	return list, c.do(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/agents", nil, &list)
+	return list, c.doShort(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/agents", nil, &list)
 }
 
 func (c *Client) GetAgent(ctx context.Context, ref, id string) (*Agent, error) {
 	var a Agent
-	return &a, c.do(ctx, http.MethodGet, agentPath(ref, id), nil, &a)
+	return &a, c.doShort(ctx, http.MethodGet, agentPath(ref, id), nil, &a)
 }
 
 // AgentEvents returns the events after seq after. With wait (at most 60

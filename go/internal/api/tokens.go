@@ -44,21 +44,21 @@ type Me struct {
 
 func (c *Client) Me(ctx context.Context) (*Me, error) {
 	var m Me
-	return &m, c.do(ctx, http.MethodGet, "/v1/me", nil, &m)
+	return &m, c.doShort(ctx, http.MethodGet, "/v1/me", nil, &m)
 }
 
 func (c *Client) CreateToken(ctx context.Context, r CreateTokenRequest) (*NewToken, error) {
 	var t NewToken
-	return &t, c.do(ctx, http.MethodPost, "/v1/tokens", r, &t)
+	return &t, c.doShort(ctx, http.MethodPost, "/v1/tokens", r, &t)
 }
 
 func (c *Client) ListTokens(ctx context.Context) ([]Token, error) {
 	var ts []Token
-	return ts, c.do(ctx, http.MethodGet, "/v1/tokens", nil, &ts)
+	return ts, c.doShort(ctx, http.MethodGet, "/v1/tokens", nil, &ts)
 }
 
 func (c *Client) RevokeToken(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/v1/tokens/"+url.PathEscape(id), nil, nil)
+	return c.doShort(ctx, http.MethodDelete, "/v1/tokens/"+url.PathEscape(id), nil, nil)
 }
 
 // DeviceCode is the start of a device login (RFC 8628).
@@ -135,17 +135,17 @@ func (c *Client) PollDeviceLogin(ctx context.Context, deviceCode string) (*Devic
 
 func (c *Client) ListDeviceLogins(ctx context.Context) ([]DeviceRequest, error) {
 	var rs []DeviceRequest
-	return rs, c.do(ctx, http.MethodGet, "/v1/auth/device", nil, &rs)
+	return rs, c.doShort(ctx, http.MethodGet, "/v1/auth/device", nil, &rs)
 }
 
 func (c *Client) ApproveDeviceLogin(ctx context.Context, r DeviceApproveRequest) (*DeviceRequest, error) {
 	var d DeviceRequest
-	return &d, c.do(ctx, http.MethodPost, "/v1/auth/device/approve", r, &d)
+	return &d, c.doShort(ctx, http.MethodPost, "/v1/auth/device/approve", r, &d)
 }
 
 func (c *Client) DenyDeviceLogin(ctx context.Context, userCode string) (*DeviceRequest, error) {
 	var d DeviceRequest
-	return &d, c.do(ctx, http.MethodPost, "/v1/auth/device/deny", map[string]string{"user_code": userCode}, &d)
+	return &d, c.doShort(ctx, http.MethodPost, "/v1/auth/device/deny", map[string]string{"user_code": userCode}, &d)
 }
 
 // LoginLink is a one-time link that signs a browser in to the dashboard.
@@ -158,5 +158,5 @@ type LoginLink struct {
 // a browser in as this client, once, within ExpiresIn seconds.
 func (c *Client) LoginLink(ctx context.Context, path string) (*LoginLink, error) {
 	var l LoginLink
-	return &l, c.do(ctx, http.MethodPost, "/v1/auth/links", map[string]string{"path": path}, &l)
+	return &l, c.doShort(ctx, http.MethodPost, "/v1/auth/links", map[string]string{"path": path}, &l)
 }
