@@ -403,7 +403,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		switch code {
 		case CloseRevoked:
 			d = RevokedWait
-			why = "this node was removed from the deployment (cloudex node rm); its key no longer works. Add it again with cloudex node add, then join with the new token"
+			why = "this node was removed from the deployment (cloudex node rm); its key no longer works. Uninstall the agent (node-install.sh --uninstall), then add the node again with cloudex node add and run the installer it prints"
 			a.revoked(ctx, why)
 		case CloseReplaced:
 			d = ReplacedWait
