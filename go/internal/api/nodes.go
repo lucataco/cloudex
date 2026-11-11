@@ -4,7 +4,12 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"time"
 )
+
+// ForceNodeTimeout is what cloudex node rm --force waits beyond ShortTimeout:
+// an online node's machines are removed first, each within 90 s.
+var ForceNodeTimeout = 2 * time.Minute
 
 // Node is a user's own host that runs sandboxes (packages/schema/src/node.ts).
 type Node struct {
@@ -83,5 +88,10 @@ func (c *Client) DeleteNode(ctx context.Context, ref string, force bool) (map[st
 		path += "?force=1"
 	}
 	var out map[string]string
-	return out, c.do(ctx, http.MethodDelete, path, nil, &out)
+	if !force {
+		return out, c.doShort(ctx, http.MethodDelete, path, nil, &out)
+	}
+	// With force, an online node first removes its sandboxes' machines,
+	// each within 90 s (index.ts), so that has longer (review R2).
+	return out, c.doWithin(ctx, ShortTimeout+ForceNodeTimeout, http.MethodDelete, path, nil, &out)
 }

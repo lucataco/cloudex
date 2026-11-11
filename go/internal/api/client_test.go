@@ -146,3 +146,43 @@ func TestARecordRequestTimesOutButAStartDoesNot(t *testing.T) {
 		t.Fatalf("a create that takes longer than ShortTimeout: %v", err)
 	}
 }
+
+// Review R2: removing a node gets an answer within ShortTimeout, or with
+// --force (which removes its machines first) a little longer; it never hangs.
+func TestDeleteNodeTimesOut(t *testing.T) {
+	old, oldForce := ShortTimeout, ForceNodeTimeout
+	ShortTimeout, ForceNodeTimeout = 200*time.Millisecond, 200*time.Millisecond
+	defer func() { ShortTimeout, ForceNodeTimeout = old, oldForce }()
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-hold // a connection a deploy cut without closing it
+	}))
+	defer srv.Close()
+	defer close(hold)
+	c := New(srv.URL, "k")
+	for _, force := range []bool{false, true} {
+		t0 := time.Now()
+		_, err := c.DeleteNode(context.Background(), "vm", force)
+		if err == nil || time.Since(t0) > 5*time.Second || !strings.Contains(err.Error(), "didn't answer within") {
+			t.Fatalf("force %v, after %v: %v", force, time.Since(t0), err)
+		}
+	}
+}
+
+// Review W3: CleanText keeps newlines, tabs and ordinary text, and makes
+// every other control character and bidirectional override a "?".
+func TestCleanText(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                            "",
+		"plain text, ünïcode and 日本語": "plain text, ünïcode and 日本語",
+		"two\nlines\tand a tab":       "two\nlines\tand a tab",
+		"\x1b[2Jcleared\x07":          "?[2Jcleared?",
+		"\r\x00\x7f\u0085\u009b":      "?????",
+		"abc‮def⁦x⁩‪":                 "abc?def?x??",
+		"  and ​ stay":                "  and ​ stay",
+	} {
+		if got := CleanText(in); got != want {
+			t.Errorf("CleanText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

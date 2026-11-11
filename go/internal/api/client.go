@@ -189,11 +189,16 @@ var ShortTimeout = 60 * time.Second
 
 // doShort is do within ShortTimeout, unless ctx ends sooner.
 func (c *Client) doShort(ctx context.Context, method, path string, body, out any) error {
-	sctx, cancel := context.WithTimeout(ctx, ShortTimeout)
+	return c.doWithin(ctx, ShortTimeout, method, path, body, out)
+}
+
+// doWithin is do within limit, unless ctx ends sooner.
+func (c *Client) doWithin(ctx context.Context, limit time.Duration, method, path string, body, out any) error {
+	sctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	err := c.do(sctx, method, path, body, out)
 	if err != nil && ctx.Err() == nil && errors.Is(sctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("the Cloudex API at %s didn't answer within %v; try again (a deploy may have cut the connection)", c.BaseURL, ShortTimeout)
+		return fmt.Errorf("the Cloudex API at %s didn't answer within %v; try again (a deploy may have cut the connection)", c.BaseURL, limit)
 	}
 	return err
 }
