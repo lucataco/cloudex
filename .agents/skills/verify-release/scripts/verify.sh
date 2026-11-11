@@ -1547,6 +1547,71 @@ forged-source 000"
 	"$CX" delete "$S6" --yes >/dev/null 2>&1
 }
 
+# ---- node_review_worker: the 2026-11-12 review's Worker checks (W1, W2), N55-N56.
+# Misbehaving agents, run with the node's own key while its agent is stopped
+# (go/internal/node/probe_flood.go): N55 floods the control socket, N56 plays
+# a node whose streams send past their credit, on a channel nothing reads,
+# and down an ssh splice nobody reads. Needs the node installed ($N online)
+# and $AIMG; starts the agent again at the end. With CLOUDFLARE_API_TOKEN,
+# N55 also counts D1's write queries in the flood's minutes (analytics).
+REVIEW_WORKER_CHECKS=("N55 a node that floods its control socket (facts, state and ticket requests for a sandbox that isn't its own, then a second hello) is cut off: no tickets for another's sandbox, the second hello closes the socket, and D1 sees at most a few writes"
+	"N56 a node whose streams misbehave is cut off without the Sandbox object buffering it: an exec's output past its credit, a frame on a channel nothing reads, and an ssh splice nobody reads each close with 4400")
+review_worker_skip() { for c in "${REVIEW_WORKER_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
+review_desc() { for c in "${REVIEW_WORKER_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
+d1_writes() {
+	local acc db q
+	acc=$(curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id')
+	db=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$acc/d1/database?name=cloudex" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].uuid')
+	q='query($acc:String!,$db:String!,$from:Time!,$to:Time!){viewer{accounts(filter:{accountTag:$acc}){d1AnalyticsAdaptiveGroups(limit:1000,filter:{databaseId:$db,datetimeMinute_geq:$from,datetimeMinute_leq:$to}){sum{writeQueries}}}}}'
+	jq -n --arg q "$q" --arg acc "$acc" --arg db "$db" --arg from "$1" --arg to "$2" '{query:$q, variables:{acc:$acc, db:$db, from:$from, to:$to}}' |
+		curl -s https://api.cloudflare.com/client/v4/graphql -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' --data @- |
+		jq -r '[.data.viewer.accounts[0].d1AnalyticsAdaptiveGroups[]?.sum.writeQueries] | add // 0'
+}
+node_review_worker() {
+	local other f55 t0 t1 w55 fk s56 l56 ov ch sp
+	if [[ $(node_state "$N") != online ]]; then
+		review_worker_skip "the node isn't online"
+		return
+	fi
+	# N55: 300 of each, for a sandbox id that's no sandbox of this node's.
+	kill_agent
+	wait_state "$N" offline 75 >/dev/null
+	other=cx-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)
+	t0=$(date -u +%Y-%m-%dT%H:%M:00Z)
+	f55=$(probe flood --other "$other" --count 300)
+	t1=$(date -u -v+1M +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d '+1 min' +%Y-%m-%dT%H:%M:00Z)
+	w55="not counted (no CLOUDFLARE_API_TOKEN)"
+	if [[ -n ${CLOUDFLARE_API_TOKEN:-} ]]; then
+		sleep 150 # the analytics lag
+		w55=$(d1_writes "$t0" "$t1")
+	fi
+	OUT="flood: ${f55:-nothing}; D1 write queries in $t0..$t1: $w55" CODE=""
+	ok N55 "$(review_desc N55)" [ "$(jq -r .ticketsGiven <<<"$f55")" = 0 -a -n "$(jq -r .ticketError <<<"$f55" | grep "isn't a sandbox on this node")" \
+		-a "$(jq -r .secondHello <<<"$f55")" = 4400 -a \( -z "${CLOUDFLARE_API_TOKEN:-}" -o "${w55:-999}" -le 30 \) ]
+	# N56: the fake agent, with the node's identity, and a sandbox on it.
+	fk=$P-fake
+	node_sh "docker run -d --rm --name $fk -v cloudex-node:/var/lib/cloudex-node $AIMG probe fake-agent --splice --for 8m" >/dev/null 2>&1
+	wait_state "$N" online 30 >/dev/null
+	cx new --on "$N" --name "$P-n56" --no-use
+	s56=$(field .state)
+	if [[ $s56 == running ]]; then
+		(timeout 90 "$CX" exec "$P-n56" -- cx-flood-overrun | sleep 45) >/dev/null 2>&1
+		timeout 30 "$CX" exec "$P-n56" -- cx-flood-channel >/dev/null 2>&1
+		(sleep 60 | timeout 60 "$CX" proxy "$P-n56" 22 | sleep 55) >/dev/null 2>&1
+	fi
+	sleep 3
+	l56=$(node_sh "docker logs $fk 2>/dev/null" | grep '^{')
+	"$CX" delete "$P-n56" --yes >/dev/null 2>&1
+	node_sh "docker rm -f $fk" >/dev/null 2>&1
+	start_agent
+	wait_state "$N" online 30 >/dev/null
+	ov=$(jq -c 'select(.kind == "overrun")' <<<"$l56" | head -1) ch=$(jq -c 'select(.kind == "channel")' <<<"$l56" | head -1) sp=$(jq -c 'select(.kind == "splice")' <<<"$l56" | head -1)
+	OUT="sandbox on the fake agent: ${s56:-none} ${ERR:0:120}; overrun $ov; channel $ch; splice $sp" CODE=""
+	ok N56 "$(review_desc N56)" [ "$(jq -r .closeCode <<<"$ov")" = 4400 -a "$(jq -r '.sentBytes < 32*1048576' <<<"$ov")" = true \
+		-a "$(jq -r .closeCode <<<"$ch")" = 4400 -a "$(jq -r .closeCode <<<"$sp")" = 4400 -a "$(jq -r '.sentBytes < 64*1048576' <<<"$sp")" = true ]
+}
+# ---- end node_review_worker
+
 if want node; then
 	if [[ -z ${VERIFY_NODE_SSH:-} ]]; then
 		skip N00 "the node area" "set VERIFY_NODE_SSH to a command that runs a command on a host for the agent, such as 'ssh box'"

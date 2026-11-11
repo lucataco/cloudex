@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -421,6 +422,75 @@ func newProbe(state func() node.State) *cobra.Command {
 	}
 	join.Flags().StringVar(&apiURL, "api", "", "the deployment's URL")
 	join.Flags().StringVar(&token, "token", "", "the join token")
-	probe.AddCommand(connect, join, stream)
+	// 2026-11-12 review, W1 and W2: misbehaving agents (probe_flood.go).
+	var other string
+	var count int
+	flood := &cobra.Command{
+		Use:   "flood",
+		Short: "Connect as the node and flood the control socket: facts, state and ticket requests for --other (a sandbox not on this node), --count of each, then a second hello; print what the deployment did, as JSON",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			s := state()
+			id, err := s.Identity()
+			if err != nil || id == nil {
+				return fmt.Errorf("not joined: %v", err)
+			}
+			key, err := s.Key()
+			if err != nil {
+				return err
+			}
+			rep, err := node.ProbeFlood(cmd.Context(), id.APIURL, id.ID, key, version, other, count)
+			if err != nil {
+				return err
+			}
+			b, _ := json.Marshal(rep)
+			fmt.Fprintln(cmd.OutOrStdout(), string(b))
+			return nil
+		},
+	}
+	flood.Flags().StringVar(&other, "other", "", "a sandbox id that isn't on this node")
+	flood.Flags().IntVar(&count, "count", 500, "how many of each message")
+
+	var splice bool
+	var runFor time.Duration
+	var spliceMax, overrunMax int64
+	fake := &cobra.Command{
+		Use:   "fake-agent",
+		Short: "Run as the node's agent without machines, answering create and start, with execs of cx-flood-overrun and cx-flood-channel (and with --splice, ssh) flooding their streams; print one JSON line per flood",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			s := state()
+			id, err := s.Identity()
+			if err != nil || id == nil {
+				return fmt.Errorf("not joined: %v", err)
+			}
+			key, err := s.Key()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), runFor)
+			defer cancel()
+			var mu sync.Mutex
+			out := cmd.OutOrStdout()
+			f := &node.FakeAgent{API: id.APIURL, NodeID: id.ID, Version: version, Key: key, Splice: splice, SpliceMax: spliceMax, OverrunMax: overrunMax,
+				Report: func(m map[string]any) {
+					b, _ := json.Marshal(m)
+					mu.Lock()
+					fmt.Fprintln(out, string(b))
+					mu.Unlock()
+				},
+				Log: func(format string, args ...any) { fmt.Fprintf(cmd.ErrOrStderr(), format+"\n", args...) },
+			}
+			if err := f.Run(ctx); err != nil && ctx.Err() == nil {
+				return err
+			}
+			return nil
+		},
+	}
+	fake.Flags().BoolVar(&splice, "splice", false, "flood ssh splices too")
+	fake.Flags().DurationVar(&runFor, "for", 10*time.Minute, "how long to run")
+	fake.Flags().Int64Var(&spliceMax, "splice-max", 256<<20, "the most a splice flood sends")
+	fake.Flags().Int64Var(&overrunMax, "overrun-max", 96<<20, "the most an overrun flood sends")
+	probe.AddCommand(connect, join, stream, flood, fake)
 	return probe
 }
