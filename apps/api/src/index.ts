@@ -813,9 +813,10 @@ app.post("/v1/nodes/:node/dev-sandboxes", async (c) => {
 });
 
 app.post("/v1/nodes/:node/dev-sandboxes/:ref/:action{stop|start}", async (c) => {
+  const n = await mustFindNode(c.env.DB, c.req.param("node"));
   const s = await resolve(c.env, c.req.param("ref"));
   if (!s) fail(404, `no sandbox named ${c.req.param("ref")}`);
-  return c.json(await s.stub.devLifecycle(c.req.param("action") as "stop" | "start"));
+  return c.json(await s.stub.devLifecycle(n.id, c.req.param("action") as "stop" | "start"));
 });
 
 // A development sandbox's node streams (spares and open ones) and where its

@@ -2030,10 +2030,10 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   // Stops or starts a development sandbox's machine (its disk stays).
-  async devLifecycle(action: "stop" | "start"): Promise<SandboxRecord> {
+  async devLifecycle(node: string, action: "stop" | "start"): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       const p = this.onNode?.placement;
-      if (!p || !this.record) fail(404, "this sandbox isn't on a node");
+      if (!p || !this.record || p.node !== node) fail(404, "this sandbox isn't on that node");
       const stub = this.env.NODE.getByName(p.node);
       if (action === "stop") {
         this.streams.closeAll(1000, "the machine stopped");

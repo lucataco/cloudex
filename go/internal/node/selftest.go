@@ -500,7 +500,7 @@ func (r *Runtime) judgeInside(rep *SelfTestReport, raw string) {
 		return
 	}
 	rep.Inside = json.RawMessage(raw)
-	add("inside: the Docker socket", "absent", fmt.Sprint(in.DockerSocket), !in.DockerSocket)
+	add("inside: a Docker or containerd socket mounted from the host", "none", fmt.Sprint(in.DockerSocket), !in.DockerSocket)
 	add("inside: IPv6", "off (lo keeps ::1)", fmt.Sprintf("eth0 %v %v", in.IPv6, in.IPv6Addresses), !in.IPv6 && len(in.IPv6Addresses) == 0)
 	odd := []string{}
 	for _, d := range in.Devices {

@@ -6,7 +6,7 @@
 #   {"id", "kind": "dns", "name"}                      resolved:<address> | err:...
 #   {"id", "kind": "ip", "args": [...]}                ok | err:... (runs ip(8); the probe with NET_ADMIN only)
 #   {"id", "kind": "inside"}                           what the machine's root can do, as JSON
-import errno, json, os, socket, struct, subprocess, sys, threading
+import errno, json, os, re, socket, struct, subprocess, sys, threading
 
 T = 2.5
 
@@ -76,7 +76,10 @@ def inside(s):
             st[k] = v.strip()
     out = {"capEff": st.get("CapEff"), "capBnd": st.get("CapBnd"), "seccomp": st.get("Seccomp")}
     out["uidMap"] = " ".join(open("/proc/self/uid_map").read().split()[:3])
-    out["dockerSocket"] = any(os.path.exists(p) for p in ("/var/run/docker.sock", "/run/docker.sock"))
+    # The host's Docker (or containerd) socket would be a bind mount; under
+    # Sysbox the machine's own dockerd makes a socket of its own, which isn't.
+    out["dockerSocket"] = any(re.search(r"(docker|containerd)[^/]*\.sock$", l.split()[4]) for l in open("/proc/self/mountinfo"))
+    out["socketFiles"] = [p for p in ("/var/run/docker.sock", "/run/docker.sock") if os.path.exists(p)]
     def w(path, data):
         with open(path, "w") as f:
             f.write(data)
