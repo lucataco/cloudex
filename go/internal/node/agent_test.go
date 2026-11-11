@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -329,6 +330,51 @@ func statFile(p string) (os.FileMode, error) {
 		return 0, err
 	}
 	return fi.Mode().Perm(), nil
+}
+
+func TestALongOpDoesntStopTheAgentReadingPongs(t *testing.T) {
+	// An op that takes longer than PongDead (a start waiting on a hostile
+	// machine's ready check) must not hold the read loop: the agent would
+	// miss the pongs and drop its node offline.
+	results := make(chan Result, 1)
+	f := &fakeWorker{t: t}
+	f.session = func(n int, c *websocket.Conn) {
+		ctx := context.Background()
+		c.Write(ctx, websocket.MessageText, []byte(`{"type":"op","id":"op-1","name":"facts","args":{}}`))
+		answerPings(ctx, c, func(data []byte) {
+			var r Result
+			json.Unmarshal(data, &r)
+			results <- r
+		})
+	}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	a, pub, _ := newAgent(t, srv.URL)
+	f.key = pub
+	var calls atomic.Int32
+	facts := a.Facts
+	a.Facts = func() Facts {
+		if calls.Add(1) > 1 { // the hello's is quick; the op's takes 5 x PongDead
+			time.Sleep(400 * time.Millisecond)
+		}
+		return facts()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.Run(ctx)
+	select {
+	case r := <-results:
+		if r.ID != "op-1" || !r.OK {
+			t.Fatalf("answer %+v", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no answer")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.conns != 1 {
+		t.Fatalf("%d connections: the long op stopped the agent reading pongs", f.conns)
+	}
 }
 
 func TestAnOpsAnswerGoesOnTheConnectionThatsUpWhenItsReady(t *testing.T) {

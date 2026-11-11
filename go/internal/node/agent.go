@@ -581,7 +581,10 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 			a.logf("ignoring a message it doesn't know: %.200s", data)
 			continue
 		}
-		go a.reply(op, a.answer(op))
+		// Both in their own goroutine: a go statement evaluates its arguments
+		// in this one, and an op can take minutes (a start waits up to 90 s
+		// for a machine that may be hostile), while pongs must still be read.
+		go func() { a.reply(op, a.answer(op)) }()
 	}
 }
 
