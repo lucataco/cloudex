@@ -737,7 +737,7 @@ now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
 # Active seconds of one Durable Object from $1 to $2 (ISO times), from the GraphQL analytics.
 do_active() {
 	local acc q
-	acc=$(curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id')
+	acc=$(cf_account)
 	q='query($acc:String!,$from:Time!,$to:Time!,$ids:[String!]){viewer{accounts(filter:{accountTag:$acc}){durableObjectsPeriodicGroups(limit:1000,filter:{datetimeMinute_geq:$from,datetimeMinute_leq:$to,objectId_in:$ids}){sum{activeTime}}}}}'
 	jq -n --arg q "$q" --arg acc "$acc" --arg from "$1" --arg to "$2" --arg id "$3" '{query:$q, variables:{acc:$acc, from:$from, to:$to, ids:[$id]}}' |
 		curl -s https://api.cloudflare.com/client/v4/graphql -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' --data @- |
@@ -749,6 +749,20 @@ in_agent() { node_sh "docker exec cloudex-node cloudex-node $*"; }
 probe() { node_sh "docker run --rm -v cloudex-node:/var/lib/cloudex-node $AIMG probe $*" 2>/dev/null | head -1; }
 start_agent() { node_sh "docker start cloudex-node" >/dev/null 2>&1; }
 kill_agent() { node_sh "docker kill cloudex-node" >/dev/null 2>&1; }
+# install_node TOKEN ARGS...: the installer, with the join token in its
+# environment from stdin, as cloudex node add prints it: never in a process's
+# arguments on the host (review H9, N53).
+install_node() {
+	local tok=$1
+	shift
+	"${NODE_SSH[@]}" "read -r t; export CLOUDEX_JOIN_TOKEN=\$t; ${NODE_SUDO:+sudo --preserve-env=CLOUDEX_JOIN_TOKEN} bash $NODE_DIR/node-install.sh $*" <<<"$tok"
+}
+# The account the deployment is in (do_active, d1_writes): the token may see others.
+cf_account() {
+	local acc=${CLOUDFLARE_ACCOUNT_ID:-$(jq -r '.accountId // empty' "$CLOUDEX_CONFIG_DIR/config.json")}
+	[[ -n $acc ]] || acc=$(curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r 'if (.result | length) == 1 then .result[0].id else empty end')
+	echo "$acc"
+}
 
 # Streams and exec over the link (M3), against a sandbox on the node.
 node_m3() {
@@ -1547,6 +1561,339 @@ forged-source 000"
 	"$CX" delete "$S6" --yes >/dev/null 2>&1
 }
 
+# ---- node_review_host: the 2026-11-12 review's host checks (H1-H4, H6, H8, H9), N45-N51 and N53, from inside
+# hostile machines on the node; N52 (R3) runs after N25 with a node of its own. host-review.py does the
+# machine's side. N46-N48 and N50 need root on the host (VERIFY_NODE_SUDO=1). N47 flushes the host's
+# nftables: it saves the iptables(-nft) rules first, arms a timed restore, and puts them back, so it SKIPs on
+# a host with nftables tables of its own (only iptables' and inet cloudex are restored).
+REVIEW_HOST_CHECKS=("N45 a machine whose root replaced /bin/sh can't hold its agent: endless output fails its start at once, a ready check that never ends fails it within 100 s, the agent stays under 200 MiB, and another machine's exec and the node's link keep working"
+	"N46 a machine filling Docker's disk is stopped by the agent's watchdog once the free space is under the node's floor, before it falls 1.5 GB further, and its sandbox's notice says why"
+	"N47 after systemctl restart nftables, and after nft flush ruleset, a running machine reaches the host for at most 15 s: the table comes back (at once, or within 40 s), the agent stops the machine and says why, and the self-test passes again"
+	"N48 a self-test that finds the firewall open stops the running machines, saying why, not only new ones"
+	"N49 a machine holding thousands of connections to its agent gets at most 256 at once, the agent stays under 200 MiB, and another machine's cloudex.internal and exec and the node's link keep working"
+	"N50 a machine that takes another machine's address can't have answers sent there: UDP from the forged source draws no answer onto the other machine's network"
+	"N51 a deleted machine's network isn't given to the next machine, and the agent no longer listens on its address"
+	"N52 a node removed while its agent is offline: once the agent is back it stops its machines, which keep their disks, says it was removed, and the installer refuses to run over it until --uninstall"
+	"N53 the join token is in no process's arguments or container's config on the host, and the node CA excludes every IP address")
+review_host_skip() { for c in "${REVIEW_HOST_CHECKS[@]}"; do [[ -z ${2:-} || " $2 " == *" ${c%% *} "* ]] && skip "${c%% *}" "${c#* }" "$1"; done; }
+review_host_desc() { for c in "${REVIEW_HOST_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
+# The agent's memory in MiB every 2 s for $1 s, into $NODE_DIR/mem-$2.log, in the background.
+agent_mem_watch() {
+	node_sh "nohup sh -c 'end=\$((\$(date +%s) + $1)); while [ \$(date +%s) -lt \$end ]; do docker stats --no-stream --format \"{{.MemUsage}}\" cloudex-node | awk \"{v=\\\$1; u=v; gsub(/[0-9.]/, \\\"\\\", u); sub(/[A-Za-z]+\\\$/, \\\"\\\", v); printf \\\"%.0f\\\\n\\\", (u == \\\"GiB\\\" ? v * 1024 : (u == \\\"KiB\\\" ? v / 1024 : (u == \\\"B\\\" ? 0 : v)))}\"; sleep 2; done' > $NODE_DIR/mem-$2.log 2>&1 &"
+}
+agent_mem_max() { node_sh "sort -n $NODE_DIR/mem-$1.log | tail -1"; }
+# A sandbox on the node for a check: sets RID and RMC (its container).
+review_new() {
+	cx new --on "$N" --name "$1" --no-use
+	RID=$(field .id)
+	RMC=cloudex-$RID
+	[[ $CODE == 0 && -n $RID ]]
+}
+machine_state() { node_sh "docker inspect $1 -f '{{.State.Status}}'" 2>/dev/null; }
+# The agent's listening sockets on an address (dotted), from its network namespace.
+agent_listens_on() {
+	local hex
+	hex=$(awk -F. '{printf "%02X%02X%02X%02X", $4, $3, $2, $1}' <<<"$1")
+	node_sh "$NODE_SUDO cat /proc/\$(docker inspect cloudex-node -f '{{.State.Pid}}')/net/tcp" | awk -v h="$hex" '$4 == "0A" && index($2, h ":") == 1' | wc -l | tr -d ' '
+}
+# Saves the host's iptables(-nft) rules and arms their restore (with the firewall unit's) in $1 s.
+fw_save() {
+	node_sh "sudo iptables-save > $NODE_DIR/ipt4 && sudo ip6tables-save > $NODE_DIR/ipt6 && sudo systemd-run --quiet --unit cx-verify-restore-$P --on-active=$1 /bin/sh -c 'iptables-restore < $NODE_DIR/ipt4; ip6tables-restore < $NODE_DIR/ipt6; systemctl restart cloudex-node-firewall.service'"
+}
+fw_restore() {
+	node_sh "sudo iptables-restore < $NODE_DIR/ipt4 && sudo ip6tables-restore < $NODE_DIR/ipt6 && sudo systemctl restart cloudex-node-firewall.service"
+}
+fw_disarm() { node_sh "sudo systemctl stop cx-verify-restore-$P.timer 2>/dev/null; sudo systemctl reset-failed cx-verify-restore-$P.service 2>/dev/null; true"; }
+# Seconds after $2 (epoch) that the log $1 (host-review.py reach) last saw one of the host's addresses open, before $3 (epoch); "none" if never.
+open_window() { awk -v t0="$2" -v t1="$3" '$1 >= t0 && $1 < t1 && $2 !~ /^169[.]254/ && $3 == "open" { w = $1 - t0 } END { if (w == "") print "none"; else printf "%.1f", w }' <<<"$1"; }
+# Wait (up to $2 s) for the machine $1 to stop; prints the seconds, or nothing.
+wait_stopped() {
+	local t0
+	t0=$(now_s)
+	while [[ $(awk -v w="$(since "$t0")" -v m="$2" 'BEGIN { print (w > m) }') == 0 ]]; do
+		[[ $(machine_state "$1") != running ]] && { since "$t0"; return 0; }
+		sleep 0.5
+	done
+	return 1
+}
+
+node_review_host() {
+	local h t0 r1 r1took r2 r2took okb execs bad mem notice
+	if [[ $(node_state "$N") != online ]]; then
+		review_host_skip "the node isn't online" "N45 N46 N47 N48 N49 N50 N51 N53"
+		return
+	fi
+	"${NODE_SSH[@]}" "cat > $NODE_DIR/host-review.py" <"$here/host-review.py"
+	local host_ip
+	host_ip=$(node_sh "ip -4 route get 1.1.1.1" | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+
+	# N45 (H1): /bin/sh replaced in A, first by endless output, then by a ready check that never ends.
+	local A B
+	if review_new "$P-h1a" && A=$RID && review_new "$P-h1b" && B=$RID; then
+		local endless=$'#!/bin/dash\n# A hostile machine\'s sh (review H1): endless output for the agent\'s own commands.\ncase "$*" in *cloudex-ready*|*CX_EXEC*|*kill\\ -*) exec /usr/bin/yes "$(head -c 4000 /dev/zero | tr \'\\0\' A)";; esac\nexec /bin/dash "$@"\n'
+		h=$(printf '%s' "$endless" | base64 | tr -d '\n')
+		"$CX" exec "$P-h1a" --root -- "echo $h | base64 -d > /usr/local/sbin/cx-sh && chmod 755 /usr/local/sbin/cx-sh && ln -sf /usr/local/sbin/cx-sh /usr/bin/sh" >/dev/null 2>&1
+		cx stop "$P-h1a"
+		agent_mem_watch 200 h1
+		t0=$(now_s)
+		cx resume "$P-h1a"
+		r1took=$(since "$t0") r1="code $CODE: ${ERR:0:160}"
+		printf '#!/bin/dash\ncase "$*" in *cloudex-ready*) exec /usr/bin/sleep 100000;; esac\nexec /bin/dash "$@"\n' >"$work/hang-sh"
+		"${NODE_SSH[@]}" "cat > $NODE_DIR/hang-sh && chmod 755 $NODE_DIR/hang-sh && docker cp $NODE_DIR/hang-sh cloudex-$A:/usr/local/sbin/cx-sh" <"$work/hang-sh"
+		t0=$(now_s)
+		("$CX" resume "$P-h1a" >"$work/h1o" 2>&1; echo "code $?" >>"$work/h1o"; since "$t0" >"$work/h1t") &
+		execs=0 bad=""
+		for _ in $(seq 1 10); do
+			sleep 9
+			if [[ $(timeout 30 "$CX" exec "$P-h1b" -- 'echo ok' 2>/dev/null) == ok ]]; then execs=$((execs + 1)); else bad="$bad exec-failed"; fi
+			[[ $(node_state "$N") == online ]] || bad="$bad offline"
+			[[ -s $work/h1t ]] && break
+		done
+		wait
+		r2took=$(cat "$work/h1t") r2=$(tr '\n' ' ' <"$work/h1o" | grep -o 'error:.*' | head -c 160)
+		mem=$(agent_mem_max h1)
+		OUT="endless output: $r1 after ${r1took}s; never-ending check: ${r2:-$(tail -1 "$work/h1o")} after ${r2took}s; exec in another machine ok $execs times${bad:+, then$bad}; agent at most ${mem} MiB" CODE=""
+		ok N45 "$(review_host_desc N45)" [ -n "$(grep 'printed more than 64 KiB' <<<"$r1")" -a "$(awk -v w="$r1took" 'BEGIN { print (w <= 30) }')" = 1 \
+			-a -n "$(grep "wasn't ready within" <<<"$r2")" -a "$(awk -v w="${r2took:-999}" 'BEGIN { print (w <= 100) }')" = 1 -a -z "$bad" -a "$execs" -ge 5 -a "${mem:-999}" -lt 200 ]
+		"$CX" delete "$P-h1a" --yes >/dev/null 2>&1
+	else
+		skip N45 "$(review_host_desc N45)" "couldn't make its sandboxes: ${ERR:0:200}"
+	fi
+
+	# N49 (H4): a flood from A, with B (made for N45) as the bystander.
+	if review_new "$P-h4a"; then
+		A=$RID
+		"$CX" cp "$here/host-review.py" "$P-h4a:host-review.py" >/dev/null 2>&1
+		agent_mem_watch 100 h4
+		("$CX" exec "$P-h4a" --timeout 3m -- 'python3 host-review.py flood 3000 70' >"$work/h4o" 2>&1) &
+		local codes="" conns=0 c
+		execs=0 bad=""
+		for _ in $(seq 1 6); do
+			sleep 10
+			c=$(timeout 30 "$CX" exec "$P-h1b" -- 'curl -s -m 10 -o /dev/null -w "%{http_code}" -X POST http://cloudex.internal/save-on-term' 2>/dev/null)
+			codes="$codes $c"
+			[[ $c == 200 ]] && execs=$((execs + 1))
+			[[ $(node_state "$N") == online ]] || bad="$bad offline"
+			c=$(node_sh "$NODE_SUDO cat /proc/\$(docker inspect cloudex-node -f '{{.State.Pid}}')/net/tcp" | awk '$4 == "01"' | wc -l | tr -d ' ')
+			((c > conns)) && conns=$c
+		done
+		wait
+		mem=$(agent_mem_max h4)
+		local most
+		most=$(grep '^{' "$work/h4o" | jq -r .most)
+		OUT="flood: $(grep '^{' "$work/h4o" || tail -2 "$work/h4o"); the agent's established connections at most $conns; the other machine's cloudex.internal:$codes${bad:+;$bad}; agent at most ${mem} MiB" CODE=""
+		ok N49 "$(review_host_desc N49)" [ -n "$most" -a "${most:-9999}" -le 256 -a "$conns" -le 300 -a "$execs" -ge 5 -a -z "$bad" -a "${mem:-999}" -lt 200 ]
+		"$CX" delete "$P-h4a" --yes >/dev/null 2>&1
+	else
+		skip N49 "$(review_host_desc N49)" "couldn't make its sandbox: ${ERR:0:200}"
+	fi
+
+	# N51 (H8): A's /28, then A deleted and C made.
+	if review_new "$P-h8a"; then
+		local sub1 sub2 aaddr listen1 listen2
+		sub1=$(node_sh "docker network inspect $RMC -f '{{(index .IPAM.Config 0).Subnet}}'")
+		aaddr=$(awk -F'[./]' '{printf "%s.%s.%s.%d", $1, $2, $3, $4 + 2}' <<<"$sub1")
+		listen1=$(agent_listens_on "$aaddr")
+		cx delete "$P-h8a" --yes
+		listen2=$(agent_listens_on "$aaddr")
+		review_new "$P-h8c"
+		sub2=$(node_sh "docker network inspect $RMC -f '{{(index .IPAM.Config 0).Subnet}}'")
+		OUT="deleted machine's network $sub1 (agent listening on $aaddr: $listen1, after the delete: $listen2); the next machine's $sub2" CODE=""
+		ok N51 "$(review_host_desc N51)" [ -n "$sub1" -a -n "$sub2" -a "$sub1" != "$sub2" -a "$listen1" = 2 -a "$listen2" = 0 ]
+		"$CX" delete "$P-h8c" --yes >/dev/null 2>&1
+	else
+		skip N51 "$(review_host_desc N51)" "couldn't make its sandbox: ${ERR:0:200}"
+	fi
+
+	# N53 (H9): the token, then the CA's constraints.
+	local leak cons
+	leak=$(node_sh "docker inspect cloudex-node -f '{{json .Config.Cmd}} {{json .Args}} {{json .Config.Env}}'; ps -eo args" | grep -c 'cxj_')
+	cons=$(in_agent ca show 2>/dev/null | sed -n '/BEGIN/,/END/p' | "${NODE_SSH[@]}" "openssl x509 -noout -text" 2>/dev/null | sed -n '/Excluded/,/Signature Algorithm/p' | grep -v 'Signature Algorithm' | tr -s ' \n' ' ')
+	OUT="lines with a join token: $leak; the CA's exclusions: ${cons:-none}" CODE=""
+	ok N53 "$(review_host_desc N53)" [ "$leak" = 0 -a -n "$(grep 'IP:0.0.0.0/0.0.0.0' <<<"$cons")" -a -n "$(grep 'IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0' <<<"$cons")" ]
+
+	if [[ -z $NODE_SUDO ]]; then
+		review_host_skip "needs root on the node host (VERIFY_NODE_SUDO=1)" "N46 N47 N48 N50"
+		"$CX" delete "$P-h1b" --yes >/dev/null 2>&1
+		return
+	fi
+
+	# N50 (H6): A takes B's address (Sysbox: its own root; plain Docker: a NET_ADMIN container on A's network).
+	if review_new "$P-h6a"; then
+		A=$RID
+		local amc=$RMC bmc=cloudex-$B vip vbr sp cap drops runtime
+		runtime=$("$CX" node info "$N" --json 2>/dev/null | jq -r .runtime)
+		vip=$(node_sh "docker inspect $bmc -f '{{(index .NetworkSettings.Networks \"$bmc\").IPAddress}}'")
+		vbr=$(node_sh "docker network inspect $bmc -f '{{index .Options \"com.docker.network.bridge.name\"}}'")
+		node_sh "sudo sh -c 'timeout 15 tcpdump -n -i $vbr -c 20 udp and src host 1.1.1.1 > $NODE_DIR/h6cap 2>/dev/null &'"
+		sleep 2
+		if [[ $runtime == sysbox ]]; then
+			"$CX" cp "$here/host-review.py" "$P-h6a:host-review.py" >/dev/null 2>&1
+			sp=$("$CX" exec "$P-h6a" --root -- "ip addr add $vip/32 dev eth0 && python3 /home/cloudex/host-review.py spoof $vip" 2>&1 | tail -1)
+		else
+			local img own5
+			img=$(node_sh "docker inspect $amc -f '{{.Config.Image}}'")
+			own5=$(node_sh "docker inspect $amc -f '{{(index .NetworkSettings.Networks \"$amc\").IPAddress}}'" | awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 + 5}')
+			sp=$(node_sh "docker run --rm --label build.cloudex.node=verify --label build.cloudex.role=check --network $amc --ip $own5 --cap-add NET_ADMIN -v $NODE_DIR/host-review.py:/r.py:ro --entrypoint bash $img -c 'ip addr add $vip/32 dev eth0 && python3 /r.py spoof $vip'" 2>&1 | tail -1)
+		fi
+		sleep 14
+		cap=$(node_sh "sudo cat $NODE_DIR/h6cap | grep -c '1.1.1.1.53 >'")
+		drops=$(node_sh "sudo nft list chain inet cloudex forward" | grep "isn't on the bridge" | grep -o 'packets [0-9]*' | awk '{print $2}')
+		OUT="on $runtime, as $vip ($bmc on $vbr): $sp; answers on that bridge: $cap; the firewall's drop counted $drops" CODE=""
+		ok N50 "$(review_host_desc N50)" [ -n "$(grep 'sent 5 from' <<<"$sp")" -a "$cap" = 0 -a "${drops:-0}" -ge 5 ]
+		"$CX" delete "$P-h6a" --yes >/dev/null 2>&1
+	else
+		skip N50 "$(review_host_desc N50)" "couldn't make its sandbox: ${ERR:0:200}"
+	fi
+	"$CX" delete "$P-h1b" --yes >/dev/null 2>&1
+
+	# N46 (H2): the host's disk filled to the floor + 4 GB, then A writes.
+	if review_new "$P-h2"; then
+		local floor droot fill took least
+		floor=$(node_sh "docker inspect cloudex-node -f '{{json .Args}}'" | jq -r '(index(["--keep-free-gb"])) as $i | if $i then .[$i + 1] else "5" end')
+		droot=$(node_sh "docker info -f '{{.DockerRootDir}}'")
+		fill="$(dirname "$droot")/cloudex-verify-fill-$P"
+		node_sh "sudo fallocate -l \$(df -B1 --output=avail $droot | tail -1 | awk '{printf \"%d\", \$1 - ($floor + 4) * 1e9}') $fill"
+		"$CX" exec "$P-h2" -- 'nohup dd if=/dev/zero of=/home/cloudex/fill bs=4M status=none >/dev/null 2>&1 &' >/dev/null 2>&1
+		least=999 took=""
+		t0=$(now_s)
+		while [[ $(awk -v w="$(since "$t0")" 'BEGIN { print (w > 150) }') == 0 ]]; do
+			local f
+			f=$(node_sh "df -B1 --output=avail $droot | tail -1" | awk '{printf "%.2f", $1 / 1e9}')
+			least=$(awk -v a="$f" -v m="$least" 'BEGIN { print (a < m ? a : m) }')
+			[[ $(machine_state "$RMC") != running ]] && { took=$(since "$t0"); break; }
+			if [[ $(awk -v a="$f" 'BEGIN { print (a < 1.5) }') == 1 ]]; then
+				node_sh "docker stop -t 1 $RMC" >/dev/null 2>&1
+				break
+			fi
+			sleep 1
+		done
+		node_sh "sudo rm -f $fill"
+		sleep 3
+		notice=$("$CX" info "$P-h2" --json 2>/dev/null | jq -r '.state + ": " + (.notice // "")')
+		OUT="floor $floor GB; the machine stopped ${took:+after $took s}${took:-only at the safety stop of this check}, the least free was $least GB; the sandbox: ${notice:0:240}" CODE=""
+		ok N46 "$(review_host_desc N46)" [ -n "$took" -a "$(awk -v l="$least" -v f="$floor" 'BEGIN { print (l >= f - 1.5) }')" = 1 \
+			-a -n "$(grep '^stopped: .*under its floor' <<<"$notice")" ]
+		"$CX" delete "$P-h2" --yes >/dev/null 2>&1
+	else
+		skip N46 "$(review_host_desc N46)" "couldn't make its sandbox: ${ERR:0:200}"
+	fi
+
+	# N47 (H3): restart nftables, then flush the ruleset, with A probing the host meanwhile.
+	local others
+	others=$(node_sh "sudo nft list tables" | grep -v -E '^table (ip|ip6|inet|arp|bridge) (filter|nat|mangle|raw|security)$|^table inet cloudex$' | tr '\n' ' ')
+	if [[ -n $others ]]; then
+		skip N47 "$(review_host_desc N47)" "the host has nftables tables of its own ($others), which a flush would lose"
+	elif ! node_sh "command -v iptables-save && systemctl cat nftables.service" >/dev/null 2>&1; then
+		skip N47 "$(review_host_desc N47)" "the host has no iptables-save or nftables.service"
+	elif review_new "$P-h3"; then
+		local gw nft_was log3 t1 t2 tb1 tb2 st2 w1 w2 iso1 iso3 dl
+		gw=$(node_sh "docker network inspect $RMC -f '{{(index .IPAM.Config 0).Gateway}}'")
+		nft_was=$(node_sh "systemctl is-active nftables")
+		"$CX" cp "$here/host-review.py" "$P-h3:host-review.py" >/dev/null 2>&1
+		"$CX" exec "$P-h3" -- "nohup python3 host-review.py reach 150 $host_ip:22 $gw:22 169.254.169.254:80 > /home/cloudex/reach.log 2>&1 &" >/dev/null 2>&1
+		fw_save 300
+		sleep 5
+		t1=$(now_s)
+		node_sh "sudo systemctl restart nftables"
+		tb1=""
+		for _ in $(seq 1 80); do node_sh "sudo nft list table inet cloudex" >/dev/null 2>&1 && { tb1=$(since "$t1"); break; }; sleep 0.5; done
+		sleep 10
+		# Docker's rules went with the rest: back as they were, then the agent
+		# restarted to test again, as systemctl restart docker would do.
+		fw_restore
+		t0=$(now_ms)
+		node_sh "docker restart cloudex-node" >/dev/null
+		iso1=$(wait_iso "$t0")
+		wait_state "$N" online 60 >/dev/null
+		if [[ $(machine_state "$RMC") != running ]]; then
+			"$CX" resume "$P-h3" >/dev/null 2>&1
+			"$CX" exec "$P-h3" -- "nohup python3 host-review.py reach 90 $host_ip:22 $gw:22 > /home/cloudex/reach2.log 2>&1 &" >/dev/null 2>&1
+		fi
+		sleep 5
+		t2=$(now_s)
+		node_sh "sudo nft flush ruleset"
+		st2=$(wait_stopped "$RMC" 30)
+		tb2=""
+		for _ in $(seq 1 100); do node_sh "sudo nft list table inet cloudex" >/dev/null 2>&1 && { tb2=$(since "$t2"); break; }; sleep 0.5; done
+		fw_restore
+		[[ $nft_was != active ]] && { node_sh "sudo systemctl stop nftables"; fw_restore; }
+		fw_disarm
+		t0=$(now_ms)
+		node_sh "docker restart cloudex-node" >/dev/null
+		iso3=$(wait_iso "$t0")
+		wait_state "$N" online 60 >/dev/null
+		log3=$(node_sh "docker cp $RMC:/home/cloudex/reach.log - | tar xO; docker cp $RMC:/home/cloudex/reach2.log - 2>/dev/null | tar xO" 2>/dev/null)
+		dl=$(awk -v t="$t2" '$1 >= t' <<<"$log3" | wc -l | tr -d ' ')
+		w1=$(open_window "$log3" "$t1" "$t2") w2=$(open_window "$log3" "$t2" 9999999999)
+		notice=$("$CX" info "$P-h3" --json 2>/dev/null | jq -r '.state + ": " + (.notice // "")')
+		OUT="restart nftables: table back after ${tb1:-never} s, the host open to the machine until +$w1 s; flush ruleset: machine stopped after ${st2:-never (30 s)} s, the host open until +$w2 s ($dl probes after the flush), table back after ${tb2:-never} s; self-tests once Docker's rules were back: ${iso1:-none}, ${iso3:-none}; the sandbox: ${notice:0:200}" CODE=""
+		ok N47 "$(review_host_desc N47)" [ -n "$tb1" -a -n "$tb2" -a "$(awk -v w="$tb2" 'BEGIN { print (w <= 40) }')" = 1 -a -n "$st2" \
+			-a \( "$w1" = none -o "$(awk -v w="$w1" 'BEGIN { print (w <= 15) }')" = 1 \) -a \( "$w2" = none -o "$(awk -v w="$w2" 'BEGIN { print (w <= 15) }')" = 1 \) \
+			-a "$dl" -gt 0 -a "$iso1" = pass -a "$iso3" = pass -a -n "$(grep '^stopped: .*firewall table' <<<"$notice")" ]
+		"$CX" delete "$P-h3" --yes >/dev/null 2>&1
+	else
+		skip N47 "$(review_host_desc N47)" "couldn't make its sandbox: ${ERR:0:200}"
+	fi
+
+	# N48 (H3): the table loaded without its drop for the host itself; the agent restarted to test it.
+	if review_new "$P-h3b"; then
+		local v48 st48 iso48
+		node_sh "sudo sh -c \"grep -v 'the host itself' /etc/cloudex-node/firewall.nft > $NODE_DIR/weak.nft && nft -f $NODE_DIR/weak.nft\""
+		t0=$(now_ms)
+		node_sh "docker restart cloudex-node" >/dev/null
+		v48=$(wait_iso "$t0")
+		st48=$(wait_stopped "$RMC" 60)
+		node_sh "sudo systemctl restart cloudex-node-firewall.service"
+		t0=$(now_ms)
+		node_sh "docker restart cloudex-node" >/dev/null
+		iso48=$(wait_iso "$t0")
+		notice=$("$CX" info "$P-h3b" --json 2>/dev/null | jq -r '.state + ": " + (.notice // "")')
+		OUT="self-test with the host open: ${v48:-none}; the running machine stopped after ${st48:-never (60 s)} s; with the table back: ${iso48:-none}; the sandbox: ${notice:0:200}" CODE=""
+		ok N48 "$(review_host_desc N48)" [ "$v48" = fail -a -n "$st48" -a "$iso48" = pass -a -n "$(grep '^stopped: .*self-test found the firewall open' <<<"$notice")" ]
+		"$CX" delete "$P-h3b" --yes >/dev/null 2>&1
+	else
+		skip N48 "$(review_host_desc N48)" "couldn't make its sandbox: ${ERR:0:200}"
+	fi
+}
+
+# N52 (R3), after N25: a node of its own, removed while its agent is down.
+node_review_r3() {
+	local r3 tok irc rid rmc st52 file52 stat52 again52
+	cx node add "$P-r3" --json
+	tok=$(field .joinToken)
+	local inst=(--api "$API_URL" --agent-image "$AIMG")
+	[[ -n ${VERIFY_NODE_MACHINE_IMAGE:-} ]] && inst+=(--machine-image "$VERIFY_NODE_MACHINE_IMAGE")
+	[[ -z $NODE_SUDO ]] && inst+=(--unisolated)
+	install_node "$tok" "${inst[@]}" >"$work/install-r3.log" 2>&1
+	irc=$?
+	NODE_UP=1
+	if [[ $irc != 0 ]] || ! wait_state "$P-r3" online 30; then
+		skip N52 "$(review_host_desc N52)" "the second install didn't come up: $(grep -v cxj_ "$work/install-r3.log" | tail -2 | tr '\n' ' ')"
+	else
+		cx new --on "$P-r3" --name "$P-r3s" --no-use
+		rid=$(field .id) rmc=cloudex-$(field .id)
+		"$CX" exec "$P-r3s" -- 'echo kept > /home/cloudex/r3.txt' >/dev/null 2>&1
+		kill_agent
+		wait_state "$P-r3" offline 75 >/dev/null
+		cx node rm "$P-r3" --yes --force
+		local rm52="node rm: code $CODE"
+		start_agent
+		st52=$(wait_stopped "$rmc" 60)
+		file52=$(node_sh "docker cp $rmc:/home/cloudex/r3.txt - | tar xO" 2>/dev/null)
+		stat52=$(in_agent status 2>/dev/null | head -1)
+		node_sh "$NODE_SUDO bash $NODE_DIR/node-install.sh ${inst[*]}" >"$work/o" 2>&1
+		again52="installer exit $?: $(grep -o 'was removed from its deployment.*Uninstall first (--uninstall)' "$work/o" | head -1)"
+		OUT="$rm52; the machine stopped ${st52:-: no, not within 60 s}${st52:+ after $st52 s}, its file: ${file52:-gone}; status: ${stat52:0:160}; $again52" CODE=""
+		ok N52 "$(review_host_desc N52)" [ -n "$st52" -a "$file52" = kept -a -n "$(grep 'REMOVED' <<<"$stat52")" -a -n "$(grep '^installer exit [1-9]: was removed.*--uninstall' <<<"$again52")" ]
+		"$CX" delete "$P-r3s" --yes >/dev/null 2>&1
+	fi
+	node_sh "$NODE_SUDO bash $NODE_DIR/node-install.sh --uninstall --yes --keep-images" >/dev/null 2>&1
+	NODE_UP=""
+	"$CX" node rm "$P-r3" --yes --force >/dev/null 2>&1
+}
+# ---- end node_review_host
+
 # ---- node_review_worker: the 2026-11-12 review's Worker checks (W1, W2), N55-N56.
 # Misbehaving agents, run with the node's own key while its agent is stopped
 # (go/internal/node/probe_flood.go): N55 floods the control socket, N56 plays
@@ -1559,13 +1906,24 @@ REVIEW_WORKER_CHECKS=("N55 a node that floods its control socket (facts, state a
 review_worker_skip() { for c in "${REVIEW_WORKER_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
 review_desc() { for c in "${REVIEW_WORKER_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
 d1_writes() {
+	local w
+	for _ in 1 2 3; do
+		w=$(d1_writes_once "$@")
+		[[ $w =~ ^[0-9]+$ ]] && break
+		sleep 20
+	done
+	echo "$w"
+}
+d1_writes_once() {
 	local acc db q
-	acc=$(curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id')
-	db=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$acc/d1/database?name=cloudex" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].uuid')
+	acc=$(cf_account)
+	db=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$acc/d1/database?name=cloudex" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '[.result[]? | select(.name == "cloudex")][0].uuid // empty')
+	# No account or database: nothing was counted, which mustn't read as no writes.
+	[[ -n $acc && -n $db ]] || { echo unknown; return; }
 	q='query($acc:String!,$db:String!,$from:Time!,$to:Time!){viewer{accounts(filter:{accountTag:$acc}){d1AnalyticsAdaptiveGroups(limit:1000,filter:{databaseId:$db,datetimeMinute_geq:$from,datetimeMinute_leq:$to}){sum{writeQueries}}}}}'
 	jq -n --arg q "$q" --arg acc "$acc" --arg db "$db" --arg from "$1" --arg to "$2" '{query:$q, variables:{acc:$acc, db:$db, from:$from, to:$to}}' |
 		curl -s https://api.cloudflare.com/client/v4/graphql -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' --data @- |
-		jq -r '[.data.viewer.accounts[0].d1AnalyticsAdaptiveGroups[]?.sum.writeQueries] | add // 0'
+		jq -r 'if .data.viewer.accounts[0] then [.data.viewer.accounts[0].d1AnalyticsAdaptiveGroups[]?.sum.writeQueries] | add // 0 else "unknown" end'
 }
 node_review_worker() {
 	local other f55 t0 t1 w55 fk s56 l56 ov ch sp
@@ -1587,7 +1945,7 @@ node_review_worker() {
 	fi
 	OUT="flood: ${f55:-nothing}; D1 write queries in $t0..$t1: $w55" CODE=""
 	ok N55 "$(review_desc N55)" [ "$(jq -r .ticketsGiven <<<"$f55")" = 0 -a -n "$(jq -r .ticketError <<<"$f55" | grep "isn't a sandbox on this node")" \
-		-a "$(jq -r .secondHello <<<"$f55")" = 4400 -a \( -z "${CLOUDFLARE_API_TOKEN:-}" -o "${w55:-999}" -le 30 \) ]
+		-a "$(jq -r .secondHello <<<"$f55")" = 4400 -a \( -z "${CLOUDFLARE_API_TOKEN:-}" -o "$(awk -v w="$w55" 'BEGIN { print (w ~ /^[0-9]+$/ && w <= 30) }')" = 1 \) ]
 	# N56: the fake agent, with the node's identity, and a sandbox on it.
 	fk=$P-fake
 	node_sh "docker run -d --rm --name $fk -v cloudex-node:/var/lib/cloudex-node $AIMG probe fake-agent --splice --for 8m" >/dev/null 2>&1
@@ -1619,6 +1977,8 @@ if want node; then
 		m4_skip "no node host: set VERIFY_NODE_SSH" ""
 		m5_skip "no node host: set VERIFY_NODE_SSH"
 		m6_skip "no node host: set VERIFY_NODE_SSH"
+		review_host_skip "no node host: set VERIFY_NODE_SSH"
+		review_worker_skip "no node host: set VERIFY_NODE_SSH"
 	else
 		read -ra NODE_SSH <<<"$VERIFY_NODE_SSH"
 		NODE_DIR="\$HOME/.cloudex-verify-$P"
@@ -1658,11 +2018,11 @@ if want node; then
 			# The installer (N17), then N04 from the agent's own log.
 			cx node add "$N" --json
 			tok=$(field .joinToken) nid=$(field .node.id)
-			inst=(--api "$API_URL" --token "$tok" --agent-image "$AIMG")
+			inst=(--api "$API_URL" --agent-image "$AIMG")
 			[[ -n ${VERIFY_NODE_MACHINE_IMAGE:-} ]] && inst+=(--machine-image "$VERIFY_NODE_MACHINE_IMAGE")
 			[[ -z $NODE_SUDO ]] && inst+=(--unisolated)
 			t0=$(now_s)
-			node_sh "$NODE_SUDO bash $NODE_DIR/node-install.sh ${inst[*]}" >"$work/install.log" 2>&1
+			install_node "$tok" "${inst[@]}" >"$work/install.log" 2>&1
 			irc=$?
 			itook=$(since "$t0")
 			NODE_UP=1
@@ -1750,11 +2110,18 @@ if want node; then
 			M3_SANDBOX="" M3_ID="" REBOOTED=""
 			# VERIFY_NODE_PARTS picks the milestones' checks to run after the
 			# install (default all): m3 m4 m5 m6.
-			parts=" ${VERIFY_NODE_PARTS:-m3 m4 m5 m6} "
+			parts=" ${VERIFY_NODE_PARTS:-m3 m4 m5 m6 review} "
 			if [[ $parts == *" m3 "* ]]; then node_m3; else m3_skip "not in VERIFY_NODE_PARTS"; fi
 			if [[ $parts == *" m4 "* ]]; then node_m4; else m4_skip "not in VERIFY_NODE_PARTS" "N18 N19 N20 N21 N22 N23 N24"; fi
 			if [[ $parts == *" m5 "* ]]; then node_m5; else m5_skip "not in VERIFY_NODE_PARTS"; fi
 			if [[ $parts == *" m6 "* ]]; then node_m6; else m6_skip "not in VERIFY_NODE_PARTS"; fi
+			if [[ $parts == *" review "* ]]; then
+				node_review_host
+				node_review_worker
+			else
+				review_host_skip "not in VERIFY_NODE_PARTS" "N45 N46 N47 N48 N49 N50 N51 N53"
+				review_worker_skip "not in VERIFY_NODE_PARTS"
+			fi
 			[[ -n $M3_SANDBOX ]] && "$CX" delete "$M3_SANDBOX" --yes >/dev/null 2>&1
 			left=$(node_sh "docker ps -aq --filter label=build.cloudex.role=machine | wc -l; docker network ls -q --filter label=build.cloudex.role=machine | wc -l" | tr '\n' ' ')
 			# N35: a node with a sandbox is removed only with --force, which
@@ -1797,6 +2164,7 @@ if want node; then
 			[[ -n ${REBOOTED:-} ]] && na="${na:-no change in the Docker objects, and no inet cloudex (the nftables tables were compared only without a reboot)}"
 			OUT="machines and networks after deleting the sandboxes: $left; outside the labels during the run: ${nb:-no change}; uninstall exit $urc; left by it (containers, networks, volume, unit files): $leftover; before and after: ${na:-no change}" CODE=""
 			ok N25 "$(m3_desc N25)" [ "$left" = "0 0 " -a -z "$nb" -a "$urc" = 0 -a "$leftover" = "0 0 0 0 " -a \( -z "$na" -o -n "$(grep '^no change in the Docker' <<<"$na")" \) ]
+			if [[ $parts == *" review "* ]]; then node_review_r3; else review_host_skip "not in VERIFY_NODE_PARTS" N52; fi
 			node_stop_all
 		fi
 	fi
