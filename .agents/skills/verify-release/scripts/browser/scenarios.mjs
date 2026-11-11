@@ -363,7 +363,8 @@ export async function agent(T) {
     // In the foreground: OpenCode may otherwise put it in the background and end the turn at once.
     await p.setValue(".send textarea", "Run the shell command `sleep 300` in the foreground and wait for it to finish (do not run it in the background), then reply with just the word Done.");
     await p.click("Send");
-    await p.waitFor(() => [...document.querySelectorAll(".l-cmd")].some((l) => l.textContent.includes("sleep 300")), [], { ms: 120_000, every: 1_000, what: "the agent to run sleep 300" });
+    // A command's line may only show once it ends, so give the turn time to start it instead of waiting for the line.
+    await new Promise((r) => setTimeout(r, 25_000));
     const early = await p.ev(ended, 3);
     must(!early, `the agent ended turn 3 itself before Interrupt (${early}): it didn't wait for sleep 300`);
     await p.click("Interrupt");
