@@ -40,7 +40,7 @@ func TestWorkerMetadataMatchesWrangler(t *testing.T) {
 		t.Fatalf("wrangler.jsonc: %v", err)
 	}
 
-	md := workerMetadata("2026-10-01", nil, "img", "node-img", "db", "", "k", true)
+	md := workerMetadata("2026-10-01", nil, "img", "node-img", "nd-agent", "db", "", "k", true)
 	var mdDOs, wDOs, mdVars, wVars []string
 	for _, b := range md["bindings"].([]map[string]any) {
 		switch b["type"] {
@@ -78,6 +78,14 @@ func TestWorkerMetadataMatchesWrangler(t *testing.T) {
 	for _, b := range md["bindings"].([]map[string]any) {
 		if b["name"] == "NODE_IMAGE" && b["text"] != "node-img" {
 			t.Errorf("NODE_IMAGE %v", b["text"])
+		}
+	}
+}
+
+func TestAgentTagIsTheVersionOnlyForAPlainRelease(t *testing.T) {
+	for v, want := range map[string]string{"v0.2.2": "v0.2.2", "v10.0.31": "v10.0.31", "dev": "edge", "v0.2.2-dev": "edge", "v0.2.2-rc1": "edge", "nodes": "edge", "": "edge", "0.2.2": "edge"} {
+		if got := AgentTag(v); got != want {
+			t.Errorf("%q: %s, want %s", v, got, want)
 		}
 	}
 }

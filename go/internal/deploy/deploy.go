@@ -134,6 +134,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	var meta struct {
 		CompatibilityDate  string   `json:"compatibility_date"`
 		CompatibilityFlags []string `json:"compatibility_flags"`
+		Version            string   `json:"version"` // the Worker's, from scripts/bundle-api.sh
 	}
 	if data, err := readAsset("assets/meta.json"); err != nil || json.Unmarshal(data, &meta) != nil {
 		return nil, errors.New("this cloudex build's API bundle is incomplete; rebuild it with scripts/bundle-api.sh")
@@ -207,6 +208,8 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		return nil, err
 	}
 
+	nodeAgent := resolveNodeAgent(ctx, meta.Version, log)
+
 	dbID, created, err := cf.EnsureD1(ctx, account.ID, DatabaseName)
 	if err != nil {
 		return nil, stepError("D1 database", permD1, err)
@@ -237,13 +240,14 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
-	md := workerMetadata(meta.CompatibilityDate, meta.CompatibilityFlags, image, nodeImage, dbID, zone, key, backups)
+	md := workerMetadata(meta.CompatibilityDate, meta.CompatibilityFlags, image, nodeImage, nodeAgent, dbID, zone, key, backups)
 	if err := installWorker(ctx, cf, account.ID, md, worker, zoneID, zone, log); err != nil {
 		return nil, err
 	}
 	log("API deployed at %s", apiURL)
 	if live.running {
 		log("Sandboxes keep running. Busy connections (ssh, desktops) move to the new version within about 5 minutes and may drop then; reconnect if one does")
+		log("Nodes reconnect by themselves, and their sandboxes keep running. A deploy doesn't update their agents: on each node host, run the installer again with this version's --version (it keeps the node, its identity and its machines)")
 	}
 	res := &Result{APIURL: apiURL, APIKey: key, AccountID: account.ID, PreviewZone: zone}
 	if o.OnInstalled != nil {
@@ -382,6 +386,58 @@ func nodeImageRef(src name.Reference, digest string) string {
 	return repo + "@" + digest
 }
 
+// NodeAgentRepo is where the node agent's image is published (release.yml).
+const NodeAgentRepo = "ghcr.io/lucataco/cloudex-node"
+
+// AgentTag is the agent image tag a deployment of version names in its
+// install command: the version itself for a release (v1.2.3), edge for
+// anything else (dev, v0.2.2-dev, a branch), which isn't published by tag.
+// apps/api/src/index.ts agentTag is the same rule.
+func AgentTag(version string) string {
+	if releaseTag.MatchString(version) {
+		return version
+	}
+	return "edge"
+}
+
+var releaseTag = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// resolveNodeAgent finds the digest the agent image's tag points at now, so
+// that cloudex node add's install command pins it (NODE_AGENT,
+// "<tag>@sha256:<hex>"; the installer's --digest). Empty, with a line saying
+// why, when the tag isn't published (yet) or the registry doesn't answer: the
+// command then names the tag alone.
+func resolveNodeAgent(ctx context.Context, version string, log func(string, ...any)) string {
+	if version == "" {
+		return ""
+	}
+	tag := AgentTag(version)
+	ref, err := name.NewTag(NodeAgentRepo + ":" + tag)
+	if err != nil {
+		return ""
+	}
+	hctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	desc, err := remote.Head(ref, remote.WithContext(hctx), remote.WithAuth(authn.Anonymous))
+	if err != nil {
+		log("The node agent image %s isn't published yet (%v): node install commands name its tag without a digest", ref, shortErr(err))
+		return ""
+	}
+	log("Node install commands pin the agent image %s to %s", ref, desc.Digest)
+	return tag + "@" + desc.Digest.String()
+}
+
+func shortErr(err error) string {
+	s := err.Error()
+	if i := strings.IndexByte(s, '\n'); i > 0 {
+		s = s[:i]
+	}
+	if len(s) > 160 {
+		s = s[:160]
+	}
+	return s
+}
+
 // readImage reads the source image without credentials, so a stale docker
 // login can't break a public image. An image that needs a login, such as a
 // private one given with --image, is read again with the docker credentials.
@@ -510,7 +566,7 @@ func installWorker(ctx context.Context, cf *cloudflare.Client, account string, m
 // The Durable Object classes are declared in exports, which needs no migration:
 // a deployment from before a class gets it on its next upload. Keep the
 // bindings and exports in step with wrangler.jsonc (TestWorkerMetadataMatchesWrangler).
-func workerMetadata(compatDate string, flags []string, image, nodeImage, dbID, zone, key string, backups bool) map[string]any {
+func workerMetadata(compatDate string, flags []string, image, nodeImage, nodeAgent, dbID, zone, key string, backups bool) map[string]any {
 	if flags == nil {
 		flags = []string{}
 	}
@@ -520,6 +576,7 @@ func workerMetadata(compatDate string, flags []string, image, nodeImage, dbID, z
 		{"type": "d1", "name": "DB", "id": dbID},
 		{"type": "plain_text", "name": "PREVIEW_ZONE", "text": zone},
 		{"type": "plain_text", "name": "NODE_IMAGE", "text": nodeImage},
+		{"type": "plain_text", "name": "NODE_AGENT", "text": nodeAgent},
 		{"type": "secret_text", "name": "ADMIN_KEY", "text": key},
 	}
 	if backups {

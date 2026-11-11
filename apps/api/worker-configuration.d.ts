@@ -6,6 +6,7 @@ interface __BaseEnv_Env {
 	DB: D1Database;
 	PREVIEW_ZONE: "";
 	NODE_IMAGE: "";
+	NODE_AGENT: "";
 	ADMIN_KEY: string;
 	SANDBOX: DurableObjectNamespace<import("./src/index").Sandbox>;
 	NODE: DurableObjectNamespace<import("./src/index").Node>;
@@ -22,7 +23,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "PREVIEW_ZONE" | "NODE_IMAGE" | "ADMIN_KEY">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "PREVIEW_ZONE" | "NODE_IMAGE" | "NODE_AGENT" | "ADMIN_KEY">> {}
 }
 declare module "*.txt" {
 	const value: string;

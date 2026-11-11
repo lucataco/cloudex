@@ -39,6 +39,9 @@
   // NODE_IMAGE: the sandbox image nodes pull, as its published reference with
   // its digest (ghcr.io/lucataco/cloudex-base:<tag>@sha256:...). cloudex deploy
   // sets it; empty here.
-  "vars": { "PREVIEW_ZONE": "", "NODE_IMAGE": "" }
+  // NODE_AGENT: the node agent image's tag and the digest it pointed at when
+  // cloudex deploy ran (<tag>@sha256:...), which the install command that
+  // cloudex node add prints pins with --digest; empty when it wasn't published.
+  "vars": { "PREVIEW_ZONE": "", "NODE_IMAGE": "", "NODE_AGENT": "" }
   // Secrets: ADMIN_KEY (wrangler secret put ADMIN_KEY). Locally, put it in .dev.vars.
 }

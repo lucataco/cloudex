@@ -271,6 +271,18 @@ test("a node counts the sandboxes on it", async () => {
   assert.equal((await nodes.findNode(DB, node.id))!.machines, 1);
 });
 
+test("the install command names edge for anything but a release, and pins the digest deploy found for that tag", () => {
+  const d = "sha256:" + "a".repeat(64);
+  const cmd = (v: string, agent = "") => nodes.installCommand("https://api.example", "cxj_t", v, agent);
+  assert.match(cmd("v0.2.2"), / --version v0\.2\.2$/);
+  for (const v of ["dev", "v0.2.2-dev", "v0.2.2-rc1", "nodes", ""]) assert.match(cmd(v), / --version edge$/, v);
+  assert.match(cmd("v0.2.2", `v0.2.2@${d}`), new RegExp(` --version v0\\.2\\.2 --digest ${d}$`));
+  assert.match(cmd("v0.2.2-dev", `edge@${d}`), new RegExp(` --version edge --digest ${d}$`));
+  // A digest for another tag, or not a digest, isn't used.
+  assert.match(cmd("v0.2.3", `v0.2.2@${d}`), / --version v0\.2\.3$/);
+  assert.match(cmd("v0.2.2", "v0.2.2@sha256:zz; rm -rf /"), / --version v0\.2\.2$/);
+});
+
 test("only admins see a node's orphans, pending deletes and round trip", () => {
   const n = { id: "nd-aaaa1111", name: "box", orphans: ["cx-aaa111"], pendingDeletes: ["cx-bbb222"], rttMs: 40, state: "online" } as never;
   assert.deepEqual(nodes.nodeView(n, true), n);

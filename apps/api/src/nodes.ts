@@ -224,3 +224,19 @@ export async function forgetNode(db: D1Database, id: string) {
   await ensureSchema(db);
   await db.batch([db.prepare("DELETE FROM nodes WHERE id = ?").bind(id), db.prepare("DELETE FROM node_joins WHERE node_id = ?").bind(id)]);
 }
+
+// The command that installs a node's agent with its join token: the
+// installer (scripts/node-install.sh, published at https://cloudex.build/node)
+// run as root, with the agent image of the deployment's own version, pinned
+// to the digest cloudex deploy found for it (NODE_AGENT) when it found one.
+export function installCommand(origin: string, token: string, version: string, nodeAgent: string) {
+  const tag = agentTag(version);
+  const [pinnedTag, digest] = nodeAgent.split("@");
+  const pin = pinnedTag === tag && /^sha256:[0-9a-f]{64}$/.test(digest ?? "") ? ` --digest ${digest}` : "";
+  return `curl -fsSL https://cloudex.build/node | sudo bash -s -- --api ${origin} --token ${token} --version ${tag}${pin}`;
+}
+
+// The agent image's tag for a deployment's version: a release's own (v1.2.3),
+// else edge, since only releases are published by version (2026-11-12 review,
+// R6; go/internal/deploy AgentTag is the same rule).
+export const agentTag = (version: string) => (/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(version) ? version : "edge");

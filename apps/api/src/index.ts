@@ -66,7 +66,7 @@ import {
 import { serveDashboard } from "./dashboard";
 import { CONNECT } from "./node";
 import { HEADERS, issueJoinToken, readCapped, useJoinToken, verifyJoinSignature, verifyNodeRequest } from "./nodeauth";
-import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodeKeys, nodePublicKey, nodeView, revokeNode } from "./nodes";
+import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodeKeys, nodePublicKey, nodeView, revokeNode, installCommand } from "./nodes";
 import { placeOn, refused } from "./placement";
 import { locationHint } from "./nodestate";
 import { cachedKey, nodeEgress } from "./nodeegress";
@@ -800,20 +800,13 @@ async function live(env: Env, n: ApiNode, details: false | "some" | "all" = fals
   }
 }
 
-// The command that installs a node's agent with its join token: the
-// installer (scripts/node-install.sh, published at https://cloudex.build/node)
-// run as root, with the agent image of the deployment's own version.
-function installCommand(origin: string, token: string) {
-  const tag = VERSION === "dev" ? "edge" : VERSION;
-  return `curl -fsSL https://cloudex.build/node | sudo bash -s -- --api ${origin} --token ${token} --version ${tag}`;
-}
 
 app.post("/v1/nodes", async (c) => {
   const { name } = CreateNode.parse(await c.req.json());
   const node = await addNode(c.env.DB, name);
   const { token, expiresAt } = await issueJoinToken(c.env.DB, node.id);
   const origin = new URL(c.req.url).origin;
-  return c.json({ node, joinToken: token, expiresAt, install: installCommand(origin, token) } satisfies NewNode, 201);
+  return c.json({ node, joinToken: token, expiresAt, install: installCommand(origin, token, VERSION, c.env.NODE_AGENT ?? "") } satisfies NewNode, 201);
 });
 
 // live=false answers from the index alone, as each Node object last wrote

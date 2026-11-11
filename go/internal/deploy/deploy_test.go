@@ -106,10 +106,10 @@ func TestWorkerMetadataBindsBackupsOnlyWhenAvailable(t *testing.T) {
 		}
 		return false
 	}
-	if has(workerMetadata("2026-10-01", nil, "img", "", "db", "", "k", false), "BACKUPS") {
+	if has(workerMetadata("2026-10-01", nil, "img", "", "", "db", "", "k", false), "BACKUPS") {
 		t.Fatal("bound R2 without a bucket")
 	}
-	if !has(workerMetadata("2026-10-01", nil, "img", "", "db", "", "k", true), "BACKUPS") {
+	if !has(workerMetadata("2026-10-01", nil, "img", "", "", "db", "", "k", true), "BACKUPS") {
 		t.Fatal("no BACKUPS binding")
 	}
 }
@@ -201,7 +201,7 @@ func TestInstallWorker(t *testing.T) {
 		return 404, 0
 	})
 	cf := cloudflare.NewAt("tok", srv.URL)
-	md := workerMetadata("2026-10-01", nil, "img@sha256:1", "", "db", "example.dev", "key", true)
+	md := workerMetadata("2026-10-01", nil, "img@sha256:1", "", "", "db", "example.dev", "key", true)
 	var logged []string
 	log := func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) }
 	ctx := context.Background()

@@ -21,6 +21,6 @@ node -e '
   const fs = require("fs");
   const src = fs.readFileSync("wrangler.jsonc", "utf8").replace(/^\s*\/\/.*$/gm, "");
   const { compatibility_date, compatibility_flags = [] } = JSON.parse(src);
-  fs.writeFileSync(process.argv[1], JSON.stringify({ compatibility_date, compatibility_flags }, null, 2) + "\n");
-' "$out/meta.json"
+  fs.writeFileSync(process.argv[1], JSON.stringify({ compatibility_date, compatibility_flags, version: process.argv[2] }, null, 2) + "\n");
+' "$out/meta.json" "$version"
 echo "bundled API $version ($(wc -c < "$out/worker.js" | tr -d ' ') bytes) into go/internal/deploy/assets"
