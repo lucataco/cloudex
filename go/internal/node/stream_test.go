@@ -187,6 +187,15 @@ func (f *fakeDocker) run(conn net.Conn, in *bufio.Reader) {
 			f.halfClose = true
 			f.mu.Unlock()
 		}
+	case "yes": // prints forever, as a planted sh might (review H1)
+		line := strings.Repeat("y", 4095) + "\n"
+		for {
+			if _, err := conn.Write(muxFrame(1, line)); err != nil {
+				break
+			}
+		}
+	case "hang": // never exits and never prints
+		in.ReadByte()
 	case "cat":
 		buf := make([]byte, 64<<10)
 		for {

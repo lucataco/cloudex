@@ -348,7 +348,7 @@ func (h *Handler) session(m Target, tag string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	for _, user := range []string{"0", "1000:1000"} {
-		out, _, err := h.Docker.Run(ctx, m.Container, user, []string{"sh", "-c", sessionScript, "sh", tag})
+		out, _, err := h.Docker.Run(ctx, m.Container, user, []string{"/bin/sh", "-c", sessionScript, "sh", tag})
 		if err != nil {
 			continue
 		}
@@ -377,7 +377,7 @@ func (h *Handler) kill(m Target, sid, sig int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	// The image's sh is dash, whose kill takes no "--": kill -15 -917 signals group 917.
-	h.Docker.Run(ctx, m.Container, "0", []string{"sh", "-c", `kill -"$1" -"$2"`, "sh", strconv.Itoa(sig), strconv.Itoa(sid)})
+	h.Docker.Run(ctx, m.Container, "0", []string{"/bin/sh", "-c", `kill -"$1" -"$2"`, "sh", strconv.Itoa(sig), strconv.Itoa(sid)})
 }
 
 func short(id string) string {

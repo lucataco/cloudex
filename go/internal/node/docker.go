@@ -232,10 +232,34 @@ func (d *Docker) ExecInspect(ctx context.Context, id string) (*ExecState, error)
 	return &s, nil
 }
 
+// RunOutputMax is the most a helper exec (Run) may print, stdout and stderr
+// together; more fails it. RunTimeout bounds one that has no deadline.
+const RunOutputMax = 64 << 10
+
+var RunTimeout = 30 * time.Second
+
+// RunPath is the PATH the agent's own execs run with. A machine's root can
+// put programs in /usr/local (first in the image's PATH), so the helpers look
+// only in the system's directories. Root can replace those too: what bounds a
+// hostile helper is the output cap and the deadline (review H1).
+const RunPath = "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+
+// ErrRunOutput is a helper exec that printed more than RunOutputMax.
+var ErrRunOutput = fmt.Errorf("the command printed more than %d KiB", RunOutputMax>>10)
+
 // Run runs a command in a container to its end and returns its stdout,
-// for the agent's own small jobs (finding and signalling a session).
+// for the agent's own small jobs (the ready check, finding and signalling a
+// session). The machine may be hostile, and its root may have replaced the
+// command: Run reads at most RunOutputMax bytes and gives up when ctx ends
+// (RunTimeout when it has no deadline), closing the connection, so neither
+// endless output nor a command that never exits can hold the agent.
 func (d *Docker) Run(ctx context.Context, container, user string, argv []string) (string, int, error) {
-	id, err := d.ExecCreate(ctx, container, ExecConfig{AttachStdout: true, AttachStderr: true, Cmd: argv, User: user})
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, RunTimeout)
+		defer cancel()
+	}
+	id, err := d.ExecCreate(ctx, container, ExecConfig{AttachStdout: true, AttachStderr: true, Cmd: argv, User: user, Env: []string{RunPath}})
 	if err != nil {
 		return "", -1, err
 	}
@@ -244,18 +268,27 @@ func (d *Docker) Run(ctx context.Context, container, user string, argv []string)
 		return "", -1, err
 	}
 	defer h.Conn.Close()
-	var out, errOut bytes.Buffer
+	// ExecStart clears the connection's deadline; ending ctx closes it.
+	stop := context.AfterFunc(ctx, func() { h.Conn.Close() })
+	defer stop()
+	var out bytes.Buffer
+	total := 0
 	if err := Demux(h.Reader, func(ch int, p []byte) error {
+		total += len(p)
+		if total > RunOutputMax {
+			return ErrRunOutput
+		}
 		if ch == ChStdout {
 			out.Write(p)
-		} else {
-			errOut.Write(p)
 		}
 		return nil
 	}); err != nil {
 		return "", -1, err
 	}
-	for i := 0; ; i++ {
+	if err := ctx.Err(); err != nil {
+		return "", -1, fmt.Errorf("the command didn't finish: %w", err)
+	}
+	for {
 		s, err := d.ExecInspect(ctx, id)
 		if err != nil {
 			return "", -1, err
