@@ -37,6 +37,10 @@ const BackoffCap = 5 * time.Second
 // at once wouldn't help. Each attempt costs the Worker a D1 read.
 const RefusedWait = 60 * time.Second
 
+// TooOftenWait is the wait after the deployment says the node connects too
+// often (429; at most 12 connects a minute).
+const TooOftenWait = 15 * time.Second
+
 // ReplacedWait is how long the agent waits after another connection with the
 // same key replaced its own: two agents sharing one state directory would
 // otherwise take turns forever.

@@ -144,3 +144,5 @@ func (s State) ReadStatus() (*Status, error) {
 	var st Status
 	return &st, json.Unmarshal(b, &st)
 }
+
+func readFile(path string) ([]byte, error) { return os.ReadFile(path) }

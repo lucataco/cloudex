@@ -123,8 +123,88 @@ type Agent struct {
 	// Wait, when set, replaces sleeping between attempts.
 	Wait func(ctx context.Context, d time.Duration) error
 
+	// M3's development path: containers started by hand that the agent may
+	// adopt for a sandbox (cloudex-node run --dev-machine), and the spare
+	// stream sockets it keeps for each (SparesMin by default).
+	DevMachines []string
+	Docker      *Docker
+	Spares      int
+	Debug       bool // logs each stream
+
 	status   Status
 	statusMu sync.Mutex
+
+	runCtx context.Context
+	poolMu sync.Mutex
+	pools  map[string]*pool
+	hand   *Handler
+
+	ctlMu   sync.Mutex
+	ctlSend func(v any) error // the current control connection's, or nil
+	waiting map[string]chan Tickets
+}
+
+func (a *Agent) docker() *Docker {
+	if a.Docker == nil {
+		a.Docker = &Docker{}
+	}
+	return a.Docker
+}
+
+func (a *Agent) handler() *Handler {
+	a.poolMu.Lock()
+	defer a.poolMu.Unlock()
+	if a.hand == nil {
+		a.hand = &Handler{Docker: a.docker(), Log: a.Log, Debug: a.Debug}
+	}
+	return a.hand
+}
+
+func (a *Agent) spares() int {
+	if a.Spares > 0 {
+		return min(a.Spares, SparesMax)
+	}
+	return SparesMin
+}
+
+// requestTickets asks the Node object, over the control socket, for stream
+// tickets for a sandbox.
+func (a *Agent) requestTickets(ctx context.Context, sandbox string, n int) ([]string, error) {
+	a.ctlMu.Lock()
+	send := a.ctlSend
+	id := fmt.Sprintf("tk-%x", rand.Uint64())
+	ch := make(chan Tickets, 1)
+	if send != nil {
+		if a.waiting == nil {
+			a.waiting = map[string]chan Tickets{}
+		}
+		a.waiting[id] = ch
+	}
+	a.ctlMu.Unlock()
+	if send == nil {
+		return nil, errors.New("not connected to the deployment")
+	}
+	defer func() {
+		a.ctlMu.Lock()
+		delete(a.waiting, id)
+		a.ctlMu.Unlock()
+	}()
+	if err := send(TicketRequest{Type: "tickets", ID: id, Sandbox: sandbox, Count: min(n, StreamTicketsMax)}); err != nil {
+		return nil, err
+	}
+	t := time.NewTimer(10 * time.Second)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-t.C:
+		return nil, errors.New("the deployment didn't answer a ticket request within 10 s")
+	case r := <-ch:
+		if r.Error != "" {
+			return nil, errors.New(r.Error)
+		}
+		return r.Tickets, nil
+	}
 }
 
 func (a *Agent) logf(format string, args ...any) {
@@ -168,6 +248,13 @@ func (a *Agent) wait(ctx context.Context, d time.Duration) error {
 
 // Run keeps the control socket up until ctx ends.
 func (a *Agent) Run(ctx context.Context) error {
+	a.runCtx = ctx
+	a.poolMu.Lock()
+	a.pools = map[string]*pool{}
+	a.poolMu.Unlock()
+	if len(a.DevMachines) > 0 {
+		go a.startPools()
+	}
 	var down time.Time
 	attempt := 0
 	for {
@@ -181,6 +268,9 @@ func (a *Agent) Run(ctx context.Context) error {
 			var refused *RefusedError
 			if errors.As(err, &refused) && (refused.Status == 401 || refused.Status == 403 || refused.Status == 426) {
 				d = max(d, RefusedWait)
+			}
+			if errors.As(err, &refused) && refused.Status == 429 {
+				d = max(d, TooOftenWait) // the Node object limits connects a minute
 			}
 			attempt++
 			a.logf("connect attempt %d failed after %v: %v; trying again in %v", attempt, time.Since(t0).Round(time.Millisecond), err, d.Round(time.Millisecond))
@@ -262,9 +352,17 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 		defer wcancel()
 		return c.Write(wctx, websocket.MessageText, b)
 	}
-	if err := send(NewHello(a.Version, a.facts(), nil)); err != nil {
+	if err := send(NewHello(a.Version, a.facts(), a.machines())); err != nil {
 		return "sending hello: " + err.Error(), 0
 	}
+	a.ctlMu.Lock()
+	a.ctlSend = send
+	a.ctlMu.Unlock()
+	defer func() {
+		a.ctlMu.Lock()
+		a.ctlSend = nil
+		a.ctlMu.Unlock()
+	}()
 	now := time.Now()
 	var lastPong atomic.Int64
 	lastPong.Store(now.UnixMilli())
@@ -328,6 +426,20 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 			a.setStatus(func(s *Status) { s.LastPongAt = t })
 			continue
 		}
+		var head struct{ Type string }
+		json.Unmarshal(data, &head)
+		if head.Type == "tickets" {
+			var t Tickets
+			if json.Unmarshal(data, &t) == nil {
+				a.ctlMu.Lock()
+				ch := a.waiting[t.ID]
+				a.ctlMu.Unlock()
+				if ch != nil {
+					ch <- t
+				}
+			}
+			continue
+		}
 		var op Op
 		if json.Unmarshal(data, &op) != nil || op.Type != "op" || op.ID == "" {
 			a.logf("ignoring a message it doesn't know: %.200s", data)
@@ -341,6 +453,18 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 	}
 }
 
+// machines lists the machines this agent runs, for hello.
+func (a *Agent) machines() []Machine {
+	ms := []Machine{}
+	if len(a.DevMachines) == 0 || a.State.Dir == "" {
+		return ms
+	}
+	for sandbox := range a.State.DevMachines().Machines {
+		ms = append(ms, Machine{ID: sandbox, State: "running"})
+	}
+	return ms
+}
+
 // answer runs an op. The set is fixed; nothing here runs anything on the host.
 func (a *Agent) answer(op Op) Result {
 	switch op.Name {
@@ -348,6 +472,38 @@ func (a *Agent) answer(op Op) Result {
 		return okResult(op.ID, struct{}{})
 	case "facts":
 		return okResult(op.ID, a.facts())
+	case "adopt", "release", "streams":
+		var args struct {
+			Sandbox string `json:"sandbox"`
+			Count   int    `json:"count"`
+		}
+		b, _ := json.Marshal(op.Args)
+		json.Unmarshal(b, &args)
+		if !sandboxID.MatchString(args.Sandbox) {
+			return errResult(op.ID, "not a sandbox id")
+		}
+		switch op.Name {
+		case "adopt":
+			v, err := a.adopt(args.Sandbox)
+			if err != nil {
+				return errResult(op.ID, err.Error())
+			}
+			return okResult(op.ID, v)
+		case "release":
+			if err := a.release(args.Sandbox); err != nil {
+				return errResult(op.ID, err.Error())
+			}
+			return okResult(op.ID, struct{}{})
+		default:
+			a.poolMu.Lock()
+			p := a.pools[args.Sandbox]
+			a.poolMu.Unlock()
+			if p == nil {
+				return errResult(op.ID, "no machine here runs "+args.Sandbox)
+			}
+			p.more(max(1, min(args.Count, SparesMax)))
+			return okResult(op.ID, struct{}{})
+		}
 	default:
 		return errResult(op.ID, "unknown op "+op.Name+": this agent may be older than the deployment")
 	}

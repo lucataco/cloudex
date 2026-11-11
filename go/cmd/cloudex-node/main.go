@@ -85,8 +85,10 @@ func newRoot() *cobra.Command {
 	join.MarkFlagRequired("api")
 	join.MarkFlagRequired("token")
 
-	var runJoin, runAPI string
+	var runJoin, runAPI, dockerSocket string
 	var runUnisolated bool
+	var devMachines []string
+	var spares int
 	run := &cobra.Command{
 		Use:   "run",
 		Short: "Keep this node connected to its deployment (joining first with --join)",
@@ -116,7 +118,11 @@ func newRoot() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			lg.Printf("%s: node %s (%s) connecting to %s", version, id.Name, id.ID, id.APIURL)
-			a := &node.Agent{API: id.APIURL, ID: id.ID, Key: key, Version: version, Unisolated: id.Unisolated, State: s, Log: lg}
+			a := &node.Agent{API: id.APIURL, ID: id.ID, Key: key, Version: version, Unisolated: id.Unisolated, State: s, Log: lg,
+				DevMachines: devMachines, Docker: &node.Docker{Socket: dockerSocket}, Spares: spares, Debug: os.Getenv("CLOUDEX_NODE_DEBUG") == "1"}
+			if len(devMachines) > 0 {
+				lg.Printf("development machines it may adopt: %v", devMachines)
+			}
 			if err := a.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				return err
 			}
@@ -127,6 +133,10 @@ func newRoot() *cobra.Command {
 	run.Flags().StringVar(&runJoin, "join", "", "a join token, used when this node hasn't joined yet")
 	run.Flags().StringVar(&runAPI, "api", "", "the deployment's URL, with --join")
 	run.Flags().BoolVar(&runUnisolated, "unisolated", false, "with --join: for testing only, run machines without the firewall's isolation")
+	run.Flags().StringArrayVar(&devMachines, "dev-machine", nil, "development only: a running container this agent may adopt for a sandbox (POST /v1/nodes/{node}/dev-sandboxes); repeatable")
+	run.Flags().IntVar(&spares, "spares", node.SparesMin, "spare stream sockets kept open per machine")
+	run.Flags().StringVar(&dockerSocket, "docker-socket", node.DefaultDockerSocket, "the Docker Engine API's socket")
+	run.Flags().MarkHidden("dev-machine")
 
 	var asJSON bool
 	status := &cobra.Command{

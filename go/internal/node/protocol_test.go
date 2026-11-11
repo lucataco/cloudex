@@ -16,9 +16,11 @@ import (
 // The examples the TypeScript models are checked against too
 // (packages/schema/test/node.test.ts).
 type fixture struct {
-	Protocol int            `json:"protocol"`
-	Close    map[string]int `json:"close"`
-	Signing  struct {
+	Protocol    int            `json:"protocol"`
+	Close       map[string]int `json:"close"`
+	StreamClose map[string]int `json:"streamClose"`
+	Window      int            `json:"window"`
+	Signing     struct {
 		Method, Path, Sandbox, TS, Nonce, String, Seed, PublicKey, Signature string
 	} `json:"signing"`
 	Valid []struct {
@@ -53,8 +55,14 @@ func decodeAs(t *testing.T, model string, raw json.RawMessage) any {
 		v = &Join{}
 	case model == "NodeJoined":
 		v = &Joined{}
+	case model == "WorkerMessage" && head.Type == "tickets":
+		v = &Tickets{}
 	case model == "WorkerMessage":
 		v = &Op{}
+	case model == "StreamToAgent" || model == "StreamFromAgent":
+		v = &StreamMsg{}
+	case head.Type == "tickets":
+		v = &TicketRequest{}
 	case head.Type == "hello":
 		v = &Hello{}
 	case head.Type == "facts":
@@ -92,6 +100,10 @@ func TestEveryExampleRoundTripsThroughTheGoTypes(t *testing.T) {
 	want := map[string]int{"replaced": CloseReplaced, "revoked": CloseRevoked, "stale": CloseStale, "badMessage": CloseBadMessage}
 	if !reflect.DeepEqual(f.Close, want) {
 		t.Fatalf("close codes: fixture %v, Go %v", f.Close, want)
+	}
+	wantStream := map[string]int{"lost": StreamLost, "badTicket": StreamBadTicket, "badMessage": StreamBadMessage, "heartbeat": StreamHeartbeat}
+	if !reflect.DeepEqual(f.StreamClose, wantStream) || f.Window != StreamWindow {
+		t.Fatalf("stream close codes or window: fixture %v %d, Go %v %d", f.StreamClose, f.Window, wantStream, StreamWindow)
 	}
 	if len(f.Valid) < 8 {
 		t.Fatalf("only %d examples", len(f.Valid))
