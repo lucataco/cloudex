@@ -110,7 +110,7 @@ func TestSavesNamesTheSandboxesTheyCameFrom(t *testing.T) {
 		"GET /v1/sandboxes": "[" + sandboxJSON + "]",
 	})
 	code, out, errOut := run(t, "saves")
-	if code != 0 || !strings.Contains(out, "web\n") || !strings.Contains(out, "cx-gone99\n") || strings.Contains(out, "cx-abc123") {
+	if code != 0 || !strings.Contains(out, "web        cloudflare\n") || !strings.Contains(out, "cx-gone99  cloudflare\n") || strings.Contains(out, "cx-abc123") {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}
 }

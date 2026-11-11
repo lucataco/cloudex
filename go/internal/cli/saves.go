@@ -33,7 +33,11 @@ func newSaveCmd(opts *options) *cobra.Command {
 			"Docker images and your files, and the sandbox's settings (cloudex env). SSH host\n" +
 			"keys are left out, so each new sandbox makes its own.\n\n" +
 			"The sandbox keeps running. Saving under a name that's taken replaces that save\n" +
-			"once the new one is done.",
+			"once the new one is done.\n\n" +
+			"A save moves a sandbox between Cloudflare and your nodes: save it, then start a\n" +
+			"sandbox from the save with cloudex new --from <name> [--on <node>]. The new one\n" +
+			"has a new id and new preview links. A save of a sandbox on a node goes up over the\n" +
+			"node's own line, and holds whatever that node put in it.",
 		Example: "  cloudex save base\n  cloudex save my-box node-22",
 		Args:    cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -119,7 +123,7 @@ func printSaves(w io.Writer, saves []api.Save, names map[string]string) {
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tHOLDS\tSIZE\tSTORED\tMADE\tFROM")
+	fmt.Fprintln(tw, "NAME\tHOLDS\tSIZE\tSTORED\tMADE\tFROM\tON")
 	for _, s := range saves {
 		holds := "disk"
 		if s.Kind == "home" {
@@ -129,7 +133,11 @@ func printSaves(w io.Writer, saves []api.Save, names map[string]string) {
 		if name, ok := names[from]; ok {
 			from = name
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, holds, humanBytes(s.RawBytes), humanBytes(s.Bytes), ago(s.CreatedAt), from)
+		on := "cloudflare"
+		if s.Node != nil {
+			on = "node " + clean(s.Node.Name)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, holds, humanBytes(s.RawBytes), humanBytes(s.Bytes), ago(s.CreatedAt), from, on)
 	}
 	tw.Flush()
 }
@@ -180,6 +188,10 @@ func newSavesRmCmd(opts *options) *cobra.Command {
 // fromSave tells whether new --from names a named save rather than a
 // sandbox: save:<name> always does, and so does a name that no sandbox has
 // and a save does. It returns the sandbox ref or the save's name.
+// savesSeen are the saves fromSave looked up, for what runStartFromSave says
+// about where one was made.
+var savesSeen = map[string]*api.Save{}
+
 func fromSave(ctx context.Context, client *api.Client, from string) (string, bool, error) {
 	if name, ok := strings.CutPrefix(from, savePrefix); ok {
 		return name, true, nil
@@ -189,7 +201,8 @@ func fromSave(ctx context.Context, client *api.Client, from string) (string, boo
 	if err == nil || !errors.As(err, &notFound) || notFound.Status != 404 {
 		return from, false, err
 	}
-	if _, err := client.GetSave(ctx, from); err == nil {
+	if sv, err := client.GetSave(ctx, from); err == nil {
+		savesSeen[from] = sv
 		return from, true, nil
 	} else if !errors.As(err, &notFound) || notFound.Status != 404 {
 		return "", false, err
@@ -206,7 +219,15 @@ func runStartFromSave(cmd *cobra.Command, opts *options, name string, req api.Fo
 	if req.Count > 1 {
 		what = fmt.Sprintf("%d sandboxes", req.Count)
 	}
-	fmt.Fprintf(cmd.ErrOrStderr(), "Starting %s from the save %s. Restoring it takes about 15 seconds per GB.\n", what, name)
+	where := ""
+	if req.Node != "" {
+		where = " on node " + req.Node
+	}
+	made := ""
+	if sv := savesSeen[name]; sv != nil && sv.Node != nil {
+		made = fmt.Sprintf(" It was made on node %s, and holds whatever that node put in it.", clean(sv.Node.Name))
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "Starting %s%s from the save %s. Restoring it takes about 15 seconds per GB.%s\n", what, where, name, made)
 	ctx, cancel := context.WithTimeout(cmd.Context(), saveTimeout)
 	defer cancel()
 	list, err := client.StartFromSave(ctx, name, req)
@@ -232,7 +253,11 @@ func runStartFromSave(cmd *cobra.Command, opts *options, name string, req api.Fo
 		}
 	} else if len(list) == 1 && failed == 0 {
 		s := list[0]
-		fmt.Fprintf(out, "%s is running (%s), from the save %s.\n", s.Label(), s.Size, name)
+		if n := s.OnNode(); n != nil {
+			fmt.Fprintf(out, "%s is running on node %s (%s), from the save %s.\n", s.Label(), clean(n.Name), limits(&s), name)
+		} else {
+			fmt.Fprintf(out, "%s is running (%s), from the save %s.\n", s.Label(), s.Size, name)
+		}
 		if s.Notice != nil && *s.Notice != "" {
 			fmt.Fprintln(out, *s.Notice)
 		}

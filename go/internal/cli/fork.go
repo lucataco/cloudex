@@ -58,6 +58,9 @@ func runNewFrom(cmd *cobra.Command, opts *options, from string, req api.ForkRequ
 	if save {
 		return runStartFromSave(cmd, opts, ref, req, noUse)
 	}
+	if req.Node != "" {
+		return fmt.Errorf("%s is a sandbox, and forks can't start on a node: save it (cloudex save %s <name>), then cloudex new --from <name> --on %s", from, from, req.Node)
+	}
 	return runFork(cmd, opts, ref, req, noUse)
 }
 

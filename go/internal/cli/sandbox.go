@@ -126,21 +126,23 @@ func newNewCmd(opts *options) *cobra.Command {
 			"sandbox and a save share a name, the sandbox wins; --from save:<name> picks the save.\n\n" +
 			"With --on, it runs on one of your nodes (see cloudex node) instead of Cloudflare,\n" +
 			"with --cpus and --memory as its machine's limits there. A sandbox on a node keeps\n" +
-			"its disk there when it stops, and has no 6-hour limit; forks, named saves and\n" +
-			"agents aren't available on nodes yet.",
+			"its disk there when it stops, and has no 6-hour limit. --on goes with --from a\n" +
+			"named save, which moves a sandbox between Cloudflare and a node; forks aren't\n" +
+			"available on nodes yet.",
 		Example: "  cloudex new --name my-box\n" +
 			"  cloudex new --on box --cpus 2 --memory 4G --name n1\n" +
 			"  cloudex new --repo https://github.com/you/app --env GH_TOKEN=$(gh auth token) --env-file .env\n" +
 			"  cloudex new --from my-box --count 3 --name agent\n" +
-			"  cloudex new --from base --name task-1",
+			"  cloudex new --from base --name task-1\n" +
+			"  cloudex new --from base --on box --name n1",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			settingsFlags := len(envPairs)+len(envFiles)+len(files) > 0 || repo != ""
 			if on == "" && (cmd.Flags().Changed("cpus") || cmd.Flags().Changed("memory")) {
 				return errors.New("--cpus and --memory go with --on: on Cloudflare, pick a --size instead")
 			}
-			if on != "" && from != "" {
-				return errors.New("--on doesn't go with --from yet: sandboxes on nodes can't start from a fork or a save in this version")
+			if on == "" && from != "" && (cmd.Flags().Changed("cpus") || cmd.Flags().Changed("memory")) {
+				return errors.New("--cpus and --memory go with --on")
 			}
 			if from != "" && settingsFlags {
 				return errors.New("--env, --env-file, --file and --repo don't go with --from: the new sandboxes get the settings of the sandbox or save; change them after with cloudex env set")
@@ -149,6 +151,19 @@ func newNewCmd(opts *options) *cobra.Command {
 				req, err := forkRequest(cmd, name, size, count, idle)
 				if err != nil {
 					return err
+				}
+				if on != "" {
+					req.Node = on
+					if cmd.Flags().Changed("cpus") {
+						req.CPUs = &cpus
+					}
+					if cmd.Flags().Changed("memory") {
+						mb, err := parseMemory(mem)
+						if err != nil {
+							return err
+						}
+						req.MemoryMB = &mb
+					}
 				}
 				return runNewFrom(cmd, opts, from, req, noUse)
 			}

@@ -323,11 +323,16 @@ func (c *Client) Update(ctx context.Context, ref string, r UpdateRequest) (*Sand
 
 // ForkRequest asks for Count new sandboxes starting from a copy of another's
 // disk. Size and IdleMinutes default to the original's.
+// Node, CPUs and MemoryMB (v0.2.2) start them on a node, from a named save
+// only (StartFromSave).
 type ForkRequest struct {
-	Name        string `json:"name,omitempty"`
-	Count       int    `json:"count,omitempty"`
-	Size        string `json:"size,omitempty"`
-	IdleMinutes *int   `json:"idleMinutes,omitempty"`
+	Name        string   `json:"name,omitempty"`
+	Count       int      `json:"count,omitempty"`
+	Size        string   `json:"size,omitempty"`
+	IdleMinutes *int     `json:"idleMinutes,omitempty"`
+	Node        string   `json:"node,omitempty"`
+	CPUs        *float64 `json:"cpus,omitempty"`
+	MemoryMB    *int     `json:"memoryMb,omitempty"`
 }
 
 // Fork returns the forks, including any that failed to start (state "error").
@@ -351,7 +356,15 @@ type Save struct {
 	Bytes       int64  `json:"bytes"`
 	CreatedAt   int64  `json:"createdAt"`
 	MS          int64  `json:"ms"`
-	Replaced    *bool  `json:"replaced,omitempty"`
+	// Node is the node it was made on (v0.2.2); nil for Cloudflare.
+	Node     *SaveNode `json:"node,omitempty"`
+	Replaced *bool     `json:"replaced,omitempty"`
+}
+
+// SaveNode names the node a save was made on.
+type SaveNode struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 func savePath(name string) string { return "/v1/saves/" + url.PathEscape(name) }

@@ -54,7 +54,7 @@ func TestNewRefusesNodeFlagsThatDontGoTogether(t *testing.T) {
 	for _, args := range [][]string{
 		{"new", "--cpus", "2"},
 		{"new", "--memory", "4G"},
-		{"new", "--on", "box", "--from", "base"},
+		{"new", "--from", "base", "--cpus", "2"},
 		{"new", "--on", "box", "--memory", "4"},
 	} {
 		code, _, errOut := run(t, args...)
@@ -197,5 +197,34 @@ func TestAnOfflineNodeOrSomethingNotOnNodesYetIsNoBugToReport(t *testing.T) {
 	}
 	if _, _, errOut := run(t, "stop", "n1"); !strings.Contains(errOut, "feedback --last-error") {
 		t.Errorf("another 503 should still suggest a report: %q", errOut)
+	}
+}
+
+// v0.2.2 M6: a save starts on a node, and says where it was made; a fork can't.
+func TestNewFromASaveOnANode(t *testing.T) {
+	saved := strings.Replace(saveJSON, `"ms":`, `"node":{"id":"nd-aaaaaaaa","name":"box"},"ms":`, 1)
+	f := withFakeAPI(t, map[string]string{
+		"GET /v1/saves/base":            saved,
+		"POST /v1/saves/base/sandboxes": "!201 [" + nodeSandboxJSON("running", "online", true, "sysbox") + "]",
+	})
+	code, out, errOut := run(t, "new", "--from", "base", "--on", "box", "--cpus", "2", "--memory", "2G", "--no-use")
+	if code != 0 || !strings.Contains(out, "on node box") || !strings.Contains(errOut, "made on node box") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	if got := f.bodies[len(f.bodies)-1]; got != `{"count":1,"node":"box","cpus":2,"memoryMb":2048}` {
+		t.Fatalf("body %s", got)
+	}
+}
+
+func TestNewFromASandboxOnANodeRefuses(t *testing.T) {
+	f := withFakeAPI(t, map[string]string{"GET /v1/sandboxes/web": sandboxJSON})
+	code, _, errOut := run(t, "new", "--from", "web", "--on", "box")
+	if code == 0 || !strings.Contains(errOut, "forks can't start on a node") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	for _, r := range f.requests {
+		if strings.HasPrefix(r, "POST") {
+			t.Fatalf("sent %v", f.requests)
+		}
 	}
 }

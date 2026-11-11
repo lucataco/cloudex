@@ -60,9 +60,6 @@ func newRunCmd(opts *options) *cobra.Command {
 			if from != "" && (len(envFiles) > 0) {
 				return errors.New("--env-file doesn't go with --from; use --env")
 			}
-			if from != "" && on != "" {
-				return errors.New("--on doesn't go with --from yet: sandboxes on nodes can't start from a fork or a save in this version")
-			}
 			r := &runner{cmd: cmd, opts: opts, line: commandLine(command), keep: keep, keepOnFailure: keepOnFailure}
 			return r.run(runSpec{
 				name: name, size: size, from: from, on: on, dir: dir, workdir: workdir, idle: idle, timeout: timeout,
@@ -266,8 +263,11 @@ func (r *runner) start(ctx context.Context, spec runSpec, env map[string]string)
 	if err != nil {
 		return nil, err
 	}
-	req := api.ForkRequest{Name: spec.name, Count: 1, Size: spec.size, IdleMinutes: idle}
+	req := api.ForkRequest{Name: spec.name, Count: 1, Size: spec.size, IdleMinutes: idle, Node: spec.on}
 	var list []api.Sandbox
+	if !isSave && spec.on != "" {
+		return nil, fmt.Errorf("%s is a sandbox, and forks can't start on a node: save it (cloudex save %s <name>), then use --from <name> --on %s", ref, ref, spec.on)
+	}
 	if isSave {
 		r.say("starting a sandbox from the save %s", ref)
 		list, err = r.client.StartFromSave(ctx, ref, req)
