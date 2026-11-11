@@ -1988,9 +1988,14 @@ node_review_worker() {
 	kill_agent
 	wait_state "$N" offline 75 >/dev/null
 	other=cx-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)
+	# A minute of its own for the flood, after the agent's going offline has
+	# been told (OFFLINE_GRACE_MS): the counts below are that minute's.
+	sleep 15
+	sleep $((62 - $(date -u +%-S)))
 	t0=$(date -u +%Y-%m-%dT%H:%M:00Z)
 	f55=$(probe flood --other "$other" --count 300)
-	t1=$(date -u -v+1M +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d '+1 min' +%Y-%m-%dT%H:%M:00Z)
+	t1=$t0
+	[[ $(date -u +%Y-%m-%dT%H:%M:00Z) == "$t0" ]] || t1=$(date -u +%Y-%m-%dT%H:%M:00Z)
 	w55="not counted (no CLOUDFLARE_API_TOKEN)" r55=$w55
 	if [[ -n ${CLOUDFLARE_API_TOKEN:-} ]]; then
 		sleep 150 # the analytics lag
