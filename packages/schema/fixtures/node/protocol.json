@@ -8,16 +8,17 @@
     "badMessage": 4400
   },
   "signing": {
-    "_": "The string a node signs: METHOD, PATH?QUERY, SANDBOX (empty when none), TS (unix seconds) and NONCE, joined by newlines.",
+    "_": "The string a node signs: METHOD, PATH?QUERY, NODE (the node id; empty for a join), SANDBOX (empty when none), TS (unix seconds) and NONCE, joined by newlines.",
     "method": "GET",
     "path": "/v1/node/connect",
+    "node": "nd-abcd1234",
     "sandbox": "",
     "ts": "1762819200",
     "nonce": "0123456789abcdef0123456789abcdef",
-    "string": "GET\n/v1/node/connect\n\n1762819200\n0123456789abcdef0123456789abcdef",
+    "string": "GET\n/v1/node/connect\nnd-abcd1234\n\n1762819200\n0123456789abcdef0123456789abcdef",
     "seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
     "publicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
-    "signature": "XV5u845BoDfislSm4JT4kGHpZl0kVR1b38cmKqMCGz7OG15/JwfjrI3NxoP2Qf10Qb1W4/8yzLJEF/INPqV3Ag=="
+    "signature": "hIlbV+gCd/gn4m0kPbycBy6Rky5hYw5JHnB8HLsH+EAGdZH+NJXLfqPb70UaIqEAOg7fuU6KDR7UFTAdGgkDDw=="
   },
   "valid": [
     {

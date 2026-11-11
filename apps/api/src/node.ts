@@ -59,7 +59,7 @@ import {
   type NodeOpName,
   type WorkerMessage,
 } from "@cloudex/schema/node";
-import { BAD_SIGNATURE, rememberNonce } from "./nodeauth";
+import { REVOKED, rememberNonce } from "./nodeauth";
 import { issueTicket } from "./nodestream";
 import { sandboxesOnNode } from "./db";
 import { PROVIDERS } from "./keys";
@@ -315,8 +315,9 @@ export class Node extends DurableObject<Env> {
     if (req.headers.get("upgrade")?.toLowerCase() !== "websocket" || !id || !nonce) return Response.json({ error: "not found" }, { status: 404 });
     const known = await this.ctx.storage.get<string>("id");
     if (known && known !== id) return Response.json({ error: "this node object belongs to another node" }, { status: 500 });
-    // After revoke(), whatever D1 said when the Worker looked.
-    if (await this.ctx.storage.get<boolean>("revoked")) return Response.json({ error: BAD_SIGNATURE }, { status: 401 });
+    // After revoke(), whatever D1 said when the Worker looked; the Worker
+    // checked the signature with the node's own key, so it may hear why.
+    if (await this.ctx.storage.get<boolean>("revoked")) return Response.json({ error: REVOKED, revoked: true }, { status: 410 });
     const now = Date.now();
     const sql = this.ctx.storage.sql;
     const fresh = rememberNonce(

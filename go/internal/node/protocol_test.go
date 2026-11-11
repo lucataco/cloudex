@@ -23,7 +23,7 @@ type fixture struct {
 	StreamClose map[string]int `json:"streamClose"`
 	Window      int            `json:"window"`
 	Signing     struct {
-		Method, Path, Sandbox, TS, Nonce, String, Seed, PublicKey, Signature string
+		Method, Path, Node, Sandbox, TS, Nonce, String, Seed, PublicKey, Signature string
 	} `json:"signing"`
 	Valid []struct {
 		Name    string          `json:"name"`
@@ -169,7 +169,7 @@ func TestTheAgentWritesTheMessagesInTheFixture(t *testing.T) {
 
 func TestTheSigningExampleMatches(t *testing.T) {
 	s := loadFixture(t).Signing
-	if got := SigningString(s.Method, s.Path, s.Sandbox, s.TS, s.Nonce); got != s.String {
+	if got := SigningString(s.Method, s.Path, s.Node, s.Sandbox, s.TS, s.Nonce); got != s.String {
 		t.Fatalf("signing string %q, fixture %q", got, s.String)
 	}
 	seed, _ := hex.DecodeString(s.Seed)
@@ -178,12 +178,12 @@ func TestTheSigningExampleMatches(t *testing.T) {
 		t.Fatalf("public key %s", PublicKey(key))
 	}
 	h := http.Header{}
-	Signer{Key: key, Node: "nd-abcd1234", Now: func() time.Time { return time.Unix(1762819200, 0) }, Nonce: func() string { return s.Nonce }}.
+	Signer{Key: key, Node: s.Node, Now: func() time.Time { return time.Unix(1762819200, 0) }, Nonce: func() string { return s.Nonce }}.
 		Sign(h, s.Method, s.Path, s.Sandbox)
 	if h.Get(HeaderSig) != s.Signature {
 		t.Fatalf("signature %s, fixture %s", h.Get(HeaderSig), s.Signature)
 	}
-	if h.Get(HeaderNode) != "nd-abcd1234" || h.Get(HeaderTS) != s.TS || h.Get(HeaderSandbox) != "" {
+	if h.Get(HeaderNode) != s.Node || h.Get(HeaderTS) != s.TS || h.Get(HeaderSandbox) != "" {
 		t.Fatalf("headers %v", h)
 	}
 	sig, _ := base64.StdEncoding.DecodeString(h.Get(HeaderSig))

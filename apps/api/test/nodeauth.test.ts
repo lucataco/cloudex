@@ -26,13 +26,13 @@ const hex = (n: number) => [...crypto.getRandomValues(new Uint8Array(n))].map((b
 // A request signed as the agent signs it (go/internal/node/sign.go).
 async function signed(
   key: CryptoKey,
-  o: { node?: string; method?: string; url?: string; ts?: number; nonce?: string; signPath?: string; sandbox?: string } = {},
+  o: { node?: string; method?: string; url?: string; ts?: number; nonce?: string; signPath?: string; sandbox?: string; signNode?: string } = {},
 ) {
   const url = new URL(o.url ?? "https://api.example/v1/node/connect");
   const method = o.method ?? "GET";
   const ts = String(o.ts ?? Math.floor(Date.now() / 1000));
   const nonce = o.nonce ?? hex(16);
-  const message = auth.signingString(method, o.signPath ?? url.pathname + url.search, o.sandbox ?? "", ts, nonce);
+  const message = auth.signingString(method, o.signPath ?? url.pathname + url.search, o.signNode ?? o.node ?? "", o.sandbox ?? "", ts, nonce);
   const sig = b64(await crypto.subtle.sign("Ed25519", key, new TextEncoder().encode(message)));
   const headers: Record<string, string> = { "x-cx-ts": ts, "x-cx-nonce": nonce, "x-cx-sig": sig };
   if (o.node !== undefined) headers["x-cx-node"] = o.node;
@@ -42,7 +42,7 @@ async function signed(
 
 test("the signing example in the shared fixture verifies, and nothing else does", async () => {
   const s = fixture.signing;
-  const message = auth.signingString(s.method, s.path, s.sandbox, s.ts, s.nonce);
+  const message = auth.signingString(s.method, s.path, s.node, s.sandbox, s.ts, s.nonce);
   assert.equal(message, s.string);
   assert.ok(await auth.verifyEd25519(s.publicKey, message, s.signature));
   assert.equal(await auth.verifyEd25519(s.publicKey, message.replace("connect", "connecT"), s.signature), false);
@@ -124,9 +124,52 @@ test("a nonce works once while it can still be in the skew window", () => {
   assert.equal(auth.rememberNonce(store, "a".repeat(32), t), true);
   assert.equal(auth.rememberNonce(store, "a".repeat(32), t + 1000), false);
   assert.equal(auth.rememberNonce(store, "a".repeat(32), t + 119_000), false);
-  // Gone after two minutes, when a request carrying it is refused for its time anyway.
+  // Gone once a request carrying it is refused for its time anyway.
   assert.ok(auth.NONCE_TTL_MS >= 2 * auth.SKEW_SEC * 1000);
   assert.equal(auth.rememberNonce(store, "a".repeat(32), t + auth.NONCE_TTL_MS + 1), true);
+});
+
+// 2026-11-12 review, W6: a request passes the skew check for up to 121 s of
+// the Worker's clock (from ts - 60 to the last millisecond of ts + 60); its
+// nonce must be remembered for all of it.
+test("a nonce is remembered for the whole time its request passes the clock check", async () => {
+  const k = await keypair();
+  const lookup = async () => k.publicKey;
+  const ts = 2_000_000_000;
+  const first = (ts - auth.SKEW_SEC) * 1000;
+  const last = (ts + auth.SKEW_SEC + 1) * 1000 - 1;
+  const r = await signed(k.privateKey, { node: "nd-aaaa1111", ts });
+  assert.ok("signed" in (await auth.verifyNodeRequest(r, lookup, first)));
+  assert.ok("signed" in (await auth.verifyNodeRequest(r, lookup, last)), "still in the window");
+  const seen = new Map<string, number>();
+  const store = {
+    insert: (n: string, at: number) => (seen.has(n) ? false : (seen.set(n, at), true)),
+    prune: (before: number) => {
+      for (const [n, at] of seen) if (at < before) seen.delete(n);
+    },
+  };
+  assert.equal(auth.rememberNonce(store, "b".repeat(32), first), true);
+  assert.equal(auth.rememberNonce(store, "b".repeat(32), last), false, "a replay at the window's end is refused");
+});
+
+test("the node's id is signed: a signature made for one node doesn't pass as another's with the same key", async () => {
+  const k = await keypair();
+  const lookup = async () => k.publicKey; // two nodes that share a key, as if one was copied
+  const forged = await signed(k.privateKey, { node: "nd-bbbb2222", signNode: "nd-aaaa1111" });
+  const v = await auth.verifyNodeRequest(forged, lookup);
+  assert.ok("error" in v && v.error === auth.BAD_SIGNATURE);
+  assert.ok("signed" in (await auth.verifyNodeRequest(await signed(k.privateKey, { node: "nd-bbbb2222" }), lookup)));
+});
+
+test("a removed node's own agent hears that it was removed (410); anyone else gets the usual 401", async () => {
+  const k = await keypair();
+  const keys = async (id: string) => ({ key: null, revokedKey: id === "nd-aaaa1111" ? k.publicKey : null });
+  const own = await auth.verifyNodeRequest(await signed(k.privateKey, { node: "nd-aaaa1111" }), keys);
+  assert.ok("error" in own && own.status === 410 && own.revoked === true && /removed from the deployment/.test(own.error));
+  const other = await auth.verifyNodeRequest(await signed((await keypair()).privateKey, { node: "nd-aaaa1111" }), keys);
+  assert.deepEqual(other, { status: 401, error: auth.BAD_SIGNATURE });
+  const unknown = await auth.verifyNodeRequest(await signed(k.privateKey, { node: "nd-zzzz9999" }), keys);
+  assert.deepEqual(unknown, other);
 });
 
 test("a join must be signed with the key it brings", async () => {
@@ -194,6 +237,7 @@ test("a node joins once; revoking it clears its key, and its name makes a new no
   assert.equal((await nodes.findNode(DB, node.id))!.state, "online");
   await nodes.revokeNode(DB, node.id);
   assert.equal(await nodes.nodePublicKey(DB, node.id), null);
+  assert.deepEqual(await nodes.nodeKeys(DB, node.id), { key: null, revokedKey: k.publicKey }, "kept for telling its agent");
   // A Node object reporting late doesn't bring it back.
   await nodes.mirrorNode(DB, node.id, { state: "online", lastSeenAt: 6 });
   const revoked = (await nodes.findNode(DB, "box4"))!;
@@ -202,6 +246,19 @@ test("a node joins once; revoking it clears its key, and its name makes a new no
   const fresh = await nodes.addNode(DB, "box4");
   assert.notEqual(fresh.id, node.id);
   assert.equal(fresh.state, "pending");
+  // The revoked key outlives the forgotten node, and is no other node's.
+  assert.deepEqual(await nodes.nodeKeys(DB, node.id), { key: null, revokedKey: k.publicKey });
+  await assert.rejects(nodes.joinNode(DB, fresh.id, join), /\[409\] that agent's key belongs to another node/);
+});
+
+test("a join with a key another node has is refused", async () => {
+  const k = await keypair();
+  const a = await nodes.addNode(DB, "box7");
+  const b = await nodes.addNode(DB, "box8");
+  const join = { token: "x", publicKey: k.publicKey, version: "v0.2.2", facts: FACTS };
+  assert.ok(await nodes.joinNode(DB, a.id, join));
+  await assert.rejects(nodes.joinNode(DB, b.id, join), /\[409\]/);
+  assert.equal((await nodes.findNode(DB, b.id))!.state, "pending");
 });
 
 test("a node counts the sandboxes on it", async () => {

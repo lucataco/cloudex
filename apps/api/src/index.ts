@@ -66,7 +66,7 @@ import {
 import { serveDashboard } from "./dashboard";
 import { CONNECT } from "./node";
 import { HEADERS, issueJoinToken, readCapped, useJoinToken, verifyJoinSignature, verifyNodeRequest } from "./nodeauth";
-import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodePublicKey, revokeNode } from "./nodes";
+import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodeKeys, nodePublicKey, revokeNode } from "./nodes";
 import { placeOn, refused } from "./placement";
 import { locationHint } from "./nodestate";
 import { cachedKey, nodeEgress } from "./nodeegress";
@@ -227,8 +227,8 @@ app.get("/v1/node/connect", async (c) => {
       426,
     );
   }
-  const v = await verifyNodeRequest(c.req.raw, (id) => nodePublicKey(c.env.DB, id));
-  if (!("signed" in v)) return c.json({ error: v.error }, v.status);
+  const v = await verifyNodeRequest(c.req.raw, (id) => nodeKeys(c.env.DB, id));
+  if (!("signed" in v)) return c.json({ error: v.error, ...(v.revoked ? { revoked: true } : {}) }, v.status);
   const cf = (c.req.raw as { cf?: { colo?: unknown; continent?: unknown; longitude?: unknown } }).cf;
   const fwd = new Request("http://node/connect", c.req.raw);
   fwd.headers.set(CONNECT.node, v.signed.node);

@@ -3,12 +3,21 @@
 // made itself and never sends. The Worker holds only the public key (D1
 // nodes.public_key), and revoking a node clears it.
 //
-// The signed string is METHOD\nPATH?QUERY\nSANDBOX\nTS\nNONCE: the request's
-// method and path with its query as sent, the sandbox it acts on (empty for
-// join and connect), the time in unix seconds, and 32 random hex digits. The
-// Worker allows 60 s of clock skew either way. A nonce on connect works once:
-// the Node object keeps the ones it has seen for two minutes, which outlasts
-// the skew window (see rememberNonce).
+// The signed string is METHOD\nPATH?QUERY\nNODE\nSANDBOX\nTS\nNONCE: the
+// request's method and path with its query as sent, the node's id (empty for
+// a join, which comes before the node has one), the sandbox it acts on (empty
+// for join and connect), the time in unix seconds, and 32 random hex digits.
+// The node's id is signed (2026-11-12 review, W6) so that a signature can't
+// be presented as another node's that shares the key. The Worker allows 60 s
+// of clock skew either way, so a signed request is good for up to 121 s of
+// the Worker's clock; a nonce on connect works once: the Node object keeps the
+// ones it has seen for NONCE_TTL_MS, which covers that whole window (see
+// rememberNonce).
+//
+// A node removed with cloudex node rm (revokeNode) keeps its public key in
+// node_revocations, so that its agent, which proves it holds that key, hears
+// that it was removed (410, revoked: true) and stops its machines, rather
+// than a 401 like anyone else's.
 //
 // Join tokens are cxj_ and 40 base32 characters, made by POST /v1/nodes. D1
 // keeps their SHA-256, and a join uses one in a single UPDATE, so two joins
@@ -21,7 +30,8 @@ import { JOIN_TOKEN } from "@cloudex/schema/node";
 import { sha256 } from "./tokens";
 
 export const SKEW_SEC = 60;
-export const NONCE_TTL_MS = 2 * 60_000;
+// The whole window in which a request's time passes the skew check, and a little more.
+export const NONCE_TTL_MS = (2 * SKEW_SEC + 5) * 1000;
 export const JOIN_TTL_MS = 30 * 60_000;
 
 export const HEADERS = {
@@ -39,8 +49,8 @@ const TS = /^[0-9]{1,12}$/;
 const SIG = /^[A-Za-z0-9+/]{86}==$/;
 const PUBLIC_KEY = /^[A-Za-z0-9+/]{43}=$/;
 
-export const signingString = (method: string, pathQuery: string, sandbox: string, ts: string, nonce: string) =>
-  `${method}\n${pathQuery}\n${sandbox}\n${ts}\n${nonce}`;
+export const signingString = (method: string, pathQuery: string, node: string, sandbox: string, ts: string, nonce: string) =>
+  `${method}\n${pathQuery}\n${node}\n${sandbox}\n${ts}\n${nonce}`;
 
 export type Signed = { node: string; ts: string; nonce: string; sig: string; sandbox: string };
 
@@ -79,25 +89,36 @@ export async function verifyEd25519(publicKey: string, message: string, sig: str
 // public, so a match never counts (see key === null below).
 const NOBODY = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
 
-export type Refusal = { status: 401 | 400; error: string };
+export type Refusal = { status: 401 | 400 | 410; error: string; revoked?: true };
 
 export const BAD_SIGNATURE = "unauthorized: the node's signature didn't check out (an unknown or removed node, or another key)";
+export const REVOKED =
+  "this node was removed from the deployment (cloudex node rm), so its key no longer works; uninstall the agent (node-install.sh --uninstall), or add the node again with cloudex node add and run the installer it prints";
+
+// A node's key, and the key it had when it was removed (revokeNode), for
+// telling a removed node's own agent that it was removed.
+export type NodeKeys = { key: string | null; revokedKey: string | null };
 
 // Checks a request signed by an existing node. publicKeyOf looks the node's
-// key up, null when there's no such node or it was revoked.
+// key up, null when there's no such node or it was revoked; or both keys
+// (nodeKeys), and then a request signed with a removed node's own key gets
+// 410 with revoked: true, and only such a request.
 export async function verifyNodeRequest(
   req: Request,
-  publicKeyOf: (node: string) => Promise<string | null>,
+  publicKeyOf: (node: string) => Promise<string | null | NodeKeys>,
   nowMs = Date.now(),
 ): Promise<{ signed: Signed } | Refusal> {
   const signed = readSigned(req.headers);
   if (!signed) return { status: 401, error: "unauthorized: a node request needs the headers x-cx-node, x-cx-ts, x-cx-nonce and x-cx-sig" };
   const off = skew(signed.ts, nowMs);
   if (off !== null) return { status: 401, error: clockError(off) };
-  const key = await publicKeyOf(signed.node);
+  const found = await publicKeyOf(signed.node);
+  const { key, revokedKey } = typeof found === "object" && found !== null ? found : { key: found, revokedKey: null };
   const url = new URL(req.url);
-  const message = signingString(req.method, url.pathname + url.search, signed.sandbox, signed.ts, signed.nonce);
-  const ok = await verifyEd25519(key ?? NOBODY, message, signed.sig);
+  const message = signingString(req.method, url.pathname + url.search, signed.node, signed.sandbox, signed.ts, signed.nonce);
+  // One check whichever key there is, so that the answer takes as long.
+  const ok = await verifyEd25519(key ?? revokedKey ?? NOBODY, message, signed.sig);
+  if (ok && key === null && revokedKey !== null) return { status: 410, error: REVOKED, revoked: true };
   if (!ok || key === null) return { status: 401, error: BAD_SIGNATURE };
   return { signed };
 }
@@ -112,7 +133,7 @@ export async function verifyJoinSignature(req: Request, publicKey: string, nowMs
   const off = skew(signed.ts, nowMs);
   if (off !== null) return { status: 401, error: clockError(off) };
   const url = new URL(req.url);
-  const ok = await verifyEd25519(publicKey, signingString(req.method, url.pathname + url.search, "", signed.ts, signed.nonce), signed.sig);
+  const ok = await verifyEd25519(publicKey, signingString(req.method, url.pathname + url.search, "", "", signed.ts, signed.nonce), signed.sig);
   return ok ? null : { status: 401, error: "unauthorized: the join isn't signed with the key it brings" };
 }
 

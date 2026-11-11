@@ -38,7 +38,7 @@ func newFakeDeployment(t *testing.T, pub ed25519.PublicKey) *fakeDeployment {
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		sig, _ := base64.StdEncoding.DecodeString(r.Header.Get(HeaderSig))
-		msg := SigningString(r.Method, r.URL.EscapedPath()+"?"+r.URL.RawQuery, r.Header.Get(HeaderSandbox), r.Header.Get(HeaderTS), r.Header.Get(HeaderNonce))
+		msg := SigningString(r.Method, r.URL.EscapedPath()+"?"+r.URL.RawQuery, r.Header.Get(HeaderNode), r.Header.Get(HeaderSandbox), r.Header.Get(HeaderTS), r.Header.Get(HeaderNonce))
 		if r.URL.Path != EgressRoute || !ed25519.Verify(f.pub, []byte(msg), sig) {
 			w.WriteHeader(401)
 			return

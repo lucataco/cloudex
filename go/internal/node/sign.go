@@ -20,9 +20,10 @@ const (
 	HeaderProtocol = "x-cx-protocol"
 )
 
-// SigningString is what a node signs: METHOD\nPATH?QUERY\nSANDBOX\nTS\nNONCE.
-func SigningString(method, pathQuery, sandbox, ts, nonce string) string {
-	return method + "\n" + pathQuery + "\n" + sandbox + "\n" + ts + "\n" + nonce
+// SigningString is what a node signs: METHOD\nPATH?QUERY\nNODE\nSANDBOX\nTS\nNONCE.
+// NODE is the node's id, empty for a join (2026-11-12 review, W6).
+func SigningString(method, pathQuery, node, sandbox, ts, nonce string) string {
+	return method + "\n" + pathQuery + "\n" + node + "\n" + sandbox + "\n" + ts + "\n" + nonce
 }
 
 // Signer signs requests with a node's key. Now and Nonce are replaced in tests.
@@ -51,7 +52,7 @@ func (s Signer) Sign(h http.Header, method, pathQuery, sandbox string) {
 	}
 	ts := strconv.FormatInt(now().Unix(), 10)
 	n := nonce()
-	sig := ed25519.Sign(s.Key, []byte(SigningString(method, pathQuery, sandbox, ts, n)))
+	sig := ed25519.Sign(s.Key, []byte(SigningString(method, pathQuery, s.Node, sandbox, ts, n)))
 	if s.Node != "" {
 		h.Set(HeaderNode, s.Node)
 	}

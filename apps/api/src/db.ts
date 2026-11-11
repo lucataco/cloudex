@@ -114,6 +114,13 @@ const SCHEMA = [
     created_at INTEGER NOT NULL,
     revoked_at INTEGER
   )`,
+  // The key a node had when it was removed (nodes.ts revokeNode), so that its
+  // own agent can be told so (2026-11-12 review, R3); kept after the node is forgotten.
+  `CREATE TABLE IF NOT EXISTS node_revocations (
+    node_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    revoked_at INTEGER NOT NULL
+  )`,
   // A node's join token: its SHA-256, never the token. Used once, within 30 minutes.
   `CREATE TABLE IF NOT EXISTS node_joins (
     token_hash TEXT PRIMARY KEY,

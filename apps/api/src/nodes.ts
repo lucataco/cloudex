@@ -108,6 +108,19 @@ export async function addNode(db: D1Database, name: string, now = Date.now()): P
   return (await findNode(db, id))!;
 }
 
+// The agent's key, and (2026-11-12 review, R3) the key a removed node had, in
+// one D1 read: the connect route tells a removed node's own agent so.
+export async function nodeKeys(db: D1Database, id: string): Promise<{ key: string | null; revokedKey: string | null }> {
+  await ensureSchema(db);
+  const r = await db
+    .prepare(
+      "SELECT (SELECT public_key FROM nodes WHERE id = ?1 AND state != 'revoked') AS key, (SELECT public_key FROM node_revocations WHERE node_id = ?1) AS revoked_key",
+    )
+    .bind(id)
+    .first<{ key: string | null; revoked_key: string | null }>();
+  return { key: r?.key ?? null, revokedKey: r?.revoked_key ?? null };
+}
+
 // The agent's public key, while the node has joined and isn't revoked.
 export async function nodePublicKey(db: D1Database, id: string): Promise<string | null> {
   await ensureSchema(db);
@@ -115,16 +128,21 @@ export async function nodePublicKey(db: D1Database, id: string): Promise<string 
 }
 
 // A pending node's agent joins with its key. Null when the node was removed
-// in the meantime, or has joined already.
+// in the meantime, or has joined already. A key another node has (or had,
+// until it was removed) is refused (2026-11-12 review, W6): each node's key is
+// its own, so a signature names one node.
 export async function joinNode(db: D1Database, id: string, j: NodeJoin, now = Date.now()): Promise<{ id: string; name: string } | null> {
   const f = j.facts;
+  if (await keyTaken(db, j.publicKey, id)) fail(409, "that agent's key belongs to another node of this deployment: each node needs its own (remove the agent's state volume, cloudex-node, and run the installer again)");
   const row = await db
     .prepare(
       `UPDATE nodes SET public_key = ?, state = 'offline', version = ?, arch = ?, runtime = ?, isolation = ?, cpus = ?, memory_mb = ?,
          disk_free_gb = ?, last_seen_at = ?
-       WHERE id = ? AND state = 'pending' AND public_key IS NULL RETURNING id, name`,
+       WHERE id = ? AND state = 'pending' AND public_key IS NULL
+         AND NOT EXISTS (SELECT 1 FROM nodes WHERE public_key = ?) AND NOT EXISTS (SELECT 1 FROM node_revocations WHERE public_key = ?)
+       RETURNING id, name`,
     )
-    .bind(j.publicKey, j.version, f.arch, f.runtime, JSON.stringify(f.isolation), f.cpus, f.memoryMb, f.diskFreeGb, now, id)
+    .bind(j.publicKey, j.version, f.arch, f.runtime, JSON.stringify(f.isolation), f.cpus, f.memoryMb, f.diskFreeGb, now, id, j.publicKey, j.publicKey)
     .first<{ id: string; name: string }>();
   return row ? { id: row.id, name: row.name } : null;
 }
@@ -174,9 +192,21 @@ export async function mirrorNode(db: D1Database, id: string, m: Mirror) {
     .run();
 }
 
+async function keyTaken(db: D1Database, key: string, id: string) {
+  const r = await db
+    .prepare("SELECT 1 AS x FROM nodes WHERE public_key = ?1 AND id != ?2 UNION ALL SELECT 1 FROM node_revocations WHERE public_key = ?1 AND node_id != ?2 LIMIT 1")
+    .bind(key, id)
+    .first<{ x: number }>();
+  return r !== null;
+}
+
+// The node's key goes; a copy stays in node_revocations (nodeKeys).
 export async function revokeNode(db: D1Database, id: string, now = Date.now()) {
   await ensureSchema(db);
   await db.batch([
+    db
+      .prepare("INSERT OR REPLACE INTO node_revocations (node_id, public_key, revoked_at) SELECT id, public_key, ? FROM nodes WHERE id = ? AND public_key IS NOT NULL")
+      .bind(now, id),
     db.prepare("UPDATE nodes SET state = 'revoked', public_key = NULL, revoked_at = ? WHERE id = ?").bind(now, id),
     db.prepare("DELETE FROM node_joins WHERE node_id = ?").bind(id),
   ]);

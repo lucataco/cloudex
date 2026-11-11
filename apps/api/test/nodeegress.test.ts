@@ -33,7 +33,7 @@ async function fromAgent(key: CryptoKey, o: { node?: string; sandbox?: string; t
   const method = o.method ?? "POST";
   const ts = String(Math.floor(Date.now() / 1000));
   const nonce = hex(16);
-  const sig = b64(await crypto.subtle.sign("Ed25519", key, new TextEncoder().encode(signingString(method, signedUrl.pathname + signedUrl.search, o.sandbox ?? "", ts, nonce))));
+  const sig = b64(await crypto.subtle.sign("Ed25519", key, new TextEncoder().encode(signingString(method, signedUrl.pathname + signedUrl.search, o.node ?? NODE, o.sandbox ?? "", ts, nonce))));
   const headers: Record<string, string> = { "x-cx-node": o.node ?? NODE, "x-cx-ts": ts, "x-cx-nonce": nonce, "x-cx-sig": sig, ...(o.headers ?? {}) };
   if (o.sandbox) headers["x-cx-sandbox"] = o.sandbox;
   return new Request(url, { method, headers, body: o.body ?? null });
