@@ -245,3 +245,10 @@ export async function idForName(db: D1Database, name: string): Promise<string | 
 export async function nameTaken(db: D1Database, name: string) {
   return (await idForName(db, name)) !== null;
 }
+
+// The sandboxes on a node (nodes.ts), by id.
+export async function sandboxesOnNode(db: D1Database, node: string): Promise<string[]> {
+  await ensureSchema(db);
+  const { results } = await db.prepare("SELECT id FROM sandboxes WHERE node = ?").bind(node).all<{ id: string }>();
+  return results.map((r) => r.id);
+}

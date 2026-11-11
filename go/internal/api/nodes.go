@@ -69,3 +69,15 @@ func (c *Client) DeleteNode(ctx context.Context, ref string, force bool) (map[st
 	var out map[string]string
 	return out, c.do(ctx, http.MethodDelete, path, nil, &out)
 }
+
+// CreateDevSandbox is v0.2.2 M3's development path, for admins: a sandbox on
+// the container a node's agent runs with --dev-machine (cloudex node
+// dev-sandbox, hidden). M5 places sandboxes on nodes for real.
+func (c *Client) CreateDevSandbox(ctx context.Context, node, name string) (*Sandbox, error) {
+	body := map[string]string{}
+	if name != "" {
+		body["name"] = name
+	}
+	var s Sandbox
+	return &s, c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(node)+"/dev-sandboxes", body, &s)
+}

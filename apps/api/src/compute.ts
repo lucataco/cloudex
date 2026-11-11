@@ -1,12 +1,19 @@
 // Where a sandbox's machine runs. The Sandbox object (sandbox.ts) owns the
 // lifecycle and asks this for everything it does to the machine itself, so
-// that the container binding is used here and nowhere else. CloudflareCompute
-// is the only kind so far: a Cloudflare container owned by the Durable Object.
+// that the container binding is used here and nowhere else. Two kinds:
+// - CloudflareCompute: a Cloudflare container owned by the Durable Object.
+// - NodeCompute (v0.2.2 M3): a machine on a node, a user's own Docker host,
+//   reached through stream sockets its agent opens into this object
+//   (nodestream.ts). In M3 that's only a development machine: a container
+//   started by hand that the agent adopts (POST /v1/nodes/{node}/dev-sandboxes),
+//   so the lifecycle calls (start, snapshot, stop) answer 501 until M5.
 //
 // Each call keeps the shape of the platform call it stands for. Deadlines stay
 // with the caller (sandbox.ts), except where noted.
 import type { SandboxSize } from "@cloudex/schema";
-import { withTimeout } from "./util";
+import { StreamChannel } from "@cloudex/schema/node";
+import { type Framed, type NodeStreams, StreamGone } from "./nodestream";
+import { fail, withTimeout } from "./util";
 
 export type ExecOpts = {
   cwd?: string;
@@ -56,6 +63,7 @@ export class NotListening extends Error {
 }
 
 export interface Compute {
+  readonly kind: "cloudflare" | "node";
   // Where the guest's servers answer, for connections from this object.
   readonly guestAddress: string;
   // The guest's path of the CA that intercepted HTTPS calls (route) are
@@ -82,6 +90,7 @@ export interface Compute {
 const PLATFORM_MAX_INACTIVITY_MS = 6 * 3600_000;
 
 export class CloudflareCompute implements Compute {
+  readonly kind = "cloudflare";
   readonly guestAddress = "10.0.0.1";
   readonly caPath = "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 
@@ -154,3 +163,214 @@ export class CloudflareCompute implements Compute {
     }
   }
 }
+
+// ---------------------------------------------------------------- nodes
+
+// A sandbox's place on a node: which node, and the machine's address there.
+export type NodePlacement = { node: string; address: string; dev: true };
+
+const notYet = (what: string): never =>
+  fail(501, `${what} isn't available for a sandbox on a node yet (v0.2.2 M3 runs only development machines); delete it instead`);
+
+// A preview's request headers, as the node's agent sends them on.
+function headerList(req: Request): [string, string][] {
+  const out: [string, string][] = [["host", new URL(req.url).host]];
+  for (const [k, v] of req.headers) if (k !== "host") out.push([k, v]);
+  return out;
+}
+
+const NO_BODY = new Set([101, 204, 205, 304]);
+
+export class NodeCompute implements Compute {
+  readonly kind = "node";
+  readonly caPath = "/etc/cloudex/node-ca.crt"; // M6
+  readonly running = true;
+
+  constructor(
+    private readonly streams: NodeStreams,
+    readonly placement: NodePlacement,
+    // Tells the node's agent the machine no longer runs this sandbox.
+    private readonly release: () => Promise<void>,
+  ) {}
+
+  get guestAddress() {
+    return this.placement.address;
+  }
+
+  start(): void {
+    notYet("starting");
+  }
+  monitor(): Promise<void> {
+    // M5: the node's state messages. A development machine never exits by itself here.
+    return new Promise(() => {});
+  }
+  async route() {
+    // cloudex.internal and provider calls on a node go through its agent (M6).
+  }
+  async keepAlive() {
+    // A node has no platform timer.
+  }
+  snapshot(): Promise<{ id: string; size?: number }> {
+    return notYet("saving its disk");
+  }
+  async destroy() {
+    this.streams.closeAll(1000, "the sandbox was deleted");
+    await withTimeout(this.release(), 10_000, "releasing the machine").catch((e) => console.error(`release: ${e instanceof Error ? e.message : e}`));
+  }
+
+  async exec(argv: string[], o: ExecOpts = {}): Promise<Proc> {
+    const pipe = o.stdin === "pipe";
+    const given = o.stdin && o.stdin !== "pipe" ? o.stdin : null;
+    if (o.signal?.aborted) throw new DOMException("aborted", "AbortError");
+    const f = await this.streams.open({
+      exec: {
+        argv,
+        ...(o.cwd ? { cwd: o.cwd } : {}),
+        ...(o.env ? { env: o.env } : {}),
+        ...(o.user ? { user: o.user } : {}),
+        ...(o.pty ? { pty: { cols: o.pty.cols, rows: o.pty.rows } } : {}),
+        stdin: pipe || given !== null,
+        stderr: o.stderr !== "ignore" && !o.pty,
+      },
+    });
+    const onAbort = () => f.end(1000, "aborted"); // the agent hangs the process up
+    o.signal?.addEventListener("abort", onAbort, { once: true });
+    f.exited.finally(() => o.signal?.removeEventListener("abort", onAbort)).catch(() => {});
+    const stdin = pipe || given ? f.writable(StreamChannel.stdin) : null;
+    if (given && stdin) void given.pipeTo(stdin).catch(() => {});
+    return new NodeProc(f, pipe ? stdin : null, o.stderr === "ignore" || Boolean(o.pty));
+  }
+
+  // A TCP connection to a guest port, framed with credits. ssh (port 22) is
+  // spliced instead (sandbox.ts bridge, NodeStreams.splice), so that it can
+  // hibernate.
+  connect(port: number): Stream {
+    const ready = this.streams.open({ tcp: { port, splice: false } });
+    let f: Framed | null = null;
+    const opened = ready.then((x) => {
+      f = x;
+      return x.opened.then((m) => {
+        if ("refused" in m) throw new NotListening(m.refused, `not listening in the TCP address ${m.refused}:${port}`);
+        return m;
+      });
+    });
+    opened.catch(() => {});
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    void opened.then(
+      () => f!.inbox[StreamChannel.stdout]!.readable.pipeTo(writable).catch(() => {}),
+      () => writable.abort().catch(() => {}),
+    );
+    const out = new WritableStream<Uint8Array>({
+      write: async (chunk) => (await ready).data(StreamChannel.stdin, chunk),
+      close: async () => (await ready).control({ eof: 0 }),
+    });
+    return {
+      opened,
+      readable,
+      writable: out,
+      close: async () => {
+        (await ready.catch(() => null))?.end(1000, "closed");
+      },
+    };
+  }
+
+  async fetch(port: number, req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const f = await this.streams.open({
+      http: { port, method: req.method, path: url.pathname + url.search, headers: headerList(req), body: req.body !== null },
+    });
+    if (req.body) void req.body.pipeTo(f.writable(StreamChannel.stdin)).catch(() => {});
+    const m = await (await this.streams.answered(f)).opened;
+    if ("refused" in m) {
+      throw new NotListening(m.refused, `The container is not listening in the TCP address ${m.refused}:${port}`);
+    }
+    if (!("status" in m)) throw new Error("the node's agent answered a preview with something else");
+    const headers = new Headers();
+    for (const [k, v] of m.status.headers) {
+      try {
+        headers.append(k, v);
+      } catch {
+        // a header the runtime won't carry
+      }
+    }
+    if (m.status.code === 101) return this.upgrade(f, headers);
+    const body = NO_BODY.has(m.status.code) || req.method === "HEAD" ? null : f.inbox[StreamChannel.stdout]!.readable;
+    if (!body) f.inbox[StreamChannel.stdout]!.readable.cancel().catch(() => {});
+    // The stream closes once the body is read; there's no exit for HTTP.
+    f.exitCode = 0;
+    return new Response(body, { status: m.status.code, headers });
+  }
+
+  // A preview's WebSocket: the app's messages relayed one for one, which
+  // carry() in sandbox.ts passes to the visitor.
+  private upgrade(f: Framed, headers: Headers): Response {
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
+    server.accept();
+    server.binaryType = "arraybuffer";
+    let ended = false;
+    const end = (code: number, reason: string) => {
+      if (ended) return;
+      ended = true;
+      try {
+        server.close(code === 1000 || (code >= 3000 && code <= 4999) ? code : 1000, reason.slice(0, 120));
+      } catch {}
+      f.end(1000, "closed");
+    };
+    f.onWsMessage = (data) => {
+      try {
+        server.send(data);
+      } catch {
+        end(1011, "");
+      }
+    };
+    f.onWsClose = (code, reason) => end(code, reason);
+    server.addEventListener("message", (e) => {
+      const text = typeof e.data === "string";
+      const data = text ? new TextEncoder().encode(e.data as string) : new Uint8Array(e.data as ArrayBuffer);
+      f.data(text ? StreamChannel.textIn : StreamChannel.stdin, data).catch(() => end(1011, ""));
+    });
+    server.addEventListener("close", (e) => {
+      f.control({ close: { code: e.code >= 1000 && e.code <= 4999 && ![1005, 1006, 1015].includes(e.code) ? e.code : 1000, reason: (e.reason ?? "").slice(0, 120) } });
+      end(1000, "");
+    });
+    server.addEventListener("error", () => end(1011, ""));
+    headers.delete("content-length");
+    return new Response(null, { status: 101, webSocket: client, headers });
+  }
+}
+
+// A process on a node, over its stream.
+class NodeProc implements Proc {
+  readonly stdout: ReadableStream | null;
+  readonly stderr: ReadableStream | null;
+
+  constructor(
+    private readonly f: Framed,
+    readonly stdin: WritableStream | null,
+    noStderr: boolean,
+  ) {
+    this.stdout = f.inbox[StreamChannel.stdout]!.readable;
+    this.stderr = noStderr ? null : f.inbox[StreamChannel.stderr]!.readable;
+  }
+
+  get exitCode() {
+    return this.f.exited;
+  }
+
+  async output() {
+    const read = async (s: ReadableStream | null) => (s ? await new Response(s).arrayBuffer() : new ArrayBuffer(0));
+    const [stdout, stderr] = await Promise.all([read(this.stdout).catch(() => new ArrayBuffer(0)), read(this.stderr).catch(() => new ArrayBuffer(0))]);
+    return { exitCode: await this.f.exited, stdout, stderr };
+  }
+
+  kill(signal = 15) {
+    this.f.control({ signal });
+  }
+
+  resize(cols: number, rows: number) {
+    this.f.control({ resize: { cols, rows } });
+  }
+}
+
+export { StreamGone };

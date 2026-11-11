@@ -83,6 +83,27 @@ func newNodeCmd(opts *options) *cobra.Command {
 		},
 	})
 
+	var devName string
+	dev := &cobra.Command{
+		Use:    "dev-sandbox <node>",
+		Hidden: true,
+		Short:  "Development only (v0.2.2 M3): a sandbox on the container a node's agent runs with --dev-machine",
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, client, err := opts.load()
+			if err != nil {
+				return err
+			}
+			s, err := client.CreateDevSandbox(cmd.Context(), args[0], devName)
+			if err != nil {
+				return err
+			}
+			return writeJSON(cmd.OutOrStdout(), s)
+		},
+	}
+	dev.Flags().StringVar(&devName, "name", "", "a name for the sandbox")
+	cmd.AddCommand(dev)
+
 	var force, yes bool
 	rm := &cobra.Command{
 		Use:     "rm <name>",

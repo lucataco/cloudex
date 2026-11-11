@@ -40,7 +40,7 @@ import { openapi } from "@cloudex/schema/openapi";
 import { isAgentId } from "./agents";
 import { isCommandId } from "./commands";
 import { backupBucket } from "./backup";
-import { deleteSandbox, idForName, listSandboxes, nameTaken } from "./db";
+import { deleteSandbox, idForName, listSandboxes, nameTaken, sandboxesOnNode } from "./db";
 import {
   DEVICE_INTERVAL,
   SESSION_TTL_SEC,
@@ -68,6 +68,7 @@ import { CONNECT } from "./node";
 import { HEADERS, issueJoinToken, readCapped, useJoinToken, verifyJoinSignature, verifyNodeRequest } from "./nodeauth";
 import { addNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodePublicKey, revokeNode } from "./nodes";
 import { locationHint } from "./nodestate";
+import { readTicket } from "./nodestream";
 import { notFromDashboard, readSession, sessionCookie, sessionName } from "./session";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, keyRefusal, listKeys, setKey } from "./keys";
@@ -234,6 +235,19 @@ app.get("/v1/node/connect", async (c) => {
   fwd.headers.set(CONNECT.continent, typeof cf?.continent === "string" ? cf.continent.slice(0, 4) : "");
   fwd.headers.set(CONNECT.hint, locationHint(cf) ?? "");
   return c.env.NODE.getByName(v.signed.node).fetch(fwd);
+});
+
+// A stream socket from a node's agent (nodestream.ts): an exec, a connection
+// or a preview request to one of its sandboxes. Its ticket, issued by the
+// node's object over the control socket, is checked here without D1, and
+// again in the sandbox's object, which also refuses a stream id it has seen.
+app.get("/v1/node/streams/:sandbox/:stream", async (c) => {
+  if (c.req.header("upgrade")?.toLowerCase() !== "websocket") return c.json({ error: "a node's stream is a WebSocket" }, 426);
+  const t = await readTicket(c.env.ADMIN_KEY, c.req.header("x-cx-ticket") ?? "");
+  if (!t || t.sandbox !== c.req.param("sandbox") || t.stream !== c.req.param("stream")) {
+    return c.json({ error: "unauthorized: that stream ticket is unknown, expired, or for another stream" }, 401);
+  }
+  return c.env.SANDBOX.getByName(t.sandbox).fetch(new Request("http://sandbox/node-stream", c.req.raw));
 });
 
 // Every other /v1 route: the admin key or a token as the bearer, or the
@@ -765,10 +779,32 @@ app.delete("/v1/nodes/:node", async (c) => {
   if (n.machines > 0 && !force) {
     fail(409, `node ${n.name} still has ${n.machines} sandbox${n.machines === 1 ? "" : "es"}: delete ${n.machines === 1 ? "it" : "them"} first, or remove the node anyway with --force`);
   }
-  // D1 first, so its key stops working at once; then the socket closes.
+  // D1 first, so its key stops working at once; then the socket closes, and
+  // its sandboxes close the node's stream sockets and take no more.
   await revokeNode(c.env.DB, n.id);
   await c.env.NODE.getByName(n.id).revoke();
+  for (const id of await sandboxesOnNode(c.env.DB, n.id)) {
+    await c.env.SANDBOX.getByName(id)
+      .nodeRevoked(n.id)
+      .catch((e: unknown) => console.error(`[${id}] node revoked: ${errorStatus(e).message}`));
+  }
   return c.json({ revoked: n.id });
+});
+
+// v0.2.2 M3's development path, for admins only (rules.ts leaves it to its
+// default): a sandbox on a node whose agent runs with --dev-machine, on that
+// container. Placing sandboxes on nodes for real is M5's POST /v1/sandboxes.
+app.post("/v1/nodes/:node/dev-sandboxes", async (c) => {
+  const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")));
+  if (n.state !== "online") fail(503, `node ${n.name} is ${n.state}`);
+  const text = await c.req.text();
+  const { name } = z.object({ name: Name.optional() }).parse(text ? JSON.parse(text) : {});
+  if (name && (await nameTaken(c.env.DB, name))) return c.json({ error: `the name ${name} is taken` }, 409);
+  const id = newSandboxId();
+  await setOwner(c.env.DB, id, c.get("who"));
+  const hint = n.locationHint as DurableObjectLocationHint | null;
+  const s = await c.env.SANDBOX.getByName(id, hint ? { locationHint: hint } : undefined).adoptDev(id, n.id, name ?? null);
+  return c.json(s, 201);
 });
 
 // AI provider keys (keys.ts). Keys are write-only: listing shows a hint.

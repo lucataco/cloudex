@@ -12,8 +12,18 @@
 // - Messages are JSON of the protocol in @cloudex/schema/node, at most 64 KiB.
 //   Anything else closes the socket (4400). hello and facts are kept here and
 //   copied to D1, which lists nodes.
-// - op() sends a request to the agent and waits for its answer.
+// - op() sends a request to the agent and waits for its answer. Ops are short
+//   (ping, facts, and M3's adopt, release and streams); a restart of this
+//   object loses its waiters, and their callers get an error. Nothing long
+//   runs as an op: an exec has a stream socket of its own (nodestream.ts),
+//   whose loss the agent sees and acts on.
+// - Stream tickets (M3): the agent asks for them on the control socket, and
+//   this object, which knows the socket is the node's (signed and nonce-checked
+//   at connect, closed on revoke), issues them. Each opens one stream to one
+//   sandbox, once, within 60 s (nodestream.ts).
 // - revoke() refuses the node from now on and closes its socket (4003).
+// - A node may connect at most CONNECTS_PER_MINUTE times a minute; more get
+//   429, so a broken or hostile agent can't keep this object and D1 busy.
 //
 // Later milestones add reconciling machines on hello (M5) and the tombstones of
 // machines deleted while the node was offline.
@@ -26,8 +36,10 @@ import {
   NodeMessage,
   type NodeMachine,
   type NodeOpName,
+  type WorkerMessage,
 } from "@cloudex/schema/node";
 import { BAD_SIGNATURE, rememberNonce } from "./nodeauth";
+import { issueTicket } from "./nodestream";
 import { mirrorNode } from "./nodes";
 import { type ControlSocket, lastSign, newest, pick } from "./nodestate";
 import { fail } from "./util";
@@ -51,6 +63,8 @@ export type NodeStatus = { online: boolean; lastSeenAt: number | null; connected
 // Close codes 1005, 1006 and 1015 can't be sent (spike: a peer that drops
 // arrives as 1006, and passing it on to close() throws).
 const sendable = (code: number) => (code === 1005 || code === 1006 || code === 1015 ? 1000 : code);
+
+export const CONNECTS_PER_MINUTE = 12;
 
 type Waiter = { resolve: (v: Record<string, unknown>) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
 
@@ -87,7 +101,7 @@ export class Node extends DurableObject<Env> {
     for (const s of close) {
       const stale = s === best;
       if (stale) alive = null;
-      this.close(s.ws, stale ? NodeClose.stale : NodeClose.replaced, stale ? "no ping for a minute" : "replaced by a newer connection");
+      this.close(s.ws, stale ? NodeClose.stale : NodeClose.replaced, stale ? "no ping for 45 s" : "replaced by a newer connection");
       if (stale) void this.wentOffline(lastSign(s));
     }
     return { use, online, alive };
@@ -130,6 +144,15 @@ export class Node extends DurableObject<Env> {
       now,
     );
     if (!fresh) return Response.json({ error: "unauthorized: that nonce was used already; each connect needs a new one" }, { status: 401 });
+    const recent = ((await this.ctx.storage.get<number[]>("connects")) ?? []).filter((t) => now - t < 60_000);
+    if (recent.length >= CONNECTS_PER_MINUTE) {
+      const wait = Math.max(1, Math.ceil((recent[0]! + 60_000 - now) / 1000));
+      return Response.json(
+        { error: `this node connected ${recent.length} times in the last minute; wait ${wait} s` },
+        { status: 429, headers: { "retry-after": String(wait) } },
+      );
+    }
+    await this.ctx.storage.put("connects", [...recent, now]);
     if (!known) await this.ctx.storage.put("id", id);
 
     for (const s of this.sockets()) this.close(s.ws, NodeClose.replaced, "replaced by a newer connection");
@@ -190,6 +213,15 @@ export class Node extends DurableObject<Env> {
         // node can't fill this object's storage with made-up machines.
         console.log(`[${id}] machine ${m.machine.id} is ${m.machine.state}`);
         return;
+      case "tickets": {
+        const revoked = await this.ctx.storage.get<boolean>("revoked");
+        const tickets = revoked ? [] : await Promise.all(Array.from({ length: m.count }, () => issueTicket(this.env.ADMIN_KEY, id, m.sandbox, now)));
+        const answer: WorkerMessage = { type: "tickets", id: m.id, tickets, ...(revoked ? { error: "this node was removed" } : {}) };
+        try {
+          ws.send(JSON.stringify(answer));
+        } catch {}
+        return;
+      }
       case "result": {
         const w = this.waiters.get(m.id);
         if (!w) return; // answered after its deadline, or to an instance that's gone

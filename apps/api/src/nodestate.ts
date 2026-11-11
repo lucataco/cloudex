@@ -9,10 +9,12 @@
 // - It's online only once the agent has said hello on that socket (so that
 //   anything listing it sees its protocol and facts), and only while the
 //   socket's last sign of life (the agent's "ping", answered by auto-response
-//   without waking the object, or any message) is under 60 s old. The agent
-//   pings every 10 s.
+//   without waking the object, or any message) is under 45 s old. The agent
+//   pings every 10 s and replaces a connection after 35 s without a pong, so
+//   a link that drops and comes back never shows offline, and one that stays
+//   down shows offline within 45 s (+ the list's poll).
 
-export const ONLINE_WITHIN_MS = 60_000;
+export const ONLINE_WITHIN_MS = 45_000;
 
 export type ControlSocket<W> = {
   ws: W;

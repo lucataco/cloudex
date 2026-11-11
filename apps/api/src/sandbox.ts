@@ -59,7 +59,7 @@ import {
 } from "./backup";
 import { AGENT_BAD_REQUEST, AGENT_BOOT, AGENT_NOT_FOUND, AGENT_SCRIPT } from "./agents";
 import { COMMAND_BAD_REQUEST, COMMAND_BOOT, COMMAND_CONFLICT, COMMAND_NOT_FOUND, COMMAND_SCRIPT } from "./commands";
-import { CloudflareCompute, type Compute, NotListening, type Proc } from "./compute";
+import { CloudflareCompute, type Compute, NodeCompute, type NodePlacement, NotListening, type Proc } from "./compute";
 import { deleteSandbox, renameSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER, VNC_PORT } from "./desktop";
 import { ARCHIVE_SCRIPT, FILE_BAD_REQUEST, FILE_FORBIDDEN, FILE_NOT_FOUND, FILE_SCRIPT, UNPACK_SCRIPT } from "./files";
@@ -87,6 +87,7 @@ import {
   store,
   view,
 } from "./settings";
+import { NodeStreams } from "./nodestream";
 import { tokenAlive } from "./tokens";
 import { CREDENTIAL_ENDED, LINK_HEADER, TOKEN_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
@@ -255,13 +256,43 @@ export class Sandbox extends DurableObject<Env> {
   // writes the record back.
   private removing = false;
   private inactivitySet = false;
-  // The machine: a container on Cloudflare (compute.ts).
-  private readonly compute: Compute = new CloudflareCompute(this.ctx);
+  // The machine (compute.ts): a container on Cloudflare, or a machine on a
+  // node when the sandbox has a placement there (v0.2.2 M3: development
+  // machines only), reached through the node's stream sockets.
+  private readonly cloudflare = new CloudflareCompute(this.ctx);
+  private onNode: NodeCompute | undefined;
+  private get compute(): Compute {
+    return this.onNode ?? this.cloudflare;
+  }
+  private readonly streams = new NodeStreams({
+    ctx: this.ctx,
+    env: this.env,
+    sandbox: () => this.record?.id ?? null,
+    node: () => this.onNode?.placement.node ?? null,
+    more: async (count) => {
+      const p = this.onNode?.placement;
+      if (!p) throw new Error("this sandbox isn't on a node");
+      await this.env.NODE.getByName(p.node).op("streams", { sandbox: this.record!.id, count }, 5000);
+    },
+    touch: () => this.touch(),
+  });
+
+  private place(p: NodePlacement | undefined) {
+    this.onNode = p
+      ? new NodeCompute(this.streams, p, async () => {
+          await this.env.NODE.getByName(p.node).op("release", { sandbox: this.record?.id ?? "" }, 10_000);
+        })
+      : undefined;
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    // Node stream heartbeats, answered without waking the object
+    // (nodestream.ts). Only node streams use the Hibernation API here.
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("cx-hb", "cx-hb-ok"));
     void ctx.blockConcurrencyWhile(async () => {
       this.record = await ctx.storage.get<SandboxRecord>("sandbox");
+      this.place(await ctx.storage.get<NodePlacement>("node"));
       this.lastActivity = (await ctx.storage.get<number>("lastActivity")) ?? Date.now();
       // After an eviction or deploy, reattach the exit watcher to a running box.
       if (this.compute.running) this.watch();
@@ -329,7 +360,7 @@ export class Sandbox extends DurableObject<Env> {
     this.record = r;
     await this.ctx.storage.put("sandbox", r);
     try {
-      await upsertSandbox(this.env.DB, r);
+      await upsertSandbox(this.env.DB, { ...r, node: this.onNode?.placement.node ?? null });
     } catch (e) {
       console.error(`[${r.id}] index update failed: ${message(e)}`);
     }
@@ -502,6 +533,7 @@ export class Sandbox extends DurableObject<Env> {
   async forkPoint(): Promise<ForkSource> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
+      if (this.onNode) this.onNode.snapshot(); // 501: forks aren't on nodes in v0.2.2
       if (r.state === "running") {
         this.touch();
         const t0 = Date.now();
@@ -611,6 +643,7 @@ export class Sandbox extends DurableObject<Env> {
   async stop(): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
+      if (this.onNode) this.onNode.snapshot(); // 501 until M5
       if (r.state === "stopped" || r.state === "error") return r;
       if (r.state !== "running") fail(409, wrongState(r));
       await this.saveAndDestroy();
@@ -710,7 +743,9 @@ export class Sandbox extends DurableObject<Env> {
       this.record = { ...r, state: "stopping" }; // so the exit watcher stays out of it
       this.removing = true;
       try {
-        return await this.removeAll(r);
+        const out = await this.removeAll(r);
+        this.place(undefined);
+        return out;
       } catch (e) {
         // Undo the stopping mark so it can be deleted again. A container
         // already destroyed shows up as an exit at the next alarm.
@@ -1432,6 +1467,7 @@ export class Sandbox extends DurableObject<Env> {
       });
     }
     if (!r || r.state !== "running") return;
+    if (this.onNode) await this.nodeAlarm();
     if (!this.compute.running) return this.onExit();
     // An object that restarted, as after a deploy, leaves its running box on
     // the platform's short default until it's set again.
@@ -1453,7 +1489,7 @@ export class Sandbox extends DurableObject<Env> {
         if (this.record?.state === "running") await this.applyPlatform();
       }).catch((e) => console.error(`[${r.id}] ${message(e)}`));
     }
-    if (this.idle()) {
+    if (this.idle() && !this.onNode) {
       try {
         // Asked again in the queue: what ran ahead of it, such as a long save,
         // may have been activity.
@@ -1496,6 +1532,11 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.record;
     if (!r || this.removing) return new Response("no such sandbox", { status: 404 });
     const url = new URL(req.url);
+    if (url.pathname === "/node-stream") {
+      if (!this.onNode) return new Response("this sandbox isn't on a node\n", { status: 403 });
+      return this.streams.accept(req);
+    }
+    if (this.onNode) this.streams.reap();
     const tokenId = req.headers.get(TOKEN_HEADER);
     if (url.pathname === "/term" || url.pathname === "/vnc") {
       if (r.state !== "running") return new Response(`${wrongState(r)}\n`, { status: 409 });
@@ -1824,6 +1865,9 @@ export class Sandbox extends DurableObject<Env> {
   // WebSocket <-> guest TCP. Reads from the guest are coalesced into frames of
   // up to 256 KiB, which took scp downloads from 6-8 to 17 MiB/s in the spikes.
   private async bridge(port: number, tokenId: string | null): Promise<Response> {
+    // On a node, ssh is a splice that lets this object hibernate while the
+    // session is idle; other ports are framed streams with flow control.
+    if (this.onNode && port === 22) return this.streams.splice(port, tokenId);
     const sock = this.compute.connect(port);
     try {
       await withTimeout(sock.opened, 15_000, `connecting to port ${port}`);
@@ -1905,5 +1949,81 @@ export class Sandbox extends DurableObject<Env> {
       }
     })();
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // ---------------------------------------------------------------- nodes (v0.2.2 M3)
+
+  // The Hibernation API's handlers. Only a node's stream sockets (and the
+  // clients spliced to them) are accepted that way here (nodestream.ts).
+  async webSocketMessage(ws: WebSocket, msg: string | ArrayBuffer) {
+    if (this.streams.handles(ws)) this.streams.onMessage(ws, msg);
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string) {
+    if (this.streams.handles(ws)) this.streams.onClose(ws, code, reason);
+  }
+
+  async webSocketError(ws: WebSocket) {
+    if (this.streams.handles(ws)) this.streams.onClose(ws, 1011, "error");
+  }
+
+  // From the 60 s alarm: dead streams go, and spliced sessions whose token
+  // was revoked end, as watchCredential ends the others.
+  private async nodeAlarm() {
+    const closed = this.streams.reap();
+    if (closed) console.log(`[${this.record?.id}] closed ${closed} dead node streams`);
+    for (const c of this.streams.clients()) {
+      if (!(await tokenAlive(this.env.DB, c.tokenId).catch(() => true))) {
+        this.streams.endClient(c.id, CREDENTIAL_ENDED, "signed out: the token or session that opened this has ended");
+      }
+    }
+  }
+
+  // M3's development path (POST /v1/nodes/{node}/dev-sandboxes, admins only):
+  // a sandbox whose machine is a container the node's agent was told to adopt
+  // with --dev-machine. It runs from the start and can't be stopped, saved or
+  // forked; deleting it releases the container, which stays on the node.
+  async adoptDev(id: string, node: string, name: string | null): Promise<SandboxRecord> {
+    return this.exclusive(async () => {
+      if (this.record) fail(409, `${id} already exists`);
+      const answer = (await this.env.NODE.getByName(node).op("adopt", { sandbox: id }, 15_000)) as Record<string, unknown>;
+      const address = typeof answer.address === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(answer.address) ? answer.address : null;
+      if (!address) fail(502, "the node's agent didn't say where the machine is");
+      const placement: NodePlacement = { node, address, dev: true };
+      const now = Date.now();
+      this.record = {
+        id,
+        name,
+        size: "standard-2",
+        state: "running",
+        idleMinutes: 0,
+        createdAt: now,
+        updatedAt: now,
+        startedAt: now,
+        stoppedAt: null,
+        savedAt: null,
+        savedBytes: null,
+        error: null,
+        notice: "A development machine on a node (v0.2.2 M3): it can't be stopped, saved or forked.",
+      };
+      this.place(placement);
+      await this.ctx.storage.put("node", placement);
+      await this.ctx.storage.put("selfToken", crypto.randomUUID());
+      await this.update({});
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+      return this.mustRecord();
+    });
+  }
+
+  // The node was removed (cloudex node rm): its streams close, and no more are taken.
+  async nodeRevoked(node: string) {
+    if (this.onNode?.placement.node !== node) return;
+    await this.ctx.storage.put("revokedNode", node);
+    this.streams.closeAll(4003, "the node was removed");
+  }
+
+  // Counts of this sandbox's node streams, for the release checks.
+  async nodeStreams(): Promise<{ spares: number; open: number } | null> {
+    return this.onNode ? this.streams.count() : null;
   }
 }
