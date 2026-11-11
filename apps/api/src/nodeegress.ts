@@ -54,12 +54,18 @@ export function egressTarget(raw: string | null | undefined): URL | null {
 // which go on to Egress or a provider.
 const EDGE = new Set(["cf-connecting-ip", "cf-connecting-ipv6", "cf-ipcountry", "cf-ray", "cf-visitor", "cf-worker", "cf-ew-via", "cdn-loop", "x-forwarded-for", "x-forwarded-proto", "x-real-ip", "true-client-ip"]);
 
+// The machine's own User-Agent, which the agent carries in GUEST_UA (the
+// edge refuses some clients' defaults); the agent's own goes.
+export const GUEST_UA = "x-cx-guest-ua";
+
 export function guestHeaders(h: Headers): Headers {
   const out = new Headers();
   for (const [k, v] of h) {
-    if (k.startsWith("x-cx-") || EDGE.has(k)) continue;
+    if (k.startsWith("x-cx-") || EDGE.has(k) || k === "user-agent") continue;
     out.append(k, v);
   }
+  const ua = h.get(GUEST_UA);
+  if (ua) out.set("user-agent", ua);
   return out;
 }
 

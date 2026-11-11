@@ -206,12 +206,18 @@ func (c *CA) sign(host string, now time.Time) (*tls.Certificate, error) {
 // stolen key could: the release checks hand it to a machine to show that it
 // fails verification there for any name the CA doesn't cover (cloudex-node
 // ca test-cert). It needs the CA's key, so it runs only where that is.
-func (c *CA) SignAnyForTest(host string) (certPEM []byte, err error) {
+// The output is the certificate, then its own key (which a test server needs).
+func (c *CA) SignAnyForTest(host string) (certAndKeyPEM []byte, err error) {
 	l, err := c.sign(host, time.Now())
 	if err != nil {
 		return nil, err
 	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: l.Certificate[0]}), nil
+	der, err := x509.MarshalECPrivateKey(l.PrivateKey.(*ecdsa.PrivateKey))
+	if err != nil {
+		return nil, err
+	}
+	out := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: l.Certificate[0]})
+	return append(out, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})...), nil
 }
 
 // LoadCA reads the CA from the state directory; nil when there's none.

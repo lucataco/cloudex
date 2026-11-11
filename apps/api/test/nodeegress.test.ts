@@ -144,9 +144,11 @@ test("an unknown node and a bad signature look the same", async () => {
   assert.equal((await badSig.json()).message, BAD_SIGNATURE);
 });
 
-test("guest headers drop the node's and the edge's", () => {
-  const h = guestHeaders(new Headers({ "x-cx-sandbox": "cx-x", "cf-ray": "1", "content-type": "text/plain", authorization: "Bearer p" }));
-  assert.deepEqual([...h.keys()].sort(), ["authorization", "content-type"]);
+test("guest headers drop the node's and the edge's, and get the machine's own User-Agent back", () => {
+  const h = guestHeaders(new Headers({ "x-cx-sandbox": "cx-x", "cf-ray": "1", "content-type": "text/plain", authorization: "Bearer p", "user-agent": "cloudex-node/v1", "x-cx-guest-ua": "Python-urllib/3.12" }));
+  assert.deepEqual([...h.keys()].sort(), ["authorization", "content-type", "user-agent"]);
+  assert.equal(h.get("user-agent"), "Python-urllib/3.12");
+  assert.equal(guestHeaders(new Headers({ "user-agent": "cloudex-node/v1" })).get("user-agent"), null);
 });
 
 test("the node's key is looked up once a minute, and an unknown node every time", async () => {

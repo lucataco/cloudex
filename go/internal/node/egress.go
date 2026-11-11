@@ -68,8 +68,9 @@ type Egress struct {
 	Node string
 	Key  ed25519.PrivateKey
 	HTTP *http.Client
-	Log  *log.Logger
-	Debug bool
+	Log     *log.Logger
+	Debug   bool
+	Version string
 	// CA is the node CA now; nil until the deployment has named its provider hosts.
 	CA func() *CA
 	// Ports replaces 80 and 443 (tests, which can't bind them; 0 is any).
@@ -233,6 +234,13 @@ func (e *Egress) tlsConfig() *tls.Config {
 	}
 }
 
+func (e *Egress) version() string {
+	if e.Version == "" {
+		return "dev"
+	}
+	return e.Version
+}
+
 func (e *Egress) ca() *CA {
 	if e.CA == nil {
 		return nil
@@ -336,13 +344,23 @@ var hopHeaders = map[string]bool{
 	"Te": true, "Trailer": true, "Transfer-Encoding": true, "Upgrade": true, "Host": true,
 }
 
-func copyRequestHeaders(dst, src http.Header) {
+// HeaderGuestUA carries the machine's own User-Agent to the Worker, which
+// puts it back (nodeegress.ts). The request to the deployment goes with the
+// agent's: the edge's Browser Integrity Check refuses some clients' default
+// ones (Python's urllib, which the cloudex command inside uses: 1010).
+const HeaderGuestUA = "x-cx-guest-ua"
+
+func copyRequestHeaders(dst, src http.Header, agentUA string) {
 	for k, v := range src {
-		if hopHeaders[k] || strings.HasPrefix(strings.ToLower(k), "x-cx-") {
+		if hopHeaders[k] || strings.HasPrefix(strings.ToLower(k), "x-cx-") || k == "User-Agent" {
 			continue
 		}
 		dst[k] = append([]string(nil), v...)
 	}
+	if ua := src.Get("User-Agent"); ua != "" {
+		dst.Set(HeaderGuestUA, ua)
+	}
+	dst.Set("User-Agent", agentUA)
 }
 
 // errBodyTooBig is a body that grew past EgressBodyMax while it was sent.
@@ -410,7 +428,7 @@ func (e *Egress) forward(en *egressNet, w http.ResponseWriter, r *http.Request, 
 	if body == nil {
 		req.ContentLength = 0
 	}
-	copyRequestHeaders(req.Header, r.Header)
+	copyRequestHeaders(req.Header, r.Header, "cloudex-node/"+e.version())
 	Signer{Key: e.Key, Node: e.Node}.Sign(req.Header, r.Method, signed, en.sandbox)
 	hc := e.HTTP
 	if hc == nil {

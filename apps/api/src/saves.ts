@@ -218,7 +218,11 @@ jq -cn --argjson a "$summary" --argjson b "$up" --arg kind "$kind" '$a + $b + {k
 // through Python's tar filters, which keep every member and link inside /home
 // (extended attributes aren't restored there). Paths the save deleted go
 // first, so that one that became another kind of file can be put back.
-// Prints "all" or "home", what was restored.
+// Prints "all" or "home", what was restored, last. A machine on a node has no
+// CAP_MKNOD (v0.2.2 M6), so device files in a save (Docker's data on
+// Cloudflare holds some: backingFsBlockDev, overlay whiteouts) can't be made
+// there: those alone are left out, counted in a "devices N" line before it;
+// any other error fails the restore.
 export const RESTORE_SAVE_SCRIPT = String.raw`
 set -euo pipefail
 list=/usr/share/cloudex/image-files.gz
@@ -243,7 +247,15 @@ for p in sys.stdin.buffer.read().split(b"\0"):
         print("cloudex: could not remove " + os.fsdecode(p) + ": " + str(e), file=sys.stderr)
 ' "$scope"
 if [ "$scope" = all ]; then
-  python3 -c "$1" get "/saves/$2" "$3" | zstd -q -d | tar -C / --numeric-owner --xattrs --xattrs-include='*' --sparse -xpf -
+  err=$(mktemp)
+  if ! python3 -c "$1" get "/saves/$2" "$3" | zstd -q -d | tar -C / --numeric-owner --xattrs --xattrs-include='*' --sparse -xpf - 2>"$err"; then
+    if grep -v -e ': Cannot mknod: Operation not permitted$' -e '^tar: Exiting with failure status due to previous errors$' "$err" | grep -q .; then
+      cat "$err" >&2
+      exit 1
+    fi
+    echo "devices $(grep -c ': Cannot mknod: ' "$err")"
+  fi
+  rm -f "$err"
 elif [ "$5" != 0 ]; then
   python3 -c "$1" get "/saves/$2" "$3" | zstd -q -d | python3 -I -c '
 import os, sys, tarfile

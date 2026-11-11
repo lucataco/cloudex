@@ -1033,7 +1033,12 @@ export class Sandbox extends DurableObject<Env> {
     } finally {
       await this.ctx.storage.delete("saveGrant");
     }
+    const devices = Number(/^devices (\d+)$/m.exec(scope)?.[1] ?? 0);
+    scope = scope.split("\n").pop() ?? "";
     console.log(`[${r.id}] restored ${scope === "all" ? "the save" : "/home from the save"} ${m.name} (${m.bytes} bytes) in ${Date.now() - t0} ms`);
+    if (scope === "all" && devices > 0) {
+      return `Restored the save ${m.name}, except ${devices} device file${devices === 1 ? "" : "s"} (from Docker's data in a sandbox on Cloudflare), which a machine on a node can't make.`;
+    }
     if (scope === "all") return "";
     if (m.kind === "home") return `Restored /home from the save ${m.name}, which holds only /home: it was made on an image from before v0.1.15.`;
     return `Restored /home from the save ${m.name}. It was made on another version of the sandbox image, so anything installed outside /home needs installing again.`;
@@ -2174,9 +2179,6 @@ export class Sandbox extends DurableObject<Env> {
       120_000,
     );
     const answer = await this.nodeOp("start", { sandbox: r.id, ...(hold ? { hold: true } : {}) }, 150_000);
-    // The node CA its machines trust for the providers' hosts (M6).
-    const ca = typeof answer.ca === "string" && answer.ca.length < 16_384 && answer.ca.startsWith("-----BEGIN CERTIFICATE-----") ? answer.ca : null;
-    if (this.onNode) this.onNode.ca = ca;
     const address = typeof answer.address === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(answer.address) ? answer.address : null;
     if (!address) fail(502, `node ${p.name}'s agent didn't say where the machine is`);
     if (address !== p.address) {
@@ -2184,6 +2186,10 @@ export class Sandbox extends DurableObject<Env> {
       await this.ctx.storage.put("node", next);
       this.place(next);
     }
+    // The node CA its machines trust for the providers' hosts (M6), for
+    // this start's KEYS_SCRIPT.
+    const ca = typeof answer.ca === "string" && answer.ca.length < 16_384 && answer.ca.startsWith("-----BEGIN CERTIFICATE-----") ? answer.ca : null;
+    this.onNode!.ca = ca;
     // Its machine was removed outside Cloudex since it last ran.
     if (made.created === true && r.startedAt !== null) {
       await this.update({ notice: `Its machine was gone from node ${p.name}, so it started over from the image, without its files.` });

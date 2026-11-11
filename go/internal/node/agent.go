@@ -337,7 +337,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		if hc == nil {
 			hc = &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true, MaxIdleConnsPerHost: 16, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 15 * time.Second}}
 		}
-		a.egress = &Egress{API: a.API, Node: a.ID, Key: a.Key, HTTP: hc, Log: a.Log, Debug: a.Debug, CA: a.CA}
+		a.egress = &Egress{API: a.API, Node: a.ID, Key: a.Key, HTTP: hc, Log: a.Log, Debug: a.Debug, CA: a.CA, Version: a.Version}
 		a.egressNow = make(chan struct{}, 1)
 		go a.egressLoop(ctx)
 	}

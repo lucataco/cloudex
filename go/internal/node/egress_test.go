@@ -106,7 +106,7 @@ func TestEgressInternal(t *testing.T) {
 	// machine's headers but none of its own x-cx-* (it can't name another
 	// sandbox), and the target from the path alone.
 	w = do("PATCH", "http://anything.example/v1/sandboxes/self?x=1", strings.NewReader(`{"idleMinutes":5}`),
-		map[string]string{"x-cloudex-self": "tok", "x-cx-sandbox": "cx-zzz999", "x-cx-node": "nd-other000", "content-type": "application/json"})
+		map[string]string{"x-cloudex-self": "tok", "x-cx-sandbox": "cx-zzz999", "x-cx-node": "nd-other000", "x-cx-guest-ua": "forged", "content-type": "application/json", "User-Agent": "Python-urllib/3.12"})
 	r, body := f.last()
 	if w.Code != 200 || r == nil {
 		t.Fatalf("self API: %d %q", w.Code, w.Body)
@@ -114,6 +114,11 @@ func TestEgressInternal(t *testing.T) {
 	if r.Method != "PATCH" || r.Header.Get(HeaderSandbox) != "cx-abc123" || r.Header.Get(HeaderNode) != "nd-test0001" ||
 		r.Header.Get("x-cloudex-self") != "tok" || string(body) != `{"idleMinutes":5}` {
 		t.Fatalf("forwarded: %s sandbox %q node %q self %q body %q", r.Method, r.Header.Get(HeaderSandbox), r.Header.Get(HeaderNode), r.Header.Get("x-cloudex-self"), body)
+	}
+	// The machine's User-Agent rides in a header of the agent's (the edge
+	// refuses some), which the machine can't set itself.
+	if r.Header.Get("User-Agent") != "cloudex-node/dev" || r.Header.Get(HeaderGuestUA) != "Python-urllib/3.12" {
+		t.Fatalf("user agents: %q, guest %q", r.Header.Get("User-Agent"), r.Header.Get(HeaderGuestUA))
 	}
 	if got := r.URL.Query().Get("target"); got != "http://cloudex.internal/v1/sandboxes/self?x=1" {
 		t.Fatalf("target %q", got)
