@@ -644,7 +644,7 @@ host_snapshot() {
 	node_sh "docker ps -a --format '{{.Names}}|{{.Labels}}' | awk -F'|' '\$2 !~ /build[.]cloudex[.]/ {print \$1}' | sort;
 		echo ---; docker network ls --format '{{.Name}}|{{.Labels}}' | awk -F'|' '\$2 !~ /build[.]cloudex[.]/ {print \$1}' | sort;
 		echo ---; docker volume ls --format '{{.Name}}|{{.Labels}}' | awk -F'|' '\$2 !~ /build[.]cloudex[.]/ {print \$1}' | sort;
-		echo ---; ${NODE_SUDO:+sudo nft list tables | sort}"
+		echo ---; ${NODE_SUDO:+sudo nft list tables 2>/dev/null | sort}"
 }
 M3_CHECKS=("N09 exec over the link: exit codes, stdout and stderr, the user, cwd, and a round trip p50 under 150 ms"
 	"N10 data each way: 256 MiB with scp, 90 MiB with cp, and a preview's body and WebSocket, unchanged"
@@ -881,7 +881,7 @@ node_m4() {
 		return
 	fi
 	MC=cloudex-$MID
-	wait_iso 0
+	wait_iso 0 >/dev/null
 	cx node dev-sandbox "$N" --name "$M2" --cpus 0.5 --memory-mb 1024
 	M2ID=$(field .id)
 
