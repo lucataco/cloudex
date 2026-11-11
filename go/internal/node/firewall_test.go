@@ -30,11 +30,13 @@ func TestTheFirewallTouchesOnlyMachineBridges(t *testing.T) {
 			}
 		}
 	}
-	// In this order: IPv6, the agent on a machine's own bridge, answers,
-	// nothing in, machine to machine, Docker's bridges, the blocked ranges.
-	order := []string{"meta nfproto ipv6", "meta nfproto ipv6", "fib daddr . iif oif exists", "ct state established,related",
+	// In this order: a source from another bridge (review H6), IPv6, the
+	// agent on a machine's own bridge, answers, nothing in, machine to
+	// machine, Docker's bridges, the blocked ranges; and into the host: a
+	// source from another bridge, answers, the agent's canary, nothing else.
+	order := []string{"fib saddr . iif oif missing", "meta nfproto ipv6", "meta nfproto ipv6", "fib daddr . iif oif exists", "ct state established,related",
 		`oifname "cx*" counter drop`, `iifname "cx*" oifname "cx*" counter drop`, `oifname "docker0"`, `oifname "br-*"`,
-		"@blocked4", "@onlink4", "ct state established,related", `iifname "cx*" counter drop`}
+		"@blocked4", "@onlink4", "fib saddr . iif oif missing", "ct state established,related", "tcp dport 9 counter reject with icmp type admin-prohibited", `iifname "cx*" counter drop`}
 	if len(chainRules) != len(order) {
 		t.Fatalf("%d rules:\n%s", len(chainRules), strings.Join(chainRules, "\n"))
 	}

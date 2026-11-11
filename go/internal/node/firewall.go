@@ -19,7 +19,11 @@ import (
 // accept here still lets Docker's chains see the packet.
 //
 // What it does, for a packet from a machine:
-//   - input (to any of the host's own addresses, whichever it names): drop.
+//   - first, in both chains: a source address that isn't on the bridge it
+//     came in on (a machine that took another's address) is dropped.
+//   - input (to any of the host's own addresses, whichever it names): drop,
+//     except the agent's canary port, which is rejected so that the agent
+//     can tell the table is there (canary.go).
 //   - forward: drop IPv6; accept frames between the machine and the agent on
 //     its own bridge, when the bridge is filtered at all (br_netfilter); drop
 //     traffic to other machine networks and Docker's other bridges, private,
@@ -29,6 +33,10 @@ import (
 //
 // The agent can't read these rules (it has no NET_ADMIN on the host), so it
 // tests them instead (selftest.go).
+
+// CanaryPort is where the agent's canary knocks on the host from a machine
+// network: the firewall answers it with an ICMP admin-prohibited (canary.go).
+const CanaryPort = 9
 
 // Blocked4 are the IPv4 ranges a machine may not reach.
 var Blocked4 = []string{
@@ -102,6 +110,10 @@ table inet cloudex {
 
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
+		# A machine's packet must come from its own bridge's subnet: under
+		# Sysbox root may add another machine's address, and an answer to a
+		# forged source would reach that machine as established (review H6).
+		iifname "cx*" fib saddr . iif oif missing counter drop comment "a source address that isn't on the bridge it came in on"
 		# Machine networks are IPv4 only.
 		iifname "cx*" meta nfproto ipv6 counter drop comment "IPv6 from a machine"
 		oifname "cx*" meta nfproto ipv6 counter drop comment "IPv6 to a machine"
@@ -122,11 +134,16 @@ table inet cloudex {
 	# address they name, so this covers the host's services on every one.
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
+		iifname "cx*" fib saddr . iif oif missing counter drop comment "a source address that isn't on the bridge it came in on"
 		iifname "cx*" ct state established,related counter accept comment "answers to the host"
+		# The agent's canary (review H3): it connects here from its address on
+		# a machine network every few seconds. This answer says the table is
+		# loaded; a refusal or an answer from the host says it's gone.
+		iifname "cx*" tcp dport %d counter reject with icmp type admin-prohibited comment "the agent's canary"
 		iifname "cx*" counter drop comment "the host itself"
 	}
 }
-`, c.Pool, elems(blocked), elems(onlink))
+`, c.Pool, elems(blocked), elems(onlink), CanaryPort)
 	return b.String(), nil
 }
 
