@@ -2404,7 +2404,7 @@ export class Sandbox extends DurableObject<Env> {
       stoppedAt: r.stoppedAt ?? Date.now(),
       error:
         `node ${name} was removed (cloudex node rm --force); ` +
-        (machineDeleted ? "its machine was deleted with it. " : "its machine wasn't reachable then, and stays on that host until its agent is uninstalled there. ") +
+        (machineDeleted ? "its machine was deleted with it. " : "its machine wasn't reachable then: the node's agent stops it when it next connects, and its disk stays on that host until the agent is uninstalled there. ") +
         "Delete this sandbox",
     });
   }

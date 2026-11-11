@@ -150,7 +150,7 @@ function RemoveNode(props: { n: Node; onDone: () => unknown; onError: (e: string
   const confirmText = forget
     ? `Forget ${n.name}?`
     : n.machines > 0
-      ? `Remove ${n.name}? It has ${n.machines} sandbox${n.machines === 1 ? "" : "es"}: ${n.state === "online" ? "their machines are deleted with it" : "their machines stay on the host, which can't be reached any more"}, and they stay listed until you delete them. Its agent is disconnected and must join again with a new token.`
+      ? `Remove ${n.name}? It has ${n.machines} sandbox${n.machines === 1 ? "" : "es"}: ${n.state === "online" ? "their machines are deleted with it" : "their machines are stopped when its agent next connects (their disks stay on the host until it's uninstalled)"}, and they stay listed until you delete them. Its agent is disconnected and must join again with a new token.`
       : `Remove ${n.name}? Its agent is disconnected and must join again with a new token.`;
   return (
     <Act

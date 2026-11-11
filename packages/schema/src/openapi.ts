@@ -232,8 +232,8 @@ export function openapi(version: string) {
             "online (503 otherwise, naming it and when it was last seen) and pass its isolation self-test; an own-only " +
             "token can't use a node whose isolation is plain Docker (403). cpus and memoryMb go only with node. On a " +
             "node, in this version: stopping keeps the disk on the node (no save or backup), there's no 6-hour limit, " +
-            "and forks, named saves, agents, provider keys and the cloudex command inside aren't available yet " +
-            "(501 where asked for).",
+            "named saves, agents, provider keys and the cloudex command inside work, and forks, sizes and backups " +
+            "aren't available (501 for a fork, 400 for a size or a backup).",
           requestBody: body("CreateSandbox", false),
           responses: { 201: sandbox },
         }),
@@ -279,8 +279,8 @@ export function openapi(version: string) {
           description:
             "A running sandbox is saved first and keeps running. Forks that fail to start are " +
             "returned in state error, with the reason; resuming one tries again. Not available for a sandbox on a " +
-            "node yet (501); and forks can't be made on a node (node, cpus and memoryMb are a 400): save the sandbox, " +
-            "then start sandboxes from the save there.",
+            "node (501); and forks can't be made on a node (node, cpus and memoryMb are a 400): save the sandbox, " +
+            "then start sandboxes from the save there (startFromSave).",
           requestBody: body("ForkRequest", false),
           responses: { 201: ok("The forks", { type: "array", items: ref("Sandbox") }) },
         }),
@@ -568,18 +568,19 @@ export function openapi(version: string) {
       },
       "/v1/nodes/{node}": {
         parameters: [{ name: "node", in: "path", required: true, description: "The node's name or id (nd-xxxxxxxx)", schema: { type: "string" } }],
-        get: op("getNode", "Get a node; while it's online, with a round trip to its agent", {
+        get: op("getNode", "Get a node; for admins while it's online, with a round trip to its agent", {
           description:
-            "Also the machine image as the agent last reported it, the machines it runs that belong to no sandbox " +
-            "(orphans, left alone), and the sandboxes deleted while it was offline whose machines it removes when it's " +
-            "back (pendingDeletes).",
+            "Also the machine image as the agent last reported it; and, for admins only, the round trip, the machines " +
+            "it runs that belong to no sandbox (orphans, left alone), and the sandboxes deleted while it was offline " +
+            "whose machines it removes when it's back (pendingDeletes).",
           responses: { 200: ok("The node", ref("Node")) },
         }),
         delete: op("deleteNode", "Remove a node: its key stops working and its agent is disconnected (admins only)", {
           description:
             "The node stays listed as revoked; removing a revoked node forgets it. A node that still has sandboxes " +
             "is refused (409) unless force is set. With force, an online node removes their machines first; the " +
-            "sandboxes stay listed in state error, saying so, until they're deleted.",
+            "sandboxes stay listed in state error, saying so, until they're deleted. An offline node's agent hears " +
+            "that it was removed when it next connects, and stops its machines (their disks stay until it's uninstalled).",
           parameters: [{ name: "force", in: "query", description: "Remove it even though it has sandboxes", schema: { type: "boolean", default: false } }],
           responses: { 200: ok("Revoked or forgotten", { type: "object", properties: { revoked: { type: "string" }, deleted: { type: "string" } } }) },
         }),
@@ -588,8 +589,9 @@ export function openapi(version: string) {
         post: op("joinNode", "The node agent's first call: trade a join token for its place, with its public key", {
           security: [],
           description:
-            "For the cloudex-node agent, not for clients. Signed with the new key (see connectNode). The token works " +
-            "once, for 30 minutes; one that is unknown, used or expired is a 401.",
+            "For the cloudex-node agent, not for clients. Signed with the new key (see connectNode, with NODE empty). " +
+            "The token works once, for 30 minutes; one that is unknown, used or expired is a 401, and a key another " +
+            "node has is a 409.",
           requestBody: body("NodeJoin"),
           responses: { 200: ok("The node it joined as", ref("NodeJoined")) },
         }),
@@ -600,9 +602,9 @@ export function openapi(version: string) {
           description:
             "For the cloudex-node agent, not for clients. Headers: x-cx-node (its id), x-cx-ts (unix seconds), " +
             "x-cx-nonce (32 hex digits), x-cx-protocol, and x-cx-sig: Ed25519 in base64 over " +
-            "METHOD\\nPATH?QUERY\\nSANDBOX\\nTS\\nNONCE, with SANDBOX empty. 60 s of clock skew are allowed, and a nonce " +
-            "works once. A bad signature, a skewed clock, a reused nonce, or a removed or unknown node is a 401; " +
-            "another protocol is a 426.",
+            "METHOD\\nPATH?QUERY\\nNODE\\nSANDBOX\\nTS\\nNONCE, with NODE its id and SANDBOX empty. 60 s of clock " +
+            "skew are allowed, and a nonce works once. A bad signature, a skewed clock, a reused nonce, or an unknown " +
+            "node is a 401; a removed node, signed with its own key, a 410 with revoked: true; another protocol a 426.",
           responses: { 101: { description: "Switching to the WebSocket" } },
         }),
       },

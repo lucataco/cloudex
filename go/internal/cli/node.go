@@ -93,7 +93,9 @@ func newNodeCmd(opts *options) *cobra.Command {
 			"node stays listed as revoked until it's removed a second time. A node that still\n" +
 			"has sandboxes is refused unless --force is given. With --force, an online node\n" +
 			"removes their machines first; the sandboxes stay listed, in state error, until\n" +
-			"you delete them.",
+			"you delete them. An offline node's agent hears that it was removed when it next\n" +
+			"connects, and stops its machines; their disks stay on the host until you run\n" +
+			"the installer there with --uninstall.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, client, err := opts.load()
