@@ -763,14 +763,13 @@ install_node() {
 cf_fresh() {
 	if [[ -n ${VERIFY_CF_TOKEN_CMD:-} ]]; then
 		local t
-		for _ in 1 2 3; do
-			t=$(eval "$VERIFY_CF_TOKEN_CMD" 2>/dev/null | tail -1)
-			# One the API takes: a token just refreshed has been refused for a moment.
-			if [[ -n $t ]] && curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $t" | jq -e .success >/dev/null 2>&1; then
-				export CLOUDFLARE_API_TOKEN=$t
-				break
-			fi
-			sleep 5
+		for _ in 1 2 3 4 5 6; do
+			t=$( (eval "$VERIFY_CF_TOKEN_CMD") 2>/dev/null | tail -1)
+			# The newest token, always (a refresh may end the one before), once
+			# the API takes it: a token just refreshed has been refused for a while.
+			[[ -n $t ]] && export CLOUDFLARE_API_TOKEN=$t
+			curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN:-}" | jq -e .success >/dev/null 2>&1 && break
+			sleep 10
 		done
 	fi
 	return 0
@@ -1963,7 +1962,7 @@ d1_writes_once() {
 	acc=$(cf_account)
 	db=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$acc/d1/database?name=cloudex" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '[.result[]? | select(.name == "cloudex")][0].uuid // empty')
 	# No account or database: nothing was counted, which mustn't read as no writes.
-	[[ -n $acc && -n $db ]] || { echo unknown; return; }
+	[[ -n $acc && -n $db ]] || { echo "unknown (no ${acc:+database}${acc:-account})"; return; }
 	q='query($acc:String!,$db:String!,$from:Time!,$to:Time!){viewer{accounts(filter:{accountTag:$acc}){d1AnalyticsAdaptiveGroups(limit:1000,filter:{databaseId:$db,datetimeMinute_geq:$from,datetimeMinute_leq:$to}){sum{writeQueries}}}}}'
 	jq -n --arg q "$q" --arg acc "$acc" --arg db "$db" --arg from "$1" --arg to "$2" '{query:$q, variables:{acc:$acc, db:$db, from:$from, to:$to}}' |
 		curl -s https://api.cloudflare.com/client/v4/graphql -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' --data @- |
@@ -2023,12 +2022,20 @@ node_review_worker() {
 	wait_state "$N" online 30 >/dev/null
 	cx new --on "$N" --name "$P-n56" --no-use
 	s56=$(field .state)
-	if [[ $s56 == running ]]; then
-		(timeout 90 "$CX" exec "$P-n56" -- cx-flood-overrun | sleep 45) >/dev/null 2>&1
-		timeout 30 "$CX" exec "$P-n56" -- cx-flood-channel >/dev/null 2>&1
-		(sleep 60 | timeout 60 "$CX" proxy "$P-n56" 22 | sleep 55) >/dev/null 2>&1
-	fi
-	sleep 3
+	# Each flood, again once if it left no report (an edge reset can cut the
+	# stream before the deployment closes it), with what the client said.
+	local kind e56=""
+	for kind in overrun channel splice overrun channel splice; do
+		[[ $s56 == running ]] || break
+		node_sh "docker logs $fk 2>/dev/null" | grep -q "\"kind\":\"$kind\"" && continue
+		case $kind in
+		overrun) (timeout 90 "$CX" exec "$P-n56" -- cx-flood-overrun | sleep 45) >/dev/null 2>"$work/e56" ;;
+		channel) timeout 30 "$CX" exec "$P-n56" -- cx-flood-channel >/dev/null 2>"$work/e56" ;;
+		splice) (sleep 60 | timeout 60 "$CX" proxy "$P-n56" 22 2>"$work/e56" | sleep 55) >/dev/null ;;
+		esac
+		sleep 3
+		e56="$e56 $kind: $(tail -1 "$work/e56" | head -c 100);"
+	done
 	l56=$(node_sh "docker logs $fk 2>&1")
 	local fkst
 	fkst="the fake agent $(node_sh "docker inspect $fk -f '{{.State.Status}}'" 2>/dev/null || echo gone), its last lines: $(grep -v '^{' <<<"$l56" | tail -3 | tr '\n' ' ')"
@@ -2040,7 +2047,7 @@ node_review_worker() {
 	wait_state "$N" online 30 >/dev/null
 	"$CX" delete "$P-n56" --yes >/dev/null 2>&1 || "$CX" delete "$P-n56" --yes --force >/dev/null 2>&1
 	ov=$(jq -c 'select(.kind == "overrun")' <<<"$l56" | head -1) ch=$(jq -c 'select(.kind == "channel")' <<<"$l56" | head -1) sp=$(jq -c 'select(.kind == "splice")' <<<"$l56" | head -1)
-	OUT="sandbox on the fake agent: ${s56:-none} ${ERR:0:120}; overrun $ov; channel $ch; splice $sp; $fkst" CODE=""
+	OUT="sandbox on the fake agent: ${s56:-none} ${ERR:0:120}; overrun $ov; channel $ch; splice $sp; $fkst; the clients:$e56" CODE=""
 	ok N56 "$(review_desc N56)" [ "$(jq -r .closeCode <<<"$ov")" = 4400 -a "$(jq -r '.sentBytes < 32*1048576' <<<"$ov")" = true \
 		-a "$(jq -r .closeCode <<<"$ch")" = 4400 -a "$(jq -r .closeCode <<<"$sp")" = 4400 -a "$(jq -r '.sentBytes < 64*1048576' <<<"$sp")" = true ]
 }
