@@ -737,6 +737,7 @@ now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
 # Active seconds of one Durable Object from $1 to $2 (ISO times), from the GraphQL analytics.
 do_active() {
 	local acc q
+	cf_fresh
 	acc=$(cf_account)
 	q='query($acc:String!,$from:Time!,$to:Time!,$ids:[String!]){viewer{accounts(filter:{accountTag:$acc}){durableObjectsPeriodicGroups(limit:1000,filter:{datetimeMinute_geq:$from,datetimeMinute_leq:$to,objectId_in:$ids}){sum{activeTime}}}}}'
 	jq -n --arg q "$q" --arg acc "$acc" --arg from "$1" --arg to "$2" --arg id "$3" '{query:$q, variables:{acc:$acc, from:$from, to:$to, ids:[$id]}}' |
@@ -756,6 +757,16 @@ install_node() {
 	local tok=$1
 	shift
 	"${NODE_SSH[@]}" "read -r t; export CLOUDEX_JOIN_TOKEN=\$t; ${NODE_SUDO:+sudo --preserve-env=CLOUDEX_JOIN_TOKEN} bash $NODE_DIR/node-install.sh $*" <<<"$tok"
+}
+# A fresh CLOUDFLARE_API_TOKEN from VERIFY_CF_TOKEN_CMD when it's set (wrangler's
+# own login gives tokens that last an hour, less than a node run).
+cf_fresh() {
+	if [[ -n ${VERIFY_CF_TOKEN_CMD:-} ]]; then
+		local t
+		t=$(eval "$VERIFY_CF_TOKEN_CMD" 2>/dev/null | tail -1)
+		[[ -n $t ]] && export CLOUDFLARE_API_TOKEN=$t
+	fi
+	return 0
 }
 # The account the deployment is in (do_active, d1_writes): the token may see others.
 cf_account() {
@@ -887,6 +898,7 @@ node_m3() {
 		scp -F "$ssh_cfg" -o BatchMode=yes -q -l 4000 "$big" "$NM.cloudex:/tmp/vr-slow" 2>/dev/null &
 		spid=$!
 		sleep 5
+		cf_fresh
 		"$CX" deploy --yes --skip-check >"$work/deploy2.log" 2>&1
 		t_cut="" t_gone=""
 		for _ in $(seq 1 420); do
@@ -1537,6 +1549,7 @@ forged-source 000"
 		("$CX" save "$S6" "$P-n6d" >"$work/o44" 2>"$work/e44"; echo $? >"$work/rc44") &
 		local spid=$!
 		sleep 8
+		cf_fresh
 		"$CX" deploy --yes --skip-check >"$work/deploy44.log" 2>&1
 		wait "$spid"
 		local rc44 st44 saved44 acc objs ids
@@ -1544,7 +1557,8 @@ forged-source 000"
 		sleep 20
 		st44=$("$CX" info "$S6" --json 2>/dev/null | jq -r .state)
 		saved44=$("$CX" saves --json 2>/dev/null | jq -r --arg n "$P-n6d" '.[] | select(.name == $n) | .id')
-		acc=$(curl -s https://api.cloudflare.com/client/v4/accounts -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id')
+		cf_fresh
+		acc=$(cf_account)
 		ids=$("$CX" saves --json 2>/dev/null | jq -r '.[].id' | tr '\n' '|')
 		curl -s "https://api.cloudflare.com/client/v4/accounts/$acc/r2/buckets/cloudex-backups/objects?prefix=saves/&per_page=1000" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" >"$work/r2.json"
 		local listed44
@@ -1916,6 +1930,7 @@ d1_writes() {
 }
 d1_writes_once() {
 	local acc db q
+	cf_fresh
 	acc=$(cf_account)
 	db=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$acc/d1/database?name=cloudex" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '[.result[]? | select(.name == "cloudex")][0].uuid // empty')
 	# No account or database: nothing was counted, which mustn't read as no writes.
@@ -2081,6 +2096,7 @@ if want node; then
 			done
 			if [[ ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
 				# Poll while a deploy runs; the longest run of offline answers counts.
+				cf_fresh
 				("$CX" deploy --yes --skip-check >"$work/deploy.log" 2>&1; echo $? >"$work/deploy.rc") &
 				dpid=$!
 				worst=0 down_since=""
