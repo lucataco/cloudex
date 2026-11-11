@@ -56,6 +56,11 @@ const EgressBodyMax = 100_000_000
 // EgressInflightMax is how many requests one machine may have in flight.
 const EgressInflightMax = 64
 
+// EgressConnsMax is how many connections one machine network's listeners
+// hold at once (review H4); more are closed as they're accepted, before
+// anything is read from them, so one machine can't exhaust the agent.
+var EgressConnsMax = 256
+
 // ActivityEvery is how often a machine's /activity reaches the deployment.
 const ActivityEvery = 30 * time.Second
 
@@ -64,10 +69,10 @@ const EgressRoute = "/v1/node/egress"
 
 // Egress runs the agent's listeners on its machine networks.
 type Egress struct {
-	API  string
-	Node string
-	Key  ed25519.PrivateKey
-	HTTP *http.Client
+	API     string
+	Node    string
+	Key     ed25519.PrivateKey
+	HTTP    *http.Client
 	Log     *log.Logger
 	Debug   bool
 	Version string
@@ -88,6 +93,9 @@ type egressNet struct {
 	servers  []*http.Server
 	addrs    []string // where the two listeners are
 	inflight atomic.Int32
+	conns    atomic.Int32 // open connections, both listeners together
+	full     atomic.Int64 // connections closed because conns was at EgressConnsMax
+	bound    bool         // the listeners are bound to the network's interface
 }
 
 func (e *Egress) logf(format string, args ...any) {
@@ -137,6 +145,17 @@ func (e *Egress) Sync(nets map[string]MachineNet) {
 	}
 }
 
+// Drop closes a sandbox's listeners and their connections now: its machine
+// is being deleted, and its /28 may later be another's (review H8).
+func (e *Egress) Drop(sandbox string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if en := e.nets[sandbox]; en != nil {
+		en.close()
+		delete(e.nets, sandbox)
+	}
+}
+
 // Close closes every listener.
 func (e *Egress) Close() {
 	e.mu.Lock()
@@ -153,11 +172,25 @@ func (en *egressNet) close() {
 	}
 }
 
-// machineListener accepts only connections from inside its network.
+// machineListener accepts only connections from inside its network, and
+// at most EgressConnsMax at once for the network.
 type machineListener struct {
 	net.Listener
-	n MachineNet
-	e *Egress
+	n  MachineNet
+	e  *Egress
+	en *egressNet
+}
+
+// countedConn gives its place back when it closes.
+type countedConn struct {
+	net.Conn
+	once sync.Once
+	en   *egressNet
+}
+
+func (c *countedConn) Close() error {
+	c.once.Do(func() { c.en.conns.Add(-1) })
+	return c.Conn.Close()
 }
 
 func (l *machineListener) Accept() (net.Conn, error) {
@@ -169,6 +202,17 @@ func (l *machineListener) Accept() (net.Conn, error) {
 		la, _ := netip.ParseAddrPort(c.LocalAddr().String())
 		pa, _ := netip.ParseAddrPort(c.RemoteAddr().String())
 		if _, ok := CallerNetwork(la.Addr(), pa.Addr(), []MachineNet{l.n}); ok {
+			if l.en != nil {
+				if n := l.en.conns.Add(1); int(n) > EgressConnsMax {
+					l.en.conns.Add(-1)
+					c.Close()
+					if f := l.en.full.Add(1); f <= 5 || f%1000 == 0 {
+						l.e.logf("%s: closed a connection at once: its network has %d open already (%d so far)", l.en.sandbox, EgressConnsMax, f)
+					}
+					continue
+				}
+				return &countedConn{Conn: c, en: l.en}, nil
+			}
 			return c, nil
 		}
 		c.Close()
@@ -185,15 +229,26 @@ func (e *Egress) listen(sandbox string, n MachineNet) (*egressNet, error) {
 	if len(e.Ports) == 2 {
 		ports = e.Ports
 	}
+	// Bound to the network's own interface where the kernel lets a process
+	// without CAP_NET_RAW do it (Linux 5.7 and later), so that a connection
+	// another machine routes to this address through its own network (the
+	// weak-host path, under Sysbox) is refused by the kernel and never
+	// reaches this accept loop (review H4).
+	ifname := interfaceOf(n.Agent)
+	en.bound = ifname != ""
 	for _, port := range ports {
-		ln, err := net.Listen("tcp4", netip.AddrPortFrom(n.Agent, uint16(port)).String())
+		ln, err := listenOn(netip.AddrPortFrom(n.Agent, uint16(port)).String(), ifname)
+		if err != nil && ifname != "" {
+			en.bound = false
+			ln, err = listenOn(netip.AddrPortFrom(n.Agent, uint16(port)).String(), "")
+		}
 		if err != nil {
 			for _, l := range lns {
 				l.Close()
 			}
 			return nil, err
 		}
-		lns = append(lns, &machineListener{Listener: ln, n: n, e: e})
+		lns = append(lns, &machineListener{Listener: ln, n: n, e: e, en: en})
 		en.addrs = append(en.addrs, ln.Addr().String())
 	}
 	plain := &http.Server{

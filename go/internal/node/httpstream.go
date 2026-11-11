@@ -25,6 +25,9 @@ var wsOwn = map[string]bool{
 	"sec-websocket-protocol": true, "sec-websocket-accept": true,
 }
 
+// PreviewMessageMax is the largest WebSocket message a preview may send.
+const PreviewMessageMax = 1 << 20
+
 var previewTransport = &http.Transport{
 	DialContext:        (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 	DisableCompression: true,
@@ -185,7 +188,9 @@ func (h *Handler) websocket(s *Stream, m Target, r StreamHTTP) {
 		return
 	}
 	defer c.CloseNow()
-	c.SetReadLimit(64 << 20)
+	// A preview's message is read whole before it's passed on: a machine
+	// could make each one 64 MiB. The Worker takes at most 1 MiB (review H4).
+	c.SetReadLimit(PreviewMessageMax)
 	hs := [][2]string{}
 	if p := c.Subprotocol(); p != "" {
 		hs = append(hs, [2]string{"sec-websocket-protocol", p})
