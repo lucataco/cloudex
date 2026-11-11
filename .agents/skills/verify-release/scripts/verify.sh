@@ -14,6 +14,10 @@
 # which runs cloudex deploy with $CLOUDFLARE_API_TOKEN), VERIFY_NODE_LONG=1 (N12's 30 idle
 # minutes, and with VERIFY_NODE_DEPLOY=1 N13's deploy during an scp), VERIFY_NODE_REBOOT=1
 # (N23 reboots the host).
+# VERIFY_NODE=<node> (v0.2.2): the lifecycle, connect, inside, agents, tokens, dashboard, sdk
+# and browser areas make their sandboxes on that node, which must be online (cloudex node
+# add, then its installer), instead of on Cloudflare; what isn't on nodes yet SKIPs, saying
+# why, once the API has refused it as it should.
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
 set -uo pipefail
 
@@ -34,6 +38,11 @@ mkdir -p "$out"
 results=$out/results.tsv
 printf 'id\tresult\tcheck\tdetail\n' >"$results"
 P=vr$(date +%H%M%S)
+# VERIFY_NODE: the areas' sandboxes go on that node (see the top).
+ON=()
+[[ -n ${VERIFY_NODE:-} ]] && ON=(--on "$VERIFY_NODE")
+on_node() { [[ -n ${VERIFY_NODE:-} ]]; }
+NOT_ON_NODES="not on nodes in v0.2.2"
 API_URL=$(jq -r .apiUrl "$CLOUDEX_CONFIG_DIR/config.json")
 ZONE=$(jq -r '.previewZone // empty' "$CLOUDEX_CONFIG_DIR/config.json")
 fails=0
@@ -90,12 +99,16 @@ trap cleanup EXIT
 want() { [[ $# -eq 0 || " ${areas[*]} " == *" $1 "* ]]; }
 areas=("$@")
 [[ ${#areas[@]} -eq 0 ]] && areas=(setup lifecycle connect inside agents tokens dashboard browser sdk node)
-echo "Cloudex verify: $("$CX" version --json 2>/dev/null | jq -r '.version // empty' 2>/dev/null) against $API_URL, prefix $P, areas: ${areas[*]}"
+echo "Cloudex verify: $("$CX" version --json 2>/dev/null | jq -r '.version // empty' 2>/dev/null) against $API_URL, prefix $P, areas: ${areas[*]}${VERIFY_NODE:+, sandboxes on node $VERIFY_NODE}"
+if on_node && [[ $("$CX" node info "$VERIFY_NODE" --json 2>/dev/null | jq -r .state) != online ]]; then
+	echo "VERIFY_NODE=$VERIFY_NODE isn't an online node of this deployment (cloudex node list)" >&2
+	exit 2
+fi
 
 A=$P-a
 need_a() {
 	[[ -n ${A_ID:-} ]] && return
-	cx new --name "$A"
+	cx new --name "$A" ${ON[@]+"${ON[@]}"}
 	A_ID=$(field .id)
 }
 
@@ -149,9 +162,9 @@ fi
 # ---------------------------------------------------------------- lifecycle
 if want lifecycle; then
 	echo "file-content-$P" >"$work/dotfile"
-	cx new --name "$A" --env VR_ONE=1 --file ".vr/dot=$work/dotfile" --repo https://github.com/octocat/Hello-World
+	cx new --name "$A" --env VR_ONE=1 --file ".vr/dot=$work/dotfile" --repo https://github.com/octocat/Hello-World ${ON[@]+"${ON[@]}"}
 	A_ID=$(field .id)
-	ok L01 "new starts a running sandbox with the name" [ "$(field .state)" = running -a "$(field .name)" = "$A" ]
+	ok L01 "new starts a running sandbox with the name${VERIFY_NODE:+, on node $VERIFY_NODE}" [ "$(field .state)" = running -a "$(field .name)" = "$A" -a "$(field '.placement.node.name // "cloudflare"')" = "${VERIFY_NODE:-cloudflare}" ]
 	cx list
 	ok L02 "list shows it" [ "$(jq -r --arg n "$A" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 1 ]
 	cx exec "$A" -- 'echo $VR_ONE; cat ~/.vr/dot; test -f ~/Hello-World/README && echo repo'
@@ -162,7 +175,7 @@ if want lifecycle; then
 	cx env unset "$A" VR_TWO
 	cx env "$A"
 	ok L05 "env unset removes it, env lists names only" [ "$(field '.env | join(",")')" = VR_ONE ]
-	cx new --name "$A"
+	cx new --name "$A" ${ON[@]+"${ON[@]}"}
 	ok L06 "new with a taken name fails" [ "$CODE" != 0 ]
 	cx set "$A" --idle 2h
 	ok L07 "set --idle" [ "$(field .idleMinutes)" = 120 ]
@@ -175,45 +188,74 @@ if want lifecycle; then
 	ok L09 "use makes it current" has "$OUT" "$A_ID"
 	cx exec "$A" -- 'mkdir -p ~/.cloudex && echo "touch /tmp/vr-started" >~/.cloudex/start && echo kept >~/vr-home && sudo sh -c "echo kept >/opt/vr-sys"'
 	cx stop "$A"
-	ok L10 "stop saves and backs up" [ "$(field .state)" = stopped -a "$(field .savedBytes)" != null -a "$(field .backupError)" = null ]
+	if on_node; then
+		# On a node the disk stays there when it stops: no save, no backup (L13 checks the disk).
+		ok L10 "stop on a node stops it, keeping its disk there ($NOT_ON_NODES: saves and backups on stop)" [ "$(field .state)" = stopped -a "$(field .savedBytes)" = null ]
+	else
+		ok L10 "stop saves and backs up" [ "$(field .state)" = stopped -a "$(field .savedBytes)" != null -a "$(field .backupError)" = null ]
+	fi
 	cx exec "$A" -- true
 	ok L11 "exec on a stopped sandbox says to resume" [ "$CODE" = 1 -a "$(has "$ERR" resume && echo y)" = y ]
 	cx resume "$A"
 	ok L12 "resume runs it again" [ "$(field .state)" = running ]
 	cx exec "$A" -- 'cat ~/vr-home /opt/vr-sys; test -f /tmp/vr-started && echo started; echo $VR_ONE'
 	ok L13 "resume keeps the disk, runs ~/.cloudex/start, keeps env" is "$OUT" "$(printf 'kept\nkept\nstarted\n1')"
-	cx fork "$A" --count 2 --name "$P-f"
-	ok L14 "fork --count 2 makes two named forks" [ "$(field 'map(.name) | sort | join(",")')" = "$P-f-1,$P-f-2" -a "$(field '.[0].forkedFrom')" = "$A_ID" ]
-	cx exec "$P-f-1" -- 'cat ~/vr-home /opt/vr-sys; echo $VR_ONE'
-	ok L15 "a fork has the disk and settings" is "$OUT" "$(printf 'kept\nkept\n1')"
-	cx save "$A" "$P-base"
-	ok L16 "save makes a named save" [ "$(field .name)" = "$P-base" -a "$(field .replaced)" = false ]
-	cx save "$A" "$P-base"
-	ok L17 "saving under a taken name replaces it" [ "$(field .replaced)" = true ]
-	cx saves
-	ok L18 "saves lists it" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 1 ]
-	cx new --from "$P-base" --name "$P-s"
-	ok L19 "new --from a save" [ "$(field '.[0].state')" = running -a "$(field '.[0].fromSave')" = "$P-base" ]
-	cx exec "$P-s" -- 'cat ~/vr-home /opt/vr-sys; echo $VR_ONE'
-	ok L20 "a sandbox from a save has the disk and settings" is "$OUT" "$(printf 'kept\nkept\n1')"
-	cx stop "$P-f-2"
-	cx resume "$P-f-2" --size standard-4
-	cx exec "$P-f-2" -- nproc
-	ok L21 "resume --size changes the size" is "$OUT" 4
-	cx stop "$P-f-2"
-	cx resume "$P-f-2" --from-backup
-	ok L22 "resume --from-backup says what it restored" has "$(field .notice)" "backup"
-	cx exec "$P-f-2" -- 'cat ~/vr-home; test -e /opt/vr-sys && echo has-sys || echo no-sys'
-	ok L23 "the backup brings /home back and nothing else" is "$OUT" "$(printf 'kept\nno-sys')"
+	if on_node; then
+		# Refused, as they should be (N34 checks the messages): then SKIP, saying why.
+		# What follows uses $P-f-1 and $P-s, which are made on the node instead.
+		cx fork "$A" --count 2 --name "$P-f"
+		if [[ $CODE == 0 ]]; then fail L14 "a fork on a node is refused" "it was made: ${OUT:0:200}"; else
+			skip L14 "fork --count 2 makes two named forks" "$NOT_ON_NODES: forks (refused: ${ERR:0:120})"
+			skip L15 "a fork has the disk and settings" "$NOT_ON_NODES: forks"
+		fi
+		cx save "$A" "$P-base"
+		if [[ $CODE == 0 ]]; then fail L16 "a named save of a node sandbox is refused" "it was made: ${OUT:0:200}"; else
+			for c in "L16 save makes a named save" "L17 saving under a taken name replaces it" "L18 saves lists it" "L19 new --from a save" \
+				"L20 a sandbox from a save has the disk and settings" "L25 saves rm deletes the save"; do
+				skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: named saves of a node sandbox come with M6 (refused: ${ERR:0:120})"
+			done
+		fi
+		for c in "L21 resume --size changes the size" "L22 resume --from-backup says what it restored" "L23 the backup brings /home back and nothing else"; do
+			skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: sizes and backups are Cloudflare's; resume --size and --from-backup refuse with a 400 (N34)"
+		done
+		"$CX" new --name "$P-f-1" --no-use "${ON[@]}" >/dev/null 2>&1
+		cx new --name "$P-s" --no-use "${ON[@]}"
+	else
+		cx fork "$A" --count 2 --name "$P-f"
+		ok L14 "fork --count 2 makes two named forks" [ "$(field 'map(.name) | sort | join(",")')" = "$P-f-1,$P-f-2" -a "$(field '.[0].forkedFrom')" = "$A_ID" ]
+		cx exec "$P-f-1" -- 'cat ~/vr-home /opt/vr-sys; echo $VR_ONE'
+		ok L15 "a fork has the disk and settings" is "$OUT" "$(printf 'kept\nkept\n1')"
+		cx save "$A" "$P-base"
+		ok L16 "save makes a named save" [ "$(field .name)" = "$P-base" -a "$(field .replaced)" = false ]
+		cx save "$A" "$P-base"
+		ok L17 "saving under a taken name replaces it" [ "$(field .replaced)" = true ]
+		cx saves
+		ok L18 "saves lists it" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 1 ]
+		cx new --from "$P-base" --name "$P-s"
+		ok L19 "new --from a save" [ "$(field '.[0].state')" = running -a "$(field '.[0].fromSave')" = "$P-base" ]
+		cx exec "$P-s" -- 'cat ~/vr-home /opt/vr-sys; echo $VR_ONE'
+		ok L20 "a sandbox from a save has the disk and settings" is "$OUT" "$(printf 'kept\nkept\n1')"
+		cx stop "$P-f-2"
+		cx resume "$P-f-2" --size standard-4
+		cx exec "$P-f-2" -- nproc
+		ok L21 "resume --size changes the size" is "$OUT" 4
+		cx stop "$P-f-2"
+		cx resume "$P-f-2" --from-backup
+		ok L22 "resume --from-backup says what it restored" has "$(field .notice)" "backup"
+		cx exec "$P-f-2" -- 'cat ~/vr-home; test -e /opt/vr-sys && echo has-sys || echo no-sys'
+		ok L23 "the backup brings /home back and nothing else" is "$OUT" "$(printf 'kept\nno-sys')"
+	fi
 	cx delete "$P-s" --yes
 	cx info "$P-s"
 	ok L24 "delete removes it" [ "$CODE" != 0 ]
-	cx saves rm "$P-base" --yes
-	cx saves
-	ok L25 "saves rm deletes the save" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 0 ]
+	if ! on_node; then
+		cx saves rm "$P-base" --yes
+		cx saves
+		ok L25 "saves rm deletes the save" [ "$(jq -r --arg n "$P-base" '[.[] | select(.name == $n)] | length' <<<"$OUT")" = 0 ]
+	fi
 	cx new --from "$P-nosave" --name "$P-x"
 	ok L26 "new --from something missing fails clearly" [ "$CODE" != 0 ]
-	cx new --name "$P-cred" --repo "https://user:token@github.com/octocat/Hello-World"
+	cx new --name "$P-cred" --repo "https://user:token@github.com/octocat/Hello-World" ${ON[@]+"${ON[@]}"}
 	ok L29 "new refuses a repo URL with a token in it and points to GH_TOKEN" [ "$CODE" != 0 -a "$(has "$ERR" GH_TOKEN && echo y)" = y ]
 	cx set "$P-f-1" --idle 1m
 	cx exec "$P-f-1" --timeout 5m -- 'sleep 150; echo alive'
@@ -227,7 +269,11 @@ if want lifecycle; then
 	cx env "$P-f-1"
 	ok L27 "env unset <sandbox> --file removes the file from that sandbox" [ "$CODE" = 0 -a "$(field '.files | index("~/.vr-e")')" = null ]
 	cx resume "$P-f-1" --from-backup
-	ok L28 "resume --from-backup on a running sandbox refuses" [ "$CODE" != 0 ]
+	if on_node; then
+		skip L28 "resume --from-backup on a running sandbox refuses" "$NOT_ON_NODES: backups; it refuses on a node whatever the state (${ERR:0:100})"
+	else
+		ok L28 "resume --from-backup on a running sandbox refuses" [ "$CODE" != 0 ]
+	fi
 fi
 
 # ---------------------------------------------------------------- connect
@@ -279,10 +325,10 @@ if want connect; then
 	else
 		fail C16 "ssh-config lets scp reach <name>.cloudex" "$(cat "$work/e")"
 	fi
-	cx new --name "$P-reuse" --no-use
+	cx new --name "$P-reuse" --no-use ${ON[@]+"${ON[@]}"}
 	ssh -F "$work/ssh_config" -o BatchMode=yes "$P-reuse.cloudex" true >/dev/null 2>&1
 	cx delete "$P-reuse" --yes
-	cx new --name "$P-reuse" --no-use
+	cx new --name "$P-reuse" --no-use ${ON[@]+"${ON[@]}"}
 	got=$(ssh -F "$work/ssh_config" -o BatchMode=yes -o LogLevel=ERROR "$P-reuse.cloudex" 'echo reached' 2>&1)
 	ok C17 "ssh-config reaches a new sandbox that reuses a name" is "$got" reached
 	cx delete "$P-reuse" --yes
@@ -324,13 +370,13 @@ http.server.HTTPServer((\"127.0.0.1\", 8127), H).serve_forever()"'
 	before=$("$CX" list --json 2>/dev/null | jq length)
 	run=$work/run
 	mkdir -p "$run" && (cd "$run" && git init -q && echo 'print("ran")' >t.py && echo x >skip.log && echo '*.log' >.gitignore && git add -A && git -c user.email=v@v -c user.name=v commit -qm x)
-	(cd "$run" && "$CX" run -- 'python3 t.py; test ! -e skip.log && echo no-ignored; exit 5' >"$work/o" 2>"$work/e")
+	(cd "$run" && "$CX" run ${ON[@]+"${ON[@]}"} -- 'python3 t.py; test ! -e skip.log && echo no-ignored; exit 5' >"$work/o" 2>"$work/e")
 	CODE=$? OUT=$(cat "$work/o") ERR=$(cat "$work/e")
 	ok C24 "run copies what git would commit and exits with the code" [ "$CODE" = 5 -a "$OUT" = "$(printf 'ran\nno-ignored')" ]
-	(cd "$run" && "$CX" run --out out -- 'mkdir out && echo built >out/r.txt' >"$work/o" 2>"$work/e")
+	(cd "$run" && "$CX" run ${ON[@]+"${ON[@]}"} --out out -- 'mkdir out && echo built >out/r.txt' >"$work/o" 2>"$work/e")
 	CODE=$?
 	ok C25 "run --out copies results back" [ "$CODE" = 0 -a "$(cat "$run/out/r.txt" 2>/dev/null)" = built ]
-	(cd "$run" && "$CX" run --out cov/deep/lcov.info -- 'mkdir -p cov/deep && echo lcov >cov/deep/lcov.info' >"$work/o" 2>"$work/e")
+	(cd "$run" && "$CX" run ${ON[@]+"${ON[@]}"} --out cov/deep/lcov.info -- 'mkdir -p cov/deep && echo lcov >cov/deep/lcov.info' >"$work/o" 2>"$work/e")
 	CODE=$? ERR=$(cat "$work/e")
 	ok C27 "run --out of a nested file makes the local directories" [ "$CODE" = 0 -a "$(cat "$run/cov/deep/lcov.info" 2>/dev/null)" = lcov ]
 	ln -sfn "$work/tree" "$work/link"
@@ -344,7 +390,18 @@ http.server.HTTPServer((\"127.0.0.1\", 8127), H).serve_forever()"'
 fi
 
 # ---------------------------------------------------------------- inside
-if want inside; then
+if want inside && on_node; then
+	# The cloudex command inside needs cloudex.internal, which nodes get with M6.
+	need_a
+	cx exec "$A" -- 'stat -c %u /'
+	ok I07 "/ is owned by root, so tools that check it work" is "$OUT" 0
+	cx exec "$A" -- 'cloudex info --json'
+	ok I08 "cloudex inside a sandbox on a node says it doesn't work there yet" [ "$CODE" != 0 -a "$(has "$ERR" "doesn't work yet in a sandbox on a node" && echo y)" = y ]
+	for c in "I01 cloudex inside a sandbox knows itself" "I02 cloudex set --idle inside" "I06 cloudex set --idle over 6h inside says the limit" \
+		"I03 cloudex inside refuses other sandboxes clearly" "I04 cloudex host inside prints a working link" "I05 cloudex feedback inside sends nothing without a terminal"; do
+		skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: the cloudex command inside needs cloudex.internal, which nodes get with M6"
+	done
+elif want inside; then
 	need_a
 	cx exec "$A" -- 'stat -c %u /'
 	ok I07 "/ is owned by root, so tools that check it work" is "$OUT" 0
@@ -382,7 +439,13 @@ if want agents; then
 	fi
 	cx keys
 	providers=$(field 'map(.provider) | join(" ")' 2>/dev/null)
-	if [[ -z $providers || $providers == null ]]; then
+	if on_node; then
+		need_a
+		cx agents start "$A" "Reply with exactly the word VERIFYOK and nothing else."
+		if [[ $CODE == 0 ]]; then fail A00 "agents on a node are refused" "one started: ${OUT:0:200}"; else
+			skip A00 "agents" "$NOT_ON_NODES: agents need provider keys, which reach nodes with M6 (refused: ${ERR:0:120})"
+		fi
+	elif [[ -z $providers || $providers == null ]]; then
 		skip A00 "agents" "no provider keys on the deployment (cloudex keys set anthropic|openai)"
 	else
 		need_a
@@ -434,8 +497,19 @@ if want tokens; then
 		ok K01 "tokens create prints a secret once" has "$own" "cx_"
 		cx tokens create "$P-ro" --role read --expires 1h
 		ro=$(field .secret)
-		as "$own" new --name "$P-own1" --no-use
-		ok K02 "an own-only token makes a sandbox" [ "$CODE" = 0 ]
+		own_on=()
+		if on_node; then
+			iso=$("$CX" node info "$VERIFY_NODE" --json 2>/dev/null | jq -r 'if .isolation.unisolated then "none" else .runtime end')
+			if [[ $iso == sysbox ]]; then
+				own_on=("${ON[@]}")
+			else
+				# Decision 4: own-only (CI) tokens stay off plain-Docker nodes; its sandbox goes on Cloudflare.
+				as "$own" new --name "$P-own0" --no-use "${ON[@]}"
+				ok K02n "an own-only token can't place a sandbox on a $iso node" [ "$CODE" != 0 -a "$(has "$ERR" "own-only token can't place sandboxes on node" && echo y)" = y ]
+			fi
+		fi
+		as "$own" new --name "$P-own1" --no-use ${own_on[@]+"${own_on[@]}"}
+		ok K02 "an own-only token makes a sandbox${own_on[*]:+ on node $VERIFY_NODE}" [ "$CODE" = 0 ]
 		as "$own" list
 		ok K03 "an own-only token lists only its own sandboxes" is "$(field 'map(.name) | join(" ")')" "$P-own1"
 		as "$own" info "$A"
@@ -597,7 +671,9 @@ fi
 # Nodes (v0.2.2): the agent, cloudex-node, joins with a token and keeps its
 # control socket open (M2, N01-N08); streams and exec over the link (M3,
 # N09-N16); the Docker runtime, the firewall, the self-test and the installer
-# (M4, N17-N25). It runs on the host VERIFY_NODE_SSH reaches, as the
+# (M4, N17-N25); sandboxes on nodes, offline, reconnects and removal (M5,
+# N26-N35), all through ordinary sandboxes (cloudex new --on). It runs on the
+# host VERIFY_NODE_SSH reaches, as the
 # installer sets it up: scripts/node-install.sh, as root with
 # VERIFY_NODE_SUDO=1 (passwordless sudo there), else --unisolated (testing
 # only: no firewall, and the root-only checks are a SKIP). The agent's image
@@ -658,9 +734,9 @@ M4_CHECKS=("N17 the installer, as root: the firewall unit is loaded, the agent c
 	"N18 from inside a machine: the internet and DNS answer; the host's addresses, its gateway and DNS, Docker's bridges, the tailnet range, metadata, another machine and the agent's other addresses don't"
 	"N19 with route-changing rights (the self-test's NET_ADMIN probe, now): routes through the agent reach nothing, a forged source address finishes no handshake, and the agent takes nothing from another network for a machine"
 	"N20 a machine's container has exactly its flags and limits (docker inspect); inside, root has Docker's default capabilities less NET_RAW, MKNOD and SETFCAP, no Docker socket, read-only /proc/sys and /sys, no devices, raw sockets or mknod, no IPv6 outside lo; and a restart gives it a new start id"
-	"N21 the firewall survives systemctl restart docker: its table is loaded, the self-test passes, and a machine started again reaches the internet"
+	"N21 the firewall survives systemctl restart docker: its table is loaded, the self-test passes, the sandbox shows stopped, and once resumed it reaches the internet"
 	"N22 a restart of the agent leaves its machines running, and exec works again within 10 s"
-	"N23 after the host reboots: the firewall is loaded, the agent is back with its self-test passing, the machine is stopped with its disk, and it starts again with its files"
+	"N23 after the host reboots: the firewall is loaded, the agent is back with its self-test passing, the machine and its sandbox are stopped, with its disk, and it resumes with its files"
 	"N24 a node whose self-test fails refuses new machines and says why; with --unisolated (testing only) it runs them and shows isolation none"
 	"N25 nothing on the host changed outside the build.cloudex labels, and the uninstaller removes the agent, its machines, networks, volume and firewall")
 m3_skip() { for c in "${M3_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
@@ -683,12 +759,11 @@ probe() { node_sh "docker run --rm -v cloudex-node:/var/lib/cloudex-node $AIMG p
 start_agent() { node_sh "docker start cloudex-node" >/dev/null 2>&1; }
 kill_agent() { node_sh "docker kill cloudex-node" >/dev/null 2>&1; }
 
-# Streams and exec over the link (M3), against a sandbox whose machine the
-# agent makes (POST /v1/nodes/{node}/dev-sandboxes, for admins, until M5).
+# Streams and exec over the link (M3), against a sandbox on the node.
 node_m3() {
 	local NM=$P-m key M_ID ssh_cfg big ok_all why MC
 	key=$(jq -r .apiKey "$src_cfg/config.json")
-	cx node dev-sandbox "$N" --name "$NM"
+	cx new --on "$N" --name "$NM" --no-use
 	M_ID=$(field .id)
 	if [[ $CODE != 0 || -z $M_ID ]]; then
 		m3_skip "couldn't make a sandbox on the node: ${ERR:0:200}"
@@ -787,7 +862,8 @@ node_m3() {
 	# N12: an idle ssh session for 30 minutes, and the object's active time.
 	if [[ ${VERIFY_NODE_LONG:-} == 1 && -n ${CLOUDFLARE_API_TOKEN:-} ]]; then
 		local oid from to act alive
-		oid=$("$CX" node dev-streams "$N" "$NM" 2>/dev/null | jq -r .objectId)
+		# The diagnostic route for a node sandbox's streams (admins only) has its object's id.
+		oid=$(curl -s -H "authorization: Bearer $key" "$API_URL/v1/sandboxes/$M_ID/node-streams" | jq -r .objectId)
 		from=$(date -u -v+1M +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d '+1 min' +%Y-%m-%dT%H:%M:00Z)
 		alive=$(python3 "$here/keys.py" "$NM.cloudex" 0 "$ssh_cfg" --idle 1800 2>/dev/null | jq -r .alive)
 		to=$(date -u -v-2M +%Y-%m-%dT%H:%M:00Z 2>/dev/null || date -u -d '-2 min' +%Y-%m-%dT%H:%M:00Z)
@@ -882,7 +958,7 @@ node_m4() {
 	fi
 	MC=cloudex-$MID
 	wait_iso 0 >/dev/null
-	cx node dev-sandbox "$N" --name "$M2" --cpus 0.5 --memory-mb 1024
+	cx new --on "$N" --name "$M2" --cpus 0.5 --memory 1G --no-use
 	M2ID=$(field .id)
 
 	# N18: the matrix from inside a real machine, through the product's exec.
@@ -974,8 +1050,8 @@ node_m4() {
 			(.mknod | startswith("denied")), .mount == "denied", .routeChange == "denied", (.ipv6Addresses | length) == 0, .ipv6 == false] | all' <<<"$inside" 2>/dev/null)
 	fi
 	boot1=$(in_m 'cat /run/cloudex-boot')
-	"$CX" node dev-stop "$N" "$NM" >/dev/null 2>&1
-	"$CX" node dev-start "$N" "$NM" >/dev/null 2>&1
+	"$CX" stop "$NM" >/dev/null 2>&1
+	"$CX" resume "$NM" >/dev/null 2>&1
 	boot2=$(in_m 'cat /run/cloudex-boot')
 	OUT="flags ok: $hc_ok ($(jq -c '{Privileged,CapDrop,PidsLimit,Memory,NanoCpus,Tmpfs,NetworkMode,Runtime}' <<<"$insp" 2>/dev/null)); inside ($runtime) ok: $in_ok ($inside); start ids $boot1 then $boot2" CODE=""
 	ok N20 "$(m3_desc N20)" [ "$hc_ok" = true -a "$in_ok" = true -a -n "$boot1" -a -n "$boot2" -a "$boot1" != "$boot2" ]
@@ -988,10 +1064,14 @@ node_m4() {
 		tbl=$(node_sh "sudo nft list table inet cloudex >/dev/null && echo loaded")
 		st=$(in_agent selftest 2>/dev/null | jq -r .pass)
 		wait_iso 0 >/dev/null # the agent's own, after its restart with Docker's
-		"$CX" node dev-start "$N" "$NM" >/dev/null 2>&1
+		# Docker's restart stopped the machine; its record says so (the agent's
+		# events, or the reconcile at its hello), and resume starts it again.
+		local rst=""
+		for _ in $(seq 1 30); do rst=$("$CX" info "$NM" --json 2>/dev/null | jq -r .state); [[ $rst == stopped ]] && break; sleep 1; done
+		"$CX" resume "$NM" >/dev/null 2>&1
 		net=$(in_m "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://example.com")
-		OUT="table: ${tbl:-missing}; self-test pass: $st; the machine's https after starting it again: $net" CODE=""
-		ok N21 "$(m3_desc N21)" [ "$tbl" = loaded -a "$st" = true -a "$net" = 200 ]
+		OUT="table: ${tbl:-missing}; self-test pass: $st; the sandbox after Docker's restart: $rst; the machine's https after resume: $net" CODE=""
+		ok N21 "$(m3_desc N21)" [ "$tbl" = loaded -a "$st" = true -a "$rst" = stopped -a "$net" = 200 ]
 	else
 		skip N21 "$(m3_desc N21)" "needs root on the node host (VERIFY_NODE_SUDO=1)"
 	fi
@@ -1031,10 +1111,12 @@ node_m4() {
 			sleep 2
 		done
 		mstate=$(node_sh "docker inspect $MC -f '{{.State.Status}}'")
-		"$CX" node dev-start "$N" "$NM" >/dev/null 2>&1
+		local rstate=""
+		for _ in $(seq 1 30); do rstate=$("$CX" info "$NM" --json 2>/dev/null | jq -r .state); [[ $rstate == stopped ]] && break; sleep 1; done
+		"$CX" resume "$NM" >/dev/null 2>&1
 		files=$(in_m 'cat ~/vr-reboot.txt')
-		OUT="ssh back after ${back:-never} s; the node online $on s later; table: ${tbl2:-missing}; isolation: $iso; the machine: $mstate; its file after start: $files (was $(cat "$work/mark"))" CODE=""
-		ok N23 "$(m3_desc N23)" [ "$tbl2" = loaded -a "$iso" = pass -a "$mstate" = exited -a -n "$files" -a "$files" = "$(cat "$work/mark")" ]
+		OUT="ssh back after ${back:-never} s; the node online $on s later; table: ${tbl2:-missing}; isolation: $iso; the machine: $mstate, its sandbox: $rstate; its file after resume: $files (was $(cat "$work/mark"))" CODE=""
+		ok N23 "$(m3_desc N23)" [ "$tbl2" = loaded -a "$iso" = pass -a "$mstate" = exited -a "$rstate" = stopped -a -n "$files" -a "$files" = "$(cat "$work/mark")" ]
 	else
 		skip N23 "$(m3_desc N23)" "reboots the host: set VERIFY_NODE_REBOOT=1 (and VERIFY_NODE_SUDO=1)"
 	fi
@@ -1049,7 +1131,7 @@ node_m4() {
 		node_sh "docker restart cloudex-node" >/dev/null 2>&1
 		f1=$(wait_iso "$t")
 		f1="$f1, failed: $("$CX" node info "$N" --json 2>/dev/null | jq -r '.isolation.failed // [] | length') checks"
-		cx node dev-sandbox "$N" --name "$P-m3"
+		cx new --on "$N" --name "$P-m3" --no-use
 		r1="code $CODE: ${ERR:0:240}"
 		[[ $CODE == 0 ]] && "$CX" delete "$P-m3" --yes >/dev/null 2>&1
 		node_sh "sudo systemctl restart cloudex-node-firewall.service" >/dev/null 2>&1
@@ -1068,11 +1150,179 @@ node_m4() {
 	"$CX" delete "$M2" --yes >/dev/null 2>&1
 }
 
+M5_CHECKS=("N26 a node that goes offline shows offline, with when it was last seen; exec, ssh and a new sandbox on it are a 503 that names it; it comes back by itself with its running sandbox still running"
+	"N27 a machine stopped by hand on the host while its node was offline shows stopped once the node is back, and resumes with its files"
+	"N28 deleting a sandbox while its node is offline is a 503 unless --force; with --force it goes at once, and the node removes its machine and network when it's back"
+	"N29 --idle 2m stops a sandbox on a node by itself, keeping its disk"
+	"N30 stop and resume on a node each take under 2 s, and keep the disk"
+	"N31 the WHERE column says where each sandbox runs: the node, then the node (offline) while it's offline"
+	"N32 new --on --cpus 2 --memory 2G gives the machine exactly those limits (docker inspect), and info shows them"
+	"N33 an own-only token can't place a sandbox on a node whose isolation is plain Docker (or none); a token that isn't own-only can"
+	"N34 forks, named saves, agents, resume --size and --from-backup on a node refuse with a message that says why; the cloudex command inside says it doesn't work there yet"
+	"N35 removing a node with a sandbox needs --force; then its machine is deleted, and the sandbox stays, in error, saying so, until it's deleted")
+m5_skip() { for c in "${M5_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
+m5_desc() { for c in "${M5_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
+# The line of a sandbox in cloudex list (the human table), squeezed.
+list_line() { "$CX" list --json=false 2>/dev/null | grep -E "^. +[^ ]+ +$1 " | tr -s ' '; }
+
+# Sandboxes on nodes (M5): ordinary sandboxes, their lifecycle on the node,
+# the node going offline and coming back, deletes while it's offline,
+# idle stop, limits, who may place sandboxes, and what's refused.
+node_m5() {
+	local S5=$P-n5 S5B=$P-n5b S5D=$P-n5d S5ID S5BID S5DID ms_stop ms_res kept t0
+	wait_iso 0 >/dev/null
+	cx new --on "$N" --name "$S5" --no-use
+	S5ID=$(field .id)
+	if [[ $CODE != 0 || -z $S5ID ]]; then
+		m5_skip "couldn't make a sandbox on the node: ${ERR:0:200}"
+		return
+	fi
+	cx new --on "$N" --name "$S5B" --no-use
+	S5BID=$(field .id)
+	cx new --on "$N" --name "$S5D" --no-use
+	S5DID=$(field .id)
+
+	# N30: stop and resume, timed as the CLI sees them.
+	"$CX" exec "$S5B" -- 'echo n30 > ~/n30; sudo sh -c "echo sys > /opt/n30"' >/dev/null 2>&1
+	local st1 st2
+	t0=$(now_ms)
+	cx stop "$S5B"
+	ms_stop=$(($(now_ms) - t0))
+	st1=$(field .state)
+	t0=$(now_ms)
+	cx resume "$S5B"
+	ms_res=$(($(now_ms) - t0))
+	st2=$(field .state)
+	kept=$("$CX" exec "$S5B" -- 'cat ~/n30 /opt/n30' 2>/dev/null | tr '\n' ' ')
+	OUT="stop $ms_stop ms ($st1), resume $ms_res ms ($st2), files after: $kept" CODE=""
+	ok N30 "$(m5_desc N30)" [ "$st1" = stopped -a "$st2" = running -a "$ms_stop" -lt 2000 -a "$ms_res" -lt 2000 -a "$kept" = "n30 sys " ]
+
+	# N32: the machine's limits.
+	cx new --on "$N" --name "$P-n5c" --cpus 2 --memory 2G --no-use
+	local cid lim shown
+	cid=$(field .id)
+	shown=$(field '"\(.placement.cpus) \(.placement.memoryMb)"')
+	lim=$(node_sh "docker inspect cloudex-$cid -f '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}'")
+	"$CX" delete "$P-n5c" --yes >/dev/null 2>&1
+	OUT="docker inspect: NanoCpus Memory = $lim; the API: cpus memoryMb = $shown" CODE=""
+	ok N32 "$(m5_desc N32)" [ "$lim" = "2000000000 2147483648" -a "$shown" = "2 2048" ]
+
+	# N34: what's refused on a node, and why (the refusal table in the plan's M5 Built).
+	local r=""
+	refused() { # refused WHAT WANT CMD...: the command must fail with WANT in its error
+		local what=$1 want=$2
+		shift 2
+		cx "$@"
+		[[ $CODE != 0 && $ERR == *"$want"* ]] || r="$r $what: code $CODE, ${ERR:0:120};"
+	}
+	refused fork "forks aren't available for a sandbox on a node" fork "$S5" --name "$P-n5f"
+	refused save "named saves of a sandbox on a node aren't available" save "$S5" "$P-n5s"
+	refused agent "don't reach sandboxes on nodes yet" agents start "$S5" "Reply with OK."
+	refused "resume --size" "sizes are for Cloudflare" resume "$S5" --size standard-4
+	refused "cloudex inside" "doesn't work yet in a sandbox on a node" exec "$S5" -- 'cloudex info'
+	"$CX" stop "$S5" >/dev/null 2>&1
+	refused "resume --from-backup" "so it has no backups" resume "$S5" --from-backup
+	refused "new --on --from" "--on doesn't go with --from" new --on "$N" --from "$S5"
+	"$CX" resume "$S5" >/dev/null 2>&1
+	OUT="${r:-all refused, each saying why}" CODE=""
+	ok N34 "$(m5_desc N34)" [ -z "$r" ]
+
+	# N33: decision 4, who may place sandboxes on a node.
+	local iso own usr o1 o2
+	iso=$("$CX" node info "$N" --json 2>/dev/null | jq -r 'if .isolation.unisolated then "none" else .runtime end')
+	cx tokens create "$P-n5own" --own --expires 1h
+	own=$(field .secret)
+	cx tokens create "$P-n5usr" --expires 1h
+	usr=$(field .secret)
+	CLOUDEX_CONFIG_DIR=$work/tok-n5a CLOUDEX_API_URL=$API_URL CLOUDEX_API_KEY=$own "$CX" new --on "$N" --name "$P-n5o" --no-use >"$work/o" 2>"$work/e" </dev/null
+	o1="code $? $(head -c 200 "$work/e")"
+	CLOUDEX_CONFIG_DIR=$work/tok-n5b CLOUDEX_API_URL=$API_URL CLOUDEX_API_KEY=$usr "$CX" new --on "$N" --name "$P-n5u" --no-use >"$work/o" 2>"$work/e" </dev/null
+	o2="code $?"
+	"$CX" delete "$P-n5o" --yes >/dev/null 2>&1
+	"$CX" delete "$P-n5u" --yes >/dev/null 2>&1
+	for t in "$P-n5own" "$P-n5usr"; do
+		"$CX" tokens revoke "$("$CX" tokens --json 2>/dev/null | jq -r --arg n "$t" '.[] | select(.name == $n) | .id')" >/dev/null 2>&1
+	done
+	OUT="node isolation $iso; own-only token: $o1; user token: $o2" CODE=""
+	if [[ $iso == sysbox ]]; then
+		ok N33 "$(m5_desc N33)" [ "${o1:0:6}" = "code 0" -a "$o2" = "code 0" ]
+	else
+		ok N33 "$(m5_desc N33)" [ "${o1:0:6}" = "code 1" -a -n "$(grep "own-only token can't place sandboxes on node $N" <<<"$o1")" -a "$o2" = "code 0" ]
+	fi
+
+	# N26, N27, N28 and N31: the node goes offline. S5 keeps running there;
+	# S5B's machine is stopped by hand on the host meanwhile; S5D is deleted.
+	local w_on w_off e_exec c_exec e_ssh e_new code_api d1 d2 after
+	w_on=$(list_line "$S5")
+	"$CX" exec "$S5B" -- 'echo n27 > ~/n27; sync' >/dev/null 2>&1
+	kill_agent
+	wait_state "$N" offline 75
+	local went=$WAITED
+	w_off=$(list_line "$S5")
+	cx exec "$S5" -- true
+	e_exec=$ERR c_exec=$CODE
+	code_api=$(curl -s -o "$work/b" -w '%{http_code}' --max-time 30 -X POST -H "authorization: Bearer $(jq -r .apiKey "$src_cfg/config.json")" \
+		-H 'content-type: application/json' -d '{"cmd":"true"}' "$API_URL/v1/sandboxes/$S5ID/exec")
+	e_ssh=$("$CX" ssh "$S5" -- true </dev/null 2>&1 | head -1)
+	cx new --on "$N" --name "$P-n5x" --no-use
+	e_new=$ERR
+	local info_off
+	info_off=$("$CX" info "$S5" --json 2>/dev/null | jq -c '{state, online: .placement.node.online, seen: .placement.node.lastSeenAt}')
+	node_sh "docker stop -t 5 cloudex-$S5BID" >/dev/null 2>&1
+	cx delete "$S5D" --yes
+	d1="code $CODE: ${ERR:0:160}"
+	cx delete "$S5D" --yes --force
+	d2="code $CODE"
+	local pend
+	pend=$("$CX" node info "$N" --json 2>/dev/null | jq -c '.pendingDeletes // []')
+	start_agent
+	wait_state "$N" online 60
+	local back=$WAITED works="" sbst=""
+	for _ in $(seq 1 40); do [[ $("$CX" exec "$S5" -- 'echo up' 2>/dev/null) == up ]] && { works=yes; break; }; sleep 0.5; done
+	for _ in $(seq 1 40); do sbst=$("$CX" info "$S5B" --json 2>/dev/null | jq -r .state); [[ $sbst == stopped ]] && break; sleep 1; done
+	after="" # S5D's container and network
+	for _ in $(seq 1 40); do
+		after=$(node_sh "docker ps -aq --filter label=build.cloudex.sandbox=$S5DID | wc -l; docker network ls -q --filter label=build.cloudex.sandbox=$S5DID | wc -l" | tr '\n' ' ')
+		[[ $after == "0 0 " ]] && break
+		sleep 1
+	done
+	local s5state
+	s5state=$("$CX" info "$S5" --json 2>/dev/null | jq -r .state)
+	OUT="offline after $went s; info then: $info_off; exec: code $c_exec, ${e_exec:0:120}; API: $code_api $(jq -r .error "$work/b" 2>/dev/null | head -c 80); ssh: ${e_ssh:0:100}; new --on: ${e_new:0:100}; back after $back s, $S5 $s5state, exec works: ${works:-no}" CODE=""
+	ok N26 "$(m5_desc N26)" [ "$c_exec" = 1 -a -n "$(grep "node $N is offline (last seen" <<<"$e_exec")" -a "$code_api" = 503 -a -n "$(grep "node $N is offline" <<<"$e_ssh")" \
+		-a -n "$(grep "node $N is offline" <<<"$e_new")" -a "$(jq -r .state <<<"$info_off")" = running -a "$(jq -r .online <<<"$info_off")" = false \
+		-a "$(jq -r .seen <<<"$info_off")" != null -a "$works" = yes -a "$s5state" = running ]
+	local n27files
+	n27files=$("$CX" resume "$S5B" >/dev/null 2>&1; "$CX" exec "$S5B" -- 'cat ~/n27' 2>/dev/null)
+	OUT="$S5B after the node came back: $sbst; notice: $("$CX" info "$S5B" --json 2>/dev/null | jq -r '.notice // "none"' | head -c 120); after resume: $n27files" CODE=""
+	ok N27 "$(m5_desc N27)" [ "$sbst" = stopped -a "$n27files" = n27 ]
+	OUT="without --force: $d1; with --force: $d2; pending on the node: $pend; its container and network after the node came back: $after" CODE=""
+	ok N28 "$(m5_desc N28)" [ "${d1:0:6}" = "code 1" -a -n "$(grep "can't be removed now" <<<"$d1")" -a "$d2" = "code 0" -a "$pend" = "[\"$S5DID\"]" -a "$after" = "0 0 " ]
+	OUT="online: '$w_on'; offline: '$w_off'" CODE=""
+	ok N31 "$(m5_desc N31)" [ -n "$(grep -E "^[* ]? ?$S5ID $S5 running $N - " <<<"$w_on")" -a -n "$(grep -E "^[* ]? ?$S5ID $S5 running $N \\(offline\\) - " <<<"$w_off")" ]
+
+	# N29: idle stop, from the sandbox's 60 s alarm.
+	"$CX" exec "$S5B" -- 'echo n29 > ~/n29' >/dev/null 2>&1
+	"$CX" set "$S5B" --idle 2m >/dev/null 2>&1
+	t0=$(now_s)
+	local ist=""
+	for _ in $(seq 1 60); do ist=$("$CX" info "$S5B" --json 2>/dev/null | jq -r .state); [[ $ist == stopped ]] && break; sleep 5; done
+	local itook mst n29
+	itook=$(since "$t0")
+	mst=$(node_sh "docker inspect cloudex-$S5BID -f '{{.State.Status}}'")
+	n29=$("$CX" resume "$S5B" >/dev/null 2>&1; "$CX" exec "$S5B" -- 'cat ~/n29' 2>/dev/null)
+	OUT="stopped after $itook s idle ($ist; the machine $mst); its file after resume: $n29" CODE=""
+	ok N29 "$(m5_desc N29)" [ "$ist" = stopped -a "$mst" = exited -a "$n29" = n29 ]
+	"$CX" delete "$S5B" --yes >/dev/null 2>&1
+	"$CX" delete "$S5" --yes >/dev/null 2>&1
+}
+
 if want node; then
 	if [[ -z ${VERIFY_NODE_SSH:-} ]]; then
 		skip N00 "the node area" "set VERIFY_NODE_SSH to a command that runs a command on a host for the agent, such as 'ssh box'"
 		m3_skip "no node host: set VERIFY_NODE_SSH"
 		m4_skip "no node host: set VERIFY_NODE_SSH" ""
+		m5_skip "no node host: set VERIFY_NODE_SSH"
 	else
 		read -ra NODE_SSH <<<"$VERIFY_NODE_SSH"
 		NODE_DIR="\$HOME/.cloudex-verify-$P"
@@ -1204,9 +1454,16 @@ if want node; then
 			M3_SANDBOX="" M3_ID="" REBOOTED=""
 			node_m3
 			node_m4
+			node_m5
 			[[ -n $M3_SANDBOX ]] && "$CX" delete "$M3_SANDBOX" --yes >/dev/null 2>&1
 			left=$(node_sh "docker ps -aq --filter label=build.cloudex.role=machine | wc -l; docker network ls -q --filter label=build.cloudex.role=machine | wc -l" | tr '\n' ' ')
+			# N35: a node with a sandbox is removed only with --force, which
+			# deletes its machine first; the sandbox stays, in error, until deleted.
+			cx new --on "$N" --name "$P-n5r" --no-use
+			rid=$(field .id)
 			cx node rm "$N" --yes
+			r35="without --force: code $CODE, ${ERR:0:120}"
+			cx node rm "$N" --yes --force
 			sleep 2
 			st=$(node_state "$N")
 			log=$(node_sh "docker logs --tail 5 cloudex-node 2>&1")
@@ -1215,6 +1472,13 @@ if want node; then
 			OUT="state $st, connect $again, agent: ${log: -200}" CODE=""
 			ok N08 "after node rm the agent is disconnected, its next connect is refused, and the node shows revoked" \
 				[ "$st" = revoked -a "$again" = 401 -a -n "$(grep 'removed from the deployment' <<<"$log")" ]
+			rrec=$("$CX" info "$P-n5r" --json 2>/dev/null | jq -c '{state, error}')
+			rleft=$(node_sh "docker ps -aq --filter label=build.cloudex.sandbox=$rid | wc -l" | tr -d ' ')
+			"$CX" delete "$P-n5r" --yes >/dev/null 2>&1
+			rgone=$("$CX" info "$P-n5r" >/dev/null 2>&1 && echo still-there || echo deleted)
+			OUT="$r35; then the sandbox: $rrec; its machines left: $rleft; delete: $rgone" CODE=""
+			ok N35 "$(m5_desc N35)" [ -n "$(grep "still has 1 sandbox" <<<"$r35")" -a "$(jq -r .state <<<"$rrec")" = error \
+				-a -n "$(jq -r .error <<<"$rrec" | grep 'was removed (cloudex node rm --force); its machine was deleted')" -a "$rleft" = 0 -a "$rgone" = deleted ]
 
 			# N25: the host as it was, outside the labels; then the uninstaller.
 			MID_RUN=$(host_snapshot)

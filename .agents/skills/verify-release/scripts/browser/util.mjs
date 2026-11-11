@@ -7,7 +7,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-export const SCENARIOS = ["signin", "terminal", "reconnect", "desktop", "agent", "work", "code", "next", "phone", "revoke", "console"];
+export const SCENARIOS = ["signin", "terminal", "reconnect", "desktop", "agent", "work", "nodes", "code", "next", "phone", "revoke", "console"];
 
 export const USAGE = `node run.mjs [--browser chrome|firefox] [--only <scenario>[,<scenario>...]] [--keep]
             [--out <dir>] [--results <results.tsv>]

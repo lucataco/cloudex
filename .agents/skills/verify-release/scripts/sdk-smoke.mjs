@@ -1,5 +1,7 @@
 // The TypeScript SDK against a live deployment: node sdk-smoke.mjs <path to dist/index.js> <name prefix>
-// Uses the deployment in $CLOUDEX_CONFIG_DIR. Deletes what it makes.
+// Uses the deployment in $CLOUDEX_CONFIG_DIR. Deletes what it makes. With $VERIFY_NODE, its
+// sandbox runs on that node, and what isn't on nodes in v0.2.2 (forks, named saves,
+// agents) must be refused with a 501 instead.
 import assert from "node:assert/strict";
 
 const [, , dist, prefix] = process.argv;
@@ -8,15 +10,27 @@ const cx = new Cloudex();
 const made = [];
 const saves = [];
 const step = (s) => console.log("ok", s);
+const node = process.env.VERIFY_NODE || "";
+// On a node: the call must be refused, not available yet (501), saying why.
+const refused = async (what, call) => {
+  await assert.rejects(call, (e) => e instanceof CloudexError && e.status === 501, `${what} on a node`);
+  console.log("skip", what, "(not on nodes in v0.2.2; refused with 501 as it should be)");
+};
 
 try {
   const health = await cx.health();
   assert.ok(health.version, "health has a version");
   step("health");
 
-  const box = await cx.create({ name: `${prefix}-a`, env: { SDK_VAR: "ts" }, files: { "sdk.txt": "from-ts\n" } });
+  const box = await cx.create({ name: `${prefix}-a`, env: { SDK_VAR: "ts" }, files: { "sdk.txt": "from-ts\n" }, ...(node ? { node } : {}) });
   made.push(box);
   assert.equal(box.state, "running");
+  if (node) {
+    assert.equal(box.placement.provider, "node");
+    assert.equal(box.placement.node?.name, node);
+    assert.ok((await cx.nodes.list({ live: false })).some((n) => n.name === node), "nodes.list has it");
+    step("create on a node, placement, nodes.list");
+  }
   assert.equal((await cx.get(`${prefix}-a`)).id, box.id, "get by name");
   assert.ok((await cx.list()).some((b) => b.id === box.id), "list has it");
   step("create, get, list");
@@ -83,19 +97,24 @@ try {
   }
 
   await box.exec("echo forked > ~/marker");
-  const forks = await box.fork({ count: 2, name: `${prefix}-f` });
-  made.push(...forks);
-  assert.equal(forks.length, 2);
-  assert.equal((await forks[1].exec("cat ~/marker")).stdout, "forked\n");
-  step("fork");
+  if (node) {
+    await refused("fork", box.fork({ count: 2, name: `${prefix}-f` }));
+    await refused("save", box.save(`${prefix}-save`));
+  } else {
+    const forks = await box.fork({ count: 2, name: `${prefix}-f` });
+    made.push(...forks);
+    assert.equal(forks.length, 2);
+    assert.equal((await forks[1].exec("cat ~/marker")).stdout, "forked\n");
+    step("fork");
 
-  const save = await box.save(`${prefix}-save`);
-  saves.push(save.name);
-  assert.ok((await cx.listSaves()).some((s) => s.name === save.name));
-  const [fromSave] = await cx.startFromSave(save.name, { name: `${prefix}-s` });
-  made.push(fromSave);
-  assert.equal((await fromSave.exec("cat ~/marker")).stdout, "forked\n");
-  step("save, listSaves, startFromSave");
+    const save = await box.save(`${prefix}-save`);
+    saves.push(save.name);
+    assert.ok((await cx.listSaves()).some((s) => s.name === save.name));
+    const [fromSave] = await cx.startFromSave(save.name, { name: `${prefix}-s` });
+    made.push(fromSave);
+    assert.equal((await fromSave.exec("cat ~/marker")).stdout, "forked\n");
+    step("save, listSaves, startFromSave");
+  }
 
   await box.stop();
   assert.equal(box.state, "stopped");
@@ -107,7 +126,9 @@ try {
   await assert.rejects(cx.get(`${prefix}-missing`), (e) => e instanceof CloudexError && e.status === 404);
   step("errors are CloudexError with status");
 
-  if ((await cx.listKeys()).some((k) => k.provider === "anthropic")) {
+  if (node) {
+    await refused("prompt", box.prompt("Reply with exactly the word SDKOK and nothing else."));
+  } else if ((await cx.listKeys()).some((k) => k.provider === "anthropic")) {
     const agent = await box.prompt("Reply with exactly the word SDKOK and nothing else. Do not run any tools.");
     await agent.wait();
     assert.match(agent.lastMessage ?? "", /SDKOK/, `agent said: ${agent.lastMessage} ${agent.error}`);

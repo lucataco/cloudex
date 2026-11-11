@@ -2,6 +2,7 @@
 
 Uses the deployment in $CLOUDEX_CONFIG_DIR. Deletes what it makes.
 """
+import os
 import sys
 import time
 import urllib.error
@@ -10,6 +11,19 @@ import urllib.request
 from cloudex import Cloudex, CloudexError
 
 prefix = sys.argv[1]
+# With $VERIFY_NODE, its sandbox runs on that node, and what isn't on nodes in
+# v0.2.2 (forks, named saves, agents) must be refused with a 501 instead.
+node = os.environ.get("VERIFY_NODE") or None
+
+
+def refused(what, call):
+    try:
+        call()
+    except CloudexError as e:
+        assert e.status == 501, f"{what} on a node: {e.status} {e}"
+        print("skip", what, "(not on nodes in v0.2.2; refused with 501 as it should be)")
+        return
+    raise AssertionError(f"{what} on a node wasn't refused")
 cx = Cloudex()
 made, saves = [], []
 
@@ -33,7 +47,7 @@ try:
     assert health.version, "health has a version"
     step("health")
 
-    box = cx.create(name=f"{prefix}-a", env={"SDK_VAR": "py"}, files={"sdk.txt": "from-py\n"})
+    box = cx.create(name=f"{prefix}-a", env={"SDK_VAR": "py"}, files={"sdk.txt": "from-py\n"}, node=node)
     made.append(box)
     assert box.state == "running"
     assert cx.get(f"{prefix}-a").id == box.id
@@ -99,18 +113,25 @@ try:
         step("host, links, revoke_links")
 
     box.exec("echo forked > ~/marker")
-    forks = box.fork(count=2, name=f"{prefix}-f")
-    made += forks
-    assert len(forks) == 2 and forks[1].exec("cat ~/marker").stdout == "forked\n"
-    step("fork")
+    if node:
+        assert box.placement["provider"] == "node" and box.placement["node"]["name"] == node
+        assert any(n.name == node for n in cx.nodes.list(live=False))
+        step("create on a node, placement, nodes.list")
+        refused("fork", lambda: box.fork(count=2, name=f"{prefix}-f"))
+        refused("save", lambda: box.save(f"{prefix}-save"))
+    else:
+        forks = box.fork(count=2, name=f"{prefix}-f")
+        made += forks
+        assert len(forks) == 2 and forks[1].exec("cat ~/marker").stdout == "forked\n"
+        step("fork")
 
-    save = box.save(f"{prefix}-save")
-    saves.append(save.name)
-    assert any(s.name == save.name for s in cx.list_saves())
-    (from_save,) = cx.start_from_save(save.name, name=f"{prefix}-s")
-    made.append(from_save)
-    assert from_save.exec("cat ~/marker").stdout == "forked\n"
-    step("save, list_saves, start_from_save")
+        save = box.save(f"{prefix}-save")
+        saves.append(save.name)
+        assert any(s.name == save.name for s in cx.list_saves())
+        (from_save,) = cx.start_from_save(save.name, name=f"{prefix}-s")
+        made.append(from_save)
+        assert from_save.exec("cat ~/marker").stdout == "forked\n"
+        step("save, list_saves, start_from_save")
 
     box.stop()
     assert box.state == "stopped"
@@ -126,7 +147,9 @@ try:
         assert e.status == 404, e.status
     step("errors are CloudexError with status")
 
-    if any(k.provider == "openai" for k in cx.list_keys()):
+    if node:
+        refused("prompt", lambda: box.prompt("Reply with exactly the word SDKOK and nothing else.", agent="codex"))
+    elif any(k.provider == "openai" for k in cx.list_keys()):
         agent = box.prompt("Reply with exactly the word SDKOK and nothing else. Do not run any tools.", agent="codex")
         agent.wait()
         assert "SDKOK" in (agent.last_message or ""), (agent.last_message, agent.error)

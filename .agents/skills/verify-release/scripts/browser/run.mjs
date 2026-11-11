@@ -289,9 +289,13 @@ async function main() {
     const has = Array.isArray(k.json) && k.json.some((x) => x.provider === "anthropic");
     T.agents = has ? { on: true } : { on: false, why: "no anthropic key on the deployment (cloudex keys set anthropic)" };
   } else T.agents = { on: false, why: "it spends provider tokens: set VERIFY_AGENTS=1, or run verify.sh with the agents area" };
+  // VERIFY_NODE: the run's sandbox is on that node (v0.2.2), where agents
+  // aren't available yet: the API refuses them with a 501.
+  T.node = process.env.VERIFY_NODE || "";
+  if (T.node) T.agents = { on: false, why: "not on nodes in v0.2.2: agents need provider keys, which don't reach nodes yet (the API refuses them with a 501)" };
 
   console.log(`browser checks in ${kind === "chrome" ? "Chrome" : "Firefox"} (${exe}), sandbox ${prefix}, screenshots of failures in ${shots}`);
-  const made = await cx(["new", "--name", prefix, "--no-use", "--json"]);
+  const made = await cx(["new", "--name", prefix, "--no-use", "--json", ...(T.node ? ["--on", T.node] : [])]);
   if (made.code !== 0 || !made.json?.id) {
     R.fail("B00", "a sandbox for the browser checks", made.err || "cloudex new gave no id");
     // It may exist even so: cleanup looks it up by name.

@@ -811,4 +811,63 @@ export async function consoleCheck(T) {
   );
 }
 
-export const ORDER = { signin, terminal, reconnect, desktop, agent, work, code, next, phone, revoke, console: consoleCheck };
+// ---------------------------------------------------------------- nodes (v0.2.2)
+
+export async function nodes(T) {
+  const S = T.scenario("nodes");
+  const p = T.main;
+  const what = [
+    "the sandbox list and the sandbox's page say it runs on the node, and its isolation",
+    "the Nodes page lists the node, online, with its name as text",
+  ];
+  if (!T.node) {
+    S.skip("B41", what[0], "the run's sandbox is on Cloudflare: set VERIFY_NODE to a node's name");
+    S.skip("B42", what[1], "no node: set VERIFY_NODE to a node's name");
+    return;
+  }
+  await S.check(
+    "B41",
+    what[0],
+    async () => {
+      await p.go(`${T.api}/`);
+      const where = await p.waitFor(
+        (n) => {
+          const row = [...document.querySelectorAll("table.list tbody tr")].find((tr) => tr.querySelector("td:first-child a")?.textContent === n);
+          return row ? row.children[2]?.textContent : null;
+        },
+        [T.box.name],
+        { ms: 20_000, what: `the Where cell of ${T.box.name}` },
+      );
+      must(where === T.node, `the Where cell says ${where}`);
+      await p.go(`${T.api}/s/${T.box.name}`);
+      const facts = await p.waitFor(() => (document.querySelector("dl.facts")?.textContent.includes("Runs on") ? document.querySelector("dl.facts").textContent : null), [], {
+        ms: 20_000,
+        what: "the sandbox's facts",
+      });
+      must(facts.includes(`node ${T.node}`), `no "node ${T.node}" in ${facts}`);
+      must(/Isolation(plain Docker|Sysbox|none)/.test(facts), `no isolation in ${facts}`);
+    },
+    { alone: true },
+  );
+  if (!T.admin) return S.skip("B42", what[1], "this config isn't an admin, so it has no Nodes page");
+  await S.check(
+    "B42",
+    what[1],
+    async () => {
+      await p.go(`${T.api}/nodes`);
+      const row = await p.waitFor(
+        (n) => {
+          const tr = [...document.querySelectorAll("table.list tbody tr")].find((r) => r.querySelector(".strong")?.textContent === n);
+          return tr ? { state: tr.children[1]?.textContent, html: tr.querySelector(".strong").innerHTML } : null;
+        },
+        [T.node],
+        { ms: 20_000, what: `a row for node ${T.node}` },
+      );
+      must(row.state === "online", `its state is ${row.state}`);
+      must(row.html === T.node, "its name isn't plain text");
+    },
+    { alone: true },
+  );
+}
+
+export const ORDER = { signin, terminal, reconnect, desktop, agent, work, nodes, code, next, phone, revoke, console: consoleCheck };
