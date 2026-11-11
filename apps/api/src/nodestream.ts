@@ -336,8 +336,16 @@ export class Framed {
   // started holds open closes when its reader stops reading (exec's grace
   // period), or when the agent closes it. Output nobody reads never holds it:
   // the agent closes the stream when the output ends.
+  //
+  // Before the exit, a reader that cancels stdout (a download whose client
+  // went away) ends the stream, and the agent hangs the process up: what
+  // SIGPIPE does for a process whose reader closes its pipe. Without it, the
+  // process waits for credit that never comes, and the object stays awake.
   maybeDone() {
-    if (this.exitCode === null) return;
+    if (this.exitCode === null) {
+      if (this.inbox[StreamChannel.stdout]!.cancelled) this.end(1000, "the reader went away");
+      return;
+    }
     if ([StreamChannel.stdout, StreamChannel.stderr].every((ch) => this.inbox[ch]!.done)) this.end(1000, "done");
   }
 

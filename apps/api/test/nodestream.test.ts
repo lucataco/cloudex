@@ -169,3 +169,12 @@ test("signals and resizes go to the agent as control messages", () => {
   f.control({ resize: { cols: 100, rows: 30 } });
   assert.deepEqual(ws.controls(), [{ signal: 15 }, { resize: { cols: 100, rows: 30 } }]);
 });
+
+test("a reader that cancels stdout before the exit ends the stream, so the agent hangs the process up", async () => {
+  const { f, ws } = stream();
+  f.onBinary(frame(1, "part of a download"));
+  await f.inbox[1]!.readable.cancel();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ws.closed?.code, 1000);
+  await assert.rejects(f.exited);
+});
