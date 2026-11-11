@@ -51,6 +51,21 @@ export function offlineAlarm(down: { since: number; retryAt?: number } | null, n
   return now < retryAt ? { ask: false, next: Math.max(retryAt, now + everyMs) } : { ask: true, next: now + everyMs };
 }
 
+// After that alarm's work: the backoff to keep, and when it runs next. A try
+// that came and went with nothing to ask the node (it wasn't idle, nothing
+// was due) counts as made, so that the alarm sleeps until the next one rather
+// than running each minute while the node stays offline (review W4). A try
+// that asked has moved retryAt on already (failed), or cleared it (the node
+// answered).
+export function offlineAlarmDone<D extends { since: number; tries?: number; retryAt?: number }>(down: D | null, now: number, everyMs: number): { down: D | null; next: number } {
+  if (!down) return { down, next: now + everyMs };
+  const retryAt = down.retryAt ?? nodeRetryAt(down.since, 0);
+  if (now < retryAt) return { down, next: Math.max(retryAt, now + everyMs) };
+  const tries = (down.tries ?? 0) + 1;
+  const spent = { ...down, tries, retryAt: nodeRetryAt(now, tries) };
+  return { down: spent, next: Math.max(spent.retryAt, now + everyMs) };
+}
+
 export const removedMessage = (name: string) => `node ${name} was removed (cloudex node rm), so its sandboxes can't run any more; delete this one`;
 
 export type Placer = { ownOnly: boolean };

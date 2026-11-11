@@ -183,6 +183,33 @@ test("a sandbox whose node stays offline asks its node less and less often, at m
   assert.equal(offlineAlarm(null, 5, 60_000).ask, true);
 });
 
+// Review W4: a running sandbox on an offline node whose tries find nothing to
+// ask (it isn't idle) sleeps from try to try; it isn't woken each minute.
+test("an offline node's sandbox with nothing to ask sleeps until its next try", async () => {
+  const { offlineAlarm, offlineAlarmDone, nodeRetryAt, NODE_RETRY_FIRST_MS } = await import("../src/placement.ts");
+  const t0 = 1_000_000_000;
+  let down: { since: number; lastSeenAt: number | null; tries?: number; retryAt?: number } | null = { since: t0, lastSeenAt: t0, tries: 0, retryAt: nodeRetryAt(t0, 0) };
+  let now = t0 + 60_000;
+  let wakes = 0;
+  const end = t0 + 48 * 3600_000;
+  while (now < end) {
+    wakes++;
+    assert.equal(typeof offlineAlarm(down, now, 60_000).ask, "boolean");
+    // Nothing to ask: no op, so nothing moves the backoff but this.
+    const after = offlineAlarmDone(down, now, 60_000);
+    down = after.down;
+    assert.ok(after.next >= now + 60_000);
+    now = after.next;
+  }
+  assert.ok(wakes <= 20, `woken ${wakes} times in 48 hours`);
+  assert.equal(down?.lastSeenAt, t0, "the rest of it is kept");
+  // Back (nodeOp or nodeReport cleared it): each minute again.
+  assert.deepEqual(offlineAlarmDone(null, now, 60_000), { down: null, next: now + 60_000 });
+  // A try that failed moved retryAt on itself: kept as it is.
+  const failed = { since: t0, lastSeenAt: null, tries: 3, retryAt: now + NODE_RETRY_FIRST_MS };
+  assert.deepEqual(offlineAlarmDone(failed, now, 60_000), { down: failed, next: now + NODE_RETRY_FIRST_MS });
+});
+
 // 2026-11-12 review, W7: a save's provenance survives a trip through Cloudflare.
 test("a save names the node it was made on, or the node its sandbox's disk came from", async () => {
   await import("./d1.ts");
@@ -193,4 +220,22 @@ test("a save names the node it was made on, or the node its sandbox's disk came 
   assert.deepEqual(saveProvenance(b, undefined), { node: b });
   assert.deepEqual(saveProvenance(null, a), { node: a }, "on Cloudflare, started from a's save");
   assert.deepEqual(saveProvenance(b, a), { node: b }, "made on b: b put it there last");
+});
+
+// Review W7: a restore from a save carries its node forward, whichever path
+// restores it (a restart from the newest save of its name too), so the
+// sandbox's next save on Cloudflare still names a node.
+test("a sandbox restored from a node's save marks its next saves with that node", async () => {
+  await import("./d1.ts");
+  const { restoredProvenance, saveProvenance } = await import("../src/saves.ts");
+  const a = { id: "nd-aaaa1111", name: "box-a" };
+  const b = { id: "nd-bbbb2222", name: "box-b" };
+  // Made from a Cloudflare save, restarted from the newest of its name, which b made.
+  const madeOn = restoredProvenance(undefined, { node: b });
+  assert.deepEqual(saveProvenance(null, madeOn), { node: b });
+  // Through two nodes: the most recent.
+  assert.deepEqual(restoredProvenance(a, { node: b }), b);
+  // A Cloudflare save over a disk that held a's content: still marked.
+  assert.deepEqual(restoredProvenance(a, {}), a);
+  assert.equal(restoredProvenance(undefined, {}), undefined);
 });

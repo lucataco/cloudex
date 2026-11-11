@@ -74,6 +74,7 @@ import {
   getSave,
   readManifest,
   recordSave,
+  restoredProvenance,
   saveProvenance,
   saveView,
 } from "./saves";
@@ -90,7 +91,7 @@ import {
 } from "./settings";
 import type { NodeEgressInfo } from "./nodeegress";
 import { NodeStreams } from "./nodestream";
-import { type MachineReport, machineAction, nodeIsolation, nodeRetryAt, offlineAlarm, offlineMessage, removedMessage } from "./placement";
+import { type MachineReport, machineAction, nodeIsolation, nodeRetryAt, offlineAlarm, offlineAlarmDone, offlineMessage, removedMessage } from "./placement";
 
 // A sandbox's node is offline since since; tries failed asks since, and the next is at retryAt (nodeRetryAt).
 type NodeDown = { since: number; lastSeenAt: number | null; tries?: number; retryAt?: number };
@@ -866,6 +867,12 @@ export class Sandbox extends DurableObject<Env> {
     // goes before t0, so that waitReady doesn't take its exit for this run's.
     if (c.running) await this.destroyContainer(r.id);
     if (c.running) fail(503, `${r.name ?? r.id} didn't start: its last run hasn't stopped yet; try again in a minute`);
+    // A named save's content comes from where it was made: the saves this
+    // sandbox makes say so (review W7), whichever path restores it.
+    if (restore) {
+      const madeOn = restoredProvenance(await this.ctx.storage.get<{ id: string; name: string }>("madeOn"), restore);
+      if (madeOn) await this.ctx.storage.put("madeOn", madeOn);
+    }
     const t0 = Date.now();
     // A new run: no relays yet, and no stop asked for from inside the last one.
     this.relayed.clear();
@@ -2304,7 +2311,8 @@ export class Sandbox extends DurableObject<Env> {
   // on Cloudflare. There's no 6-hour limit. While the node is offline
   // nothing here can act (its machine keeps running there), so it doesn't
   // keep asking: it tries again after 10 minutes, then less and less often
-  // (nodeRetryAt), and sleeps until then; the node coming back wakes it.
+  // (nodeRetryAt), and sleeps until then, whether or not a try had anything to
+  // ask (offlineAlarmDone); the node coming back wakes it.
   private async alarmOnNode(r: SandboxRecord, stopRequested: boolean) {
     await this.nodeAlarm();
     const plan = offlineAlarm(this.nodeDown, Date.now(), ALARM_EVERY_MS);
@@ -2331,7 +2339,9 @@ export class Sandbox extends DurableObject<Env> {
       }).catch((e) => console.error(`[${r.id}] ${message(e)}`));
     }
     if (this.record?.state !== "running") return;
-    await this.ctx.storage.setAlarm(down ? plan.next : Date.now() + ALARM_EVERY_MS);
+    const after = offlineAlarmDone(this.nodeDown, Date.now(), ALARM_EVERY_MS);
+    if (after.down !== this.nodeDown) await this.setNodeDown(after.down);
+    await this.ctx.storage.setAlarm(after.next);
   }
 
   // From the node's Node object (node.ts): the node went offline or came

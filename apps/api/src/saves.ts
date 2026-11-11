@@ -55,6 +55,15 @@ export function saveProvenance(on: { id: string; name: string } | null, madeOn: 
   return node ? { node } : {};
 }
 
+// The node a sandbox's disk came from (madeOn, for saveProvenance), once a
+// named save is restored onto it: the save's node, whenever it restores one,
+// not only at create (review W7). A save made on Cloudflare keeps what the
+// sandbox had: a disk that once held a node's content stays marked, since
+// over-marking is the safe side.
+export function restoredProvenance(madeOn: { id: string; name: string } | undefined, m: Pick<SaveManifest, "node">): { id: string; name: string } | undefined {
+  return m.node ?? madeOn;
+}
+
 // What the save script prints, last.
 export type SaveSummary = Pick<SaveManifest, "kind" | "image" | "parts" | "bytes" | "rawBytes" | "files" | "home" | "deleted">;
 
