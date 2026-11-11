@@ -205,14 +205,14 @@ if want lifecycle; then
 		# What follows uses $P-f-1 and $P-s, which are made on the node instead.
 		cx fork "$A" --count 2 --name "$P-f"
 		if [[ $CODE == 0 ]]; then fail L14 "a fork on a node is refused" "it was made: ${OUT:0:200}"; else
-			skip L14 "fork --count 2 makes two named forks" "$NOT_ON_NODES: forks (refused: ${ERR:0:120})"
+			skip L14 "fork --count 2 makes two named forks" "$NOT_ON_NODES: forks (refused: $(grep -m1 "^error:" <<<"$ERR" | cut -c8-127))"
 			skip L15 "a fork has the disk and settings" "$NOT_ON_NODES: forks"
 		fi
 		cx save "$A" "$P-base"
 		if [[ $CODE == 0 ]]; then fail L16 "a named save of a node sandbox is refused" "it was made: ${OUT:0:200}"; else
 			for c in "L16 save makes a named save" "L17 saving under a taken name replaces it" "L18 saves lists it" "L19 new --from a save" \
 				"L20 a sandbox from a save has the disk and settings" "L25 saves rm deletes the save"; do
-				skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: named saves of a node sandbox come with M6 (refused: ${ERR:0:120})"
+				skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: named saves of a node sandbox come with M6 (refused: $(grep -m1 "^error:" <<<"$ERR" | cut -c8-127))"
 			done
 		fi
 		for c in "L21 resume --size changes the size" "L22 resume --from-backup says what it restored" "L23 the backup brings /home back and nothing else"; do
@@ -270,7 +270,7 @@ if want lifecycle; then
 	ok L27 "env unset <sandbox> --file removes the file from that sandbox" [ "$CODE" = 0 -a "$(field '.files | index("~/.vr-e")')" = null ]
 	cx resume "$P-f-1" --from-backup
 	if on_node; then
-		skip L28 "resume --from-backup on a running sandbox refuses" "$NOT_ON_NODES: backups; it refuses on a node whatever the state (${ERR:0:100})"
+		skip L28 "resume --from-backup on a running sandbox refuses" "$NOT_ON_NODES: backups; it refuses on a node whatever the state ($(grep -m1 "^error:" <<<"$ERR" | cut -c8-107))"
 	else
 		ok L28 "resume --from-backup on a running sandbox refuses" [ "$CODE" != 0 ]
 	fi
@@ -443,7 +443,7 @@ if want agents; then
 		need_a
 		cx agents start "$A" "Reply with exactly the word VERIFYOK and nothing else."
 		if [[ $CODE == 0 ]]; then fail A00 "agents on a node are refused" "one started: ${OUT:0:200}"; else
-			skip A00 "agents" "$NOT_ON_NODES: agents need provider keys, which reach nodes with M6 (refused: ${ERR:0:120})"
+			skip A00 "agents" "$NOT_ON_NODES: agents need provider keys, which reach nodes with M6 (refused: $(grep -m1 "^error:" <<<"$ERR" | cut -c8-127))"
 		fi
 	elif [[ -z $providers || $providers == null ]]; then
 		skip A00 "agents" "no provider keys on the deployment (cloudex keys set anthropic|openai)"
