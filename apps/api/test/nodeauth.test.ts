@@ -271,6 +271,16 @@ test("a node counts the sandboxes on it", async () => {
   assert.equal((await nodes.findNode(DB, node.id))!.machines, 1);
 });
 
+test("only admins see a node's orphans, pending deletes and round trip", () => {
+  const n = { id: "nd-aaaa1111", name: "box", orphans: ["cx-aaa111"], pendingDeletes: ["cx-bbb222"], rttMs: 40, state: "online" } as never;
+  assert.deepEqual(nodes.nodeView(n, true), n);
+  const seen = nodes.nodeView(n, false) as Record<string, unknown>;
+  assert.equal(seen.orphans, undefined);
+  assert.equal(seen.pendingDeletes, undefined);
+  assert.equal(seen.rttMs, undefined);
+  assert.equal(seen.name, "box");
+});
+
 test("facts are checked again before they reach D1", async () => {
   const node = await nodes.addNode(DB, "box6");
   await assert.rejects(nodes.mirrorNode(DB, node.id, { facts: { ...FACTS, cpus: -1 } }));

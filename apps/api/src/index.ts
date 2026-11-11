@@ -66,7 +66,7 @@ import {
 import { serveDashboard } from "./dashboard";
 import { CONNECT } from "./node";
 import { HEADERS, issueJoinToken, readCapped, useJoinToken, verifyJoinSignature, verifyNodeRequest } from "./nodeauth";
-import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodeKeys, nodePublicKey, revokeNode } from "./nodes";
+import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodeKeys, nodePublicKey, nodeView, revokeNode } from "./nodes";
 import { placeOn, refused } from "./placement";
 import { locationHint } from "./nodestate";
 import { cachedKey, nodeEgress } from "./nodeegress";
@@ -374,7 +374,7 @@ async function placeOnNode(
   if (!o.node) return { hint: null };
   const found = await findNode(env.DB, o.node);
   if (!found) fail(404, `no node named ${o.node}`);
-  const n = await live(env, found, true);
+  const n = await live(env, found, "some");
   const placed = placeOn(n, { ownOnly: who.kind === "token" && who.token.ownOnly }, { size: o.size, cpus: o.cpus, memoryMb: o.memoryMb });
   if (refused(placed)) fail(placed.status as 400, placed.error);
   return { on: { node: n.id, name: n.name, cpus: placed.cpus, memoryMb: placed.memoryMb }, hint: n.locationHint as DurableObjectLocationHint | null };
@@ -780,23 +780,20 @@ app.patch("/v1/sandboxes/:ref/settings", async (c) => {
 // With details: the machine image as the agent last reported it, and the
 // machines it runs that belong to no sandbox, and the sandboxes deleted while
 // it was offline (GET /v1/nodes/{node}, and placing a sandbox).
-async function live(env: Env, n: ApiNode, details = false): Promise<ApiNode> {
+async function live(env: Env, n: ApiNode, details: false | "some" | "all" = false): Promise<ApiNode> {
   if (n.state !== "online" && n.state !== "offline") return n;
   try {
     const s = await withTimeout(env.NODE.getByName(n.id).status(), 3000, "the node's status");
     const out: ApiNode = { ...n, state: s.online ? "online" : "offline", lastSeenAt: s.lastSeenAt ?? n.lastSeenAt };
     if (!details) return out;
     const image = s.hello?.facts.image;
+    const more = { ...out, ...(image ? { image } : {}), ...(s.clockSkewSec !== null ? { clockSkewSec: s.clockSkewSec } : {}) };
+    // Machines of other users' sandboxes are for admins only (2026-11-12 review, W5).
+    if (details !== "all") return more;
     const mine = new Set(await sandboxesOnNode(env.DB, n.id));
     const tomb = new Set(s.tombstones);
     const orphans = (s.hello?.machines ?? []).map((m) => m.id).filter((id) => !mine.has(id) && !tomb.has(id));
-    return {
-      ...out,
-      ...(image ? { image } : {}),
-      orphans,
-      pendingDeletes: s.tombstones,
-      ...(s.clockSkewSec !== null ? { clockSkewSec: s.clockSkewSec } : {}),
-    };
+    return { ...more, orphans, pendingDeletes: s.tombstones };
   } catch (e) {
     console.error(`[${n.id}] status: ${errorStatus(e).message}`);
     return n;
@@ -828,9 +825,13 @@ app.get("/v1/nodes", async (c) => {
   return c.json(await Promise.all(rows.map((n) => live(c.env, n))));
 });
 
+// orphans, pendingDeletes and the round trip to the agent (which wakes the
+// node's object and the agent) are for admins: other callers may see a node,
+// not other users' sandbox ids, nor make it ping its agent (2026-11-12 review, W5).
 app.get("/v1/nodes/:node", async (c) => {
-  const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")), true);
-  if (n.state !== "online") return c.json(n);
+  const admin = me(c.get("who")).role === "admin";
+  const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")), admin ? "all" : "some");
+  if (n.state !== "online" || !admin) return c.json(nodeView(n, admin));
   const t0 = Date.now();
   try {
     await c.env.NODE.getByName(n.id).op("ping", {}, 5000);

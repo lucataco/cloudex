@@ -212,6 +212,14 @@ export async function revokeNode(db: D1Database, id: string, now = Date.now()) {
   ]);
 }
 
+// A node as a caller may see it: other users' sandbox ids (orphans, pending
+// deletes) and the agent's round trip are for admins (2026-11-12 review, W5).
+export function nodeView(n: Node, admin: boolean): Node {
+  if (admin) return n;
+  const { orphans: _o, pendingDeletes: _p, rttMs: _r, ...rest } = n;
+  return rest;
+}
+
 export async function forgetNode(db: D1Database, id: string) {
   await ensureSchema(db);
   await db.batch([db.prepare("DELETE FROM nodes WHERE id = ?").bind(id), db.prepare("DELETE FROM node_joins WHERE node_id = ?").bind(id)]);
