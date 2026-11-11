@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { STREAM_WINDOW } from "@cloudex/schema/node";
-import { Framed, NodeStreams, OVERRUN_SLACK, SPLICE_AHEAD_MAX, SPLICE_EARLY_MAX, TICKET_TTL_SEC, WS_RELAY_RATE, issueTicket, readTicket, sendable } from "../src/nodestream.ts";
+import { Framed, NodeStreams, OVERRUN_SLACK, SPLICE_AHEAD_MAX, SPLICE_CLIENT_CREDIT, SPLICE_EARLY_MAX, STREAMS_MAX, STREAMS_WAIT, TICKET_TTL_SEC, WS_RELAY_RATE, issueTicket, readTicket, sendable } from "../src/nodestream.ts";
 
 const KEY = "admin-key-for-tests";
 
@@ -198,13 +198,15 @@ test("a node that sends past its window, or on a channel nobody reads, has its s
     g.f.onBinary(frame(ch, "nobody reads this"));
     assert.equal(g.ws.closed?.code, 4400, `channel ${ch}`);
   }
-  // A TCP connection uses stdout only; HTTP stdout and the WebSocket's text.
+  // A TCP connection uses stdout only; HTTP stdout, and the WebSocket's text
+  // once the answer is an upgrade (review W2).
   const t = stream();
   t.f.control({ tcp: { port: 80, splice: false } });
   t.f.onBinary(frame(4, "x"));
   assert.equal(t.ws.closed?.code, 4400);
   const h = stream();
   h.f.control({ http: { port: 80, method: "GET", path: "/", headers: [], body: false } });
+  h.f.onText('{"status":{"code":101,"headers":[]}}');
   h.f.onBinary(frame(4, "x"));
   h.f.onBinary(frame(1, "x"));
   assert.equal(h.ws.closed, null);
@@ -212,9 +214,23 @@ test("a node that sends past its window, or on a channel nobody reads, has its s
   assert.equal(h.ws.closed?.code, 4400, "an empty frame has no channel");
 });
 
+test("an HTTP answer that isn't a WebSocket has its stream closed for a frame on the WebSocket's text channel", () => {
+  for (const answer of [null, '{"status":{"code":200,"headers":[]}}']) {
+    const h = stream();
+    h.f.control({ http: { port: 80, method: "GET", path: "/", headers: [], body: false } });
+    if (answer) h.f.onText(answer);
+    h.f.onBinary(frame(1, "the body"));
+    assert.equal(h.ws.closed, null);
+    h.f.onBinary(frame(4, "nobody reads this"));
+    assert.equal(h.ws.closed?.code, 4400, `after ${answer ?? "no answer"}`);
+    assert.match(h.ws.closed?.reason ?? "", /channel 4/);
+  }
+});
+
 test("a preview WebSocket's messages are capped in size, and their credit is paced", async () => {
   const { f, ws } = stream();
   f.control({ http: { port: 80, method: "GET", path: "/", headers: [], body: false } });
+  f.onText('{"status":{"code":101,"headers":[]}}');
   const got: number[] = [];
   f.onWsMessage = (d) => got.push(typeof d === "string" ? d.length : d.byteLength);
   const mib = "z".repeat(1 << 20);
@@ -232,7 +248,8 @@ test("a preview WebSocket's messages are capped in size, and their credit is pac
 function spliceHost() {
   const sockets: { ws: FakeSocket & { readyState: number; deserializeAttachment(): unknown }; tag: string }[] = [];
   const add = (tag: string, role?: string) => {
-    const ws = Object.assign(new FakeSocket(), { readyState: 1, deserializeAttachment: () => (role ? { role, at: Date.now() } : { tokenId: null, lastAt: Date.now() }) });
+    let att: unknown = role ? { role, at: Date.now() } : { tokenId: null, lastAt: Date.now() };
+    const ws = Object.assign(new FakeSocket(), { readyState: 1, deserializeAttachment: () => att, serializeAttachment: (a: unknown) => void (att = a) });
     sockets.push({ ws, tag });
     return ws;
   };
@@ -252,12 +269,24 @@ test("a splice's node can't run more than SPLICE_AHEAD_MAX ahead of its client, 
   const mib = new Uint8Array(1 << 20).buffer;
   for (let i = 0; i < SPLICE_AHEAD_MAX >> 20; i++) ns.onMessage(node as never, mib);
   assert.equal(node.closed, null);
-  ns.onMessage(client as never, new Uint8Array(10).buffer); // the client reads: a window adjust
-  for (let i = 0; i < SPLICE_AHEAD_MAX >> 20; i++) ns.onMessage(node as never, mib);
-  assert.equal(node.closed, null, "the count starts again when the client speaks");
+  // Each message from the client (a window adjust, or a keystroke) lets it
+  // run SPLICE_CLIENT_CREDIT further, not SPLICE_AHEAD_MAX (review W2).
+  ns.onMessage(client as never, new Uint8Array(10).buffer);
+  for (let i = 0; i < SPLICE_CLIENT_CREDIT >> 20; i++) ns.onMessage(node as never, mib);
+  assert.equal(node.closed, null, "a client message's worth more");
   ns.onMessage(node as never, mib);
   assert.equal(node.closed?.code, 4400);
   assert.equal(client.closed?.code, 4400);
+
+  // An honest node, whose client answers each window: never closed.
+  const h = spliceHost();
+  const hn = h.add("n:hhhh", "splice");
+  const hc = h.add("c:hhhh");
+  for (let i = 0; i < 200; i++) {
+    h.ns.onMessage(hn as never, new Uint8Array(2 << 20).buffer);
+    h.ns.onMessage(hc as never, new Uint8Array(40).buffer);
+  }
+  assert.equal(hn.closed, null);
 
   const b = spliceHost();
   const early = b.add("n:bbbb", "splice");
@@ -266,4 +295,25 @@ test("a splice's node can't run more than SPLICE_AHEAD_MAX ahead of its client, 
   assert.equal(early.closed, null);
   b.ns.onMessage(early as never, new Uint8Array(1).buffer);
   assert.equal(early.closed?.code, 4400);
+});
+
+test("a sandbox's object holds at most STREAMS_MAX open streams to its node; more wait, then are refused", async () => {
+  const wait = STREAMS_WAIT.ms;
+  STREAMS_WAIT.ms = 200;
+  const { ns, add } = spliceHost();
+  for (let i = 0; i < STREAMS_MAX; i++) {
+    const id = i.toString(16).padStart(4, "0");
+    add(`n:${id}`, "splice");
+    add(`c:${id}`);
+  }
+  const spare = add("n:ffff", "spare");
+  try {
+    const t0 = Date.now();
+    await assert.rejects(ns.open({ exec: { argv: ["true"], stdin: false, stderr: false } }), /\[429\] this sandbox has 64 streams/);
+    assert.ok(Date.now() - t0 >= 200, "it waited for one to end first");
+    await assert.rejects(ns.splice(22, null), /\[429\]/);
+    assert.deepEqual(spare.sent, [], "the spare is left alone");
+  } finally {
+    STREAMS_WAIT.ms = wait;
+  }
 });
