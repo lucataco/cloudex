@@ -1,0 +1,177 @@
+{
+  "_": "Examples of the node agent's messages (src/node.ts). Both the TypeScript models (packages/schema/test/node.test.ts) and the Go agent (go/internal/node/protocol_test.go) are checked against this file: every valid example must parse on both sides and come back the same from Go, and every invalid one must be refused by the Worker's models. Change a message here first.",
+  "protocol": 1,
+  "close": { "replaced": 4000, "revoked": 4003, "stale": 4008, "badMessage": 4400 },
+  "signing": {
+    "_": "The string a node signs: METHOD, PATH?QUERY, SANDBOX (empty when none), TS (unix seconds) and NONCE, joined by newlines.",
+    "method": "GET",
+    "path": "/v1/node/connect",
+    "sandbox": "",
+    "ts": "1762819200",
+    "nonce": "0123456789abcdef0123456789abcdef",
+    "string": "GET\n/v1/node/connect\n\n1762819200\n0123456789abcdef0123456789abcdef",
+    "seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "publicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+    "signature": "XV5u845BoDfislSm4JT4kGHpZl0kVR1b38cmKqMCGz7OG15/JwfjrI3NxoP2Qf10Qb1W4/8yzLJEF/INPqV3Ag=="
+  },
+  "valid": [
+    {
+      "name": "join",
+      "model": "NodeJoin",
+      "message": {
+        "token": "cxj_abcdefghijklmnopqrstuvwxyz234567abcdefgh",
+        "publicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+        "version": "v0.2.2",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "docker",
+          "isolation": { "firewall": "unchecked", "unisolated": false },
+          "cpus": 4,
+          "memoryMb": 16000,
+          "diskFreeGb": null
+        }
+      }
+    },
+    {
+      "name": "joined",
+      "model": "NodeJoined",
+      "message": { "node": { "id": "nd-abcd1234", "name": "box" } }
+    },
+    {
+      "name": "hello",
+      "model": "NodeMessage",
+      "message": {
+        "type": "hello",
+        "protocol": 1,
+        "version": "v0.2.2",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "docker",
+          "isolation": { "firewall": "unchecked", "unisolated": true },
+          "cpus": 2,
+          "memoryMb": 7936,
+          "diskFreeGb": 42.5
+        },
+        "machines": [
+          { "id": "cx-abc123", "state": "running" },
+          { "id": "cx-def456", "state": "stopped" }
+        ]
+      }
+    },
+    {
+      "name": "hello-empty",
+      "model": "NodeMessage",
+      "message": {
+        "type": "hello",
+        "protocol": 1,
+        "version": "dev",
+        "facts": {
+          "arch": "arm64",
+          "runtime": "docker",
+          "isolation": { "firewall": "unchecked", "unisolated": false },
+          "cpus": null,
+          "memoryMb": null,
+          "diskFreeGb": null
+        },
+        "machines": []
+      }
+    },
+    {
+      "name": "facts",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": { "firewall": "pass", "unisolated": false },
+          "cpus": 8,
+          "memoryMb": 32000,
+          "diskFreeGb": 200
+        }
+      }
+    },
+    {
+      "name": "state",
+      "model": "NodeMessage",
+      "message": { "type": "state", "machine": { "id": "cx-abc123", "state": "stopped" } }
+    },
+    {
+      "name": "result-ok",
+      "model": "NodeMessage",
+      "message": { "type": "result", "id": "op-k2j4h5", "ok": true, "value": {} }
+    },
+    {
+      "name": "result-error",
+      "model": "NodeMessage",
+      "message": { "type": "result", "id": "op-k2j4h6", "ok": false, "error": "unknown op exec" }
+    },
+    {
+      "name": "op-ping",
+      "model": "WorkerMessage",
+      "message": { "type": "op", "id": "op-k2j4h5", "name": "ping", "args": {} }
+    },
+    {
+      "name": "op-facts",
+      "model": "WorkerMessage",
+      "message": { "type": "op", "id": "op-k2j4h7", "name": "facts", "args": {} }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "no cpus",
+      "model": "NodeMessage",
+      "message": { "type": "facts", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 0, "memoryMb": 1, "diskFreeGb": 1 } }
+    },
+    {
+      "name": "more memory than any host has",
+      "model": "NodeMessage",
+      "message": { "type": "facts", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1e12, "diskFreeGb": 1 } }
+    },
+    {
+      "name": "fractional cpus",
+      "model": "NodeMessage",
+      "message": { "type": "facts", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1.5, "memoryMb": 1, "diskFreeGb": 1 } }
+    },
+    {
+      "name": "markup in the version",
+      "model": "NodeMessage",
+      "message": { "type": "hello", "protocol": 1, "version": "<img src=x onerror=alert(1)>", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1, "diskFreeGb": 1 }, "machines": [] }
+    },
+    {
+      "name": "SQL in a machine id",
+      "model": "NodeMessage",
+      "message": { "type": "state", "machine": { "id": "cx-1'; DROP TABLE nodes; --", "state": "running" } }
+    },
+    {
+      "name": "an unknown runtime",
+      "model": "NodeMessage",
+      "message": { "type": "facts", "facts": { "arch": "amd64", "runtime": "lxc", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1, "diskFreeGb": 1 } }
+    },
+    {
+      "name": "an unknown arch",
+      "model": "NodeMessage",
+      "message": { "type": "facts", "facts": { "arch": "mips", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1, "diskFreeGb": 1 } }
+    },
+    {
+      "name": "an unknown message type",
+      "model": "NodeMessage",
+      "message": { "type": "exec", "argv": ["sh"] }
+    },
+    {
+      "name": "a result with a made-up id",
+      "model": "NodeMessage",
+      "message": { "type": "result", "id": "../../x", "ok": true }
+    },
+    {
+      "name": "an op outside the fixed set",
+      "model": "WorkerMessage",
+      "message": { "type": "op", "id": "op-k2j4h5", "name": "exec", "args": { "argv": ["sh"] } }
+    },
+    {
+      "name": "a public key that isn't 32 bytes",
+      "model": "NodeJoin",
+      "message": { "token": "cxj_abcdefghijklmnopqrstuvwxyz234567abcdefgh", "publicKey": "AAAA", "version": "v1", "facts": { "arch": "amd64", "runtime": "docker", "isolation": { "firewall": "unchecked", "unisolated": false }, "cpus": 1, "memoryMb": 1, "diskFreeGb": 1 } }
+    }
+  ]
+}
