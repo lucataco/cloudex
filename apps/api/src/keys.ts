@@ -194,11 +194,11 @@ export async function providerKey(env: Env, provider: Provider): Promise<string 
 
 
 // Run as root after each start. $1 is the providers with keys, space-separated
-// (possibly none); $2 the Anthropic and $3 the OpenAI placeholder; the rest
+// (possibly none); $2 the Anthropic and $3 the OpenAI placeholder; $4 the path
+// of the platform's interception certificate (Compute.caPath); the rest
 // NAME=placeholder for every variable of those providers (placeholderVars).
-// Trusts the platform's interception certificate, which appears once
-// interception is on, and writes the placeholders where login shells (ssh,
-// exec, agents) see them.
+// Trusts that certificate, which appears once interception is on, and writes
+// the placeholders where login shells (ssh, exec, agents) see them.
 export const KEYS_SCRIPT = String.raw`
 set -euo pipefail
 providers=" $1 "
@@ -223,7 +223,7 @@ begin="# Cloudex: placeholder provider keys, rewritten at each start" end="# Clo
 sed -i "/^$begin\$/,/^$end\$/d" /etc/environment
 [ -z "$(tail -c1 /etc/environment)" ] || echo >>/etc/environment
 if [ -z "$1" ]; then rm -f "$profile"; exit 0; fi
-ca=/etc/cloudflare/certs/cloudflare-containers-ca.crt
+ca=$4
 for _ in $(seq 150); do [ -s "$ca" ] && break; sleep 0.1; done
 [ -s "$ca" ] || { echo "the platform's interception certificate didn't appear" >&2; exit 1; }
 cp "$ca" /usr/local/share/ca-certificates/cloudflare-containers-ca.crt
@@ -231,7 +231,7 @@ update-ca-certificates >/dev/null 2>&1
 bundle=/etc/ssl/certs/ca-certificates.crt
 # NAME=value pairs; none has a space.
 vars="NODE_EXTRA_CA_CERTS=$bundle SSL_CERT_FILE=$bundle REQUESTS_CA_BUNDLE=$bundle"
-shift 3
+shift 4
 vars="$vars $*"
 {
   echo "# Written by Cloudex at each start. These keys are placeholders: the real"

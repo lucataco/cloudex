@@ -59,6 +59,7 @@ import {
 } from "./backup";
 import { AGENT_BAD_REQUEST, AGENT_BOOT, AGENT_NOT_FOUND, AGENT_SCRIPT } from "./agents";
 import { COMMAND_BAD_REQUEST, COMMAND_BOOT, COMMAND_CONFLICT, COMMAND_NOT_FOUND, COMMAND_SCRIPT } from "./commands";
+import { CloudflareCompute, type Compute, NotListening, type Proc } from "./compute";
 import { deleteSandbox, renameSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER, VNC_PORT } from "./desktop";
 import { ARCHIVE_SCRIPT, FILE_BAD_REQUEST, FILE_FORBIDDEN, FILE_NOT_FOUND, FILE_SCRIPT, UNPACK_SCRIPT } from "./files";
@@ -105,7 +106,6 @@ const RESTORE_SAVE_TIMEOUT_MS = 25 * 60_000;
 // A save expires 30 days after it was made or last restored; past this, resume
 // restores the backup instead of trying the save.
 const SAVE_LIFETIME_MS = 29 * 24 * 3600_000;
-const PLATFORM_MAX_INACTIVITY_MS = 6 * 3600_000;
 const ALARM_EVERY_MS = 60_000;
 // How often an open terminal, desktop or TCP WebSocket checks that its token still works.
 const CREDENTIAL_CHECK_MS = 60_000;
@@ -186,7 +186,7 @@ const EXIT_GRACE_MS = 500;
 
 // Reads a process's stdout and stderr until it exits, then for EXIT_GRACE_MS
 // more, keeping the first OUTPUT_LIMIT bytes of each.
-async function readOutput(p: ExecProcess) {
+async function readOutput(p: Proc) {
   let stop!: () => void;
   const stopped = new Promise<void>((resolve) => (stop = resolve));
   const read = async (stream: ReadableStream | null) => {
@@ -255,6 +255,8 @@ export class Sandbox extends DurableObject<Env> {
   // writes the record back.
   private removing = false;
   private inactivitySet = false;
+  // The machine: a container on Cloudflare (compute.ts).
+  private readonly compute: Compute = new CloudflareCompute(this.ctx);
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -262,9 +264,9 @@ export class Sandbox extends DurableObject<Env> {
       this.record = await ctx.storage.get<SandboxRecord>("sandbox");
       this.lastActivity = (await ctx.storage.get<number>("lastActivity")) ?? Date.now();
       // After an eviction or deploy, reattach the exit watcher to a running box.
-      if (ctx.container?.running) this.watch();
+      if (this.compute.running) this.watch();
       if (this.record?.state === "starting" || this.record?.state === "stopping") await this.repair(this.record);
-      if (this.record?.state === "running" && ctx.container?.running && (await ctx.storage.getAlarm()) === null) {
+      if (this.record?.state === "running" && this.compute.running && (await ctx.storage.getAlarm()) === null) {
         await ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
       }
     });
@@ -277,7 +279,7 @@ export class Sandbox extends DurableObject<Env> {
   // aren't set up. Either way it counts as stopped, or as a failed start if it
   // never made a save.
   private async repair(r: SandboxRecord) {
-    const running = this.ctx.container?.running;
+    const running = this.compute.running;
     if (r.state === "stopping" && running) {
       await this.update({ state: "running" });
       await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
@@ -300,12 +302,6 @@ export class Sandbox extends DurableObject<Env> {
       }
     }
     console.log(`[${r.id}] was ${r.state} after a restart; now ${this.record?.state}`);
-  }
-
-  private get container() {
-    const c = this.ctx.container;
-    if (!c) throw new Error("no container is configured for this Durable Object");
-    return c;
   }
 
   private mustRecord(): SandboxRecord {
@@ -348,7 +344,7 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   private watch() {
-    this.exited = this.container.monitor().then(
+    this.exited = this.compute.monitor().then(
       () => this.onExit(),
       (e) => this.onExit(e),
     );
@@ -510,7 +506,7 @@ export class Sandbox extends DurableObject<Env> {
         this.touch();
         const t0 = Date.now();
         const snap = await withTimeout(
-          this.container.snapshotContainer({ name: `${r.id}-fork-${t0}` }),
+          this.compute.snapshot(`${r.id}-fork-${t0}`),
           SAVE_TIMEOUT_MS,
           "saving the disk",
         );
@@ -727,7 +723,7 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   private async removeAll(r: SandboxRecord): Promise<{ deleted: string }> {
-    if (this.ctx.container?.running) await withTimeout(this.container.destroy(), 60_000, "destroy");
+    if (this.compute.running) await withTimeout(this.compute.destroy(), 60_000, "destroy");
     // Before its storage, so that a later failure leaves a sandbox to delete
     // again, not an index row holding its name.
     await deleteSandbox(this.env.DB, r.id);
@@ -751,7 +747,7 @@ export class Sandbox extends DurableObject<Env> {
   // restored onto it first.
   private async boot(snapshot?: unknown, afterReady?: () => Promise<void>, restore?: SaveManifest) {
     const r = this.mustRecord();
-    const c = this.container;
+    const c = this.compute;
     // A stop whose destroy failed can leave the last run's container up. It
     // goes before t0, so that waitReady doesn't take its exit for this run's.
     if (c.running) await this.destroyContainer(r.id);
@@ -772,15 +768,13 @@ export class Sandbox extends DurableObject<Env> {
     let platformProblem = "";
     let restoreNotice = "";
     try {
-      const images = c.images as Record<string, string>;
       c.start({
-        ...(snapshot ? { containerSnapshot: snapshot } : { image: images.base }),
-        instance: r.size,
-        enableInternet: true,
+        snapshot,
+        size: r.size,
         // CLOUDEX_HOLD: the entrypoint waits for the restore before starting anything.
         env: { CLOUDEX_SANDBOX: r.id, ...(restore ? { CLOUDEX_HOLD: "1" } : {}) },
         labels: { sandbox: r.id },
-      } as ContainerStartupOptions);
+      });
       this.watch();
       // The cloudex command in the sandbox shows this run's token to the API
       // the sandbox has for itself (self.ts), so that an app in the sandbox
@@ -788,10 +782,7 @@ export class Sandbox extends DurableObject<Env> {
       const selfToken = [...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, "0")).join("");
       await this.ctx.storage.put("selfToken", selfToken);
       const egress = this.ctx.exports.Egress({ props: { id: r.id, selfToken } });
-      await withTimeout(c.interceptOutboundHttp("cloudex.internal", egress), 30_000, "routing cloudex.internal");
-      for (const p of providers) {
-        await withTimeout(c.interceptOutboundHttps(PROVIDERS[p].host, egress), 30_000, `routing ${PROVIDERS[p].host}`);
-      }
+      await c.route(egress, providers.map((p) => PROVIDERS[p].host));
       const held = await this.waitReady(t0, Boolean(restore));
       if (restore) {
         restoreNotice = await this.restoreSave(restore, held);
@@ -806,7 +797,7 @@ export class Sandbox extends DurableObject<Env> {
       try {
         await this.runScript(
           KEYS_SCRIPT,
-          [providers.join(" "), PROVIDERS.anthropic.placeholder, PROVIDERS.openai.placeholder, ...placeholderVars(providers)],
+          [providers.join(" "), PROVIDERS.anthropic.placeholder, PROVIDERS.openai.placeholder, c.caPath, ...placeholderVars(providers)],
           "setting up provider keys",
           60_000,
         );
@@ -862,7 +853,7 @@ export class Sandbox extends DurableObject<Env> {
   // boots. With hold, also returns once the entrypoint holds for a restore:
   // true then, false when it's ready (an image too old to hold).
   private async waitReady(since: number, hold = false): Promise<boolean> {
-    const c = this.container;
+    const c = this.compute;
     let last = "";
     while (Date.now() - since < READY_TIMEOUT_MS) {
       if (this.exitedAt > since) throw new Error("the container exited while booting");
@@ -985,7 +976,7 @@ export class Sandbox extends DurableObject<Env> {
     const r = this.mustRecord();
     const t0 = Date.now();
     const snap = await withTimeout(
-      this.container.snapshotContainer({ name: `${r.id}-${t0}` }),
+      this.compute.snapshot(`${r.id}-${t0}`),
       SAVE_TIMEOUT_MS,
       "saving the disk",
     );
@@ -1018,7 +1009,7 @@ export class Sandbox extends DurableObject<Env> {
   // A container that doesn't go keeps billing, so the alarm tries again.
   private async destroyContainer(id: string) {
     try {
-      await withTimeout(this.container.destroy(), 60_000, "destroy");
+      await withTimeout(this.compute.destroy(), 60_000, "destroy");
       // The exit watcher may never settle for a box that never got an instance.
       await Promise.race([this.exited, sleep(10_000)]);
     } catch (e) {
@@ -1029,7 +1020,7 @@ export class Sandbox extends DurableObject<Env> {
 
   private async setInactivity(id: string) {
     try {
-      await withTimeout(this.container.setInactivityTimeout(PLATFORM_MAX_INACTIVITY_MS), 30_000, "setInactivityTimeout");
+      await withTimeout(this.compute.keepAlive(), 30_000, "setInactivityTimeout");
       this.inactivitySet = true;
     } catch (e) {
       console.error(`[${id}] ${message(e)}`);
@@ -1038,7 +1029,7 @@ export class Sandbox extends DurableObject<Env> {
 
   private leftOver() {
     const state = this.record?.state;
-    return (state === "stopped" || state === "error") && Boolean(this.ctx.container?.running);
+    return (state === "stopped" || state === "error") && this.compute.running;
   }
 
   // Called through the outbound handler when the platform sends SIGTERM.
@@ -1085,7 +1076,7 @@ export class Sandbox extends DurableObject<Env> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
-      const p = await this.container.exec(["bash", "-c", script, "cloudex", ...args], {
+      const p = await this.compute.exec(["bash", "-c", script, "cloudex", ...args], {
         cwd: "/",
         env: { HOME: "/root", LANG: "C.UTF-8" },
         ...(stdin === undefined ? {} : { stdin: new Response(stdin).body! }),
@@ -1110,19 +1101,19 @@ export class Sandbox extends DurableObject<Env> {
     this.touch();
   }
 
-  private async startExec(input: ExecInput, signal: AbortSignal): Promise<ExecProcess> {
+  private async startExec(input: ExecInput, signal: AbortSignal): Promise<Proc> {
     const home = input.root ? "/root" : GUEST_HOME;
     // A relative directory, or one starting with ~, is in the home directory.
     const cwd = !input.cwd ? home : input.cwd.startsWith("/") ? input.cwd : `${home}/${input.cwd.replace(/^~(\/|$)/, "")}`;
     // The container runtime reports a missing directory as a missing command.
     if (input.cwd) {
-      const found = this.container.exec(["test", "-d", cwd], { cwd: "/", signal }).then((p) => p.exitCode);
+      const found = this.compute.exec(["test", "-d", cwd], { cwd: "/", signal }).then((p) => p.exitCode);
       if ((await withTimeout(found, 30_000, "checking the directory")) !== 0) fail(400, `there's no directory ${cwd} in the sandbox`);
     }
     // GNU timeout puts the command in a process group of its own and stops the
     // whole group, so what it started in the background goes too; the abort is
     // a backstop.
-    return this.container.exec(guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root), {
+    return this.compute.exec(guestArgv(["timeout", "-k", "10", String(input.timeoutSec), "bash", "-lc", input.cmd], input.root), {
       cwd,
       env: input.root
         ? { HOME: "/root", USER: "root", LANG: "C.UTF-8", TERM: "dumb" }
@@ -1155,7 +1146,7 @@ export class Sandbox extends DurableObject<Env> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), input.timeoutSec * 1000 + 30_000);
     const t0 = Date.now();
-    let p: ExecProcess;
+    let p: Proc;
     this.execs++;
     try {
       p = await this.startExec(input, ctl.signal);
@@ -1250,7 +1241,7 @@ export class Sandbox extends DurableObject<Env> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), o.timeoutMs);
     try {
-      const p = await this.container.exec(guestArgv(argv, o.root), {
+      const p = await this.compute.exec(guestArgv(argv, o.root), {
         cwd: o.root ? "/root" : GUEST_HOME,
         env: o.root
           ? { HOME: "/root", USER: "root", LANG: "C.UTF-8" }
@@ -1330,7 +1321,7 @@ export class Sandbox extends DurableObject<Env> {
     // A deadline, in case the file was swapped for a pipe that never ends.
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), FILE_TIMEOUT_MS);
-    const p = await this.container.exec(guestArgv(argv, root), {
+    const p = await this.compute.exec(guestArgv(argv, root), {
       cwd: "/",
       env: { HOME: root ? "/root" : GUEST_HOME, LANG: "C.UTF-8" },
       stderr: "ignore",
@@ -1383,7 +1374,7 @@ export class Sandbox extends DurableObject<Env> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
-      const p = await this.container.exec(guestArgv(["bash", "-lc", argv[0]!, "cloudex", ...argv.slice(1)]), {
+      const p = await this.compute.exec(guestArgv(["bash", "-lc", argv[0]!, "cloudex", ...argv.slice(1)]), {
         cwd: GUEST_HOME,
         env: { HOME: GUEST_HOME, USER: "cloudex", LOGNAME: "cloudex", LANG: "C.UTF-8" },
         ...(stdin === undefined ? {} : { stdin: new Response(stdin).body! }),
@@ -1441,7 +1432,7 @@ export class Sandbox extends DurableObject<Env> {
       });
     }
     if (!r || r.state !== "running") return;
-    if (!this.ctx.container?.running) return this.onExit();
+    if (!this.compute.running) return this.onExit();
     // An object that restarted, as after a deploy, leaves its running box on
     // the platform's short default until it's set again.
     if (!this.inactivitySet) await this.setInactivity(r.id);
@@ -1514,7 +1505,7 @@ export class Sandbox extends DurableObject<Env> {
       this.touch();
       if (url.pathname === "/term") return this.terminal(url, tokenId);
       // The VNC server listens on localhost only, so through the relay previews use.
-      const through = await this.relay(VNC_PORT, "10.0.0.1");
+      const through = await this.relay(VNC_PORT, this.compute.guestAddress);
       if (through === null) return new Response("the desktop isn't running: start it first\n", { status: 409 });
       if (!through) return new Response("couldn't reach the desktop's VNC server\n", { status: 502 });
       return this.bridge(through, tokenId);
@@ -1595,20 +1586,21 @@ export class Sandbox extends DurableObject<Env> {
         ? new Request(target, { method: req.method, headers: req.headers, body: held, redirect: req.redirect })
         : new Request(target, req);
       fwd.headers.delete(LINK_HEADER);
-      return this.container.getTcpPort(to).fetch(fwd);
+      return this.compute.fetch(to, fwd);
     };
     let why = "";
+    let addr: string | undefined;
     const relay = this.relayed.get(port);
     for (const to of relay ? [relay, port] : [port]) {
       try {
         return await send(to);
       } catch (e) {
         why = message(e);
+        addr = e instanceof NotListening ? e.addr : undefined;
         if (to !== port) this.relayed.delete(port);
         if (once) break;
       }
     }
-    const addr = /not listening in the TCP address (\d{1,3}(?:\.\d{1,3}){3}):\d+/.exec(why)?.[1];
     if (addr) {
       const through = await this.relay(port, addr);
       if (through === null) {
@@ -1704,7 +1696,7 @@ export class Sandbox extends DurableObject<Env> {
     const id = this.record?.id;
     try {
       const p = await withTimeout(
-        this.container.exec(["bash", "-c", RELAY_SCRIPT, "cloudex", String(port), addr], { cwd: "/", env: { LANG: "C.UTF-8" } }),
+        this.compute.exec(["bash", "-c", RELAY_SCRIPT, "cloudex", String(port), addr], { cwd: "/", env: { LANG: "C.UTF-8" } }),
         15_000,
         "starting the relay",
       );
@@ -1732,7 +1724,7 @@ export class Sandbox extends DurableObject<Env> {
     const script =
       'mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && ' +
       '{ grep -qxF "$KEY" ~/.ssh/authorized_keys || printf "%s\\n" "$KEY" >> ~/.ssh/authorized_keys; }';
-    const p = await this.container.exec(["sh", "-c", script], {
+    const p = await this.compute.exec(["sh", "-c", script], {
       user: GUEST_USER,
       env: { HOME: GUEST_HOME, KEY: key },
     });
@@ -1763,7 +1755,7 @@ export class Sandbox extends DurableObject<Env> {
     const user = root ? "root" : "cloudex";
     const env = { HOME: home, USER: user, LOGNAME: user, SHELL: "/bin/bash", TERM: "xterm-256color", LANG: "C.UTF-8", COLORTERM: "truecolor" };
     const argv = session === null ? ["bash", "-l"] : tmuxArgv(session);
-    const p = await this.container.exec(guestArgv(argv, root), { cwd: home, env, pty: { cols, rows }, stdin: "pipe" });
+    const p = await this.compute.exec(guestArgv(argv, root), { cwd: home, env, pty: { cols, rows }, stdin: "pipe" });
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     server.accept();
@@ -1798,7 +1790,7 @@ export class Sandbox extends DurableObject<Env> {
         } catch {}
       }
       if (m.kill && session !== null) {
-        void this.container
+        void this.compute
           .exec(guestArgv(["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", `=${session}`], root), { cwd: home, env })
           .then((k) => k.exitCode)
           .catch(() => {});
@@ -1832,7 +1824,7 @@ export class Sandbox extends DurableObject<Env> {
   // WebSocket <-> guest TCP. Reads from the guest are coalesced into frames of
   // up to 256 KiB, which took scp downloads from 6-8 to 17 MiB/s in the spikes.
   private async bridge(port: number, tokenId: string | null): Promise<Response> {
-    const sock = this.container.getTcpPort(port).connect(`10.0.0.1:${port}`);
+    const sock = this.compute.connect(port);
     try {
       await withTimeout(sock.opened, 15_000, `connecting to port ${port}`);
     } catch (e) {
