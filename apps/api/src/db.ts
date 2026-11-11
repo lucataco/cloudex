@@ -3,7 +3,8 @@
 // It also holds the names of named saves (saves.ts), the provider keys, and
 // access tokens with the sandboxes each one made (tokens.ts), and the nodes
 // with their join tokens (nodes.ts).
-import type { Sandbox } from "@cloudex/schema";
+import { NodeIsolation, type Node, type Sandbox } from "@cloudex/schema";
+import { nodeIsolation } from "./placement";
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS sandboxes (
@@ -167,7 +168,39 @@ type Row = {
   saved_at: number | null;
   saved_bytes: number | null;
   error: string | null;
+  // v0.2.2: the node it runs on, and that node as the index has it (LEFT JOIN nodes).
+  node: string | null;
+  node_name: string | null;
+  node_state: Node["state"] | null;
+  node_seen: number | null;
+  node_runtime: Node["runtime"];
+  node_isolation: string | null;
 };
+
+function isolationOf(text: string | null) {
+  if (!text) return null;
+  try {
+    const r = NodeIsolation.safeParse(JSON.parse(text));
+    return r.success ? r.data : null;
+  } catch {
+    return null;
+  }
+}
+
+// Where it runs, from the index's copy of its node: listing sandboxes never
+// wakes a Node object. A node's online state there is what its Node object
+// last wrote (online at its agent's hello, offline when its socket went).
+function placementOf(r: Row): Pick<Sandbox, "placement" | "isolation"> {
+  if (!r.node) return { placement: { provider: "cloudflare" }, isolation: "vm" };
+  const iso = r.node_state ? nodeIsolation({ runtime: r.node_runtime, isolation: isolationOf(r.node_isolation) }) : null;
+  return {
+    placement: {
+      provider: "node",
+      node: { id: r.node, name: r.node_name ?? r.node, online: r.node_state === "online", state: r.node_state, lastSeenAt: r.node_seen },
+    },
+    ...(iso ? { isolation: iso } : {}),
+  };
+}
 
 const fromRow = (r: Row): Sandbox => ({
   id: r.id,
@@ -182,7 +215,12 @@ const fromRow = (r: Row): Sandbox => ({
   savedAt: r.saved_at,
   savedBytes: r.saved_bytes,
   error: r.error,
+  ...placementOf(r),
 });
+
+const LIST =
+  "SELECT s.*, n.name AS node_name, n.state AS node_state, n.last_seen_at AS node_seen, n.runtime AS node_runtime, n.isolation AS node_isolation " +
+  "FROM sandboxes s LEFT JOIN nodes n ON n.id = s.node";
 
 // node: the node it runs on (nodes.ts), which a sandbox keeps for life. A
 // record that doesn't say leaves the column as it was.
@@ -229,10 +267,8 @@ export async function deleteSandbox(db: D1Database, id: string): Promise<boolean
 export async function listSandboxes(db: D1Database, owner?: string): Promise<Sandbox[]> {
   await ensureSchema(db);
   const { results } = await (owner
-    ? db
-        .prepare("SELECT s.* FROM sandboxes s JOIN sandbox_owners o ON o.id = s.id WHERE o.owner = ? ORDER BY s.created_at DESC")
-        .bind(owner)
-    : db.prepare("SELECT * FROM sandboxes ORDER BY created_at DESC")
+    ? db.prepare(`${LIST} JOIN sandbox_owners o ON o.id = s.id WHERE o.owner = ? ORDER BY s.created_at DESC`).bind(owner)
+    : db.prepare(`${LIST} ORDER BY s.created_at DESC`)
   ).all<Row>();
   return results.map(fromRow);
 }
@@ -251,4 +287,18 @@ export async function sandboxesOnNode(db: D1Database, node: string): Promise<str
   await ensureSchema(db);
   const { results } = await db.prepare("SELECT id FROM sandboxes WHERE node = ?").bind(node).all<{ id: string }>();
   return results.map((r) => r.id);
+}
+
+// A node as a sandbox on it shows it (Sandbox.placement): its name, state and
+// isolation as the index has them. Null once it's been forgotten.
+export async function nodeRow(
+  db: D1Database,
+  id: string,
+): Promise<{ name: string; state: Node["state"]; lastSeenAt: number | null; runtime: Node["runtime"]; isolation: Node["isolation"] } | null> {
+  await ensureSchema(db);
+  const r = await db
+    .prepare("SELECT name, state, last_seen_at, runtime, isolation FROM nodes WHERE id = ?")
+    .bind(id)
+    .first<{ name: string; state: Node["state"]; last_seen_at: number | null; runtime: Node["runtime"]; isolation: string | null }>();
+  return r ? { name: r.name, state: r.state, lastSeenAt: r.last_seen_at, runtime: r.runtime, isolation: isolationOf(r.isolation) } : null;
 }

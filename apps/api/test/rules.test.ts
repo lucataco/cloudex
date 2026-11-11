@@ -65,10 +65,13 @@ test("reading routes never need more than read, and :ref is captured", () => {
   assert.equal(ruleFor("POST", "/v1/auth/links").need, "any");
 });
 
-test("M3's development routes are for admins: no token rule reaches them", () => {
-  // POST /v1/nodes/{node}/dev-sandboxes and GET .../dev-sandboxes/{id}, under
-  // the node routes that read tokens may use, aren't in the OpenAPI document.
+test("the diagnostic route for a node sandbox's streams is for admins, and placing sandboxes on nodes is write", () => {
+  // GET /v1/sandboxes/{ref}/node-streams (v0.2.2 M5, which replaced M3's
+  // development routes) isn't in the OpenAPI document.
+  assert.equal(ruleFor("GET", "/v1/sandboxes/cx-abc123/node-streams").need, "admin");
   assert.equal(ruleFor("POST", "/v1/nodes/box/dev-sandboxes").need, "admin");
-  assert.equal(ruleFor("GET", "/v1/nodes/box/dev-sandboxes/cx-abc123").need, "admin");
   assert.equal(ruleFor("GET", "/v1/nodes/box").need, "read");
+  assert.equal(ruleFor("POST", "/v1/sandboxes").need, "write");
+  assert.equal(ruleFor("POST", "/v1/nodes").need, "admin");
+  assert.equal(ruleFor("DELETE", "/v1/nodes/box").need, "admin");
 });

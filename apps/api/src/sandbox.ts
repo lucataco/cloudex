@@ -60,7 +60,7 @@ import {
 import { AGENT_BAD_REQUEST, AGENT_BOOT, AGENT_NOT_FOUND, AGENT_SCRIPT } from "./agents";
 import { COMMAND_BAD_REQUEST, COMMAND_BOOT, COMMAND_CONFLICT, COMMAND_NOT_FOUND, COMMAND_SCRIPT } from "./commands";
 import { CloudflareCompute, type Compute, NodeCompute, type NodePlacement, NotListening, type Proc } from "./compute";
-import { deleteSandbox, renameSandbox, upsertSandbox } from "./db";
+import { deleteSandbox, nodeRow, renameSandbox, upsertSandbox } from "./db";
 import { DESKTOP_PORT, DESKTOP_SCRIPT, DESKTOP_STOP_SCRIPT, DESKTOP_VIEWER, VNC_PORT } from "./desktop";
 import { ARCHIVE_SCRIPT, FILE_BAD_REQUEST, FILE_FORBIDDEN, FILE_NOT_FOUND, FILE_SCRIPT, UNPACK_SCRIPT } from "./files";
 import { PLATFORM_FILES, PLATFORM_SCRIPT, PLATFORM_VERSION, RELAY_NOTHING, RELAY_SCRIPT, START_SCRIPT } from "./guest";
@@ -88,6 +88,7 @@ import {
   view,
 } from "./settings";
 import { NodeStreams } from "./nodestream";
+import { type MachineReport, machineAction, nodeIsolation, offlineMessage, removedMessage } from "./placement";
 import { tokenAlive } from "./tokens";
 import { CREDENTIAL_ENDED, LINK_HEADER, TOKEN_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
@@ -157,6 +158,11 @@ type CreateInput = {
   repo?: string | Repo;
 };
 export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?: StoredSettings };
+// What a node's Node object tells a sandbox on it (v0.2.2 M5): whether the
+// node is online, and with a report, its machine's state.
+export type NodeReport = { online: boolean; lastSeenAt: number | null; machine?: MachineReport };
+// The node a sandbox is made on, chosen by POST /v1/sandboxes (placement.ts).
+export type NodeChoice = { node: string; name: string; cpus: number; memoryMb: number };
 // Preview links handed out: a version for all of them, which revoking them all
 // bumps, and one per port, bumped by revoking that port's link. at is when the
 // port's current link was first handed out, null once revoked.
@@ -164,6 +170,15 @@ type Links = { epoch: number; ports: Record<string, { gen: number; at: number | 
 type ExecInput = { cmd: string; root: boolean; cwd?: string; timeoutSec: number };
 
 export const NO_SUCH_SANDBOX = "no such sandbox";
+
+// What a sandbox on a node can't do yet in v0.2.2 (research/v0.2.2-plan.md):
+// forks are built on Cloudflare's disk snapshots; named saves and agents need
+// cloudex.internal and provider keys on the node, which come with M6.
+export const FORK_ON_NODE =
+  "forks aren't available for a sandbox on a node yet; copy what you need with cloudex cp, or start a new sandbox on the node";
+export const SAVE_ON_NODE = "named saves of a sandbox on a node aren't available yet; copy what you need out with cloudex cp";
+export const AGENTS_ON_NODE =
+  "agents need the deployment's provider keys, which don't reach sandboxes on nodes yet; start agents in a sandbox on Cloudflare";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
 
@@ -265,6 +280,10 @@ export class Sandbox extends DurableObject<Env> {
   // machines only), reached through the node's stream sockets.
   private readonly cloudflare = new CloudflareCompute(this.ctx);
   private onNode: NodeCompute | undefined;
+  // Set while the node is known to be offline (its Node object said so, or
+  // an op found it so), so that the alarm doesn't keep asking it; cleared by
+  // the next sign that it's back. Advisory: requests try the node anyway.
+  private nodeDown: { since: number; lastSeenAt: number | null } | null = null;
   private get compute(): Compute {
     return this.onNode ?? this.cloudflare;
   }
@@ -274,19 +293,14 @@ export class Sandbox extends DurableObject<Env> {
     sandbox: () => this.record?.id ?? null,
     node: () => this.onNode?.placement.node ?? null,
     more: async (count) => {
-      const p = this.onNode?.placement;
-      if (!p) throw new Error("this sandbox isn't on a node");
-      await this.env.NODE.getByName(p.node).op("streams", { sandbox: this.record!.id, count }, 5000);
+      if (!this.onNode) throw new Error("this sandbox isn't on a node");
+      await this.nodeOp("streams", { sandbox: this.record!.id, count }, 5000);
     },
     touch: () => this.touch(),
   });
 
   private place(p: NodePlacement | undefined) {
-    this.onNode = p
-      ? new NodeCompute(this.streams, p, async () => {
-          await this.env.NODE.getByName(p.node).op("delete", { sandbox: this.record?.id ?? "" }, 60_000);
-        })
-      : undefined;
+    this.onNode = p ? new NodeCompute(this.streams, p) : undefined;
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -297,11 +311,14 @@ export class Sandbox extends DurableObject<Env> {
     void ctx.blockConcurrencyWhile(async () => {
       this.record = await ctx.storage.get<SandboxRecord>("sandbox");
       this.place(await ctx.storage.get<NodePlacement>("node"));
+      this.nodeDown = (await ctx.storage.get<{ since: number; lastSeenAt: number | null }>("nodeDown")) ?? null;
       this.lastActivity = (await ctx.storage.get<number>("lastActivity")) ?? Date.now();
       // After an eviction or deploy, reattach the exit watcher to a running box.
+      // (A node's machine has no watcher here: its exits come from its Node
+      // object, nodeReport.)
       if (this.compute.running) this.watch();
       if (this.record?.state === "starting" || this.record?.state === "stopping") await this.repair(this.record);
-      if (this.record?.state === "running" && this.compute.running && (await ctx.storage.getAlarm()) === null) {
+      if (this.record?.state === "running" && (this.onNode || this.compute.running) && (await ctx.storage.getAlarm()) === null) {
         await ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
       }
     });
@@ -314,6 +331,7 @@ export class Sandbox extends DurableObject<Env> {
   // aren't set up. Either way it counts as stopped, or as a failed start if it
   // never made a save.
   private async repair(r: SandboxRecord) {
+    if (this.onNode) return this.repairOnNode(r);
     const running = this.compute.running;
     if (r.state === "stopping" && running) {
       await this.update({ state: "running" });
@@ -403,9 +421,12 @@ export class Sandbox extends DurableObject<Env> {
 
   // With from, the sandbox is a fork and starts from that save (see forkPoint);
   // with save, it starts from that named save.
-  async create(id: string, input: CreateInput, from?: ForkSource, save?: SaveManifest): Promise<SandboxRecord> {
+  // With on, it runs on that node (v0.2.2 M5), which POST /v1/sandboxes chose
+  // and checked; never with from or save in v0.2.2.
+  async create(id: string, input: CreateInput, from?: ForkSource, save?: SaveManifest, on?: NodeChoice): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       if (this.record) fail(409, `${id} already exists`);
+      if (on && (from || save)) fail(501, "a sandbox on a node can't start from a fork or a save yet");
       // A fork gets the original's settings, and a sandbox started from a save
       // the settings saved with it; checked before anything is kept.
       const settings =
@@ -435,6 +456,13 @@ export class Sandbox extends DurableObject<Env> {
         ...(from ? { forkedFrom: from.sandbox } : {}),
         ...(save ? { fromSave: save.name } : {}),
       };
+      if (on) {
+        // Before the index row, which names the node, so that the node's
+        // reconcile never takes the machine for an orphan.
+        const placement: NodePlacement = { node: on.node, name: on.name, address: "", cpus: on.cpus, memoryMb: on.memoryMb };
+        await this.ctx.storage.put("node", placement);
+        this.place(placement);
+      }
       await this.update({});
       if (settings) await this.ctx.storage.put("settings", settings);
       if (from) {
@@ -454,7 +482,7 @@ export class Sandbox extends DurableObject<Env> {
       }
       if (settings?.repo && !from && !save) await this.clone(settings.repo);
       await this.startHook();
-      return this.mustRecord();
+      return this.shown();
     });
   }
 
@@ -496,6 +524,9 @@ export class Sandbox extends DurableObject<Env> {
         throw e;
       });
       const next = await store(this.env.ADMIN_KEY, merge(secret, change), stored?.repo ?? null);
+      // On a node that's offline the change couldn't reach a running
+      // sandbox, so nothing is kept: no half-applied settings.
+      if (r.state === "running" && this.onNode && this.nodeDown) fail(503, this.offline());
       await this.ctx.storage.put("settings", next);
       if (r.state === "running") {
         this.touch();
@@ -516,7 +547,7 @@ export class Sandbox extends DurableObject<Env> {
   private async applyPlatform() {
     const zone = this.env.PREVIEW_ZONE || "";
     const selfToken = (await this.ctx.storage.get<string>("selfToken")) ?? "";
-    await this.runScript(PLATFORM_SCRIPT, [zone, selfToken], "setting up the cloudex command", 60_000, PLATFORM_FILES);
+    await this.runScript(PLATFORM_SCRIPT, [zone, selfToken, this.onNode ? "node" : ""], "setting up the cloudex command", 60_000, PLATFORM_FILES);
     await this.ctx.storage.put("platform", `${PLATFORM_VERSION}:${zone}`);
   }
 
@@ -537,7 +568,7 @@ export class Sandbox extends DurableObject<Env> {
   async forkPoint(): Promise<ForkSource> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
-      if (this.onNode) this.onNode.snapshot(); // 501: forks aren't on nodes in v0.2.2
+      if (this.onNode) fail(501, FORK_ON_NODE);
       if (r.state === "running") {
         this.touch();
         const t0 = Date.now();
@@ -562,13 +593,34 @@ export class Sandbox extends DurableObject<Env> {
   }
 
   async get(): Promise<SandboxRecord> {
-    return this.mustRecord();
+    return this.shown();
+  }
+
+  // The record as the API shows it: with where it runs and how it's isolated
+  // (v0.2.2). For a node, from the index's copy of the node, so that showing
+  // a sandbox never wakes its Node object.
+  private async shown(r = this.mustRecord()): Promise<SandboxRecord> {
+    const p = this.onNode?.placement;
+    if (!p) return { ...r, placement: { provider: "cloudflare" }, isolation: "vm" };
+    const n = await nodeRow(this.env.DB, p.node).catch(() => null);
+    const iso = n ? nodeIsolation(n) : null;
+    return {
+      ...r,
+      placement: {
+        provider: "node",
+        node: { id: p.node, name: n?.name ?? p.name, online: n?.state === "online", state: n?.state ?? null, lastSeenAt: n?.lastSeenAt ?? null },
+        ...(p.cpus !== undefined ? { cpus: p.cpus } : {}),
+        ...(p.memoryMb !== undefined ? { memoryMb: p.memoryMb } : {}),
+      },
+      ...(iso ? { isolation: iso } : {}),
+    };
   }
 
   // With size, the sandbox runs on that size from now on.
   async resume(fromBackup = false, size?: SandboxSize): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
+      if (this.onNode) return this.resumeOnNode(r, fromBackup, size);
       if (r.state === "running") {
         if (fromBackup) fail(409, `${r.name ?? r.id} is running; stop it, then resume it from its backup`);
         if (size && size !== r.size) fail(409, `${r.name ?? r.id} is running on ${r.size}; stop it, then resume it on ${size}`);
@@ -647,11 +699,11 @@ export class Sandbox extends DurableObject<Env> {
   async stop(): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
-      if (this.onNode) this.onNode.snapshot(); // 501 until M5
-      if (r.state === "stopped" || r.state === "error") return r;
+      if (r.state === "stopped" || r.state === "error") return this.shown(r);
       if (r.state !== "running") fail(409, wrongState(r));
-      await this.saveAndDestroy();
-      return this.mustRecord();
+      if (this.onNode) await this.stopOnNode();
+      else await this.saveAndDestroy();
+      return this.shown();
     });
   }
 
@@ -676,7 +728,7 @@ export class Sandbox extends DurableObject<Env> {
     if (patch.idleMinutes !== undefined) change.idleMinutes = patch.idleMinutes;
     if (r.state === "running") this.touch();
     await this.update(change);
-    return this.mustRecord();
+    return this.shown();
   }
 
   private async linkState(): Promise<Links> {
@@ -741,12 +793,15 @@ export class Sandbox extends DurableObject<Env> {
     return sameSecret(token, await this.linkToken(await this.linkState(), port, r.id));
   }
 
-  async remove(): Promise<{ deleted: string }> {
+  // With force, a sandbox on a node that's offline goes at once, and its
+  // node removes the machine when it's back (a tombstone in its Node object).
+  async remove(force = false): Promise<{ deleted: string }> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
       this.record = { ...r, state: "stopping" }; // so the exit watcher stays out of it
       this.removing = true;
       try {
+        if (this.onNode) await this.removeMachine(r, force);
         const out = await this.removeAll(r);
         this.place(undefined);
         return out;
@@ -797,8 +852,10 @@ export class Sandbox extends DurableObject<Env> {
     await this.ctx.storage.delete("stopRequested");
     await this.update({ state: "starting", error: null, notice: null });
     let providers: (keyof typeof PROVIDERS)[] = [];
+    // Provider keys don't reach a node's machines in v0.2.2 yet (M6): none
+    // are set up there, and KEYS_SCRIPT clears any placeholders.
     try {
-      providers = (await listKeys(this.env.DB)).map((k) => k.provider);
+      if (!this.onNode) providers = (await listKeys(this.env.DB)).map((k) => k.provider);
     } catch (e) {
       console.error(`[${r.id}] reading provider keys failed: ${message(e)}`);
     }
@@ -807,14 +864,20 @@ export class Sandbox extends DurableObject<Env> {
     let platformProblem = "";
     let restoreNotice = "";
     try {
-      c.start({
-        snapshot,
-        size: r.size,
-        // CLOUDEX_HOLD: the entrypoint waits for the restore before starting anything.
-        env: { CLOUDEX_SANDBOX: r.id, ...(restore ? { CLOUDEX_HOLD: "1" } : {}) },
-        labels: { sandbox: r.id },
-      });
-      this.watch();
+      if (this.onNode) {
+        // The node's agent makes the machine (once) and starts it, and
+        // answers once its entrypoint is ready.
+        await this.startOnNode(r);
+      } else {
+        c.start({
+          snapshot,
+          size: r.size,
+          // CLOUDEX_HOLD: the entrypoint waits for the restore before starting anything.
+          env: { CLOUDEX_SANDBOX: r.id, ...(restore ? { CLOUDEX_HOLD: "1" } : {}) },
+          labels: { sandbox: r.id },
+        });
+        this.watch();
+      }
       // The cloudex command in the sandbox shows this run's token to the API
       // the sandbox has for itself (self.ts), so that an app in the sandbox
       // that fetches URLs for its visitors can't be made to call it.
@@ -822,7 +885,7 @@ export class Sandbox extends DurableObject<Env> {
       await this.ctx.storage.put("selfToken", selfToken);
       const egress = this.ctx.exports.Egress({ props: { id: r.id, selfToken } });
       await c.route(egress, providers.map((p) => PROVIDERS[p].host));
-      const held = await this.waitReady(t0, Boolean(restore));
+      const held = this.onNode ? false : await this.waitReady(t0, Boolean(restore));
       if (restore) {
         restoreNotice = await this.restoreSave(restore, held);
         if (held) {
@@ -860,9 +923,12 @@ export class Sandbox extends DurableObject<Env> {
       }
     } catch (e) {
       if (c.running) await this.destroyContainer(r.id);
+      // A node's machine that started is stopped again, keeping its disk; if
+      // the node can't be reached, its next reconcile stops it.
+      if (this.onNode) await this.stopMachine().catch(() => {});
       const why = message(e);
-      await this.update({ state: r.savedAt ? "stopped" : "error", error: `start failed: ${why}` });
-      fail(503, `${r.name ?? r.id} didn't start: ${why}`);
+      await this.update({ state: this.hasDisk(r) ? "stopped" : "error", error: `start failed: ${why}` });
+      fail(errorStatus(e).status === 410 ? 410 : 503, `${r.name ?? r.id} didn't start: ${why}`);
     }
     await this.setInactivity(r.id);
     console.log(`[${r.id}] ready in ${Date.now() - t0} ms (${snapshot ? "from save" : restore ? `from the save ${restore.name}` : "fresh"})`);
@@ -956,6 +1022,7 @@ export class Sandbox extends DurableObject<Env> {
   async saveAs(name: string, id: string): Promise<Save> {
     return this.exclusive(async () => {
       const r = this.mustRun();
+      if (this.onNode) fail(501, SAVE_ON_NODE);
       const bucket = backupBucket(this.env);
       if (!bucket) fail(501, "named saves need an R2 bucket, and this deployment has none: turn R2 on in the Cloudflare dashboard, then run cloudex deploy");
       const t0 = Date.now();
@@ -1076,6 +1143,7 @@ export class Sandbox extends DurableObject<Env> {
     return this.exclusive(async () => {
       const r = this.record;
       if (!r || r.state !== "running") return { saved: false }; // our own stop is already saving
+      if (this.onNode) return { saved: false }; // a node's machine keeps its disk
       try {
         await this.save();
         await this.backup();
@@ -1394,6 +1462,7 @@ export class Sandbox extends DurableObject<Env> {
   // on standard input. Returns the script's JSON.
   async agentOp(op: string, args: string[], prompt?: string, waitSec = 0): Promise<unknown> {
     const r = this.mustRun();
+    if (this.onNode && (op === "start" || op === "send")) fail(501, AGENTS_ON_NODE);
     try {
       const out = await this.asGuest([AGENT_BOOT, AGENT_SCRIPT, op, ...args], `agent ${op}`, (waitSec + 60) * 1000, prompt);
       const why = new TextDecoder().decode(out.stderr).trim().split("\n").pop() ?? "";
@@ -1471,7 +1540,7 @@ export class Sandbox extends DurableObject<Env> {
       });
     }
     if (!r || r.state !== "running") return;
-    if (this.onNode) await this.nodeAlarm();
+    if (this.onNode) return this.alarmOnNode(r, Boolean(stopRequested));
     if (!this.compute.running) return this.onExit();
     // An object that restarted, as after a deploy, leaves its running box on
     // the platform's short default until it's set again.
@@ -1493,7 +1562,7 @@ export class Sandbox extends DurableObject<Env> {
         if (this.record?.state === "running") await this.applyPlatform();
       }).catch((e) => console.error(`[${r.id}] ${message(e)}`));
     }
-    if (this.idle() && !this.onNode) {
+    if (this.idle()) {
       try {
         // Asked again in the queue: what ran ahead of it, such as a long save,
         // may have been activity.
@@ -1541,6 +1610,9 @@ export class Sandbox extends DurableObject<Env> {
       return this.streams.accept(req);
     }
     if (this.onNode) this.streams.reap();
+    if (this.onNode && (await this.ctx.storage.get<string>("revokedNode")) === this.onNode.placement.node) {
+      return new Response(`${removedMessage(this.onNode.placement.name)}\n`, { status: 410 });
+    }
     const tokenId = req.headers.get(TOKEN_HEADER);
     if (url.pathname === "/term" || url.pathname === "/vnc") {
       if (r.state !== "running") return new Response(`${wrongState(r)}\n`, { status: 409 });
@@ -1640,6 +1712,8 @@ export class Sandbox extends DurableObject<Env> {
       try {
         return await send(to);
       } catch (e) {
+        // A node that's offline: no relay would help.
+        if (this.onNode && errorStatus(e).status === 503) return new Response(`${errorStatus(e).message}\n`, { status: 503, headers: { "retry-after": "10" } });
         why = message(e);
         addr = e instanceof NotListening ? e.addr : undefined;
         if (to !== port) this.relayed.delete(port);
@@ -1983,83 +2057,261 @@ export class Sandbox extends DurableObject<Env> {
     }
   }
 
-  // The development path (POST /v1/nodes/{node}/dev-sandboxes, admins only;
-  // v0.2.2 M3, and since M4 a real machine): the node's agent makes the
-  // machine with its Docker runtime and starts it. It can't be saved or
-  // forked, and the sandbox's own stop and resume answer 501 until M5;
-  // devLifecycle stops and starts its machine. Deleting it removes the
-  // machine and its network.
-  async createDev(id: string, node: string, name: string | null, size: { cpus?: number; memoryMb?: number }): Promise<SandboxRecord> {
-    return this.exclusive(async () => {
-      if (this.record) fail(409, `${id} already exists`);
-      const stub = this.env.NODE.getByName(node);
-      await stub.op("create", { sandbox: id, ...(this.env.NODE_IMAGE ? { image: this.env.NODE_IMAGE } : {}), ...size }, 60_000);
-      let answer: Record<string, unknown>;
-      try {
-        answer = (await stub.op("start", { sandbox: id }, 120_000)) as Record<string, unknown>;
-      } catch (e) {
-        await (stub.op("delete", { sandbox: id }, 60_000) as Promise<unknown>).catch(() => {});
-        throw e;
+  // ---------------------------------------------------------------- the lifecycle on a node (v0.2.2 M5)
+
+  // Whether the sandbox has a disk to come back to: on Cloudflare once it has
+  // a save; on a node once its machine has started, since it keeps its disk.
+  private hasDisk(r: SandboxRecord) {
+    return this.onNode ? r.startedAt !== null : r.savedAt !== null;
+  }
+
+  private offline(lastSeenAt = this.nodeDown?.lastSeenAt) {
+    const p = this.onNode!.placement;
+    return offlineMessage(p.name, lastSeenAt);
+  }
+
+  private async setNodeDown(down: { since: number; lastSeenAt: number | null } | null) {
+    if (down === null && this.nodeDown === null) return;
+    this.nodeDown = down;
+    if (down) await this.ctx.storage.put("nodeDown", down);
+    else await this.ctx.storage.delete("nodeDown");
+  }
+
+  // An op on this sandbox's node, through its Node object. A node that's
+  // offline answers 503 naming it (and is noted, for the alarm); one that was
+  // removed, 410.
+  private async nodeOp(name: "create" | "start" | "stop" | "delete" | "streams", args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+    const p = this.onNode!.placement;
+    if ((await this.ctx.storage.get<string>("revokedNode")) === p.node) fail(410, removedMessage(p.name));
+    try {
+      const out = (await this.env.NODE.getByName(p.node).op(name, args, timeoutMs)) as Record<string, unknown>;
+      await this.setNodeDown(null);
+      return out;
+    } catch (e) {
+      const { status, message: why } = errorStatus(e);
+      if (status === 410) fail(410, removedMessage(p.name));
+      if (status === 503) {
+        const seen = /last seen (\d{4}-\d\d-\d\dT[\d:.]+Z)/.exec(why)?.[1];
+        const lastSeenAt = seen ? Date.parse(seen) : (this.nodeDown?.lastSeenAt ?? null);
+        await this.setNodeDown({ since: this.nodeDown?.since ?? Date.now(), lastSeenAt });
+        fail(503, /offline/.test(why) ? this.offline(lastSeenAt) : `node ${p.name}: ${why}`);
       }
-      const address = typeof answer.address === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(answer.address) ? answer.address : null;
-      if (!address) fail(502, "the node's agent didn't say where the machine is");
-      const placement: NodePlacement = { node, address, dev: true };
-      const now = Date.now();
-      this.record = {
-        id,
-        name,
-        size: "standard-2",
-        state: "running",
-        idleMinutes: 0,
-        createdAt: now,
-        updatedAt: now,
-        startedAt: now,
-        stoppedAt: null,
-        savedAt: null,
-        savedBytes: null,
-        error: null,
-        notice: "A development sandbox on a node (v0.2.2): it can't be saved or forked yet.",
-      };
-      this.place(placement);
-      await this.ctx.storage.put("node", placement);
-      await this.ctx.storage.put("selfToken", crypto.randomUUID());
-      await this.update({});
+      // An agent's own refusal ("[502] the node's agent answered: ...").
+      if (status === 502) fail(502, `node ${p.name}: ${why.replace(/^the node's agent answered: /, "")}`);
+      throw e;
+    }
+  }
+
+  // Makes the machine if it isn't there yet, and starts it; the agent answers
+  // once its entrypoint is ready, with its address.
+  private async startOnNode(r: SandboxRecord) {
+    const p = this.onNode!.placement;
+    const made = await this.nodeOp(
+      "create",
+      {
+        sandbox: r.id,
+        ...(this.env.NODE_IMAGE ? { image: this.env.NODE_IMAGE } : {}),
+        ...(p.cpus !== undefined ? { cpus: p.cpus } : {}),
+        ...(p.memoryMb !== undefined ? { memoryMb: p.memoryMb } : {}),
+      },
+      60_000,
+    );
+    const answer = await this.nodeOp("start", { sandbox: r.id }, 150_000);
+    const address = typeof answer.address === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(answer.address) ? answer.address : null;
+    if (!address) fail(502, `node ${p.name}'s agent didn't say where the machine is`);
+    if (address !== p.address) {
+      const next = { ...p, address };
+      await this.ctx.storage.put("node", next);
+      this.place(next);
+    }
+    // Its machine was removed outside Cloudex since it last ran.
+    if (made.created === true && r.startedAt !== null) {
+      await this.update({ notice: `Its machine was gone from node ${p.name}, so it started over from the image, without its files.` });
+    }
+  }
+
+  // Stops the machine (docker stop), keeping its disk.
+  private async stopMachine() {
+    this.streams.closeAll(1000, "the machine stopped");
+    await this.nodeOp("stop", { sandbox: this.mustRecord().id }, 60_000);
+  }
+
+  // cloudex stop, idle stop and stop from inside, on a node: no save and no
+  // backup, since the disk stays on the node.
+  private async stopOnNode() {
+    const r = this.mustRecord();
+    await this.update({ state: "stopping" });
+    try {
+      await this.stopMachine();
+    } catch (e) {
+      await this.update({ state: "running" });
       await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
-      return this.mustRecord();
-    });
+      const { status, message: why } = errorStatus(e);
+      fail(status === 500 ? 502 : status, `${why}; ${r.name ?? r.id} is still running`);
+    }
+    await this.ctx.storage.deleteAlarm();
+    await this.update({ state: "stopped", stoppedAt: Date.now(), error: null });
   }
 
-  // Stops or starts a development sandbox's machine (its disk stays).
-  async devLifecycle(node: string, action: "stop" | "start"): Promise<SandboxRecord> {
-    return this.exclusive(async () => {
-      const p = this.onNode?.placement;
-      if (!p || !this.record || p.node !== node) fail(404, "this sandbox isn't on that node");
-      const stub = this.env.NODE.getByName(p.node);
-      if (action === "stop") {
-        this.streams.closeAll(1000, "the machine stopped");
-        await stub.op("stop", { sandbox: this.record.id }, 60_000);
-        await this.update({ state: "stopped", stoppedAt: Date.now() });
-      } else {
-        const answer = (await stub.op("start", { sandbox: this.record.id }, 120_000)) as Record<string, unknown>;
-        if (typeof answer.address === "string" && answer.address !== p.address) {
-          this.place({ ...p, address: answer.address });
-          await this.ctx.storage.put("node", { ...p, address: answer.address });
-        }
-        await this.update({ state: "running", startedAt: Date.now(), error: null });
+  private async resumeOnNode(r: SandboxRecord, fromBackup: boolean, size?: SandboxSize): Promise<SandboxRecord> {
+    const name = r.name ?? r.id;
+    if (fromBackup) fail(400, `${name} runs on a node, which keeps its disk when it stops, so it has no backups; resume it without --from-backup`);
+    if (size && size !== r.size) fail(400, `sizes are for Cloudflare: ${name} runs on a node, with the CPUs and memory it was made with`);
+    if (r.state === "running") return this.shown(r);
+    if (r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
+    const p = this.onNode!.placement;
+    if ((await this.ctx.storage.get<string>("revokedNode")) === p.node) fail(410, removedMessage(p.name));
+    await this.boot();
+    await this.startHook();
+    return this.shown();
+  }
+
+  // Before a sandbox on a node is deleted: its machine and network go. On a
+  // node that's offline, that's a 503 unless force, which leaves a tombstone
+  // in the node's object; the node removes the machine when it's back. On a
+  // removed node there's nothing to reach.
+  private async removeMachine(r: SandboxRecord, force: boolean) {
+    const p = this.onNode!.placement;
+    this.streams.closeAll(1000, "the sandbox was deleted");
+    if ((await this.ctx.storage.get<string>("revokedNode")) === p.node) return;
+    try {
+      await this.nodeOp("delete", { sandbox: r.id }, 90_000);
+    } catch (e) {
+      const { status } = errorStatus(e);
+      if (status === 410) return;
+      if (status !== 503) throw e;
+      if (!force) {
+        fail(
+          503,
+          `${this.offline()}, so ${r.name ?? r.id}'s machine can't be removed now. Delete it anyway with --force (force=1); ` +
+            `node ${p.name} removes the machine when it's back`,
+        );
       }
-      return this.mustRecord();
+      await this.env.NODE.getByName(p.node).tombstone(r.id);
+      console.log(`[${r.id}] deleted while node ${p.node} is offline; it removes the machine when it's back`);
+    }
+  }
+
+  // A start or stop that a deploy or eviction cut off, on a node: the start
+  // may have gone on there, but keys, settings and tools weren't set up, so
+  // the machine is stopped again (now, or by the next reconcile), keeping
+  // its disk.
+  private async repairOnNode(r: SandboxRecord) {
+    const cutStart = r.state === "starting";
+    await this.update({
+      state: cutStart && !this.hasDisk(r) ? "error" : "stopped",
+      stoppedAt: Date.now(),
+      error: cutStart ? "start failed: it was cut off partway by an update or restart of the deployment; resume it to try again" : null,
+    });
+    void this.exclusive(() => this.stopMachine()).catch((e) => console.error(`[${r.id}] stopping the machine after a restart: ${message(e)}`));
+    console.log(`[${r.id}] was ${r.state} on a node after a restart; now ${this.record?.state}`);
+  }
+
+  // The alarm, for a sandbox running on a node: dead streams go, sessions
+  // whose token was revoked end, and idle stop and stop from inside run as
+  // on Cloudflare. There's no 6-hour limit. While the node is offline
+  // nothing here can act (its machine keeps running there), so it doesn't
+  // keep asking; after 10 minutes it tries once more.
+  private async alarmOnNode(r: SandboxRecord, stopRequested: boolean) {
+    await this.nodeAlarm();
+    const down = this.nodeDown !== null && Date.now() - this.nodeDown.since < 10 * 60_000;
+    if (!down && (stopRequested || this.idle())) {
+      try {
+        const stopped = await this.exclusive(async () => {
+          if (this.record?.state !== "running" || (!stopRequested && !this.idle())) return false;
+          await this.stopOnNode();
+          return true;
+        });
+        if (stopped) {
+          console.log(`[${r.id}] stopped ${stopRequested ? "from inside" : `after ${r.idleMinutes} idle minutes`}`);
+          return;
+        }
+      } catch (e) {
+        console.error(`[${r.id}] ${stopRequested ? "stop from inside" : "idle stop"} failed: ${message(e)}`);
+        if (stopRequested) await this.ctx.storage.put("stopRequested", true); // again at the next alarm
+      }
+    }
+    if (!down && (await this.ctx.storage.get("platform")) !== `${PLATFORM_VERSION}:${this.env.PREVIEW_ZONE || ""}`) {
+      await this.exclusive(async () => {
+        if (this.record?.state === "running") await this.applyPlatform();
+      }).catch((e) => console.error(`[${r.id}] ${message(e)}`));
+    }
+    if (this.record?.state !== "running") return;
+    await this.ctx.storage.setAlarm(Date.now() + ALARM_EVERY_MS);
+  }
+
+  // From the node's Node object (node.ts): the node went offline or came
+  // back, and with a report, what its agent says of the machine (on hello,
+  // and for each start and exit). Acted on only if this sandbox is on that
+  // node, one at a time with the lifecycle.
+  async nodeReport(node: string, rep: NodeReport): Promise<void> {
+    const p = this.onNode?.placement;
+    if (!p || p.node !== node || !this.record || this.removing) return;
+    if (!rep.online) {
+      await this.setNodeDown({ since: this.nodeDown?.since ?? Date.now(), lastSeenAt: rep.lastSeenAt });
+      return;
+    }
+    await this.setNodeDown(null);
+    const machine = rep.machine;
+    if (!machine) return;
+    await this.exclusive(async () => {
+      const r = this.record;
+      if (!r || this.removing) return;
+      const name = r.name ?? r.id;
+      const gone = `its machine is gone from node ${p.name} (removed there, outside Cloudex). Resume ${name} to start it over from the image, or delete it`;
+      switch (machineAction(r.state, machine)) {
+        case "mark-stopped":
+          console.log(`[${r.id}] its machine stopped on node ${p.node}`);
+          this.streams.closeAll(1000, "the machine stopped");
+          await this.ctx.storage.deleteAlarm();
+          await this.update({
+            state: "stopped",
+            stoppedAt: Date.now(),
+            error: null,
+            notice: `Its machine stopped on node ${p.name} without being asked to (the host restarted, it ran out of memory, or it was stopped there). Its disk is kept: resume it.`,
+          });
+          return;
+        case "mark-missing":
+          console.log(`[${r.id}] its machine is gone from node ${p.node}`);
+          this.streams.closeAll(1000, "the machine is gone");
+          await this.ctx.storage.deleteAlarm();
+          await this.update({ state: "error", stoppedAt: Date.now(), error: gone });
+          return;
+        case "note-missing":
+          if (r.error !== gone) await this.update({ error: gone });
+          return;
+        case "stop-machine":
+          console.log(`[${r.id}] its machine runs on node ${p.node} while it's ${r.state}; stopping it`);
+          await this.stopMachine().catch((e) => console.error(`[${r.id}] ${message(e)}`));
+          return;
+      }
     });
   }
 
-  // The node was removed (cloudex node rm): its streams close, and no more are taken.
-  async nodeRevoked(node: string) {
+  // The node was removed (cloudex node rm --force): its streams close, no
+  // more are taken, and the sandbox can't run again. machineDeleted: the node
+  // was online, and removed the machine first.
+  async nodeRevoked(node: string, machineDeleted = false) {
     if (this.onNode?.placement.node !== node) return;
     await this.ctx.storage.put("revokedNode", node);
     this.streams.closeAll(4003, "the node was removed");
+    const r = this.record;
+    if (!r || this.removing) return;
+    const name = this.onNode.placement.name;
+    await this.ctx.storage.deleteAlarm();
+    await this.update({
+      state: "error",
+      stoppedAt: r.stoppedAt ?? Date.now(),
+      error:
+        `node ${name} was removed (cloudex node rm --force); ` +
+        (machineDeleted ? "its machine was deleted with it. " : "its machine wasn't reachable then, and stays on that host until its agent is uninstalled there. ") +
+        "Delete this sandbox",
+    });
   }
 
   // Counts of this sandbox's node streams, and the colo this object runs in,
-  // for the release checks and measurements (GET /v1/nodes/{node}/dev-sandboxes/{id}).
+  // for the release checks and measurements (GET /v1/sandboxes/{ref}/node-streams,
+  // admins only).
   async nodeStreams(): Promise<{ spares: number; open: number; colo: string; objectId: string } | null> {
     if (!this.onNode) return null;
     let colo = "?";

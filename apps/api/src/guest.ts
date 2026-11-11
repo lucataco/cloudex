@@ -232,7 +232,7 @@ Commands:
   host --list             list the links made since Cloudex v0.1.14 that still work
   host --revoke-all       make every link to this sandbox stop working, the desktop's too
   set --idle <duration>   stop after this long without activity from now, such as 30m or 2h
-                          (0 leaves only the platform's 6-hour limit)
+                          (0: never; on Cloudflare, until the platform's 6-hour limit)
   set --name <name>       rename the sandbox
   stop                    save the disk and stop; everything running ends
   feedback "<message>"    report a bug or an idea to the Cloudex maintainers, as a public
@@ -273,6 +273,9 @@ def call(method, path="", body=None, quiet=False, timeout=120):
     except (urllib.error.URLError, OSError, ValueError) as e:
         if quiet:
             return None
+        if platform().get("node"):
+            die("the cloudex command doesn't work yet in a sandbox on a node: it can't reach the Cloudex API from here. "
+                "Use cloudex on your own computer instead")
         die("can't reach the Cloudex API from this sandbox: %s" % getattr(e, "reason", e))
 
 
@@ -296,8 +299,10 @@ def ago(ms):
     return "just now"
 
 
-def idle_text(n):
-    return "after %d minutes" % n if n else "off (6-hour platform limit)"
+def idle_text(n, on_node=False):
+    if n:
+        return "after %d minutes" % n
+    return "off" if on_node else "off (6-hour platform limit)"
 
 
 SECRETS = [
@@ -565,7 +570,10 @@ def print_sandbox(s):
     rows = [("ID", s["id"])]
     if s.get("name"):
         rows.append(("Name", s["name"]))
-    rows += [("State", s["state"]), ("Size", s["size"]), ("Idle stop", idle_text(s["idleMinutes"]))]
+    on_node = (s.get("placement") or {}).get("provider") == "node"
+    rows += [("State", s["state"]), ("Size", s["size"]), ("Idle stop", idle_text(s["idleMinutes"], on_node))]
+    if on_node:
+        rows.append(("Runs on", "node %s" % ((s["placement"].get("node") or {}).get("name") or "?")))
     if s.get("startedAt") and s["state"] == "running":
         rows.append(("Started", ago(s["startedAt"])))
     if s.get("forkedFrom"):
@@ -692,7 +700,8 @@ put() { # put PATH KEY MODE: write a file from the input, replacing it whole
   jq -j --arg k "$2" '.[$k]' <<<"$in" >"$1.new" && chmod "$3" "$1.new" && mv "$1.new" "$1"
 }
 install -d -m 755 /usr/local/lib/cloudex /etc/claude-code /etc/cloudex
-jq -n --arg v "$(jq -r .version <<<"$in")" --arg z "$zone" '{version: $v, zone: $z}' >/etc/cloudex/platform.json
+# $3 is "node" on a node (v0.2.2), where cloudex.internal doesn't answer yet.
+jq -n --arg v "$(jq -r .version <<<"$in")" --arg z "$zone" --arg w "$3" '{version: $v, zone: $z, node: ($w == "node")}' >/etc/cloudex/platform.json
 put /usr/local/lib/cloudex/relay.py relay 755
 # A cloudex installed in the sandbox by its user stays; ours carries the mark
 # at the top. (The real CLI holds the mark too, deep inside, in its copy of the API.)

@@ -29,8 +29,18 @@
 // - After hello comes welcome (M4): the image the deployment's machines run
 //   (NODE_IMAGE), which the agent pulls and checks against its own list.
 //
-// Later milestones add reconciling machines on hello (M5) and the tombstones of
-// machines deleted while the node was offline.
+// - Sandboxes on the node (M5). On hello it reconciles: each sandbox the
+//   index has on the node hears its machine's state (Sandbox.nodeReport),
+//   which decides what to do; machines of sandboxes deleted while the node
+//   was offline (tombstones, kept here) are removed; machines of no sandbox
+//   are left alone and listed (status). Each state message (a machine
+//   started or stopped) goes to its sandbox the same way, and the node going
+//   offline or coming back is told to every sandbox on it. Nothing here
+//   decides what runs: the Sandbox objects do (placement.ts).
+// - While a socket is open, an alarm every 3 minutes checks it's still
+//   answering, so that a node whose link died without a close shows offline
+//   without anything polling this object, which would keep it awake (an
+//   object kept busy drops its sockets a few minutes after each deploy).
 import { DurableObject } from "cloudflare:workers";
 import {
   NODE_MESSAGE_MAX,
@@ -44,9 +54,11 @@ import {
 } from "@cloudex/schema/node";
 import { BAD_SIGNATURE, rememberNonce } from "./nodeauth";
 import { issueTicket } from "./nodestream";
+import { sandboxesOnNode } from "./db";
 import { mirrorNode } from "./nodes";
 import { type ControlSocket, lastSign, newest, pick } from "./nodestate";
-import { fail } from "./util";
+import { type MachineReport, reconcilePlan } from "./placement";
+import { errorStatus, fail } from "./util";
 
 // Headers the Worker sets on the connect it passes here, after the signature
 // checked out; any the caller sent are overwritten.
@@ -56,13 +68,27 @@ export const CONNECT = {
   colo: "x-cx-internal-colo",
   continent: "x-cx-internal-continent",
   hint: "x-cx-internal-hint",
+  skew: "x-cx-internal-skew", // the agent's clock less the Worker's, in seconds, at connect
 } as const;
 
 type Attachment = { gen: number; acceptedAt: number; lastMessageAt: number | null; hello?: boolean };
 
-export type Hello = { version: string; protocol: number; facts: NodeFacts; machines: NodeMachine[]; at: number };
+export type Hello = { version: string; protocol: number; facts: NodeFacts; machines: NodeMachine[]; machinesError?: string; at: number };
 
-export type NodeStatus = { online: boolean; lastSeenAt: number | null; connectedAt: number | null; colo: string | null; hello: Hello | null };
+export type NodeStatus = {
+  online: boolean;
+  lastSeenAt: number | null;
+  connectedAt: number | null;
+  colo: string | null;
+  hello: Hello | null;
+  // Sandboxes deleted while the node was offline, whose machines it removes when it's back.
+  tombstones: string[];
+  // How far the agent's clock was from the Worker's at its last connect, in seconds.
+  clockSkewSec: number | null;
+};
+
+const STALE_CHECK_MS = 3 * 60_000;
+const TOMB = "tomb:";
 
 // Close codes 1005, 1006 and 1015 can't be sent (spike: a peer that drops
 // arrives as 1006, and passing it on to close() throws).
@@ -122,8 +148,78 @@ export class Node extends DurableObject<Env> {
   private async wentOffline(lastSeenAt: number) {
     const id = await this.ctx.storage.get<string>("id");
     await this.ctx.storage.put("lastSeenAt", lastSeenAt);
-    this.rejectAll("[503] the node went offline");
-    if (id) await mirrorNode(this.env.DB, id, { state: "offline", lastSeenAt }).catch((e) => console.error(`[${id}] ${e}`));
+    this.rejectAll(`[503] the node went offline (last seen ${new Date(lastSeenAt).toISOString()})`);
+    if (!id) return;
+    await mirrorNode(this.env.DB, id, { state: "offline", lastSeenAt }).catch((e) => console.error(`[${id}] ${e}`));
+    if (await this.ctx.storage.get<boolean>("revoked")) return;
+    this.ctx.waitUntil(this.tellSandboxes(id, () => ({ online: false, lastSeenAt })));
+  }
+
+  // Tells each sandbox the index has on this node.
+  private async tellSandboxes(id: string, report: (sandbox: string) => { online: boolean; lastSeenAt: number | null; machine?: MachineReport } | null) {
+    let ids: string[];
+    try {
+      ids = await sandboxesOnNode(this.env.DB, id);
+    } catch (e) {
+      console.error(`[${id}] listing its sandboxes: ${errorStatus(e).message}`);
+      return;
+    }
+    await Promise.all(
+      ids.map(async (sb) => {
+        const r = report(sb);
+        if (!r) return;
+        await this.env.SANDBOX.getByName(sb)
+          .nodeReport(id, r)
+          .catch((e: unknown) => console.error(`[${id}] telling ${sb}: ${errorStatus(e).message}`));
+      }),
+    );
+  }
+
+  // On hello: the node's machines against its sandboxes (placement.ts).
+  private async reconcile(id: string, hello: Hello) {
+    const tombstones = await this.tombstones();
+    let sandboxes: string[];
+    try {
+      sandboxes = await sandboxesOnNode(this.env.DB, id);
+    } catch (e) {
+      console.error(`[${id}] reconcile: listing its sandboxes: ${errorStatus(e).message}`);
+      return;
+    }
+    const plan = reconcilePlan({ machines: hello.machines, machinesKnown: !hello.machinesError, sandboxes, tombstones });
+    for (const sb of plan.deletes) this.ctx.waitUntil(this.removeTombstoned(sb));
+    const reports = new Map(plan.reports.map((r) => [r.id, r.machine]));
+    await this.tellSandboxes(id, (sb) => (plan.deletes.includes(sb) ? null : { online: true, lastSeenAt: hello.at, ...(reports.has(sb) ? { machine: reports.get(sb)! } : {}) }));
+    if (plan.orphans.length) console.log(`[${id}] machines of no sandbox, left alone: ${plan.orphans.join(" ")}`);
+  }
+
+  private async tombstones(): Promise<string[]> {
+    return [...(await this.ctx.storage.list<number>({ prefix: TOMB })).keys()].map((k) => k.slice(TOMB.length));
+  }
+
+  // A sandbox on this node was deleted while the node was offline (sandbox.ts
+  // removeMachine): its machine is removed when the node is back, at hello,
+  // or now if it's back already.
+  async tombstone(sandbox: string) {
+    if (!/^cx-[a-z0-9]{6}$/.test(sandbox)) fail(400, "not a sandbox id");
+    await this.ctx.storage.put(`${TOMB}${sandbox}`, Date.now());
+    if (this.current().use) this.ctx.waitUntil(this.removeTombstoned(sandbox));
+  }
+
+  private async removeTombstoned(sandbox: string) {
+    try {
+      await this.op("delete", { sandbox }, 90_000);
+      await this.ctx.storage.delete(`${TOMB}${sandbox}`);
+      console.log(`removed the machine of ${sandbox}, deleted while the node was offline`);
+    } catch (e) {
+      console.error(`removing the machine of ${sandbox}: ${errorStatus(e).message}; again at the next hello`);
+    }
+  }
+
+  // Every few minutes while a socket is open: one that stopped answering
+  // without a close is closed, and the node shows offline (current()).
+  async alarm() {
+    this.current();
+    if (this.sockets().length) await this.ctx.storage.setAlarm(Date.now() + STALE_CHECK_MS);
   }
 
   // The agent's control socket, passed on by the Worker (index.ts) once its
@@ -169,7 +265,8 @@ export class Node extends DurableObject<Env> {
       continent: h.get(CONNECT.continent) || null,
       locationHint: h.get(CONNECT.hint) || null,
     };
-    await this.ctx.storage.put({ gen, connectedAt: now, lastSeenAt: now, ...where });
+    const skew = Number(h.get(CONNECT.skew));
+    await this.ctx.storage.put({ gen, connectedAt: now, lastSeenAt: now, ...where, ...(Number.isFinite(skew) && h.get(CONNECT.skew) ? { clockSkewSec: Math.round(skew) } : {}) });
     // Online once it says hello (nodestate.ts).
     await mirrorNode(this.env.DB, id, { lastSeenAt: now, ...where }).catch((e) => console.error(`[${id}] ${e}`));
     return new Response(null, { status: 101, webSocket: client });
@@ -200,7 +297,14 @@ export class Node extends DurableObject<Env> {
         if (m.protocol !== NODE_PROTOCOL) {
           return this.close(ws, NodeClose.badMessage, `this deployment speaks node protocol ${NODE_PROTOCOL}; update the agent`);
         }
-        const hello: Hello = { version: m.version, protocol: m.protocol, facts: m.facts, machines: m.machines, at: now };
+        const hello: Hello = {
+          version: m.version,
+          protocol: m.protocol,
+          facts: m.facts,
+          machines: m.machines,
+          ...(m.machinesError ? { machinesError: m.machinesError } : {}),
+          at: now,
+        };
         await this.ctx.storage.put("hello", hello);
         await mirrorNode(this.env.DB, id, { state: "online", lastSeenAt: now, version: m.version, protocol: m.protocol, facts: m.facts });
         if (this.env.NODE_IMAGE) {
@@ -209,6 +313,10 @@ export class Node extends DurableObject<Env> {
             ws.send(JSON.stringify(welcome));
           } catch {}
         }
+        if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(now + STALE_CHECK_MS);
+        // Not awaited here: a sandbox busy starting waits on an op answer
+        // that comes on this socket.
+        this.ctx.waitUntil(this.reconcile(id, hello));
         return;
       }
       case "facts": {
@@ -217,12 +325,19 @@ export class Node extends DurableObject<Env> {
         await mirrorNode(this.env.DB, id, { lastSeenAt: now, facts: m.facts });
         return;
       }
-      case "state":
-        // M5 passes it to the machine's Sandbox object, which acts on it only
-        // if its record names this node. Nothing is stored for it here, so a
-        // node can't fill this object's storage with made-up machines.
+      case "state": {
+        // To the machine's Sandbox object, which acts on it only if its
+        // record names this node. Nothing is stored for it here, so a node
+        // can't fill this object's storage with made-up machines.
         console.log(`[${id}] machine ${m.machine.id} is ${m.machine.state}`);
+        const sb = m.machine.id;
+        this.ctx.waitUntil(
+          this.env.SANDBOX.getByName(sb)
+            .nodeReport(id, { online: true, lastSeenAt: now, machine: m.machine.state })
+            .catch((e: unknown) => console.error(`[${id}] telling ${sb}: ${errorStatus(e).message}`)),
+        );
         return;
+      }
       case "tickets": {
         const revoked = await this.ctx.storage.get<boolean>("revoked");
         const tickets = revoked ? [] : await Promise.all(Array.from({ length: m.count }, () => issueTicket(this.env.ADMIN_KEY, id, m.sandbox, now)));
@@ -264,18 +379,21 @@ export class Node extends DurableObject<Env> {
   // Whether the node is online now, for listing (index.ts).
   async status(): Promise<NodeStatus> {
     const { use, online } = this.current();
-    const s = await this.ctx.storage.get(["lastSeenAt", "connectedAt", "colo", "hello"]);
+    const s = await this.ctx.storage.get(["lastSeenAt", "connectedAt", "colo", "hello", "clockSkewSec"]);
     return {
       online,
       lastSeenAt: use ? lastSign(use) : ((s.get("lastSeenAt") as number | undefined) ?? null),
       connectedAt: (s.get("connectedAt") as number | undefined) ?? null,
       colo: (s.get("colo") as string | undefined) ?? null,
       hello: (s.get("hello") as Hello | undefined) ?? null,
+      tombstones: await this.tombstones(),
+      clockSkewSec: (s.get("clockSkewSec") as number | undefined) ?? null,
     };
   }
 
   // A request to the agent, answered within timeoutMs.
   async op(name: NodeOpName, args: Record<string, unknown> = {}, timeoutMs = 10_000): Promise<Record<string, unknown>> {
+    if (await this.ctx.storage.get<boolean>("revoked")) fail(410, "the node was removed");
     const { use } = this.current();
     if (!use) {
       const last = await this.ctx.storage.get<number>("lastSeenAt");
@@ -303,6 +421,7 @@ export class Node extends DurableObject<Env> {
   // cloudex node rm: the node is refused from now on, and its socket closes.
   async revoke() {
     await this.ctx.storage.put("revoked", true);
+    await this.ctx.storage.deleteAlarm();
     for (const s of this.sockets()) this.close(s.ws, NodeClose.revoked, "this node was removed");
     this.rejectAll("[410] the node was removed");
   }

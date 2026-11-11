@@ -4,10 +4,9 @@
 // - CloudflareCompute: a Cloudflare container owned by the Durable Object.
 // - NodeCompute (v0.2.2 M3): a machine on a node, a user's own Docker host,
 //   reached through stream sockets its agent opens into this object
-//   (nodestream.ts). Until M5 that's only a development sandbox (POST
-//   /v1/nodes/{node}/dev-sandboxes), whose machine the agent makes with its
-//   Docker runtime (M4), so the lifecycle calls here (start, snapshot) answer
-//   501 until M5.
+//   (nodestream.ts). Its lifecycle (create, start, stop, delete) goes through
+//   the node's Node object as ops, which sandbox.ts calls itself (M5), so
+//   start, snapshot and destroy here are never used for it.
 //
 // Each call keeps the shape of the platform call it stands for. Deadlines stay
 // with the caller (sandbox.ts), except where noted.
@@ -167,11 +166,10 @@ export class CloudflareCompute implements Compute {
 
 // ---------------------------------------------------------------- nodes
 
-// A sandbox's place on a node: which node, and the machine's address there.
-export type NodePlacement = { node: string; address: string; dev: true };
-
-const notYet = (what: string): never =>
-  fail(501, `${what} isn't available for a sandbox on a node yet (v0.2.2 runs only development sandboxes there until M5); delete it instead`);
+// A sandbox's place on a node (v0.2.2 M5): which node (its id, and its name
+// for messages), the machine's address there (empty until its first start),
+// and the limits it was made with.
+export type NodePlacement = { node: string; name: string; address: string; cpus?: number; memoryMb?: number };
 
 // A preview's request headers, as the node's agent sends them on.
 function headerList(req: Request): [string, string][] {
@@ -185,13 +183,14 @@ const NO_BODY = new Set([101, 204, 205, 304]);
 export class NodeCompute implements Compute {
   readonly kind = "node";
   readonly caPath = "/etc/cloudex/node-ca.crt"; // M6
-  readonly running = true;
+  // Never a container of this object's: what runs on the node is the node's
+  // Node object's to report (sandbox.ts nodeReport), so the checks that ask
+  // Cloudflare's binding whether a box is left over stay out of it.
+  readonly running = false;
 
   constructor(
     private readonly streams: NodeStreams,
     readonly placement: NodePlacement,
-    // Has the node's agent remove the machine and its network.
-    private readonly remove: () => Promise<void>,
   ) {}
 
   get guestAddress() {
@@ -199,24 +198,24 @@ export class NodeCompute implements Compute {
   }
 
   start(): void {
-    notYet("starting");
+    fail(500, "a node's machine is started through its Node object");
   }
   monitor(): Promise<void> {
-    // M5: the node's state messages. A development machine never exits by itself here.
+    // Exits come from the node's state messages (sandbox.ts nodeReport).
     return new Promise(() => {});
   }
   async route() {
     // cloudex.internal and provider calls on a node go through its agent (M6).
   }
   async keepAlive() {
-    // A node has no platform timer.
+    // A node has no platform timer, and no 6-hour limit.
   }
   snapshot(): Promise<{ id: string; size?: number }> {
-    return notYet("saving its disk");
+    return fail(501, "a sandbox on a node has no disk snapshots");
   }
   async destroy() {
+    // A node's machine is removed through its Node object (sandbox.ts removeMachine).
     this.streams.closeAll(1000, "the sandbox was deleted");
-    await withTimeout(this.remove(), 60_000, "removing the machine").catch((e) => console.error(`removing the machine: ${e instanceof Error ? e.message : e}`));
   }
 
   async exec(argv: string[], o: ExecOpts = {}): Promise<Proc> {

@@ -66,13 +66,14 @@ import {
 import { serveDashboard } from "./dashboard";
 import { CONNECT } from "./node";
 import { HEADERS, issueJoinToken, readCapped, useJoinToken, verifyJoinSignature, verifyNodeRequest } from "./nodeauth";
-import { addNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodePublicKey, revokeNode } from "./nodes";
+import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodePublicKey, revokeNode } from "./nodes";
+import { placeOn, refused } from "./placement";
 import { locationHint } from "./nodestate";
 import { readTicket } from "./nodestream";
 import { notFromDashboard, readSession, sessionCookie, sessionName } from "./session";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, keyRefusal, listKeys, setKey } from "./keys";
-import { NO_SUCH_SANDBOX, type ForkSource } from "./sandbox";
+import { NO_SUCH_SANDBOX, type ForkSource, type NodeChoice } from "./sandbox";
 import { type SaveManifest, deleteSave, getSave, listSaves, readManifest } from "./saves";
 import {
   LINK_HEADER,
@@ -234,6 +235,7 @@ app.get("/v1/node/connect", async (c) => {
   fwd.headers.set(CONNECT.colo, typeof cf?.colo === "string" ? cf.colo.slice(0, 8) : "");
   fwd.headers.set(CONNECT.continent, typeof cf?.continent === "string" ? cf.continent.slice(0, 4) : "");
   fwd.headers.set(CONNECT.hint, locationHint(cf) ?? "");
+  fwd.headers.set(CONNECT.skew, String(Number(v.signed.ts) - Math.floor(Date.now() / 1000)));
   return c.env.NODE.getByName(v.signed.node).fetch(fwd);
 });
 
@@ -346,14 +348,41 @@ async function sandbox(env: Env, ref: string) {
 
 app.post("/v1/sandboxes", async (c) => {
   const body = await c.req.text();
-  const input = CreateSandbox.parse(body ? JSON.parse(body) : {});
+  const { node, cpus, memoryMb, ...input } = CreateSandbox.parse(body ? JSON.parse(body) : {});
+  if (!node && (cpus !== undefined || memoryMb !== undefined)) {
+    return c.json({ error: "cpus and memoryMb go with node: on Cloudflare, pick a size instead" }, 400);
+  }
+  // On a node (v0.2.2 M5): it must be online, pass its self-test and allow
+  // the caller (placement.ts). Its Sandbox object is made near the node, a
+  // hint that counts only when an object is created (M0 Q3).
+  let on: NodeChoice | undefined;
+  let hint: DurableObjectLocationHint | null = null;
+  if (node) {
+    const found = await findNode(c.env.DB, node);
+    if (!found) return c.json({ error: `no node named ${node}` }, 404);
+    const n = await live(c.env, found, true);
+    const who = c.get("who");
+    const placed = placeOn(n, { ownOnly: who.kind === "token" && who.token.ownOnly }, { size: input.size, cpus, memoryMb });
+    if (refused(placed)) return c.json({ error: placed.error }, placed.status as 400);
+    on = { node: n.id, name: n.name, cpus: placed.cpus, memoryMb: placed.memoryMb };
+    hint = n.locationHint as DurableObjectLocationHint | null;
+  }
   if (input.name && (await nameTaken(c.env.DB, input.name))) {
     return c.json({ error: `the name ${input.name} is taken` }, 409);
   }
   const id = newSandboxId();
   await setOwner(c.env.DB, id, c.get("who"));
-  const s = await c.env.SANDBOX.getByName(id).create(id, { ...input, name: input.name ?? null });
-  return c.json(s, 201);
+  const stub = c.env.SANDBOX.getByName(id, hint ? { locationHint: hint } : undefined);
+  try {
+    return c.json(await stub.create(id, { ...input, name: input.name ?? null }, undefined, undefined, on), 201);
+  } catch (e) {
+    // A deploy (or a restart of its object) that cut the start off: the
+    // sandbox is kept, in the state its object settled on.
+    if (!on || errorStatus(e).status !== 500) throw e;
+    const now = await stub.get().catch(() => null);
+    if (!now) throw e;
+    fail(503, `the deployment was updated or restarted while ${now.name ?? now.id} was starting on node ${on.name}; it's kept, in state ${now.state}: resume it, or delete it`);
+  }
 });
 
 app.get("/v1/sandboxes", async (c) => {
@@ -379,8 +408,11 @@ app.post("/v1/sandboxes/:ref/resume", async (c) => {
 
 app.delete("/v1/sandboxes/:ref", async (c) => {
   const { id, stub } = await sandbox(c.env, c.req.param("ref"));
+  // force: a sandbox on a node that's offline goes now, and its node removes
+  // the machine when it's back.
+  const force = ["1", "true"].includes(c.req.query("force") ?? "");
   try {
-    return c.json(await stub.remove());
+    return c.json(await stub.remove(force));
   } catch (e) {
     // An index row left behind by a delete that failed partway goes too, so
     // that it doesn't keep holding its name.
@@ -723,11 +755,26 @@ app.patch("/v1/sandboxes/:ref/settings", async (c) => {
 // Nodes (nodes.ts, node.ts): adding and removing are for admins (rules.ts).
 // D1 has what each agent last reported; whether it's online is its Node
 // object's to say.
-async function live(env: Env, n: ApiNode): Promise<ApiNode> {
+// With details: the machine image as the agent last reported it, and the
+// machines it runs that belong to no sandbox, and the sandboxes deleted while
+// it was offline (GET /v1/nodes/{node}, and placing a sandbox).
+async function live(env: Env, n: ApiNode, details = false): Promise<ApiNode> {
   if (n.state !== "online" && n.state !== "offline") return n;
   try {
     const s = await withTimeout(env.NODE.getByName(n.id).status(), 3000, "the node's status");
-    return { ...n, state: s.online ? "online" : "offline", lastSeenAt: s.lastSeenAt ?? n.lastSeenAt };
+    const out: ApiNode = { ...n, state: s.online ? "online" : "offline", lastSeenAt: s.lastSeenAt ?? n.lastSeenAt };
+    if (!details) return out;
+    const image = s.hello?.facts.image;
+    const mine = new Set(await sandboxesOnNode(env.DB, n.id));
+    const tomb = new Set(s.tombstones);
+    const orphans = (s.hello?.machines ?? []).map((m) => m.id).filter((id) => !mine.has(id) && !tomb.has(id));
+    return {
+      ...out,
+      ...(image ? { image } : {}),
+      orphans,
+      pendingDeletes: s.tombstones,
+      ...(s.clockSkewSec !== null ? { clockSkewSec: s.clockSkewSec } : {}),
+    };
   } catch (e) {
     console.error(`[${n.id}] status: ${errorStatus(e).message}`);
     return n;
@@ -750,16 +797,22 @@ app.post("/v1/nodes", async (c) => {
   return c.json({ node, joinToken: token, expiresAt, install: installCommand(origin, token) } satisfies NewNode, 201);
 });
 
-app.get("/v1/nodes", async (c) => c.json(await Promise.all((await listNodeRows(c.env.DB)).map((n) => live(c.env, n)))));
+// live=false answers from the index alone, as each Node object last wrote
+// it, without asking the objects: the dashboard polls that way, since an
+// object kept busy drops its node's socket a few minutes after each deploy.
+app.get("/v1/nodes", async (c) => {
+  const rows = await listNodeRows(c.env.DB);
+  if (["0", "false"].includes(c.req.query("live") ?? "")) return c.json(rows);
+  return c.json(await Promise.all(rows.map((n) => live(c.env, n))));
+});
 
 app.get("/v1/nodes/:node", async (c) => {
-  const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")));
+  const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")), true);
   if (n.state !== "online") return c.json(n);
-  const image = (await c.env.NODE.getByName(n.id).status().catch(() => null))?.hello?.facts.image;
   const t0 = Date.now();
   try {
     await c.env.NODE.getByName(n.id).op("ping", {}, 5000);
-    return c.json({ ...n, rttMs: Date.now() - t0, ...(image ? { image } : {}) });
+    return c.json({ ...n, rttMs: Date.now() - t0 });
   } catch (e) {
     console.error(`[${n.id}] ping: ${errorStatus(e).message}`);
     return c.json(n);
@@ -777,51 +830,40 @@ app.delete("/v1/nodes/:node", async (c) => {
   if (n.machines > 0 && !force) {
     fail(409, `node ${n.name} still has ${n.machines} sandbox${n.machines === 1 ? "" : "es"}: delete ${n.machines === 1 ? "it" : "them"} first, or remove the node anyway with --force`);
   }
+  const ids = await sandboxesOnNode(c.env.DB, n.id);
+  // Removed anyway (force) while it's online: the machines go first, so
+  // nothing is left running on a host that can't be reached any more.
+  const deleted = new Set<string>();
+  const online = ids.length > 0 && (await live(c.env, n)).state === "online";
+  if (online) {
+    await Promise.all(
+      ids.map(async (id) => {
+        try {
+          await c.env.NODE.getByName(n.id).op("delete", { sandbox: id }, 90_000);
+          deleted.add(id);
+        } catch (e) {
+          console.error(`[${n.id}] removing the machine of ${id}: ${errorStatus(e).message}`);
+        }
+      }),
+    );
+  }
   // D1 first, so its key stops working at once; then the socket closes, and
-  // its sandboxes close the node's stream sockets and take no more.
+  // its sandboxes close the node's stream sockets, take no more, and show
+  // that their node is gone.
   await revokeNode(c.env.DB, n.id);
   await c.env.NODE.getByName(n.id).revoke();
-  for (const id of await sandboxesOnNode(c.env.DB, n.id)) {
+  for (const id of ids) {
     await c.env.SANDBOX.getByName(id)
-      .nodeRevoked(n.id)
+      .nodeRevoked(n.id, deleted.has(id))
       .catch((e: unknown) => console.error(`[${id}] node revoked: ${errorStatus(e).message}`));
   }
   return c.json({ revoked: n.id });
 });
 
-// The development path (v0.2.2 M3, M4), for admins only (rules.ts leaves it
-// to its default): a sandbox on a node, whose machine the node's agent makes
-// with its Docker runtime and starts at once. stop and start below drive its
-// machine. Placing sandboxes on nodes for real is M5's POST /v1/sandboxes.
-const DevSandbox = z.object({
-  name: Name.optional(),
-  cpus: z.number().min(0.25).max(1024).optional(),
-  memoryMb: z.number().int().min(512).max(16 * 1024 * 1024).optional(),
-});
-
-app.post("/v1/nodes/:node/dev-sandboxes", async (c) => {
-  const n = await live(c.env, await mustFindNode(c.env.DB, c.req.param("node")));
-  if (n.state !== "online") fail(503, `node ${n.name} is ${n.state}`);
-  const text = await c.req.text();
-  const { name, cpus, memoryMb } = DevSandbox.parse(text ? JSON.parse(text) : {});
-  if (name && (await nameTaken(c.env.DB, name))) return c.json({ error: `the name ${name} is taken` }, 409);
-  const id = newSandboxId();
-  await setOwner(c.env.DB, id, c.get("who"));
-  const hint = n.locationHint as DurableObjectLocationHint | null;
-  const s = await c.env.SANDBOX.getByName(id, hint ? { locationHint: hint } : undefined).createDev(id, n.id, name ?? null, { cpus, memoryMb });
-  return c.json(s, 201);
-});
-
-app.post("/v1/nodes/:node/dev-sandboxes/:ref/:action{stop|start}", async (c) => {
-  const n = await mustFindNode(c.env.DB, c.req.param("node"));
-  const s = await resolve(c.env, c.req.param("ref"));
-  if (!s) fail(404, `no sandbox named ${c.req.param("ref")}`);
-  return c.json(await s.stub.devLifecycle(n.id, c.req.param("action") as "stop" | "start"));
-});
-
-// A development sandbox's node streams (spares and open ones) and where its
-// object runs, for the release checks.
-app.get("/v1/nodes/:node/dev-sandboxes/:ref", async (c) => {
+// A sandbox's node streams (spares and open ones), where its object runs and
+// its object's id, for the release checks and measurements (admins only:
+// rules.ts leaves it to its default; not in the OpenAPI document).
+app.get("/v1/sandboxes/:ref/node-streams", async (c) => {
   const s = await resolve(c.env, c.req.param("ref"));
   const out = s ? await s.stub.nodeStreams() : null;
   if (!out) fail(404, `no sandbox on a node named ${c.req.param("ref")}`);
