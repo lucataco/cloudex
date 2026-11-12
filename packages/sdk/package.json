@@ -1,6 +1,6 @@
 {
   "name": "cloudex",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "SDK for Cloudex: agent sandboxes in your own Cloudflare account",
   "license": "MIT",
   "repository": {
