@@ -11,20 +11,9 @@ import urllib.request
 from cloudex import Cloudex, CloudexError
 
 prefix = sys.argv[1]
-# With $VERIFY_NODE, its sandbox runs on that node, a save of it starts back on
-# that node, and what isn't on nodes in v0.2.2 (forks) must be refused with a
-# 501 instead.
+# With $VERIFY_NODE, its sandbox runs on that node, its forks are made on that
+# node (v0.2.3), and a save of it starts back on that node.
 node = os.environ.get("VERIFY_NODE") or None
-
-
-def refused(what, call):
-    try:
-        call()
-    except CloudexError as e:
-        assert e.status == 501, f"{what} on a node: {e.status} {e}"
-        print("skip", what, "(not on nodes in v0.2.2; refused with 501 as it should be)")
-        return
-    raise AssertionError(f"{what} on a node wasn't refused")
 cx = Cloudex()
 made, saves = [], []
 
@@ -118,7 +107,11 @@ try:
         assert box.placement["provider"] == "node" and box.placement["node"]["name"] == node
         assert any(n.name == node for n in cx.nodes.list(live=False))
         step("create on a node, placement, nodes.list")
-        refused("fork", lambda: box.fork(count=2, name=f"{prefix}-f"))
+        forks = box.fork(count=2, name=f"{prefix}-f", cpus=1, memory_mb=1024)
+        made += forks
+        assert len(forks) == 2 and forks[1].exec("cat ~/marker").stdout == "forked\n"
+        assert all(f.placement["node"]["name"] == node and f.placement["memoryMb"] == 1024 for f in forks), [f.placement for f in forks]
+        step("fork on a node, with cpus and memory_mb")
         save = box.save(f"{prefix}-save")
         saves.append(save.name)
         assert save.node and save.node["name"] == node, save.node

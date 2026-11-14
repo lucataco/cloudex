@@ -14,8 +14,10 @@
 # which runs cloudex deploy with $CLOUDFLARE_API_TOKEN), VERIFY_NODE_LONG=1 (N12's 30 idle
 # minutes, and with VERIFY_NODE_DEPLOY=1 N13's deploy during an scp), VERIFY_NODE_REBOOT=1
 # (N23 reboots the host), and with VERIFY_NODE_DEPLOY=1, N44's deploy during a node save;
-# VERIFY_NODE_PARTS (default "m3 m4 m5 m6 review direct") runs only those milestones' checks
-# after the install. The direct path (v0.2.3, N57-N66): VERIFY_NODE_DIRECT=1 says this machine
+# VERIFY_NODE_PARTS (default "m3 m4 m5 m6 review direct forks") runs only those milestones' checks
+# after the install. Forks on nodes (v0.2.3, N67-N76): VERIFY_NODE_FORK_MB (default 1024) is what
+# the original writes before it's forked, and VERIFY_NODE_FORK_DEPLOY_MB (default 3072) what the
+# sandbox forked during N76's deploy writes. The direct path (v0.2.3, N57-N66): VERIFY_NODE_DIRECT=1 says this machine
 # reaches the node's direct addresses, VERIFY_NODE_DIRECT_CLASS (lan-onlink or tailnet) the class
 # the race should win with, VERIFY_NODE_DIRECT_ADDR (comma list) the installer's --direct-addr,
 # VERIFY_NODE_DIRECT_STALE an address with no host for N59, and VERIFY_NODE_ALLOW_ARCH the
@@ -23,8 +25,8 @@
 # VERIFY_NODE_INSTALL_ARGS more installer options (--direct off for a v0.2.2 agent).
 # VERIFY_NODE=<node> (v0.2.2): the lifecycle, connect, inside, agents, tokens, dashboard, sdk
 # and browser areas make their sandboxes on that node, which must be online (cloudex node
-# add, then its installer), instead of on Cloudflare; what isn't on nodes yet (forks, sizes
-# and backups) SKIPs, saying why, once the API has refused it as it should.
+# add, then its installer), instead of on Cloudflare; what isn't on nodes (sizes and backups)
+# SKIPs, saying why, once the API has refused it as it should. Forks are made on the node.
 # Prints one PASS/FAIL/SKIP line per check, writes results.tsv, exits 1 on any FAIL.
 set -uo pipefail
 
@@ -49,7 +51,7 @@ P=vr$(date +%H%M%S)
 ON=()
 [[ -n ${VERIFY_NODE:-} ]] && ON=(--on "$VERIFY_NODE")
 on_node() { [[ -n ${VERIFY_NODE:-} ]]; }
-NOT_ON_NODES="not on nodes in v0.2.2"
+NOT_ON_NODES="not on nodes in v0.2.3"
 API_URL=$(jq -r .apiUrl "$CLOUDEX_CONFIG_DIR/config.json")
 ZONE=$(jq -r '.previewZone // empty' "$CLOUDEX_CONFIG_DIR/config.json")
 fails=0
@@ -208,13 +210,14 @@ if want lifecycle; then
 	cx exec "$A" -- 'cat ~/vr-home /opt/vr-sys; test -f /tmp/vr-started && echo started; echo $VR_ONE'
 	ok L13 "resume keeps the disk, runs ~/.cloudex/start, keeps env" is "$OUT" "$(printf 'kept\nkept\nstarted\n1')"
 	if on_node; then
-		# Refused, as they should be (N34 checks the messages): then SKIP, saying why.
-		# What follows uses $P-f-1 and $P-s, which are made on the node instead.
+		# v0.2.3 M5: forks of a node sandbox, on that node.
 		cx fork "$A" --count 2 --name "$P-f"
-		if [[ $CODE == 0 ]]; then fail L14 "a fork on a node is refused" "it was made: ${OUT:0:200}"; else
-			skip L14 "fork --count 2 makes two named forks" "$NOT_ON_NODES: forks (refused: $(grep -m1 "^error:" <<<"$ERR" | cut -c8-127))"
-			skip L15 "a fork has the disk and settings" "$NOT_ON_NODES: forks"
-		fi
+		ok L14 "fork --count 2 makes two named forks, on the node" [ "$(field 'map(.name) | sort | join(",")')" = "$P-f-1,$P-f-2" -a "$(field '.[0].forkedFrom')" = "$A_ID" \
+			-a "$(field '[.[].placement.node.name] | unique | join(",")')" = "$VERIFY_NODE" ]
+		cx exec "$P-f-1" -- 'cat ~/vr-home /opt/vr-sys; echo $VR_ONE'
+		ok L15 "a fork has the disk and settings" is "$OUT" "$(printf 'kept\nkept\n1')"
+		cx new --from "$A" --on "$P-nowhere" --no-use
+		ok L31 "a fork onto another node is refused: it stays where its original is" [ "$CODE" != 0 -a "$(has "$ERR" "stays on node $VERIFY_NODE" && echo y)" = y ]
 		# Named saves (M6): made on the node, and started from on it.
 		cx save "$A" "$P-base"
 		ok L16 "save makes a named save, and says it was made on the node" [ "$(field .name)" = "$P-base" -a "$(field .replaced)" = false -a "$(field .node.name)" = "$VERIFY_NODE" ]
@@ -229,12 +232,13 @@ if want lifecycle; then
 		for c in "L21 resume --size changes the size" "L22 resume --from-backup says what it restored" "L23 the backup brings /home back and nothing else"; do
 			skip "${c%% *}" "${c#* }" "$NOT_ON_NODES: sizes and backups are Cloudflare's; resume --size and --from-backup refuse with a 400 (N34)"
 		done
-		"$CX" new --name "$P-f-1" --no-use "${ON[@]}" >/dev/null 2>&1
 	else
 		cx fork "$A" --count 2 --name "$P-f"
 		ok L14 "fork --count 2 makes two named forks" [ "$(field 'map(.name) | sort | join(",")')" = "$P-f-1,$P-f-2" -a "$(field '.[0].forkedFrom')" = "$A_ID" ]
 		cx exec "$P-f-1" -- 'cat ~/vr-home /opt/vr-sys; echo $VR_ONE'
 		ok L15 "a fork has the disk and settings" is "$OUT" "$(printf 'kept\nkept\n1')"
+		cx new --from "$A" --on "$P-nowhere" --no-use
+		ok L31 "a fork onto a node is refused: it stays where its original is" [ "$CODE" != 0 -a "$(has "$ERR" "stays on Cloudflare" && echo y)" = y ]
 		cx save "$A" "$P-base"
 		ok L16 "save makes a named save" [ "$(field .name)" = "$P-base" -a "$(field .replaced)" = false ]
 		cx save "$A" "$P-base"
@@ -1200,7 +1204,7 @@ M5_CHECKS=("N26 a node that goes offline shows offline, with when it was last se
 	"N31 the WHERE column says where each sandbox runs: the node, then the node (offline) while it's offline"
 	"N32 new --on --cpus 2 --memory 2G gives the machine exactly those limits (docker inspect), and info shows them"
 	"N33 an own-only token can't place a sandbox on a node whose isolation is plain Docker (or none); a token that isn't own-only can"
-	"N34 forks, resume --size and --from-backup on a node refuse with a message that says why, and so do a fork onto a node and new --from <sandbox> --on"
+	"N34 resume --size and --from-backup on a node refuse with a message that says why, and so do fork --size and a fork onto another node (new --from <sandbox> --on, and the API's node)"
 	"N35 removing a node with a sandbox needs --force; then its machine is deleted, and the sandbox stays, in error, saying so, until it's deleted")
 m5_skip() { for c in "${M5_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
 m5_desc() { for c in "${M5_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
@@ -1259,17 +1263,17 @@ node_m5() {
 		cx "$@"
 		[[ $CODE != 0 && $ERR == *"$want"* ]] || r="$r $what: code $CODE, ${ERR:0:120};"
 	}
-	refused fork "forks aren't available for a sandbox on a node" fork "$S5" --name "$P-n5f"
+	refused "fork --size" "sizes are for Cloudflare" fork "$S5" --name "$P-n5f" --size standard-4
 	refused "resume --size" "sizes are for Cloudflare" resume "$S5" --size standard-4
 	"$CX" stop "$S5" >/dev/null 2>&1
 	refused "resume --from-backup" "so it has no backups" resume "$S5" --from-backup
-	refused "new --from <sandbox> --on" "forks can't start on a node" new --on "$N" --from "$S5"
+	refused "new --from <sandbox> --on another node" "stays on node $N" new --on "$P-elsewhere" --from "$S5"
 	"$CX" resume "$S5" >/dev/null 2>&1
-	# A fork of a Cloudflare sandbox onto a node, through the API (the CLI refuses it first).
+	# A fork onto another node, through the API.
 	local fc
 	fc=$(curl -s -o "$work/b" -w '%{http_code}' --max-time 30 -X POST -H "authorization: Bearer $(jq -r .apiKey "$src_cfg/config.json")" \
-		-H 'content-type: application/json' -d "{\"node\":\"$N\"}" "$API_URL/v1/sandboxes/$S5ID/fork")
-	[[ $fc == 400 && $(jq -r .error "$work/b") == *"not on a node"* ]] || r="$r API fork with node: $fc $(head -c 120 "$work/b");"
+		-H 'content-type: application/json' -d "{\"node\":\"$P-elsewhere\"}" "$API_URL/v1/sandboxes/$S5ID/fork")
+	[[ $fc == 400 && $(jq -r .error "$work/b") == *"stays on node $N"* ]] || r="$r API fork with another node: $fc $(head -c 120 "$work/b");"
 	OUT="${r:-all refused, each saying why}" CODE=""
 	ok N34 "$(m5_desc N34)" [ -z "$r" ]
 
@@ -1830,7 +1834,7 @@ node_review_host() {
 		local floor droot fill took least
 		floor=$(node_sh "docker inspect cloudex-node -f '{{json .Args}}'" | jq -r '(index(["--keep-free-gb"])) as $i | if $i then .[$i + 1] else "5" end')
 		droot=$(node_sh "docker info -f '{{.DockerRootDir}}'")
-		fill="$(dirname "$droot")/cloudex-verify-fill-$P"
+		fill="$droot/cloudex-verify-fill-$P" # on Docker's own filesystem, which may be a mount of its own
 		node_sh "sudo fallocate -l \$(df -B1 --output=avail $droot | tail -1 | awk '{printf \"%d\", \$1 - ($floor + 4) * 1e9}') $fill"
 		"$CX" exec "$P-h2" -- 'nohup dd if=/dev/zero of=/home/cloudex/fill bs=4M status=none >/dev/null 2>&1 &' >/dev/null 2>&1
 		least=999 took=""
@@ -2481,6 +2485,359 @@ node_direct() {
 	"$CX" delete "$SD" --yes >/dev/null 2>&1
 }
 
+# Forks on nodes (v0.2.3 M5, N67-N76): the agent commits the original's
+# machine into one image per fork point, which that point's forks share; the
+# image goes with the last of them, an orphan is swept, and the uninstaller
+# removes what's left (N75, after N25). VERIFY_NODE_FORK_MB (default 1024) is
+# how much the original writes before it's forked: the commit's time, and a
+# running original's pause, grow with it (about 2.3 s per GiB on overlay2,
+# 12.5 on the containerd image store, far more on an emulated host).
+FORKS_CHECKS=("N67 a fork of a running node sandbox has its files and settings, runs on the same node, and the original keeps running, paused only while its disk is copied, which fork says first"
+	"N68 a fork of a stopped node sandbox works, and the original stays stopped"
+	"N69 new --from <sandbox> --count 3 makes three sandboxes on the node from one image"
+	"N70 deleting the original leaves its forks working; deleting the last fork of a point removes its image, parents before children or after; delete --force while the node is offline removes it at the reconnect; an orphaned fork image is swept"
+	"N71 a fork onto another node, with --size, on an offline node, with a token that can't place sandboxes there, and below the disk floor is refused with a message that says why; the disk watchdog's notice counts fork images"
+	"N72 a fork has its own identity: hostname, CLOUDEX_SANDBOX, no CLOUDEX_HOLD, a new boot id and self token, and cloudex info inside names it; its image names the original only in its fork labels"
+	"N73 a fork of a fork of a fork works, each one image layer deeper"
+	"N74 under Sysbox, Docker inside a fork of a running and of a stopped original has the original's images and runs a container"
+	"N75 the uninstaller removes fork images, with --keep-images too"
+	"N76 a deploy during a fork's commit leaves no stray image after the sweep, and the fork asked again makes one image")
+forks_skip() { for c in "${FORKS_CHECKS[@]}"; do [[ -z ${2:-} || " $2 " == *" ${c%% *} "* ]] && skip "${c%% *}" "${c#* }" "$1"; done; }
+forks_desc() { for c in "${FORKS_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
+# This node's fork images, optionally only those with a label (k=v): their count.
+fork_count() { node_sh "docker image ls -q --no-trunc --filter label=build.cloudex.role=fork --filter label=build.cloudex.node=$nid ${1:+--filter label=$1}" | sort -u | grep -c .; }
+ctr_image() { node_sh "docker inspect cloudex-$1 -f '{{.Image}}'" 2>/dev/null; }
+ctr_point() { node_sh "docker inspect cloudex-$1 -f '{{index .Config.Labels \"build.cloudex.point\"}}'" 2>/dev/null; }
+img_layers() { node_sh "docker image inspect $1 -f '{{len .RootFS.Layers}}'" 2>/dev/null; }
+sb_id() { "$CX" info "$1" --json 2>/dev/null | jq -r '.id // empty'; }
+sb_state() { "$CX" info "$1" --json 2>/dev/null | jq -r '.state // empty'; }
+# The pause Docker recorded for a container since T (the host's unix s): pause to unpause, in s.
+pause_of() { node_sh "docker events --since $2 --until \$(date +%s) --filter container=$1 --filter event=pause --filter event=unpause --format '{{.Action}} {{.TimeNano}}'" | awk '$1 == "pause" { p = $2 } $1 == "unpause" && p { printf "%.2f", ($2 - p) / 1e9; p = "" }'; }
+FORKS_RAN="" FORK_BASE=""
+# okv ID DESC CONDITION...: as ok, with all of $OUT in the line either way.
+okv() {
+	local id=$1 desc=$2
+	shift 2
+	if "$@" >/dev/null 2>&1; then pass "$id" "$desc" "$OUT"; else fail "$id" "$desc" "$OUT"; fi
+}
+# The points of this node's fork images left, for the details.
+fork_left() { node_sh "docker image ls --filter label=build.cloudex.role=fork --filter label=build.cloudex.node=$nid --format '{{.Tag}}'" | sort -u | tr '\n' ' '; }
+
+node_forks() {
+	local K=$P-k KID KMC BASEIMG mb=${VERIFY_NODE_FORK_MB:-1024} iso t0 t0h took
+	FORKS_RAN=1
+	wait_iso 0 >/dev/null
+	iso=$("$CX" node info "$N" --json 2>/dev/null | jq -r 'if .isolation.unisolated then "none" else .runtime end')
+	for _ in $(seq 1 18); do
+		cx new --on "$N" --name "$K" --no-use
+		KID=$(field .id)
+		[[ $CODE == 0 && -n $KID ]] && break
+		has "$ERR" "finished its isolation self-test" || break
+		"$CX" delete "$K" --yes >/dev/null 2>&1
+		sleep 10
+	done
+	if [[ $CODE != 0 || -z $KID ]]; then
+		forks_skip "couldn't make a sandbox on the node: ${ERR:0:200}" "N67 N68 N69 N70 N71 N72 N73 N74 N76"
+		return
+	fi
+	KMC=cloudex-$KID
+	BASEIMG=$(ctr_image "$KID")
+	FORK_BASE=$BASEIMG
+	"$CX" env set "$K" VRK=kept >/dev/null 2>&1
+	"$CX" exec "$K" --timeout 30m -- "echo kept > ~/vr-k && sudo sh -c 'echo sys > /opt/vr-k' && head -c ${mb}M /dev/urandom > ~/vr-big && sync" >/dev/null 2>&1
+	local hello=""
+	if [[ $iso == sysbox ]]; then
+		hello=$("$CX" exec "$K" --timeout 10m -- 'for i in $(seq 30); do sudo docker info >/dev/null 2>&1 && break; sleep 2; done; sudo docker run --rm hello-world 2>&1 | grep -c "Hello from Docker"' 2>/dev/null)
+	fi
+
+	# N67: a fork of the running original.
+	local K1=$P-k1 K1ID e67 c67 st67 on67 files67 ost67 pause67 forks67 up67
+	t0h=$(node_sh "date +%s")
+	t0=$(now_s)
+	cx fork "$K" --name "$K1" --no-use
+	took=$(since "$t0")
+	e67=$ERR c67=$CODE
+	K1ID=$(field '.[0].id') st67=$(field '.[0].state') on67=$(field '.[0].placement.node.name')
+	pause67=$(pause_of "$KMC" "$t0h")
+	files67=$("$CX" exec "$K1" -- 'cat ~/vr-k /opt/vr-k; echo $VRK; stat -c %s ~/vr-big' 2>/dev/null | tr '\n' ' ')
+	ost67=$(sb_state "$K")
+	up67=$("$CX" exec "$K" -- 'echo up' 2>/dev/null)
+	forks67=$("$CX" node info "$N" --json 2>/dev/null | jq -c '.forks // null')
+	OUT="fork took $took s; the original was paused ${pause67:-?} s for $mb MiB written; node info forks: $forks67; the fork: $st67 on $on67, files: $files67; the original: $ost67, exec: $up67; fork said: $(grep -m1 -o 'Making.*' <<<"$e67" | head -c 300)" CODE=""
+	okv N67 "$(forks_desc N67)" [ "$c67" = 0 -a "$st67" = running -a "$on67" = "$N" -a "$files67" = "kept sys kept $((mb * 1048576)) " -a "$ost67" = running -a "$up67" = up \
+		-a -n "$pause67" -a -n "$(grep 'paused while its disk is copied' <<<"$e67")" -a "$(jq -r '.images // 0' <<<"$forks67")" -ge 1 ]
+
+	# N72: the fork's own identity, inside and in Docker's config.
+	local id72 id72o img72 cfg72 env72 refs72
+	id72=$("$CX" exec "$K1" -- 'echo "$(hostname) ${CLOUDEX_SANDBOX:-none} hold=${CLOUDEX_HOLD:-}"; cat /run/cloudex-boot; sudo sha256sum /run/cloudex/self-token | cut -c1-16; cloudex info --json | jq -r .id' 2>/dev/null | tr '\n' ' ')
+	id72o=$("$CX" exec "$K" -- 'cat /run/cloudex-boot; sudo sha256sum /run/cloudex/self-token | cut -c1-16' 2>/dev/null | tr '\n' ' ')
+	img72=$(ctr_image "$K1ID")
+	cfg72=$(node_sh "docker image inspect $img72 -f '{{json .Config.Env}} {{json .Config.Labels}}'")
+	env72=$(node_sh "docker inspect cloudex-$K1ID -f '{{json .Config.Env}}'")
+	refs72=$(grep -o "$KID[^\"]*" <<<"$cfg72" | sort | tr '\n' ' ')
+	read -r h72 s72 hold72 boot72 tok72 info72 <<<"$id72"
+	read -r booto tokno <<<"$id72o"
+	OUT="inside the fork: $id72; the original: boot $booto token $tokno; the image names the original in: $refs72; image env: $(jq -c '[.[] | select(startswith("CLOUDEX_"))]' <<<"${cfg72%% \{*}" 2>/dev/null); the fork's env: $(jq -c '[.[] | select(startswith("CLOUDEX_"))]' <<<"$env72" 2>/dev/null)" CODE=""
+	okv N72 "$(forks_desc N72)" [ "$h72" = "$K1ID" -a "$s72" = "$K1ID" -a "$hold72" = "hold=" -a -n "$boot72" -a "$boot72" != "$booto" -a -n "$tok72" -a "$tok72" != "$tokno" -a "$info72" = "$K1ID" \
+		-a "$(wc -w <<<"$refs72" | tr -d ' ')" = 2 -a -n "$(grep '"CLOUDEX_SANDBOX="' <<<"$cfg72")" -a -z "$(grep 'CLOUDEX_HOLD=1' <<<"$cfg72$env72")" -a -n "$(grep "\"CLOUDEX_SANDBOX=$K1ID\"" <<<"$env72")" ]
+
+	# N68: a fork of the stopped original.
+	local K2=$P-k2 K2ID e68 st68 files68 ost68 mst68
+	"$CX" stop "$K" >/dev/null 2>&1
+	t0h=$(node_sh "date +%s")
+	t0=$(now_s)
+	cx fork "$K" --name "$K2" --no-use
+	took=$(since "$t0")
+	e68=$ERR
+	K2ID=$(field '.[0].id') st68=$(field '.[0].state')
+	files68=$("$CX" exec "$K2" -- 'cat ~/vr-k /opt/vr-k; echo $VRK' 2>/dev/null | tr '\n' ' ')
+	ost68=$(sb_state "$K")
+	mst68=$(machine_state "$KMC")
+	local p68
+	p68=$(pause_of "$KMC" "$t0h")
+	OUT="fork took $took s; the fork: $st68, files: $files68; the original: $ost68 (its machine $mst68), paused: ${p68:-no}; fork said: $(grep -m1 -o 'Making.*' <<<"$e68" | head -c 200)" CODE=""
+	okv N68 "$(forks_desc N68)" [ "$st68" = running -a "$files68" = "kept sys kept " -a "$ost68" = stopped -a "$mst68" = exited -a -z "$(grep paused <<<"$e68")" ]
+
+	# N74: Docker inside, under Sysbox, in a fork of a running (K1) and a stopped (K2) original.
+	if [[ $iso == sysbox ]]; then
+		local d1 d2
+		d1=$("$CX" exec "$K1" --timeout 10m -- 'for i in $(seq 30); do sudo docker info >/dev/null 2>&1 && break; sleep 2; done; sudo docker image ls --format "{{.Repository}}" | grep -c "^hello-world$"; sudo docker run --rm hello-world 2>&1 | grep -c "Hello from Docker"' 2>/dev/null | tr '\n' ' ')
+		d2=$("$CX" exec "$K2" --timeout 10m -- 'for i in $(seq 30); do sudo docker info >/dev/null 2>&1 && break; sleep 2; done; sudo docker image ls --format "{{.Repository}}" | grep -c "^hello-world$"; sudo docker run --rm hello-world 2>&1 | grep -c "Hello from Docker"' 2>/dev/null | tr '\n' ' ')
+		OUT="the original ran hello-world: ${hello:-no}; fork of it running (images, runs): $d1; fork of it stopped: $d2" CODE=""
+		okv N74 "$(forks_desc N74)" [ "$hello" = 1 -a "$d1" = "1 1 " -a "$d2" = "1 1 " ]
+	else
+		skip N74 "$(forks_desc N74)" "the node runs $iso, not Sysbox"
+	fi
+
+	# N69: new --from the (stopped) original, three from one image.
+	local K3=$P-k3 ids69 imgs69 pts69 n69 st69 files69
+	cx new --from "$K" --count 3 --name "$K3" --no-use
+	ids69=$(field '[.[].id] | join(" ")')
+	st69=$(field '[.[] | "\(.state)@\(.placement.node.name)"] | unique | join(",")')
+	imgs69="" pts69=""
+	for i in $ids69; do imgs69="$imgs69$(ctr_image "$i")"$'\n' pts69="$pts69$(ctr_point "$i")"$'\n'; done
+	imgs69=$(grep . <<<"$imgs69" | sort -u | wc -l | tr -d ' ')
+	pts69=$(grep . <<<"$pts69" | sort -u)
+	n69=$(fork_count "build.cloudex.point=$pts69")
+	files69=$("$CX" exec "$K3-3" -- 'cat ~/vr-k /opt/vr-k; echo $VRK' 2>/dev/null | tr '\n' ' ')
+	OUT="made $(wc -w <<<"$ids69" | tr -d ' '): $st69; distinct images under them $imgs69; images labelled with their point ($pts69): $n69; files in the third: $files69" CODE=""
+	okv N69 "$(forks_desc N69)" [ "$(wc -w <<<"$ids69" | tr -d ' ')" = 3 -a "$st69" = "running@$N" -a "$imgs69" = 1 -a "$n69" = 1 -a "$files69" = "kept sys kept " ]
+	local P3=$pts69
+
+	# N73: a fork of a fork of a fork.
+	local KK=$P-kk KKK=$P-kkk l0 l1 l3 files73
+	"$CX" fork "$K1" --name "$KK" --no-use >/dev/null 2>"$work/e73a"
+	cx fork "$KK" --name "$KKK" --no-use
+	l0=$(img_layers "$BASEIMG") l1=$(img_layers "$(ctr_image "$K1ID")") l3=$(img_layers "$(ctr_image "$(sb_id "$KKK")")")
+	files73=$("$CX" exec "$KKK" -- 'cat ~/vr-k /opt/vr-k; echo $VRK; hostname' 2>/dev/null | tr '\n' ' ')
+	OUT="layers: the base $l0, a fork $l1, a fork of a fork of a fork $l3; its files: $files73 ($(sb_state "$KKK"); ${ERR:0:120})" CODE=""
+	okv N73 "$(forks_desc N73)" [ -n "$l0" -a "$l1" = $((l0 + 1)) -a "$l3" = $((l0 + 3)) -a "$files73" = "kept sys kept $(sb_id "$KKK") " ]
+
+	# N71: refusals, each saying why.
+	local r71="" own o71 fill droot floor free71 notice71="" watched=""
+	refuse71() { # refuse71 WHAT WANT CMD...
+		local what=$1 want=$2
+		shift 2
+		cx "$@"
+		if [[ $CODE != 0 && $ERR == *"$want"* ]]; then r71="$r71 $what: refused ($(grep -m1 '^error' <<<"$ERR" | cut -c8-110));"; else r71="$r71 $what: NOT refused as expected (code $CODE, ${ERR:0:120});"; fi
+	}
+	refuse71 "onto another node" "stays on node $N" new --from "$K1" --on "$P-elsewhere" --no-use
+	refuse71 "--size" "sizes are for Cloudflare" fork "$K1" --size standard-4 --no-use
+	cx tokens create "$P-kown" --own --expires 1h
+	own=$(field .secret)
+	CLOUDEX_CONFIG_DIR=$work/tok-k CLOUDEX_API_URL=$API_URL CLOUDEX_API_KEY=$own "$CX" fork "$K1" --name "$P-kownf" --no-use >"$work/o" 2>"$work/e" </dev/null
+	o71="code $? $(grep -m1 '^error' "$work/e" | cut -c8-110)"
+	if [[ $iso == sysbox ]]; then
+		# An own-only token may place and fork its own on Sysbox (decision 4).
+		CLOUDEX_CONFIG_DIR=$work/tok-k CLOUDEX_API_URL=$API_URL CLOUDEX_API_KEY=$own "$CX" new --on "$N" --name "$P-ko1" --no-use >/dev/null 2>&1
+		CLOUDEX_CONFIG_DIR=$work/tok-k CLOUDEX_API_URL=$API_URL CLOUDEX_API_KEY=$own "$CX" fork "$P-ko1" --name "$P-ko2" --no-use >"$work/o" 2>"$work/e" </dev/null
+		o71="$o71; its own on Sysbox: code $?"
+		"$CX" delete "$P-ko2" --yes >/dev/null 2>&1
+		"$CX" delete "$P-ko1" --yes >/dev/null 2>&1
+	fi
+	"$CX" tokens revoke "$("$CX" tokens --json 2>/dev/null | jq -r --arg n "$P-kown" '.[] | select(.name == $n) | .id')" >/dev/null 2>&1
+	r71="$r71 own-only token: $o71;"
+	local own_ok=no
+	[[ ${o71:0:6} == "code 1" && ( $iso != sysbox || $o71 == *"its own on Sysbox: code 0"* ) ]] && own_ok=yes
+	# Below the disk floor (root): the host's disk filled to 0.6 GB above
+	# what a new machine needs, so the copy of K's changes doesn't fit; then
+	# under the watchdog's floor, with forks running and fork images holding
+	# K's changes, whose notice counts them.
+	if [[ -n $NODE_SUDO ]]; then
+		floor=$(node_sh "docker inspect cloudex-node -f '{{json .Args}}'" | jq -r '(index(["--keep-free-gb"])) as $i | if $i then .[$i + 1] else "5" end')
+		droot=$(node_sh "docker info -f '{{.DockerRootDir}}'")
+		fill="$droot/cloudex-verify-fill-$P" # on Docker's own filesystem, which may be a mount of its own
+		# Left free: what a new machine needs, plus half the copy's expected size.
+		local need
+		need=$(awk -v f="$floor" -v mb="$mb" -v x="$([[ $(jq -r '.store // ""' <<<"$forks67") == containerd ]] && echo 2 || echo 1)" \
+			'BEGIN { m = f + 5; if (m < 10) m = 10; print m + mb * 1048576 * x / 1e9 / 2 }')
+		node_sh "sudo fallocate -l \$(df -B1 --output=avail $droot | tail -1 | awk '{printf \"%d\", \$1 - $need * 1e9}') $fill"
+		free71=$(node_sh "df -B1 --output=avail $droot | tail -1" | awk '{printf "%.1f", $1 / 1e9}')
+		refuse71 "below the disk floor ($free71 GB free)" "a fork of $KID needs about" fork "$K" --name "$P-kfull" --no-use
+		node_sh "sudo rm -f $fill; sudo fallocate -l \$(df -B1 --output=avail $droot | tail -1 | awk '{printf \"%d\", \$1 - ($floor - 0.5) * 1e9}') $fill"
+		t0=$(now_s)
+		while [[ $(awk -v w="$(since "$t0")" 'BEGIN { print (w > 60) }') == 0 ]]; do
+			for s in "$K1" "$K2" "$K3-1" "$K3-2" "$K3-3" "$KK" "$KKK"; do
+				if [[ $(sb_state "$s") == stopped ]]; then
+					watched="$s after $(since "$t0") s"
+					notice71=$("$CX" info "$s" --json 2>/dev/null | jq -r '.notice // ""')
+					break 2
+				fi
+			done
+			sleep 2
+		done
+		node_sh "sudo rm -f $fill"
+		[[ -n $watched ]] && "$CX" resume "${watched%% *}" >/dev/null 2>&1
+		r71="$r71 the watchdog stopped ${watched:-nothing within 60 s}: ${notice71:0:300}"
+	else
+		r71="$r71 the disk floor and the watchdog: not checked (needs VERIFY_NODE_SUDO=1)"
+	fi
+	# On an offline node: with the agent killed (and N70's delete --force).
+	local KO=$P-ko K_OID PO gone70=""
+	cx fork "$KKK" --name "$KO" --no-use
+	K_OID=$(field '.[0].id')
+	PO=$(ctr_point "$K_OID")
+	kill_agent
+	wait_state "$N" offline 75
+	refuse71 "on an offline node" "node $N is offline" fork "$K1" --name "$P-koff" --no-use
+	cx delete "$KO" --yes --force
+	local d70="code $CODE" tr70
+	tr70=$(now_ms)
+	start_agent
+	wait_state "$N" online 60
+	wait_iso "$tr70" >/dev/null
+	for _ in $(seq 1 45); do
+		[[ $(fork_count "build.cloudex.point=$PO") == 0 ]] && { gone70=yes; break; }
+		sleep 2
+	done
+	OUT="$r71" CODE=""
+	if [[ -n $NODE_SUDO ]]; then
+		okv N71 "$(forks_desc N71)" [ -z "$(grep 'NOT refused' <<<"$r71")" -a "$own_ok" = yes -a -n "$watched" -a -n "$(grep 'Fork images on this node hold' <<<"$notice71")" ]
+	elif [[ -z $(grep 'NOT refused' <<<"$r71") && $own_ok == yes ]]; then
+		skip N71 "$(forks_desc N71)" "all but the disk floor and the watchdog passed, which need root: $r71"
+	else
+		fail N71 "$(forks_desc N71)" "$r71"
+	fi
+
+	# N70: deletes in every order. The original first; then the forks of one
+	# point (the image goes with the last); a fork with a fork of it before
+	# that fork (its image waits for the child on overlay2); the orphan swept.
+	local w70 i70a i70b i70c i70d P1 P2 r70=""
+	P1=$(ctr_point "$K1ID") P2=$(ctr_point "$K2ID")
+	"$CX" delete "$K" --yes >/dev/null 2>&1
+	w70=$("$CX" exec "$K1" -- 'cat ~/vr-k' 2>/dev/null)$("$CX" exec "$K3-2" -- 'cat ~/vr-k' 2>/dev/null)
+	r70="after the original went: forks read '$w70', images of its points: $(fork_count "build.cloudex.forkof=$KID");"
+	"$CX" delete "$K3-1" --yes >/dev/null 2>&1
+	"$CX" delete "$K3-2" --yes >/dev/null 2>&1
+	i70a=$(fork_count "build.cloudex.point=$P3")
+	"$CX" delete "$K3-3" --yes >/dev/null 2>&1
+	i70b=$(fork_count "build.cloudex.point=$P3")
+	"$CX" delete "$K2" --yes >/dev/null 2>&1
+	r70="$r70 point of the three: $i70a image with one fork left, $i70b after the last; the stopped one's: $(fork_count "build.cloudex.point=$P2") after its fork;"
+	"$CX" delete "$K1" --yes >/dev/null 2>&1
+	i70c=$(fork_count "build.cloudex.forkof=$KID")
+	"$CX" delete "$KK" --yes >/dev/null 2>&1
+	"$CX" delete "$KKK" --yes >/dev/null 2>&1
+	i70d=$(fork_count)
+	r70="$r70 after the first fork (which had a fork of its own) went: $i70c of the original's left; after the rest: $i70d fork images on the node ($(fork_left)); delete --force while offline: $d70, its image gone at the reconnect: ${gone70:-NO};"
+	# An orphan: an image labelled as this node's fork that no sandbox uses
+	# (as a fork whose start never came would leave), swept at once with --age 0s.
+	local sw70 left70
+	node_sh "c=\$(docker create --label build.cloudex.test=verify-$P $BASEIMG true) && docker commit -c 'LABEL build.cloudex.role=fork' -c 'LABEL build.cloudex.node=$nid' -c 'LABEL build.cloudex.point=cx-orphan-fork-1' \$c cloudex-fork/$nid:orphan-$P >/dev/null; docker rm \$c >/dev/null" 2>/dev/null
+	local before70
+	before70=$(fork_count)
+	sw70=$(in_agent "forks --sweep --age 0s" 2>/dev/null | jq -r .removed)
+	left70=$(fork_count)
+	r70="$r70 an orphan: $before70 fork images, the sweep removed $sw70, $left70 left"
+	OUT="$r70" CODE=""
+	okv N70 "$(forks_desc N70)" [ "$w70" = keptkept -a "$i70a" = 1 -a "$i70b" = 0 -a "$i70d" = 0 -a "$gone70" = yes -a "$d70" = "code 0" -a "$before70" = 1 -a "$sw70" = 1 -a "$left70" = 0 ]
+
+	# N76: a deploy during a fork's commit. The fork starts as the deploy
+	# begins uploading the Worker, so that the Worker (and, a few minutes on,
+	# the objects) are replaced while the commit runs; whatever that does to
+	# the fork, the sweep leaves no image without a sandbox, and a fork asked
+	# again makes one image.
+	if [[ ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
+		local D=$P-kd DID DMC76 dpid fpid t76 up76="" dep76="" c76 st76 c76b st76b pt76b n76b sw76 left76 cnt76 rc76
+		for _ in $(seq 1 18); do
+			cx new --on "$N" --name "$D" --no-use
+			DID=$(field .id)
+			[[ $CODE == 0 && -n $DID ]] && break
+			has "$ERR" "finished its isolation self-test" || break
+			"$CX" delete "$D" --yes >/dev/null 2>&1
+			sleep 10
+		done
+		DMC76=cloudex-$DID
+		local made76="made: code $CODE ${ERR:0:200}"
+		"$CX" exec "$D" --timeout 30m -- "head -c ${VERIFY_NODE_FORK_DEPLOY_MB:-3072}M /dev/urandom > ~/vr-big && sync" >/dev/null 2>&1
+		cf_fresh
+		t0h=$(node_sh "date +%s")
+		t76=$(now_s)
+		("$CX" deploy --yes --skip-check >"$work/deploy76.log" 2>&1; echo $? >"$work/deploy76.rc") &
+		dpid=$!
+		for _ in $(seq 1 600); do
+			grep -q 'Uploading the API Worker' "$work/deploy76.log" 2>/dev/null && { up76=$(since "$t76"); break; }
+			kill -0 "$dpid" 2>/dev/null || break
+			sleep 0.5
+		done
+		("$CX" fork "$D" --name "$D-a" --no-use >"$work/f76.out" 2>"$work/f76.err" </dev/null; echo $? >"$work/f76.rc") &
+		fpid=$!
+		while kill -0 "$dpid" 2>/dev/null; do
+			[[ -z $dep76 ]] && grep -q 'API deployed at' "$work/deploy76.log" 2>/dev/null && dep76=$(since "$t76")
+			sleep 0.5
+		done
+		[[ -z $dep76 ]] && grep -q 'API deployed at' "$work/deploy76.log" && dep76="by $(since "$t76")"
+		wait "$fpid"
+		rc76=$(cat "$work/deploy76.rc")
+		c76=$(cat "$work/f76.rc") st76=$(jq -r '.[0].state // empty' "$work/f76.out" 2>/dev/null)
+		local pz
+		pz=$(node_sh "docker events --since $t0h --until \$(date +%s) --filter container=$DMC76 --filter event=pause --filter event=unpause --format '{{.Action}} {{.Time}}'" | tr '\n' ' ')
+		# Asked again.
+		cx fork "$D" --name "$D-b" --no-use
+		c76b=$CODE st76b=$(field '.[0].state')
+		pt76b=$(ctr_point "$(field '.[0].id')")
+		n76b=$(fork_count "build.cloudex.point=$pt76b")
+		sw76=$(in_agent "forks --sweep --age 0s" 2>/dev/null | jq -r .removed)
+		# Every image of D's left is a point some fork of it runs from.
+		local used76="" stray76=0 i
+		for s in "$D-a" "$D-b"; do i=$(sb_id "$s"); [[ -n $i ]] && used76="$used76 $(ctr_image "$i")"; done
+		for i in $(node_sh "docker image ls -q --no-trunc --filter label=build.cloudex.role=fork --filter label=build.cloudex.forkof=$DID" | sort -u); do
+			[[ " $used76 " == *" $i "* ]] || stray76=$((stray76 + 1))
+		done
+		cnt76=$(node_sh "docker logs cloudex-node 2>&1 | grep -c 'committed fork point $DID-fork-'")
+		OUT="$made76; deploy exit $rc76: uploading at ${up76:-?} s, Worker replaced at ${dep76:-?} s; the commit's pause and unpause (host time, deploy began $t0h): ${pz:-none}; the fork during it: exit $c76, ${st76:-no fork} ($(grep -m1 '^error' "$work/f76.err" | cut -c8-160)); asked again: exit $c76b, $st76b, $n76b image for its point; the sweep removed $sw76; images of $D with no fork after: $stray76; commits logged for $D: $cnt76" CODE=""
+		okv N76 "$(forks_desc N76)" [ "$c76b" = 0 -a "$st76b" = running -a "$n76b" = 1 -a "$stray76" = 0 -a \( "$rc76" = 0 -o -n "$dep76" \) ]
+		"$CX" delete "$D-a" --yes >/dev/null 2>&1
+		"$CX" delete "$D-b" --yes >/dev/null 2>&1
+		"$CX" delete "$D" --yes >/dev/null 2>&1
+		[[ $CODE == 0 ]] || true
+	else
+		skip N76 "$(forks_desc N76)" "set VERIFY_NODE_DEPLOY=1 (and CLOUDFLARE_API_TOKEN) to deploy during a fork"
+	fi
+	node_sh "docker logs cloudex-node 2>&1 | grep -E 'fork|commit'" >"$out/agent-forks.log" 2>/dev/null
+}
+
+# N75 (after N35, which deletes the last sandboxes): fork images the node
+# still holds at the uninstall, here a fork of a fork made by hand with the
+# fork labels (as a removed node's stopped machines would leave), go with the
+# uninstall, --keep-images or not.
+forks_before_uninstall() {
+	[[ -n $FORKS_RAN ]] || return
+	node_sh "c=\$(docker create --label build.cloudex.test=verify-$P $FORK_BASE true) && docker commit -c 'LABEL build.cloudex.role=fork' -c 'LABEL build.cloudex.node=$nid' -c 'LABEL build.cloudex.point=cx-left00-fork-1' \$c cloudex-fork/$nid:left-$P >/dev/null && docker rm \$c >/dev/null &&
+		c=\$(docker create --label build.cloudex.test=verify-$P cloudex-fork/$nid:left-$P true) && docker commit -c 'LABEL build.cloudex.point=cx-left00-fork-2' \$c cloudex-fork/$nid:left2-$P >/dev/null && docker rm \$c >/dev/null" 2>/dev/null
+	FORKS_LEFT=$(fork_count)
+}
+forks_after_uninstall() {
+	if [[ -z $FORKS_RAN ]]; then
+		forks_skip "the forks part didn't run (not in VERIFY_NODE_PARTS)" N75
+		return
+	fi
+	local after
+	after=$(node_sh "docker image ls -q --filter label=build.cloudex.role=fork --filter label=build.cloudex.node=$nid | sort -u | grep -c .")
+	OUT="fork images before the uninstall (with --keep-images): $FORKS_LEFT; after: $after" CODE=""
+	ok N75 "$(forks_desc N75)" [ "$FORKS_LEFT" = 2 -a "$after" = 0 ]
+}
+
 if want node; then
 	if [[ -z ${VERIFY_NODE_SSH:-} ]]; then
 		skip N00 "the node area" "set VERIFY_NODE_SSH to a command that runs a command on a host for the agent, such as 'ssh box'"
@@ -2491,6 +2848,7 @@ if want node; then
 		review_host_skip "no node host: set VERIFY_NODE_SSH"
 		review_worker_skip "no node host: set VERIFY_NODE_SSH"
 		direct_skip "no node host: set VERIFY_NODE_SSH"
+		forks_skip "no node host: set VERIFY_NODE_SSH"
 	else
 		read -ra NODE_SSH <<<"$VERIFY_NODE_SSH"
 		NODE_DIR="\$HOME/.cloudex-verify-$P"
@@ -2629,7 +2987,7 @@ if want node; then
 			M3_SANDBOX="" M3_ID="" REBOOTED=""
 			# VERIFY_NODE_PARTS picks the milestones' checks to run after the
 			# install (default all): m3 m4 m5 m6.
-			parts=" ${VERIFY_NODE_PARTS:-m3 m4 m5 m6 review direct} "
+			parts=" ${VERIFY_NODE_PARTS:-m3 m4 m5 m6 review direct forks} "
 			if [[ $parts == *" m3 "* ]]; then node_m3; else m3_skip "not in VERIFY_NODE_PARTS"; fi
 			if [[ $parts == *" m4 "* ]]; then node_m4; else m4_skip "not in VERIFY_NODE_PARTS" "N18 N19 N20 N21 N22 N23 N24"; fi
 			if [[ $parts == *" m5 "* ]]; then node_m5; else m5_skip "not in VERIFY_NODE_PARTS"; fi
@@ -2642,6 +3000,7 @@ if want node; then
 				review_worker_skip "not in VERIFY_NODE_PARTS"
 			fi
 			if [[ $parts == *" direct "* ]]; then node_direct; else direct_skip "not in VERIFY_NODE_PARTS" "N57 N58 N59 N60 N61 N62 N63 N65"; fi
+			if [[ $parts == *" forks "* ]]; then node_forks; else forks_skip "not in VERIFY_NODE_PARTS" "N67 N68 N69 N70 N71 N72 N73 N74 N76"; fi
 			[[ -n $M3_SANDBOX ]] && "$CX" delete "$M3_SANDBOX" --yes >/dev/null 2>&1
 			left=$(node_sh "docker ps -aq --filter label=build.cloudex.role=machine | wc -l; docker network ls -q --filter label=build.cloudex.role=machine | wc -l" | tr '\n' ' ')
 			# N35: a node with a sandbox is removed only with --force, which
@@ -2696,6 +3055,7 @@ if want node; then
 				-a -n "$(jq -r .error <<<"$rrec" | grep 'was removed (cloudex node rm --force); its machine was deleted')" -a "$rleft" = 0 -a "$rgone" = deleted ]
 
 			# N25: the host as it was, outside the labels; then the uninstaller.
+			forks_before_uninstall
 			MID_RUN=$(host_snapshot)
 			node_sh "$NODE_SUDO bash $NODE_DIR/node-install.sh --uninstall --yes --keep-images" >"$work/uninstall.log" 2>&1
 			urc=$?
@@ -2722,6 +3082,7 @@ if want node; then
 			else
 				direct_skip "the node had no direct port (or the direct part didn't run)" N66
 			fi
+			forks_after_uninstall
 			if [[ $parts == *" review "* ]]; then node_review_r3; else review_host_skip "not in VERIFY_NODE_PARTS" N52; fi
 			node_stop_all
 		fi

@@ -1,7 +1,7 @@
 // The TypeScript SDK against a live deployment: node sdk-smoke.mjs <path to dist/index.js> <name prefix>
 // Uses the deployment in $CLOUDEX_CONFIG_DIR. Deletes what it makes. With $VERIFY_NODE, its
-// sandbox runs on that node, a save of it starts back on that node, and what isn't
-// on nodes in v0.2.2 (forks) must be refused with a 501 instead.
+// sandbox runs on that node, its forks are made on that node (v0.2.3), and a save of it
+// starts back on that node.
 import assert from "node:assert/strict";
 
 const [, , dist, prefix] = process.argv;
@@ -11,11 +11,6 @@ const made = [];
 const saves = [];
 const step = (s) => console.log("ok", s);
 const node = process.env.VERIFY_NODE || "";
-// On a node: the call must be refused, not available yet (501), saying why.
-const refused = async (what, call) => {
-  await assert.rejects(call, (e) => e instanceof CloudexError && e.status === 501, `${what} on a node`);
-  console.log("skip", what, "(not on nodes in v0.2.2; refused with 501 as it should be)");
-};
 
 try {
   const health = await cx.health();
@@ -98,7 +93,15 @@ try {
 
   await box.exec("echo forked > ~/marker");
   if (node) {
-    await refused("fork", box.fork({ count: 2, name: `${prefix}-f` }));
+    const forks = await box.fork({ count: 2, name: `${prefix}-f`, cpus: 1, memoryMb: 1024 });
+    made.push(...forks);
+    assert.equal(forks.length, 2);
+    for (const f of forks) {
+      assert.equal(f.placement.node?.name, node, "a fork stays on its original's node");
+      assert.equal(f.placement.memoryMb, 1024);
+    }
+    assert.equal((await forks[1].exec("cat ~/marker")).stdout, "forked\n");
+    step("fork on a node, with cpus and memoryMb");
     const save = await box.save(`${prefix}-save`);
     saves.push(save.name);
     assert.equal(save.node?.name, node, "the save names its node");
