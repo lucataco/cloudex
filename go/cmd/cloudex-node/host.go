@@ -134,6 +134,20 @@ func newSelfTest(state func() node.State, socket *string) *cobra.Command {
 				return err
 			}
 			r.NodeID, r.Unisolated = id.ID, id.Unisolated
+			if rc.DirectPort != 0 && !machine {
+				// What the running agent's sidecar publishes, read, not changed.
+				dc, err := directConfig(rc.DirectPort, rc.DirectAddrs)
+				if err != nil {
+					return err
+				}
+				d := &node.Direct{Config: dc, Docker: r.Docker, Self: rc.Self}
+				octx, ocancel := context.WithTimeout(cmd.Context(), 30*time.Second)
+				if err := d.Observe(octx); err != nil {
+					lg.Printf("the direct port: %v", err)
+				}
+				ocancel()
+				r.Direct = d
+			}
 			if img := s.Image(); img != "" && r.ImageOverride == "" {
 				r.SetImage(img)
 			}

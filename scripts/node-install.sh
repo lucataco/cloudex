@@ -45,8 +45,9 @@
 #
 # CLOUDEX_NODE_ALLOW_ARCH=<arch>, set to exactly this host's `uname -m`, is
 # for testing only too: it installs on a host that isn't amd64 (an arm64 VM
-# that runs amd64 images through Rosetta or qemu-user). Without it, anything
-# but amd64 is refused.
+# that runs the amd64 machine image through Rosetta or qemu-user, with an
+# agent built for its own arch in --agent-image). Without it, anything but
+# amd64 is refused.
 #
 # Everything is in main, called on the last line, so a download cut short
 # runs nothing.
@@ -214,7 +215,7 @@ main() {
 	x86_64 | amd64) ;;
 	*)
 		if [[ -n ${CLOUDEX_NODE_ALLOW_ARCH:-} && ${CLOUDEX_NODE_ALLOW_ARCH} == "$arch" ]]; then
-			warn "CLOUDEX_NODE_ALLOW_ARCH=$arch: installing on $arch for testing only. The agent and the machines are amd64 images, so this host must run them (Rosetta, qemu-user)."
+			warn "CLOUDEX_NODE_ALLOW_ARCH=$arch: installing on $arch for testing only. Machines run the amd64 base image, so this host must run amd64 images (Rosetta, qemu-user); give --agent-image an agent built for $arch."
 		else
 			die "nodes are amd64 only for now (this is $arch)"
 		fi

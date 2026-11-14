@@ -475,3 +475,45 @@ func TestListenerSessionCaps(t *testing.T) {
 		t.Fatalf("over the sandbox's cap: %v", err)
 	}
 }
+
+// The relay names the client, then carries both ways, half-close included.
+func TestRelay(t *testing.T) {
+	agent, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	front, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Relay(ctx, front, agent.Addr().String(), nil)
+	c, err := net.Dial("tcp4", front.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := agent.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := direct.ReadLine(a, direct.RelayHeaderMax)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := direct.ParseRelayHeader(line)
+	if err != nil || cl.String() != c.LocalAddr().String() {
+		t.Fatalf("header %q names %v, not the client %v (%v)", line, cl, c.LocalAddr(), err)
+	}
+	io.WriteString(c, "hi")
+	c.(*net.TCPConn).CloseWrite()
+	if b, _ := io.ReadAll(a); string(b) != "hi" {
+		t.Fatalf("agent read %q", b)
+	}
+	io.WriteString(a, "back")
+	a.Close()
+	if b, _ := io.ReadAll(c); string(b) != "back" {
+		t.Fatalf("client read %q", b)
+	}
+}

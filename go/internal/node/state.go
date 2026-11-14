@@ -204,6 +204,9 @@ type RuntimeConfig struct {
 	Probes     []string `json:"probes,omitempty"`
 	KeepFreeGB float64  `json:"keepFreeGb,omitempty"` // the disk watchdog's floor (guard.go)
 	DiskGB     int      `json:"diskGb,omitempty"`     // a machine's writable layer cap, where the driver has quotas
+	// The direct port (v0.2.3), for the self-test run by hand.
+	DirectPort  int      `json:"directPort,omitempty"`
+	DirectAddrs []string `json:"directAddrs,omitempty"`
 }
 
 func (s State) SaveRuntimeConfig(c RuntimeConfig) error {

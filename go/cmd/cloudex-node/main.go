@@ -137,6 +137,7 @@ func newRoot() *cobra.Command {
 				Docker: d, Spares: spares, Debug: os.Getenv("CLOUDEX_NODE_DEBUG") == "1"}
 			if rc.Pool != "" {
 				rc.Self = selfContainer(rc.Self)
+				rc.DirectPort, rc.DirectAddrs = directPort, directAddrs
 				if err := s.SaveRuntimeConfig(rc); err != nil {
 					return err
 				}

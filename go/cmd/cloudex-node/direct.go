@@ -108,6 +108,7 @@ func newProbeDirect() *cobra.Command {
 	var addr, sandbox, sshKey, cases, apiURL string
 	var port, flood int
 	var pipe bool
+	var save, present string
 	cmd := &cobra.Command{
 		Use:   "direct",
 		Short: "Try the direct port at --addr with good and bad tickets for --sandbox, and print what it did (exit 1 when a case fails); --pipe opens one session on stdin/stdout",
@@ -128,6 +129,28 @@ func newProbeDirect() *cobra.Command {
 				p.sshKey = strings.TrimSpace(string(b))
 			}
 			ctx := cmd.Context()
+			if save != "" {
+				// A ticket to present later (after the sandbox stops, say).
+				_, _, d, err := p.ticket(ctx)
+				if err != nil {
+					return err
+				}
+				b, _ := json.Marshal(d)
+				return os.WriteFile(save, b, 0o600)
+			}
+			if present != "" {
+				b, err := os.ReadFile(present)
+				if err != nil {
+					return err
+				}
+				var d api.Direct
+				if err := json.Unmarshal(b, &d); err != nil || d.Ticket == nil {
+					return fmt.Errorf("%s: not a saved answer with a ticket", present)
+				}
+				pub, _ := base64.StdEncoding.DecodeString(d.PublicKey)
+				fmt.Fprintln(cmd.OutOrStdout(), p.line(ctx, pub, "CXD1 "+*d.Ticket+"\n"))
+				return nil
+			}
 			if pipe {
 				return p.pipe(ctx, cmd.InOrStdin(), cmd.OutOrStdout())
 			}
@@ -144,6 +167,8 @@ func newProbeDirect() *cobra.Command {
 	cmd.Flags().StringVar(&apiURL, "api", "", "the deployment (default $CLOUDEX_API_URL)")
 	cmd.Flags().StringVar(&cases, "cases", "good,replay,altered,othersandbox,otherport,othernode,noticket,garbage,long,plaintext,noalpn,wrongpin,expired", "the cases, comma-separated")
 	cmd.Flags().BoolVar(&pipe, "pipe", false, "open one session and carry stdin and stdout over it")
+	cmd.Flags().StringVar(&save, "save", "", "instead: save a fresh ticket (the API's answer) to this file")
+	cmd.Flags().StringVar(&present, "present", "", "instead: present the ticket saved in this file once, and print the answer")
 	cmd.Flags().IntVar(&flood, "flood", 0, "instead: open this many TCP connections at once that send nothing (a slow-loris), and say how the node closed them; then a good session")
 	return cmd
 }

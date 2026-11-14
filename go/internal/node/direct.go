@@ -166,7 +166,11 @@ func (d *Direct) setStateLocked(state, why string) bool {
 	if state == "failed" {
 		d.logf("failed: %s", why)
 	} else if d.state != state {
-		d.logf("%s %s", state, why)
+		if why == "" {
+			d.logf("%s", state)
+		} else {
+			d.logf("%s: %s", state, why)
+		}
 	}
 	d.state, d.why = state, why
 	return true
@@ -803,6 +807,27 @@ func isRelay(c *ContainerDetail) bool {
 // it without one). A running one is left as it is, and its actual bindings
 // are what is reported.
 func (d *Direct) ensureSidecar(ctx context.Context) error {
+	return d.sidecar(ctx, true)
+}
+
+// Observe reads the agent's address and the sidecar's, and its bindings,
+// changing nothing (the self-test run by hand, outside the agent).
+func (d *Direct) Observe(ctx context.Context) error {
+	d.mu.Lock()
+	d.init()
+	d.mu.Unlock()
+	err := d.sidecar(ctx, false)
+	d.mu.Lock()
+	if err != nil {
+		d.setStateLocked("failed", err.Error())
+	} else {
+		d.setStateLocked("listening", "")
+	}
+	d.mu.Unlock()
+	return err
+}
+
+func (d *Direct) sidecar(ctx context.Context, fix bool) error {
 	self, err := d.Docker.ContainerInspect(ctx, d.Self)
 	if err != nil {
 		return fmt.Errorf("the agent's own container: %w", err)
@@ -817,7 +842,7 @@ func (d *Direct) ensureSidecar(ctx context.Context) error {
 	}
 	gw, _ := netip.ParseAddr(n.Gateway)
 	d.mu.Lock()
-	if d.ctl != ctl && d.ln != nil {
+	if fix && d.ctl != ctl && d.ln != nil {
 		// The agent's address changed: listen again on the new one.
 		d.ln.Close()
 		d.ln = nil
@@ -832,7 +857,10 @@ func (d *Direct) ensureSidecar(ctx context.Context) error {
 	if c != nil && !isRelay(c) {
 		return fmt.Errorf("a container named %s that isn't the agent's is in the way", RelayName)
 	}
-	if c != nil && c.State.Running && !slices.Equal(c.Config.Cmd, RelayCmd(ctl)) {
+	if !fix && (c == nil || !c.State.Running) {
+		return fmt.Errorf("the sidecar %s isn't running", RelayName)
+	}
+	if fix && c != nil && c.State.Running && !slices.Equal(c.Config.Cmd, RelayCmd(ctl)) {
 		d.logf("the sidecar relays to %v, not to %s: making it again", c.Config.Cmd, ctl)
 		c.State.Running = false
 	}
