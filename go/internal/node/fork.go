@@ -608,6 +608,7 @@ func (r *Runtime) sweepForks(ctx context.Context, minAge time.Duration) int {
 	// finishes after the listing then has no record here to be forgotten as
 	// "image gone"; and only records still as they were are forgotten.
 	var book map[string]ForkRecord
+	bookAt := time.Now()
 	if r.Forks != nil {
 		book = r.Forks.All()
 	}
@@ -660,7 +661,7 @@ func (r *Runtime) sweepForks(ctx context.Context, minAge time.Duration) int {
 				continue
 			}
 			at := time.Unix(i.Created, 0)
-			if _, ok := book[p]; !ok && now.Sub(at) < 2*CommitTimeout {
+			if _, ok := book[p]; !ok && at.Unix() >= bookAt.Unix() && !madeBefore(ctx, r.Docker, i.ID, bookAt) {
 				continue // made after the book was read: a commit just finished
 			}
 			if rec, ok := book[p]; ok {
@@ -696,6 +697,17 @@ func (r *Runtime) sweepForks(ctx context.Context, minAge time.Duration) int {
 		}
 	}
 	return removed
+}
+
+// madeBefore says whether an image was made before t, to the nanosecond
+// (the image list gives seconds).
+func madeBefore(ctx context.Context, d *Docker, id string, t time.Time) bool {
+	img, err := d.ImageInspect(ctx, id)
+	if err != nil {
+		return false
+	}
+	c, err := time.Parse(time.RFC3339Nano, img.Created)
+	return err == nil && c.Before(t)
 }
 
 // forkFact counts this node's fork images, for node info.

@@ -510,7 +510,7 @@ func TestForkBookAcrossProcesses(t *testing.T) {
 // record written after the sweep's read stays, and an image with no record
 // in that read is left alone while it's young.
 func TestTheSweepKeepsARecordWrittenMeanwhile(t *testing.T) {
-	r, _ := forkRuntime(t)
+	r, f := forkRuntime(t)
 	p := "cx-orig01-fork-1731600000020"
 	seen := r.Forks.All()
 	r.Forks.Put(p, ForkRecord{State: "done", Image: "sha256:x", Waiting: 1, At: time.Now().UnixMilli()})
@@ -533,5 +533,17 @@ func TestTheSweepKeepsARecordWrittenMeanwhile(t *testing.T) {
 	r.Forks.Forget("cx-orig01-fork-1731600000021") // as if the sweep's read came before the commit's record
 	if n := r.SweepForks(ctx, 0); n != 0 {
 		t.Fatalf("swept %d: a fork image just committed", n)
+	}
+	// One with no record made well before the sweep read the book is an
+	// orphan, and goes at age 0 (verify.sh N70).
+	f.mu.Lock()
+	for _, i := range f.imgs {
+		if i.id == info.ID {
+			i.created = time.Now().Add(-time.Minute).Unix()
+		}
+	}
+	f.mu.Unlock()
+	if n := r.SweepForks(ctx, 0); n != 1 {
+		t.Fatalf("swept %d: an orphan with no record", n)
 	}
 }
