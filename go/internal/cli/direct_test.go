@@ -211,6 +211,7 @@ type raceSetup struct {
 	tickets atomic.Int32
 	logs    []string
 	logMu   sync.Mutex
+	late    chan func(*directCache)
 }
 
 func newRace(t *testing.T, addrs ...string) *raceSetup {
@@ -229,12 +230,14 @@ func newRace(t *testing.T, addrs ...string) *raceSetup {
 		Addrs []string `json:"addrs"`
 	}{7022, addrs}
 	s.ends = &fakeEnds{t: t, ans: ans, apiDelay: 20 * time.Millisecond}
+	s.late = make(chan func(*directCache), 4)
 	s.race = &directRace{
 		ref: "cx-node01", id: "cx-node01", port: 22, mode: "auto",
 		api: s.ends.api, worker: s.ends.worker, dial: s.net.dial,
 		nets:  testNets,
 		cache: readDirectCache(t.TempDir(), "https://api.example"),
 		times: defaultRaceTimes,
+		late:  func(f func(*directCache)) { s.late <- f },
 		logf: func(format string, a ...any) {
 			s.logMu.Lock()
 			s.logs = append(s.logs, format)
@@ -266,6 +269,22 @@ func (s *raceSetup) applyChanges(c *directCache) {
 	for _, f := range s.race.changes {
 		f(c)
 	}
+}
+
+// failedMark says whether the race marked the network failed, at once or
+// once the attempts still going when the Worker path won had ended.
+func (s *raceSetup) failedMark(t *testing.T) bool {
+	c := readDirectCache(t.TempDir(), "x")
+	s.applyChanges(c)
+	if c.Failed[testNets.fingerprint()] != 0 {
+		return true
+	}
+	select {
+	case f := <-s.late:
+		f(c)
+	case <-time.After(1500 * time.Millisecond):
+	}
+	return c.Failed[testNets.fingerprint()] != 0
 }
 
 // N8's failure table: each bad candidate falls back to the Worker path
@@ -303,9 +322,7 @@ func TestRaceFallsBackFromEachBadCandidate(t *testing.T) {
 				if s.tickets.Load() != 0 {
 					t.Fatal("a ticket was sent")
 				}
-				c := readDirectCache(t.TempDir(), "x")
-				s.applyChanges(c)
-				if c.Failed[testNets.fingerprint()] == 0 {
+				if !s.failedMark(t) {
 					t.Fatal("the network wasn't marked failed")
 				}
 			})
@@ -323,9 +340,7 @@ func TestRaceFallsBackWhenTheTicketIsRefused(t *testing.T) {
 	if late := time.Duration(s.ends.workerAt.Load() - s.ends.apiAt.Load()); late > 350*time.Millisecond {
 		t.Fatalf("the Worker path started %v after the answer", late)
 	}
-	c := readDirectCache(t.TempDir(), "x")
-	s.applyChanges(c)
-	if c.Failed[testNets.fingerprint()] != 0 {
+	if s.failedMark(t) {
 		t.Fatal("a refused ticket isn't the network's fault")
 	}
 }
@@ -703,5 +718,44 @@ func TestDoctorChecksEachNodesDirectPort(t *testing.T) {
 	}
 	if lines[3].ok || !strings.Contains(lines[3].msg, "doesn't give its key") {
 		t.Fatalf("old: %+v", lines[3])
+	}
+}
+
+// A direct attempt that verifies after the Worker path won (a slow line,
+// a slow answer) doesn't mark the network failed.
+func TestRaceALateDirectSuccessKeepsTheNetwork(t *testing.T) {
+	s := newRace(t, "100.101.102.103:7022")
+	s.ends.apiDelay = 280 * time.Millisecond
+	slow := fakeAgent(t, s.key, "", &s.tickets)
+	s.net.at["100.101.102.103:7022"] = listen(t, func(c net.Conn) {
+		defer c.Close()
+		time.Sleep(250 * time.Millisecond) // a far line
+		up, err := net.Dial("tcp", slow)
+		if err != nil {
+			return
+		}
+		defer up.Close()
+		go io.Copy(up, c)
+		io.Copy(c, up)
+	})
+	out, _ := s.run(t, "worker")
+	if out.via != "worker" {
+		t.Fatal(out.via)
+	}
+	if s.failedMark(t) {
+		t.Fatal("marked failed though the node answered")
+	}
+}
+
+// After a slow answer, attempts still get a head start on the Worker path.
+func TestRaceASlowAnswerStillGivesDirectAHeadStart(t *testing.T) {
+	s := newRace(t, "192.168.1.10:7022")
+	s.ends.apiDelay = 290 * time.Millisecond
+	s.net.at["192.168.1.10:7022"] = fakeAgent(t, s.key, "", &s.tickets)
+	if out, _ := s.run(t, "agent"); !strings.HasPrefix(out.via, "direct") {
+		t.Fatal(out.via)
+	}
+	if s.ends.workerAt.Load() != 0 {
+		t.Fatal("the Worker path started")
 	}
 }

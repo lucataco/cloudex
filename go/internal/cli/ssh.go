@@ -220,6 +220,9 @@ func newProxyCmd(opts *options) *cobra.Command {
 				} else if port == 22 {
 					race.id = readSSHNames(dir)[r] // the name's last id, for cached candidates only
 				}
+				race.late = func(f func(*directCache)) {
+					updateDirectCache(dir, client.BaseURL, time.Now(), []func(*directCache){f})
+				}
 				if v := strings.TrimSpace(os.Getenv("CLOUDEX_DIRECT_CANDIDATES")); v != "" {
 					race.override = strings.Split(v, ",")
 				}

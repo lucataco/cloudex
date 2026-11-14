@@ -378,6 +378,9 @@ type directRace struct {
 	// answered is the sandbox id the API gave, even when no path connected
 	// after: cloudex proxy records a name's id before ssh reads known_hosts.
 	answered string
+	// late, when set, saves a change decided after run returned: whether
+	// direct attempts still going when the Worker path won all failed.
+	late func(func(*directCache))
 }
 
 // raceOutcome is the connection to splice, how it was made, and the id the
@@ -499,6 +502,7 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 		ticketErr   error
 		attemptErrs []string
 		done        bool
+		markLate    bool // the Worker won with attempts still going: judge the network when they end
 	)
 	closeConn := func(c net.Conn) {
 		if c != nil {
@@ -512,7 +516,9 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 		}
 	}
 	defer func() {
-		genCancel()
+		if !markLate {
+			genCancel()
+		}
 		if timer != nil {
 			timer.Stop()
 		}
@@ -522,9 +528,18 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 			dropWaiting()
 		}
 		// Results still on their way are closed as they come.
-		go func(p int, w, t bool) {
+		go func(p int, w, t, mark bool, g int) {
+			any := false
 			for ; p > 0; p-- {
-				closeConn((<-attempts).conn)
+				a := <-attempts
+				if a.gen == g && a.err == nil {
+					any = true
+				}
+				closeConn(a.conn)
+			}
+			if mark && !any && r.late != nil {
+				until := r.now().Add(directFailedFor).UnixMilli()
+				r.late(func(c *directCache) { c.Failed[fp] = until })
 			}
 			if w {
 				closeConn((<-workers).conn)
@@ -532,7 +547,7 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 			if t {
 				closeConn((<-tickets).conn)
 			}
-		}(pending, workerPending, presenting)
+		}(pending, workerPending, presenting, markLate, gen)
 	}()
 
 	startWorker := func(reason string) {
@@ -570,7 +585,9 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 			gen++
 			tried = map[string]bool{}
 			pin, pinB64 = key, keyB64
-			genCtx, genCancel = context.WithCancel(ctx)
+			// Not ended with run: attempts still going when the Worker path
+			// wins finish (within their limits) to say if the network failed.
+			genCtx, genCancel = context.WithCancel(context.WithoutCancel(ctx))
 		}
 		cands, skipped := orderCandidates(addrs, port, r.nets)
 		for _, s := range skipped {
@@ -590,9 +607,12 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 			firstLaunch = r.now()
 			if failedNet {
 				startWorker("the Worker path won on this network lately")
-			} else if !workerStarted && r.mode != "only" {
-				timer = time.NewTimer(r.times.headStart)
-				timerC = timer.C
+			} else if timerC != nil {
+				// Attempts that start late (after a slow answer) still get a
+				// head start of two staggers on the Worker path.
+				if left := r.times.headStart - firstLaunch.Sub(r.t0); left < 2*r.times.stagger {
+					timer.Reset(2 * r.times.stagger)
+				}
 			}
 		}
 		r.log("trying %d candidate(s) from %s", len(fresh), from)
@@ -642,11 +662,15 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 			id = r.id
 		}
 		done = true
-		if made > 0 && !verified {
+		switch {
+		case made > 0 && !verified && pending == 0:
 			r.log("chose the Worker path; on this network it starts at once for the next %v", directFailedFor)
 			until := r.now().Add(directFailedFor).UnixMilli()
 			r.change(func(c *directCache) { c.Failed[fp] = until })
-		} else {
+		case made > 0 && !verified:
+			r.log("chose the Worker path; %d direct attempt(s) still going", pending)
+			markLate = true
+		default:
 			r.log("chose the Worker path")
 		}
 		return raceOutcome{conn: wconn, via: "worker", id: id}, nil
@@ -662,6 +686,10 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 		r.log("asking the API; the Worker path won on this network lately")
 	} else {
 		r.log("asking the API")
+	}
+	if r.mode != "only" {
+		timer = time.NewTimer(r.times.headStart)
+		timerC = timer.C
 	}
 
 	switch {
@@ -707,7 +735,7 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 		case <-timerC:
 			timerC = nil
 			if waiting == nil && !presenting {
-				startWorker(fmt.Sprintf("%v after the first attempt", r.times.headStart))
+				startWorker("the direct attempts' head start is over")
 			}
 
 		case a := <-apis:
