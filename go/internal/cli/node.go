@@ -22,8 +22,10 @@ func newNodeCmd(opts *options) *cobra.Command {
 		Short:   "Run sandboxes on your own Docker hosts: add, list and remove nodes",
 		Long: "A node is a Linux host of your own, with Docker, that runs sandboxes for this\n" +
 			"deployment. An agent on it, cloudex-node, dials out to the deployment and stays\n" +
-			"connected; the host needs no open port. cloudex node add prints the command that\n" +
-			"installs the agent with a join token, which works once, for 30 minutes.\n" +
+			"connected. It takes one inbound port, 7022, on its LAN and tailnet addresses only,\n" +
+			"for direct ssh from those networks, and each connection needs a ticket from the\n" +
+			"deployment (the installer's --direct off opens none). cloudex node add prints the\n" +
+			"command that installs the agent with a join token, which works once, for 30 minutes.\n" +
 			"Adding and removing nodes needs the admin key or an admin token.\n" +
 			"With no subcommand, lists the nodes.",
 		Example: "  cloudex node add box\n  cloudex node list\n  cloudex node info box\n  cloudex node rm box",

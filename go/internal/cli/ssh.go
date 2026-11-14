@@ -108,8 +108,15 @@ func newSSHCmd(opts *options) *cobra.Command {
 		Use:   "ssh [sandbox] [-- ssh arguments or a command]",
 		Short: "Open a shell in a sandbox over SSH",
 		Long: "Open a shell in a sandbox. The connection runs through your Cloudex API over a\n" +
-			"WebSocket, so the sandbox needs no public address. Anything after -- goes to ssh,\n" +
-			"for example: cloudex ssh my-box -- -L 3000:localhost:3000",
+			"WebSocket, so the sandbox needs no public address. For a sandbox on a node this\n" +
+			"computer reaches over the LAN or a tailnet, it goes straight to the node instead\n" +
+			"(the direct path), with the API as the fallback; scp, rsync, ssh-config and attach\n" +
+			"take the same path. Anything after -- goes to ssh, for example:\n" +
+			"cloudex ssh my-box -- -L 3000:localhost:3000\n\n" +
+			"Environment:\n" +
+			"  CLOUDEX_DIRECT=auto|off|only  the direct path: tried first (auto, the default),\n" +
+			"                                never (off), or required (only, for debugging)\n" +
+			"  CLOUDEX_DEBUG=1               print which path each connection took, and why",
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			named, extra := splitAtDash(cmd, args)
