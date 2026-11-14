@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,8 +18,10 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
+	"github.com/lucataco/cloudex/go/internal/api"
 	"github.com/lucataco/cloudex/go/internal/config"
 	"github.com/lucataco/cloudex/go/internal/sshkey"
 	"github.com/spf13/cobra"
@@ -128,6 +131,7 @@ func newSSHCmd(opts *options) *cobra.Command {
 			if err := needRunning(s); err != nil {
 				return err
 			}
+			notePlacement(client.BaseURL, *s)
 			return runSSH(cmd, s.ID, append([]string{"cloudex@" + s.ID + sshHostSuffix}, extra...))
 		},
 	}
@@ -157,48 +161,121 @@ func newProxyCmd(opts *options) *cobra.Command {
 			if err != nil || port < 1 || port > 65535 {
 				return fmt.Errorf("bad port %q", args[1])
 			}
+			mode, err := directMode()
+			if err != nil {
+				return err
+			}
+			dir, err := config.Dir()
+			if err != nil {
+				return err
+			}
 			var key string
 			if port == 22 {
-				dir, err := config.Dir()
-				if err != nil {
-					return err
-				}
 				if _, key, err = sshkey.Ensure(dir); err != nil {
 					return err
-				}
-				if !sandboxIDRE.MatchString(r) {
-					s, err := client.Get(cmd.Context(), r)
-					if err != nil {
-						return err
-					}
-					if err := trackSSHName(dir, r, s.ID); err != nil {
-						fmt.Fprintf(cmd.ErrOrStderr(), "cloudex: couldn't record which sandbox %s%s is (%v). If ssh says its host key has changed, use cloudex ssh %s\n", r, sshHostSuffix, err, r)
-					}
-					r = s.ID
 				}
 			}
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
-			conn, err := client.DialTCP(ctx, r, port, key)
-			if err != nil {
-				return err
+			errOut := cmd.ErrOrStderr()
+			var logf func(string, ...any)
+			if debugOn() {
+				logf = func(format string, a ...any) { fmt.Fprintf(errOut, "cloudex proxy: "+format+"\n", a...) }
 			}
-			nc := websocket.NetConn(ctx, conn, websocket.MessageBinary)
-			// ssh closes our stdin when it's done; closing the connection then
-			// makes the read below fail, which isn't an error worth printing.
-			var closed atomic.Bool
-			go func() {
-				io.Copy(nc, os.Stdin)
-				closed.Store(true)
-				nc.Close()
-			}()
-			_, err = io.Copy(os.Stdout, nc)
-			if err != nil && !closed.Load() && ctx.Err() == nil && !errors.Is(err, io.EOF) && websocket.CloseStatus(err) == -1 {
-				return err
+			cache := readDirectCache(dir, client.BaseURL)
+			if mode == "auto" && cache.Older > time.Now().UnixMilli() {
+				mode = "off" // the deployment has no /direct; it's asked again within the hour
 			}
-			return nil
+
+			var conn net.Conn
+			if mode == "off" {
+				// The Worker path only, as before v0.2.3.
+				if port == 22 && !sandboxIDRE.MatchString(r) {
+					s, err := client.Get(ctx, r)
+					if err != nil {
+						return err
+					}
+					trackName(errOut, dir, r, s.ID)
+					r = s.ID
+				}
+				if logf != nil {
+					logf("CLOUDEX_DIRECT=off or an older deployment: the Worker path")
+				}
+				if conn, err = dialWorker(ctx, client, r, port, key); err != nil {
+					return err
+				}
+			} else {
+				race := &directRace{
+					ref: r, port: port, mode: mode,
+					api:    func(c context.Context) (*api.Direct, error) { return client.Direct(c, r, port, key) },
+					worker: func(c context.Context, ref string) (net.Conn, error) { return dialWorker(c, client, ref, port, key) },
+					get:    func(c context.Context) (*api.Sandbox, error) { return client.Get(c, r) },
+					nets:   readLocalNets(),
+					cache:  cache,
+					times:  defaultRaceTimes,
+					logf:   logf,
+				}
+				if sandboxIDRE.MatchString(r) {
+					race.id = r
+				} else if port == 22 {
+					race.id = readSSHNames(dir)[r] // the name's last id, for cached candidates only
+				}
+				if v := strings.TrimSpace(os.Getenv("CLOUDEX_DIRECT_CANDIDATES")); v != "" {
+					race.override = strings.Split(v, ",")
+				}
+				out, err := race.run(ctx)
+				updateDirectCache(dir, client.BaseURL, time.Now(), race.changes)
+				if port == 22 && !sandboxIDRE.MatchString(r) && race.answered != "" {
+					trackName(errOut, dir, r, race.answered)
+				}
+				if err != nil {
+					return err
+				}
+				conn = out.conn
+			}
+			return splice(ctx, conn)
 		},
 	}
+}
+
+func trackName(errOut io.Writer, dir, name, id string) {
+	if err := trackSSHName(dir, name, id); err != nil {
+		fmt.Fprintf(errOut, "cloudex: couldn't record which sandbox %s%s is (%v). If ssh says its host key has changed, use cloudex ssh %s\n", name, sshHostSuffix, err, name)
+	}
+}
+
+// dialWorker opens the Worker path: a WebSocket through the Sandbox object.
+// The connection lives as long as ctx's parent, not the dial's ctx.
+func dialWorker(ctx context.Context, client *api.Client, ref string, port int, key string) (net.Conn, error) {
+	ws, err := client.DialTCP(ctx, ref, port, key)
+	if err != nil {
+		return nil, err
+	}
+	return &wsConn{Conn: websocket.NetConn(context.WithoutCancel(ctx), ws, websocket.MessageBinary)}, nil
+}
+
+// wsConn marks the Worker path, whose close statuses aren't errors.
+type wsConn struct{ net.Conn }
+
+// splice connects stdin and stdout to conn until either ends.
+func splice(ctx context.Context, conn net.Conn) error {
+	// ssh closes our stdin when it's done; closing the connection then
+	// makes the read below fail, which isn't an error worth printing.
+	var closed atomic.Bool
+	go func() {
+		io.Copy(conn, os.Stdin)
+		closed.Store(true)
+		conn.Close()
+	}()
+	_, err := io.Copy(os.Stdout, conn)
+	conn.Close()
+	if err == nil || closed.Load() || ctx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	if _, ws := conn.(*wsConn); ws && websocket.CloseStatus(err) != -1 {
+		return nil
+	}
+	return err
 }
 
 func newSSHConfigCmd(opts *options) *cobra.Command {

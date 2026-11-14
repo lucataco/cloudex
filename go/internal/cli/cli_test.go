@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -34,6 +35,7 @@ func TestMain(m *testing.M) {
 
 // fakeAPI records requests and answers with canned JSON per "METHOD /path".
 type fakeAPI struct {
+	mu       sync.Mutex // cloudex proxy may ask /direct and dial at once
 	t        *testing.T
 	routes   map[string]string
 	requests []string
@@ -53,6 +55,8 @@ func newFakeAPI(t *testing.T, routes map[string]string) *httptest.Server {
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := r.Method + " " + r.URL.Path
 	body, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.requests = append(f.requests, key)
 	f.bodies = append(f.bodies, string(body))
 	if r.Header.Get("Authorization") != "Bearer test-key" {

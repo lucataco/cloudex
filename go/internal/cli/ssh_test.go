@@ -70,8 +70,14 @@ func TestRemoveKnownHostForgetsEveryFormOfTheName(t *testing.T) {
 
 func proxyAPI(t *testing.T, id string) *fakeAPI {
 	return withFakeAPI(t, map[string]string{
-		"GET /v1/sandboxes/web": strings.Replace(sandboxJSON, "cx-abc123", id, 1),
+		"GET /v1/sandboxes/web":              strings.Replace(sandboxJSON, "cx-abc123", id, 1),
+		"GET /v1/sandboxes/web/direct":       cloudflareDirect(id),
+		"GET /v1/sandboxes/cx-abc123/direct": cloudflareDirect("cx-abc123"),
 	})
+}
+
+func cloudflareDirect(id string) string {
+	return `{"sandbox":"` + id + `","provider":"cloudflare"}`
 }
 
 func TestProxyForgetsANameThatMovedBeforeDialing(t *testing.T) {
@@ -84,7 +90,7 @@ func TestProxyForgetsANameThatMovedBeforeDialing(t *testing.T) {
 	if got, want := knownHostNames(t), []string{"cx-abc123.cloudex", "cx-old111.cloudex"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("known_hosts has %v, want %v", got, want)
 	}
-	if want := []string{"GET /v1/sandboxes/web", "GET /v1/sandboxes/cx-abc123/tcp/22"}; !reflect.DeepEqual(f.requests, want) {
+	if want := []string{"GET /v1/sandboxes/web/direct", "GET /v1/sandboxes/cx-abc123/tcp/22"}; !reflect.DeepEqual(f.requests, want) {
 		t.Fatalf("requests %v, want %v: the tunnel is dialed by id", f.requests, want)
 	}
 	dir, _ := config.Dir()
@@ -101,7 +107,7 @@ func TestProxyForgetsANameThatMovedBeforeDialing(t *testing.T) {
 		t.Fatalf("a name that didn't move lost its key: %v", got)
 	}
 
-	f.routes["GET /v1/sandboxes/web"] = strings.Replace(sandboxJSON, "cx-abc123", "cx-new222", 1)
+	f.routes["GET /v1/sandboxes/web/direct"] = cloudflareDirect("cx-new222")
 	run(t, "proxy", "web.cloudex", "22")
 	if got := knownHostNames(t); len(got) != 0 {
 		t.Fatalf("a name that moved kept its key: %v", got)
@@ -118,7 +124,7 @@ func TestProxyConnectsWhenItCantRecordTheName(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, errOut := run(t, "proxy", "web.cloudex", "22")
-	if want := []string{"GET /v1/sandboxes/web", "GET /v1/sandboxes/cx-abc123/tcp/22"}; !reflect.DeepEqual(f.requests, want) {
+	if want := []string{"GET /v1/sandboxes/web/direct", "GET /v1/sandboxes/cx-abc123/tcp/22"}; !reflect.DeepEqual(f.requests, want) {
 		t.Fatalf("requests %v, want %v: the tunnel is dialed anyway", f.requests, want)
 	}
 	if !strings.Contains(errOut, "cloudex ssh web") {
@@ -165,6 +171,12 @@ func TestWriteFileAtomicTakesWritersAtOnce(t *testing.T) {
 func TestProxyByIDKeepsNoRecord(t *testing.T) {
 	f := proxyAPI(t, "cx-abc123")
 	writeKnownHosts(t, "cx-abc123.cloudex")
+	run(t, "proxy", "cx-abc123.cloudex", "22")
+	if want := []string{"GET /v1/sandboxes/cx-abc123/direct", "GET /v1/sandboxes/cx-abc123/tcp/22"}; !reflect.DeepEqual(f.requests, want) {
+		t.Fatalf("requests %v", f.requests)
+	}
+	// Known to be on Cloudflare now: the next connection asks nothing first.
+	f.requests = nil
 	run(t, "proxy", "cx-abc123.cloudex", "22")
 	if want := []string{"GET /v1/sandboxes/cx-abc123/tcp/22"}; !reflect.DeepEqual(f.requests, want) {
 		t.Fatalf("requests %v", f.requests)

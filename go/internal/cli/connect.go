@@ -368,6 +368,7 @@ func sshRun(cmd *cobra.Command, opts *options, named string, tty bool, remote st
 	if err := needRunning(s); err != nil {
 		return err
 	}
+	notePlacement(client.BaseURL, *s)
 	args := []string{}
 	if tty {
 		args = append(args, "-t")

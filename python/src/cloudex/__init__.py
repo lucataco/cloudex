@@ -284,6 +284,7 @@ class Node:
     pending_deletes: Optional[List[str]] = None  # nodes.get only: sandboxes deleted while it was offline
     clock_skew_sec: Optional[int] = None  # nodes.get only: its agent's clock less the deployment's, at its last connect
     direct: Optional[Dict[str, Any]] = None  # {"port", "addrs", "state", "error"?}: its direct path (v0.2.3 agents)
+    public_key: Optional[str] = None  # its Ed25519 public key in base64, which its direct port's TLS certificate carries
 
 
 @dataclass(frozen=True)
@@ -304,7 +305,7 @@ def _node(n: Dict[str, Any]) -> Node:
         memory_mb=n.get("memoryMb"), disk_free_gb=n.get("diskFreeGb"), colo=n.get("colo"), location_hint=n.get("locationHint"),
         machines=n.get("machines", 0), revoked_at=n.get("revokedAt"), rtt_ms=n.get("rttMs"), image=n.get("image"),
         orphans=n.get("orphans"), pending_deletes=n.get("pendingDeletes"), clock_skew_sec=n.get("clockSkewSec"),
-        direct=n.get("direct"),
+        direct=n.get("direct"), public_key=n.get("publicKey"),
     )
 
 

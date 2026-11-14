@@ -37,6 +37,10 @@ type Node struct {
 	// Direct is the node's direct port (v0.2.3): absent for an older agent
 	// or with the port turned off.
 	Direct *NodeDirect `json:"direct,omitempty"`
+	// PublicKey is the node's Ed25519 key in base64 (v0.2.3), which its
+	// direct port's certificate carries: absent before it joins, once it's
+	// removed, and from an older deployment.
+	PublicKey string `json:"publicKey,omitempty"`
 	// GetNode only (v0.2.2 M5): machines of no sandbox, sandboxes deleted
 	// while it was offline whose machines it removes when it's back, and its
 	// agent's clock less the deployment's at its last connect.

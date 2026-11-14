@@ -75,6 +75,7 @@ const fromRow = (r: Row): Node => ({
   machines: r.machines ?? 0,
   revokedAt: r.revoked_at,
   ...(direct(r.direct) ? { direct: direct(r.direct) } : {}),
+  ...(r.public_key && r.state !== "revoked" ? { publicKey: r.public_key } : {}),
 });
 
 const SELECT = "SELECT n.*, (SELECT COUNT(*) FROM sandboxes s WHERE s.node = n.id) AS machines FROM nodes n";

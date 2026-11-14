@@ -140,6 +140,9 @@ type Health struct {
 type Error struct {
 	Status  int
 	Message string
+	// Older says the deployment doesn't have the route at all: it's older
+	// than the CLI.
+	Older bool
 }
 
 func (e *Error) Error() string { return e.Message }
@@ -254,14 +257,20 @@ func (c *Client) failure(ctx context.Context, res *http.Response, data []byte) *
 	if json.Unmarshal(data, &e) != nil || e.Error == "" {
 		e.Error = plainError(res.Status, string(data))
 	}
+	older := false
 	if res.StatusCode == http.StatusNotFound && e.Error == "not found" && res.Request.URL.Path != "/v1/health" {
+		older = true
 		e.Error = "this deployment is older than the CLI"
-		if h, err := c.Health(ctx); err == nil && c.CLIVersion != "" {
-			e.Error += fmt.Sprintf(" (%s vs %s)", h.Version, c.CLIVersion)
+		// cloudex proxy asks for /direct before a connection and falls back
+		// at once, so it isn't kept waiting for the versions.
+		if !strings.HasSuffix(res.Request.URL.Path, "/direct") {
+			if h, err := c.Health(ctx); err == nil && c.CLIVersion != "" {
+				e.Error += fmt.Sprintf(" (%s vs %s)", h.Version, c.CLIVersion)
+			}
 		}
 		e.Error += ": update it with cloudex deploy"
 	}
-	return &Error{Status: res.StatusCode, Message: CleanText(e.Error)}
+	return &Error{Status: res.StatusCode, Message: CleanText(e.Error), Older: older}
 }
 
 // CleanText keeps text from the deployment, some of which a node wrote (its

@@ -184,6 +184,8 @@ test("the node's direct fact reaches D1 with its facts, and the route's one read
   assert.deepEqual({ ...row, direct: JSON.parse(row.direct!) }, { node: "nd-abcd1234", name: "box", publicKey: "KEY", direct });
   assert.deepEqual(directCandidates(row.direct), { port: 7022, addrs: ["192.168.65.2"] });
   assert.deepEqual((await findNode(db as never, "box"))!.direct, direct);
+  // The node's key, for cloudex doctor's pinned handshake.
+  assert.equal((await findNode(db as never, "box"))!.publicKey, "KEY");
   assert.deepEqual(await directRow(db as never, "cx-cf0001"), { node: null, name: null, publicKey: null, direct: null });
   assert.equal(await directRow(db as never, "cx-none00"), null);
   // An agent older than v0.2.3 reports none: cleared.
@@ -194,4 +196,5 @@ test("the node's direct fact reaches D1 with its facts, and the route's one read
   await mirrorNode(db as never, "nd-abcd1234", { facts: { ...facts, direct } });
   await revokeNode(db as never, "nd-abcd1234");
   assert.deepEqual(await directRow(db as never, "cx-abc123"), { node: "nd-abcd1234", name: "box", publicKey: null, direct: null });
+  assert.equal("publicKey" in (await findNode(db as never, "box"))!, false);
 });

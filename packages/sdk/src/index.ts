@@ -133,6 +133,8 @@ export interface NodeInfo {
   clockSkewSec?: number;
   /** Its direct path, as its agent last reported it; absent for an agent older than v0.2.3. */
   direct?: NodeDirect;
+  /** Its Ed25519 public key in base64, which its direct port's TLS certificate carries; absent before it joins and once removed. */
+  publicKey?: string;
 }
 
 /** A node as added: the token its agent joins with (once, before expiresAt), and the command that installs the agent. */

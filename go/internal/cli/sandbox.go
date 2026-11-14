@@ -274,6 +274,7 @@ func newListCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			notePlacement(client.BaseURL, list...)
 			if opts.json {
 				if list == nil {
 					list = []api.Sandbox{}
@@ -328,6 +329,7 @@ func newInfoCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			notePlacement(client.BaseURL, *s)
 			if opts.json {
 				return writeJSON(cmd.OutOrStdout(), s)
 			}

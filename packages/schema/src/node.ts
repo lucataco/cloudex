@@ -141,6 +141,10 @@ export const Node = z.object({
   // v0.2.3: the node's direct path as its agent last reported it; absent for
   // an agent older than v0.2.3.
   direct: NodeDirect.optional(),
+  // v0.2.3: the node's Ed25519 public key in base64, what its direct port's
+  // TLS certificate carries (cloudex doctor pins it); absent before it joins
+  // and once it's removed.
+  publicKey: z.string().optional(),
 });
 export type Node = z.infer<typeof Node>;
 
