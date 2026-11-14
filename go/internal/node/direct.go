@@ -41,17 +41,27 @@ import (
 // that runs. Sessions are reported to the Worker so that they count as
 // activity and end with their token (DirectReport, the directEnd op).
 
-// Limits on the direct port (plan M2, "Limits").
+// Limits on the direct port (plan M2, "Limits"; review D-L2).
 const (
-	DirectHandshakesMax   = 64   // TLS handshakes and ticket lines at once
-	DirectPerClientMax    = 16   // of those from one client address
-	DirectSessionsMax     = 256  // open sessions on the node
-	DirectSeenMax         = 4096 // session ids remembered until their ticket expires
-	DirectEndedTokensMax  = 1024 // tokens that ended, remembered until their tickets expire
-	DirectGrace           = 10 * time.Second
-	DirectQuietReport     = 5 * time.Minute // a report while sessions are open but quiet
-	DirectSidecarEvery    = 30 * time.Second
-	directRelayRecheckGap = 2 * time.Second
+	DirectHandshakesMax = 128 // TLS handshakes and ticket lines at once
+	DirectPerClientMax  = 16  // of those from one client address
+	// of those from the agent network's gateway, which is every tailnet
+	// client behind Tailscale's SNAT (and the host's own containers): one
+	// address for many people, so a budget of its own, which leaves the rest
+	// to the LAN.
+	DirectGatewayMax  = 64
+	DirectSessionsMax = 256  // open sessions on the node
+	DirectSeenMax     = 4096 // session ids remembered until their ticket expires
+	// One token's share, so that one token holder can't take the node's
+	// (the admin key, which reaches everything anyway, has none): tickets
+	// seen in a ticket's lifetime, and sessions open at once.
+	DirectTokenSeenMax     = 512
+	DirectTokenSessionsMax = 64
+	DirectEndedTokensMax   = 1024 // tokens that ended, remembered until their tickets expire
+	DirectGrace            = 10 * time.Second
+	DirectQuietReport      = 5 * time.Minute // a report while sessions are open but quiet
+	DirectSidecarEvery     = 30 * time.Second
+	directRelayRecheckGap  = 2 * time.Second
 )
 
 // directEndMax bounds a directEnd's list: the most sessions a Sandbox object
@@ -102,12 +112,18 @@ type Direct struct {
 	hs        int
 	perClient map[netip.Addr]int
 	sessions  map[string]*directSession
-	seen      map[string]time.Time // session id -> forget after (local clock)
-	ended     map[string]time.Time // token id -> refuse its tickets until (local clock)
-	reported  map[string]time.Time // sandbox -> last report
+	seen      map[string]seenTicket // session id -> until when, and its token
+	seenBy    map[string]int        // token -> how many of seen are its
+	ended     map[string]time.Time  // token id -> refuse its tickets until (local clock)
+	reported  map[string]time.Time  // sandbox -> last report
 	kick      chan struct{}
 	listened  bool
 	cert      *tls.Certificate
+}
+
+type seenTicket struct {
+	until time.Time // local clock
+	token string
 }
 
 type directSession struct {
@@ -134,7 +150,8 @@ func (d *Direct) init() {
 	if d.perClient == nil {
 		d.perClient = map[netip.Addr]int{}
 		d.sessions = map[string]*directSession{}
-		d.seen = map[string]time.Time{}
+		d.seen = map[string]seenTicket{}
+		d.seenBy = map[string]int{}
 		d.ended = map[string]time.Time{}
 		d.reported = map[string]time.Time{}
 		d.kick = make(chan struct{}, 1)
@@ -554,9 +571,13 @@ func (d *Direct) handle(c net.Conn) {
 		d.debugf("client %s is the agent network's gateway: behind the host's NAT (Tailscale's SNAT), or a machine without the firewall", cl)
 	}
 	d.mu.Lock()
-	if d.perClient[cl.Addr()] >= DirectPerClientMax {
+	limit := DirectPerClientMax
+	if gw.IsValid() && cl.Addr() == gw {
+		limit = DirectGatewayMax
+	}
+	if d.perClient[cl.Addr()] >= limit {
 		d.mu.Unlock()
-		d.debugf("refused %s: %d handshakes from it already", cl, DirectPerClientMax)
+		d.debugf("refused %s: %d handshakes from it already", cl, limit)
 		c.Close()
 		return
 	}
@@ -665,20 +686,35 @@ func (d *Direct) admit(ticket string) (direct.Claims, string) {
 	if len(d.seen) >= DirectSeenMax {
 		return c, "busy: too many tickets in the last minute"
 	}
-	d.seen[c.Session] = time.Unix(c.Exp, 0).Add(-d.skew).Add(DirectGrace)
+	if c.Token != "" && d.seenBy[c.Token] >= DirectTokenSeenMax {
+		return c, "busy: too many tickets of this token in the last minute"
+	}
+	d.markSeenLocked(c.Session, c.Token, time.Unix(c.Exp, 0).Add(-d.skew).Add(DirectGrace))
 	return c, ""
 }
 
 func (d *Direct) pruneSeenLocked(now time.Time) {
-	for id, until := range d.seen {
-		if now.After(until) {
+	for id, e := range d.seen {
+		if now.After(e.until) {
 			delete(d.seen, id)
+			if e.token != "" {
+				if d.seenBy[e.token]--; d.seenBy[e.token] <= 0 {
+					delete(d.seenBy, e.token)
+				}
+			}
 		}
 	}
 	for t, until := range d.ended {
 		if now.After(until) {
 			delete(d.ended, t)
 		}
+	}
+}
+
+func (d *Direct) markSeenLocked(id, token string, until time.Time) {
+	d.seen[id] = seenTicket{until: until, token: token}
+	if token != "" {
+		d.seenBy[token]++
 	}
 }
 
@@ -692,14 +728,20 @@ func (d *Direct) open(c direct.Claims, conn net.Conn) (*directSession, string) {
 	if len(d.sessions) >= DirectSessionsMax {
 		return nil, fmt.Sprintf("this node has %d direct sessions open", DirectSessionsMax)
 	}
-	n := 0
+	n, byToken := 0, 0
 	for _, s := range d.sessions {
 		if s.sandbox == c.Sandbox {
 			n++
 		}
+		if c.Token != "" && s.token == c.Token {
+			byToken++
+		}
 	}
 	if n >= direct.SessionsMax {
 		return nil, fmt.Sprintf("%s has %d direct sessions open", c.Sandbox, direct.SessionsMax)
+	}
+	if byToken >= DirectTokenSessionsMax {
+		return nil, fmt.Sprintf("this token has %d direct sessions open on this node", DirectTokenSessionsMax)
 	}
 	s := &directSession{id: c.Session, sandbox: c.Sandbox, token: c.Token, conn: conn}
 	d.sessions[s.id] = s
@@ -827,7 +869,7 @@ func (d *Direct) End(e DirectEnd) int {
 			closing = append(closing, s)
 		}
 		if _, ok := d.seen[id]; !ok && len(d.seen) < 2*DirectSeenMax {
-			d.seen[id] = now.Add(direct.TicketTTL + DirectGrace)
+			d.markSeenLocked(id, "", now.Add(direct.TicketTTL+DirectGrace))
 		}
 	}
 	for _, t := range e.Tokens {

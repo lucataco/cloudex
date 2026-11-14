@@ -453,7 +453,7 @@ func TestListenerHandshakeLimits(t *testing.T) {
 	waitFor(t, func() bool { r.d.mu.Lock(); defer r.d.mu.Unlock(); return r.d.hs == DirectHandshakesMax })
 	c, _ := net.Dial("tcp4", r.addr)
 	if !closedAtOnce(c) {
-		t.Fatal("the 65th handshake wasn't closed")
+		t.Fatal("the handshake over the node's cap wasn't closed")
 	}
 	// The deadline frees them.
 	for _, c := range held {
@@ -588,5 +588,97 @@ func TestEndByToken(t *testing.T) {
 	// Another sandbox's directEnd doesn't touch these.
 	if n := r.d.End(DirectEnd{Sandbox: "cx-other1", Sessions: []string{}, Tokens: []string{"tk-keepme12"}}); n != 0 {
 		t.Fatalf("another sandbox's directEnd closed %d", n)
+	}
+}
+
+// Review D-L2: the agent network's gateway (every tailnet client behind
+// Tailscale's SNAT) has a budget of its own, larger than one LAN address's
+// and leaving the rest of the node's to the LAN; one token can't take the
+// node's seen set or its sessions.
+func TestDirectSharesOfTheLimits(t *testing.T) {
+	r := newDirectRig(t, "127.0.0.1")
+	hold := func(client string) net.Conn {
+		c, err := net.Dial("tcp4", r.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.WriteString(c, "CXR1 "+client+" 50000\n")
+		return c
+	}
+	var held []net.Conn
+	defer func() {
+		for _, c := range held {
+			c.Close()
+		}
+	}()
+	for i := 0; i < DirectGatewayMax; i++ {
+		held = append(held, hold("172.18.0.1"))
+	}
+	waitFor(t, func() bool {
+		r.d.mu.Lock()
+		defer r.d.mu.Unlock()
+		return r.d.perClient[netip.MustParseAddr("172.18.0.1")] == DirectGatewayMax
+	})
+	c := hold("172.18.0.1")
+	c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := c.Read(make([]byte, 1)); err == nil || isTimeout(err) {
+		t.Fatal("a handshake over the gateway's budget wasn't closed")
+	}
+	// A LAN client still gets in.
+	var port int
+	fmt.Sscan(r.machine, &port)
+	s, err := r.connect(t, "192.168.65.1", r.ticket("cx-abc123", port))
+	if err != nil {
+		t.Fatalf("a LAN client with the gateway's budget used: %v", err)
+	}
+	s.Close()
+
+	// One token's seen tickets.
+	now := time.Unix(1_800_000_000, 0)
+	d := testDirect(now, 0)
+	tok := func(token string) string {
+		c := claims(now.Add(time.Minute))
+		c.Token = token
+		return direct.Mint(testSecret, c)
+	}
+	for i := 0; i < DirectTokenSeenMax; i++ {
+		if _, why := d.admit(tok("tk-greedy01")); why != "" {
+			t.Fatalf("ticket %d: %s", i, why)
+		}
+	}
+	if _, why := d.admit(tok("tk-greedy01")); !strings.Contains(why, "of this token") {
+		t.Fatalf("over the token's share: %q", why)
+	}
+	if _, why := d.admit(tok("tk-other001")); why != "" {
+		t.Fatalf("another token: %q", why)
+	}
+	if _, why := d.admit(tok("")); why != "" {
+		t.Fatalf("the admin key: %q", why)
+	}
+	// Forgotten with the tickets, counts and all.
+	d.Now = func() time.Time { return now.Add(time.Minute + DirectGrace + time.Second) }
+	d.mu.Lock()
+	d.pruneSeenLocked(d.now())
+	left := len(d.seenBy)
+	d.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d token counts left after their tickets expired", left)
+	}
+
+	// One token's open sessions on the node, across sandboxes.
+	d2 := testDirect(now, 0)
+	a, b := net.Pipe()
+	defer b.Close()
+	for i := 0; i < DirectTokenSessionsMax; i++ {
+		d2.sessions[fmt.Sprintf("%016x", i)] = &directSession{id: fmt.Sprintf("%016x", i), sandbox: fmt.Sprintf("cx-sb%04d", i), token: "tk-greedy01", conn: a}
+	}
+	c2 := claims(now.Add(time.Minute))
+	c2.Sandbox, c2.Token = "cx-new001", "tk-greedy01"
+	if _, why := d2.open(c2, a); !strings.Contains(why, "this token has") {
+		t.Fatalf("over the token's sessions: %q", why)
+	}
+	c2.Token = "tk-other001"
+	if _, why := d2.open(c2, a); why != "" {
+		t.Fatalf("another token: %q", why)
 	}
 }

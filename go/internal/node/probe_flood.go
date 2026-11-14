@@ -165,7 +165,7 @@ type FakeAgent struct {
 	Lines  <-chan string
 	dmu    sync.Mutex
 	secret []byte
-	skew   time.Duration // the Worker's clock less this one's, from welcome
+	skew   time.Duration                // the Worker's clock less this one's, from welcome
 	opened map[string]map[string]string // sandbox -> session -> its token
 
 	send     func(any) error
