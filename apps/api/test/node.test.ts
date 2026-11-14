@@ -97,12 +97,13 @@ function fakeStorage() {
   };
 }
 
-function setup() {
+function setup(image = "") {
   const storage = fakeStorage();
   storage.kv.set("id", NODE);
   const sockets: FakeWs[] = [];
   const woken: string[] = [];
   const reports: [string, unknown][] = [];
+  const directs: [string, string, unknown][] = [];
   const waits: Promise<unknown>[] = [];
   const ctx = {
     storage,
@@ -116,14 +117,19 @@ function setup() {
   const env = {
     DB: counted,
     ADMIN_KEY: "admin-key-for-tests",
-    NODE_IMAGE: "",
-    SANDBOX: { getByName: (sb: string) => ({ nodeReport: async (_id: string, r: unknown) => void (woken.push(sb), reports.push([sb, r])) }) },
+    NODE_IMAGE: image,
+    SANDBOX: {
+      getByName: (sb: string) => ({
+        nodeReport: async (_id: string, r: unknown) => void (woken.push(sb), reports.push([sb, r])),
+        nodeDirect: async (id: string, r: unknown) => void (woken.push(sb), directs.push([sb, id, r])),
+      }),
+    },
   };
   const node = new Node(ctx as never, env as never);
   const ws = new FakeWs({ gen: 1, acceptedAt: Date.now(), lastMessageAt: null });
   sockets.push(ws);
   const say = (m: unknown) => node.webSocketMessage(ws as never, JSON.stringify(m));
-  return { node, ws, say, woken, reports, waits, storage, sockets };
+  return { node, ws, say, woken, reports, directs, waits, storage, sockets };
 }
 
 // A connect, as the Worker passes it on once its signature checked out
@@ -139,8 +145,8 @@ globalThis.Response = class extends RealResponse {
   }
 } as typeof Response;
 let nonces = 0;
-async function connect(t: ReturnType<typeof setup>) {
-  const headers = new Headers({ upgrade: "websocket", "x-cx-node": NODE, "x-cx-nonce": `nonce-${++nonces}` });
+async function connect(t: ReturnType<typeof setup>, extra: Record<string, string> = {}) {
+  const headers = new Headers({ upgrade: "websocket", "x-cx-node": NODE, "x-cx-nonce": `nonce-${++nonces}`, ...extra });
   const res = await t.node.fetch({ headers } as unknown as Request);
   assert.equal(res.status, 200, await res.clone().text());
   const ws = t.sockets.at(-1)!;
@@ -348,4 +354,62 @@ test("a hello's note for a machine the agent stopped itself reaches its sandbox 
   const r = t.reports.find(([sb]) => sb === "cx-mine01")?.[1] as { machine?: string; note?: string } | undefined;
   assert.equal(r?.machine, "stopped");
   assert.match(r?.note ?? "", /firewall table/);
+});
+
+// v0.2.3: the direct path's messages.
+test("direct reports reach the sandbox's object only for the node's own sandboxes, up to PER_MINUTE.direct", async () => {
+  const t = setup();
+  await t.say(hello);
+  await Promise.all(t.waits);
+  t.woken.length = 0;
+  for (let i = 0; i < 20; i++) await t.say({ type: "direct", sandbox: "cx-other1", open: ["0123456789abcdef"], active: true });
+  await Promise.all(t.waits);
+  assert.deepEqual(t.directs, [], "another node's sandbox isn't told");
+  assert.equal(t.ws.closed, null);
+
+  const fresh = setup();
+  await fresh.say(hello);
+  await Promise.all(fresh.waits);
+  for (let i = 0; i < 500; i++) await fresh.say({ type: "direct", sandbox: "cx-mine01", open: [], active: i % 2 === 0 });
+  await Promise.all(fresh.waits);
+  assert.equal(fresh.directs.length, PER_MINUTE.direct);
+  assert.deepEqual(fresh.directs[0], ["cx-mine01", NODE, { open: [], active: true }]);
+  assert.equal(fresh.ws.closed, null, "a flood is dropped, not closed");
+  // A malformed one closes the socket, as any message outside the protocol.
+  await fresh.say({ type: "direct", sandbox: "cx-mine01", open: ["nope"], active: true });
+  assert.equal(fresh.ws.closed?.code, 4400);
+});
+
+test("a count kept by v0.2.2 (no direct) goes on counting", async () => {
+  const { allow } = await import("../src/node.ts");
+  const now = Date.now();
+  const old = { at: now, facts: 1, state: 2, tickets: 3, dropped: 0 };
+  const r = allow(old, "direct", now);
+  assert.equal(r.ok, true);
+  assert.equal(r.counts.direct, 1);
+  assert.equal(r.counts.state, 2);
+});
+
+test("welcome carries the node's direct secret, derived from the key its connect was checked with", async () => {
+  const { directSecret } = await import("../src/direct.ts");
+  const t = setup("ghcr.io/lucataco/cloudex-base:v0.2.2");
+  const key = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+  const c = await connect(t, { "x-cx-internal-key": key });
+  const before = Date.now();
+  await c.say(hello);
+  await Promise.all(t.waits);
+  const welcome = c.ws.sent.map((m) => JSON.parse(m)).find((m) => m.type === "welcome");
+  assert.ok(welcome, "a welcome");
+  assert.equal(welcome.direct.secret, await directSecret("admin-key-for-tests", NODE, key));
+  assert.ok(welcome.direct.now >= before && welcome.direct.now <= Date.now());
+  const { WorkerMessage } = await import("@cloudex/schema/node");
+  assert.ok(WorkerMessage.safeParse(welcome).success);
+
+  // A connect without a usable key header: no direct part (the agent leaves the path off).
+  const u = setup("ghcr.io/lucataco/cloudex-base:v0.2.2");
+  const d = await connect(u, { "x-cx-internal-key": "not a key" });
+  await d.say(hello);
+  await Promise.all(u.waits);
+  const w2 = d.ws.sent.map((m) => JSON.parse(m)).find((m) => m.type === "welcome");
+  assert.equal(w2.direct, undefined);
 });

@@ -34,13 +34,15 @@ import {
   NodeJoin,
   type NodeJoined,
   NODE_PROTOCOL,
+  type DirectAnswer,
 } from "@cloudex/schema";
 import { z } from "zod";
 import { openapi } from "@cloudex/schema/openapi";
 import { isAgentId } from "./agents";
 import { isCommandId } from "./commands";
 import { backupBucket } from "./backup";
-import { deleteSandbox, idForName, listSandboxes, nameTaken, sandboxesOnNode } from "./db";
+import { deleteSandbox, directRow, idForName, listSandboxes, nameTaken, sandboxesOnNode } from "./db";
+import { directCandidates } from "./direct";
 import {
   DEVICE_INTERVAL,
   SESSION_TTL_SEC,
@@ -67,7 +69,7 @@ import { serveDashboard } from "./dashboard";
 import { CONNECT } from "./node";
 import { HEADERS, issueJoinToken, readCapped, useJoinToken, verifyJoinSignature, verifyNodeRequest } from "./nodeauth";
 import { addNode, findNode, forgetNode, joinNode, listNodeRows, mustFindNode, nodeKeys, nodePublicKey, nodeView, revokeNode, installCommand } from "./nodes";
-import { placeOn, refused } from "./placement";
+import { placeOn, refused, removedMessage } from "./placement";
 import { locationHint } from "./nodestate";
 import { cachedKey, nodeEgress } from "./nodeegress";
 import { readTicket } from "./nodestream";
@@ -227,7 +229,12 @@ app.get("/v1/node/connect", async (c) => {
       426,
     );
   }
-  const v = await verifyNodeRequest(c.req.raw, (id) => nodeKeys(c.env.DB, id));
+  let key: string | null = null;
+  const v = await verifyNodeRequest(c.req.raw, async (id) => {
+    const k = await nodeKeys(c.env.DB, id);
+    key = k.key;
+    return k;
+  });
   if (!("signed" in v)) return c.json({ error: v.error, ...(v.revoked ? { revoked: true } : {}) }, v.status);
   const cf = (c.req.raw as { cf?: { colo?: unknown; continent?: unknown; longitude?: unknown } }).cf;
   const fwd = new Request("http://node/connect", c.req.raw);
@@ -237,6 +244,7 @@ app.get("/v1/node/connect", async (c) => {
   fwd.headers.set(CONNECT.continent, typeof cf?.continent === "string" ? cf.continent.slice(0, 4) : "");
   fwd.headers.set(CONNECT.hint, locationHint(cf) ?? "");
   fwd.headers.set(CONNECT.skew, String(Number(v.signed.ts) - Math.floor(Date.now() / 1000)));
+  fwd.headers.set(CONNECT.key, key ?? "");
   return c.env.NODE.getByName(v.signed.node).fetch(fwd);
 });
 
@@ -735,6 +743,38 @@ app.get("/v1/sandboxes/:ref/tcp/:port{[0-9]+}", async (c) => {
   const { stub } = await sandbox(c.env, c.req.param("ref"));
   const url = new URL(c.req.url);
   return stub.fetch(socketRequest(c, `http://sandbox/tcp/${c.req.param("port")}${url.search}`));
+});
+
+// The direct path (v0.2.3, direct.ts), for cloudex proxy: where the sandbox
+// runs and, on a node with a direct path, the node's key to pin, the
+// addresses to try and a ticket for one connection. A Cloudflare sandbox, or
+// a node without a direct path (an older agent, turned off, failed), wakes
+// nothing: the answer says to use the Worker path, which does its own checks.
+// The node's link to Cloudflare being down doesn't refuse a ticket: the agent
+// checks it with the secret it holds.
+const DirectQuery = z.object({
+  port: z.coerce.number().int().min(1).max(65535).default(22),
+  key: z.string().max(16_384).optional(),
+});
+app.get("/v1/sandboxes/:ref/direct", async (c) => {
+  const q = DirectQuery.safeParse(c.req.query());
+  if (!q.success) fail(400, "port must be 1-65535, and key an SSH public key");
+  const { id, stub } = await sandbox(c.env, c.req.param("ref"));
+  const row = await directRow(c.env.DB, id);
+  if (!row) {
+    // Not in the index (yet): its object says where it runs.
+    const shown = await stub.get();
+    if (shown.placement?.provider !== "node") return c.json({ sandbox: id, provider: "cloudflare" } satisfies DirectAnswer);
+    fail(503, "the deployment's index doesn't list this sandbox yet; connect through the Worker (CLOUDEX_DIRECT=off) or try again");
+  }
+  if (!row.node) return c.json({ sandbox: id, provider: "cloudflare" } satisfies DirectAnswer);
+  if (!row.publicKey) fail(410, removedMessage(row.name ?? row.node));
+  const direct = directCandidates(row.direct);
+  const base = { sandbox: id, provider: "node" as const, node: { id: row.node, name: row.name ?? row.node }, publicKey: row.publicKey, direct };
+  if (!direct) return c.json({ ...base, ticket: null, expiresAt: null } satisfies DirectAnswer);
+  const who = c.get("who");
+  const t = await stub.direct({ node: row.node, publicKey: row.publicKey, port: q.data.port, key: q.data.key ?? null, tokenId: who.kind === "token" ? who.token.id : null });
+  return c.json({ ...base, ticket: t.ticket, expiresAt: t.expiresAt } satisfies DirectAnswer);
 });
 
 // Preview links: POST hands out a port's link, GET lists the ones that work,

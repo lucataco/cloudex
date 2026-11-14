@@ -43,6 +43,8 @@ export const RULES: [string, string, Need, boolean?][] = [
   ["POST", "/v1/sandboxes/:ref/agents/:id/messages", "write"],
   ["POST", "/v1/sandboxes/:ref/agents/:id/interrupt", "write"],
   ["GET", "/v1/sandboxes/:ref/tcp/:port", "write"],
+  // The direct path's ticket opens the same connection as tcp (v0.2.3).
+  ["GET", "/v1/sandboxes/:ref/direct", "write"],
   ["GET", "/v1/sandboxes/:ref/terminal", "write"],
   ["GET", "/v1/sandboxes/:ref/desktop/vnc", "write"],
   // Links let anyone holding them into the sandbox's servers.

@@ -141,6 +141,9 @@ const MIGRATIONS = [
   "ALTER TABLE sandboxes ADD COLUMN node TEXT",
   // v0.2.2 M6: the node a named save was made on, as JSON {id, name}; null on Cloudflare.
   "ALTER TABLE saves ADD COLUMN node TEXT",
+  // v0.2.3: the node's direct path as its agent last reported it (JSON of
+  // NodeDirect, from its facts); null for an agent older than v0.2.3.
+  "ALTER TABLE nodes ADD COLUMN direct TEXT",
 ];
 
 async function migrate(db: D1Database) {
@@ -310,4 +313,20 @@ export async function nodeRow(
     .bind(id)
     .first<{ name: string; state: Node["state"]; last_seen_at: number | null; runtime: Node["runtime"]; isolation: string | null }>();
   return r ? { name: r.name, state: r.state, lastSeenAt: r.last_seen_at, runtime: r.runtime, isolation: isolationOf(r.isolation) } : null;
+}
+
+// What GET /v1/sandboxes/{ref}/direct needs (direct.ts), in one read: the
+// node the sandbox runs on (null on Cloudflare), and that node's name, key
+// (null once it's removed) and direct fact. Null when the index has no row
+// for the sandbox.
+export async function directRow(
+  db: D1Database,
+  id: string,
+): Promise<{ node: string | null; name: string | null; publicKey: string | null; direct: string | null } | null> {
+  await ensureSchema(db);
+  const r = await db
+    .prepare("SELECT s.node AS node, n.name AS name, n.public_key AS public_key, n.direct AS direct FROM sandboxes s LEFT JOIN nodes n ON n.id = s.node WHERE s.id = ?")
+    .bind(id)
+    .first<{ node: string | null; name: string | null; public_key: string | null; direct: string | null }>();
+  return r ? { node: r.node, name: r.name, publicKey: r.public_key, direct: r.direct } : null;
 }

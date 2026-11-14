@@ -8,7 +8,7 @@
 // token (nodeauth.ts), then offline or online, and revoked after cloudex node
 // rm, which clears its key. A revoked node stays listed until it's removed
 // again; adding its name again makes a new node.
-import { type Node, NodeFacts, NodeIsolation, type NodeJoin, type NodeState } from "@cloudex/schema";
+import { type Node, NodeDirect, NodeFacts, NodeIsolation, type NodeJoin, type NodeState } from "@cloudex/schema";
 import { ensureSchema } from "./db";
 import { fail } from "./util";
 
@@ -32,6 +32,7 @@ type Row = {
   created_at: number;
   revoked_at: number | null;
   machines: number;
+  direct: string | null;
 };
 
 function isolation(text: string | null) {
@@ -41,6 +42,16 @@ function isolation(text: string | null) {
     return r.success ? r.data : null;
   } catch {
     return null;
+  }
+}
+
+function direct(text: string | null) {
+  if (!text) return undefined;
+  try {
+    const r = NodeDirect.safeParse(JSON.parse(text));
+    return r.success ? r.data : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -63,6 +74,7 @@ const fromRow = (r: Row): Node => ({
   locationHint: r.location_hint,
   machines: r.machines ?? 0,
   revokedAt: r.revoked_at,
+  ...(direct(r.direct) ? { direct: direct(r.direct) } : {}),
 });
 
 const SELECT = "SELECT n.*, (SELECT COUNT(*) FROM sandboxes s WHERE s.node = n.id) AS machines FROM nodes n";
@@ -180,6 +192,8 @@ export async function mirrorNode(db: D1Database, id: string, m: Mirror) {
     put("cpus", f.cpus);
     put("memory_mb", f.memoryMb);
     put("disk_free_gb", f.diskFreeGb);
+    // An agent older than v0.2.3 reports none, which clears it.
+    put("direct", f.direct ? JSON.stringify(f.direct) : null);
   }
   if (m.colo !== undefined) put("colo", m.colo);
   if (m.continent !== undefined) put("continent", m.continent);
@@ -207,7 +221,7 @@ export async function revokeNode(db: D1Database, id: string, now = Date.now()) {
     db
       .prepare("INSERT OR REPLACE INTO node_revocations (node_id, public_key, revoked_at) SELECT id, public_key, ? FROM nodes WHERE id = ? AND public_key IS NOT NULL")
       .bind(now, id),
-    db.prepare("UPDATE nodes SET state = 'revoked', public_key = NULL, revoked_at = ? WHERE id = ?").bind(now, id),
+    db.prepare("UPDATE nodes SET state = 'revoked', public_key = NULL, direct = NULL, revoked_at = ? WHERE id = ?").bind(now, id),
     db.prepare("DELETE FROM node_joins WHERE node_id = ?").bind(id),
   ]);
 }

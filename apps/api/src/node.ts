@@ -1,6 +1,7 @@
 // One Durable Object per node (nodes.ts), named by the node's id. It holds the
 // control WebSocket its agent keeps open (go/internal/node), and is the only
-// way the deployment reaches the node: there's no inbound port on the host.
+// way the deployment reaches the node: it never dials the host. (From v0.2.3
+// a client may, on the direct port, with a ticket: direct.ts.)
 //
 // - The Worker checks the agent's signature before anything reaches here
 //   (index.ts, nodeauth.ts). This object refuses a reused nonce and a node
@@ -40,8 +41,14 @@
 //   reconnects over and over doesn't wake them all each time.
 //
 // - After hello comes welcome (M4): the image the deployment's machines run
-//   (NODE_IMAGE), which the agent pulls and checks against its own list; and
-//   (M6) the provider hosts its node CA is limited to.
+//   (NODE_IMAGE), which the agent pulls and checks against its own list; (M6)
+//   the provider hosts its node CA is limited to; and (v0.2.3) the node's
+//   secret for direct tickets (direct.ts), derived from ADMIN_KEY, its id and
+//   the key the Worker checked its connect with, with the Worker's clock.
+// - Direct reports (v0.2.3): the sessions open on a sandbox's direct port,
+//   which go to that sandbox's object (Sandbox.nodeDirect) under the same
+//   rules as state: limited to PER_MINUTE, and dropped for a sandbox that
+//   isn't on this node.
 //
 // - Sandboxes on the node (M5). On hello it reconciles: each sandbox the
 //   index has on the node hears its machine's state (Sandbox.nodeReport),
@@ -67,6 +74,7 @@ import {
   type WorkerMessage,
 } from "@cloudex/schema/node";
 import { REVOKED, rememberNonce } from "./nodeauth";
+import { directSecret } from "./direct";
 import { issueTicket } from "./nodestream";
 import { sandboxesOnNode } from "./db";
 import { PROVIDERS } from "./keys";
@@ -84,22 +92,25 @@ export const CONNECT = {
   continent: "x-cx-internal-continent",
   hint: "x-cx-internal-hint",
   skew: "x-cx-internal-skew", // the agent's clock less the Worker's, in seconds, at connect
+  key: "x-cx-internal-key", // the public key the signature checked out with (v0.2.3)
 } as const;
 
 // rl: the node's messages in the current minute, by kind (limits below),
 // carried from socket to socket.
 type Attachment = { gen: number; acceptedAt: number; lastMessageAt: number | null; hello?: boolean; rl?: Counts };
-type Counts = { at: number; facts: number; state: number; tickets: number; dropped: number };
+// direct: v0.2.3 (absent from a count an older version kept).
+type Counts = { at: number; facts: number; state: number; tickets: number; direct?: number; dropped: number };
 // When the alarm tells the node's sandboxes it went offline, if it still is.
 type OfflineDue = { at: number; lastSeenAt: number };
 
 // What one control socket may send in a minute, after its hello (2026-11-12
 // review, W1): an honest agent sends facts when they change (an image pull's
 // progress every 5 s at most), a state per machine start or stop, and a
-// ticket request per spare stream it opens. More is dropped (tickets are
-// refused), so a node can't turn its socket into D1 writes, reconciles or
-// woken Sandbox objects.
-export const PER_MINUTE = { facts: 20, state: 120, tickets: 240 } as const;
+// ticket request per spare stream it opens, and (v0.2.3) a direct report per
+// session opened or closed and per sandbox every 30 s while any is open. More
+// is dropped (tickets are refused), so a node can't turn its socket into D1
+// writes, reconciles or woken Sandbox objects.
+export const PER_MINUTE = { facts: 20, state: 120, tickets: 240, direct: 120 } as const;
 // The facts go to D1 when they change, at most this often; a change in
 // between goes with the next write or the alarm.
 export const MIRROR_MIN_MS = 10_000;
@@ -123,18 +134,19 @@ const RECONCILE_RETRY_MS = 30_000;
 export function newerCounts(a: Counts | undefined, b: Counts | undefined): Counts | undefined {
   if (!a || !b) return a ?? b;
   if (a.at !== b.at) return a.at > b.at ? a : b;
-  const sum = (c: Counts) => c.facts + c.state + c.tickets + c.dropped;
+  const sum = (c: Counts) => c.facts + c.state + c.tickets + (c.direct ?? 0) + c.dropped;
   return sum(a) >= sum(b) ? a : b;
 }
 
 // Counts a message against the node's limit; false when it's over.
 export function allow(c: Counts | undefined, kind: keyof typeof PER_MINUTE, now: number): { ok: boolean; counts: Counts } {
-  const counts = c && now - c.at < 60_000 ? { ...c } : { at: now, facts: 0, state: 0, tickets: 0, dropped: 0 };
-  if (counts[kind] >= PER_MINUTE[kind]) {
+  const counts: Counts = c && now - c.at < 60_000 ? { ...c } : { at: now, facts: 0, state: 0, tickets: 0, direct: 0, dropped: 0 };
+  const n = counts[kind] ?? 0;
+  if (n >= PER_MINUTE[kind]) {
     counts.dropped++;
     return { ok: false, counts };
   }
-  counts[kind]++;
+  counts[kind] = n + 1;
   return { ok: true, counts };
 }
 
@@ -458,6 +470,9 @@ export class Node extends DurableObject<Env> {
       locationHint: h.get(CONNECT.hint) || null,
     };
     const skew = Number(h.get(CONNECT.skew));
+    // The key its signature checked out with, for its direct secret (v0.2.3).
+    const key = h.get(CONNECT.key) ?? "";
+    if (/^[A-Za-z0-9+/]{43}=$/.test(key)) await this.ctx.storage.put("publicKey", key);
     await this.ctx.storage.put({ gen, connectedAt: now, lastSeenAt: now, ...where, ...(Number.isFinite(skew) && h.get(CONNECT.skew) ? { clockSkewSec: Math.round(skew) } : {}) });
     // Online once it says hello (nodestate.ts).
     await mirrorNode(this.env.DB, id, { lastSeenAt: now, ...where }).catch((e) => console.error(`[${id}] ${e}`));
@@ -484,7 +499,7 @@ export class Node extends DurableObject<Env> {
     if (!a.hello && m.type !== "hello") return this.close(ws, NodeClose.badMessage, "the first message on a connection is hello");
     if (a.hello && m.type === "hello") return this.close(ws, NodeClose.badMessage, "hello comes once on a connection");
     let rl = a.rl;
-    if (m.type === "facts" || m.type === "state" || m.type === "tickets") {
+    if (m.type === "facts" || m.type === "state" || m.type === "tickets" || m.type === "direct") {
       const r = allow(a.rl, m.type, now);
       rl = r.counts;
       if (!r.ok) {
@@ -519,7 +534,12 @@ export class Node extends DurableObject<Env> {
           // providers (M6): the hosts the node CA is limited to, every one the
           // deployment could hold a key for, so that a key set later works
           // without a new CA.
-          const welcome: WorkerMessage = { type: "welcome", image: this.env.NODE_IMAGE, providers: Object.values(PROVIDERS).map((p) => p.host) };
+          const welcome: WorkerMessage = {
+            type: "welcome",
+            image: this.env.NODE_IMAGE,
+            providers: Object.values(PROVIDERS).map((p) => p.host),
+            ...(await this.directWelcome(id)),
+          };
           try {
             ws.send(JSON.stringify(welcome));
           } catch {}
@@ -560,6 +580,21 @@ export class Node extends DurableObject<Env> {
           this.env.SANDBOX.getByName(sb)
             .nodeReport(id, { online: true, lastSeenAt: now, machine: m.machine.state, ...(m.machine.note ? { note: m.machine.note } : {}) })
             .catch((e: unknown) => console.error(`[${id}] telling ${sb}: ${errorStatus(e).message}`)),
+        );
+        return;
+      }
+      case "direct": {
+        // To the sandbox's object, which keeps the sessions it minted and
+        // counts active as activity (sandbox.ts nodeDirect); nothing is kept here.
+        const sb = m.sandbox;
+        if (!(await this.isMember(id, sb, now))) {
+          console.log(`[${id}] a direct report for ${sb}, which isn't on this node: dropped`);
+          return;
+        }
+        this.ctx.waitUntil(
+          this.env.SANDBOX.getByName(sb)
+            .nodeDirect(id, { open: m.open, active: m.active })
+            .catch((e: unknown) => console.error(`[${id}] telling ${sb} of its direct sessions: ${errorStatus(e).message}`)),
         );
         return;
       }
@@ -665,6 +700,14 @@ export class Node extends DurableObject<Env> {
     if (hello?.machines.some((m) => m.id === sandbox)) {
       await this.ctx.storage.put("hello", { ...hello, machines: hello.machines.filter((m) => m.id !== sandbox) });
     }
+  }
+
+  // welcome's direct part (v0.2.3): the node's secret for direct tickets and
+  // the Worker's clock, once the key its connect was checked with is known.
+  private async directWelcome(id: string): Promise<{ direct?: { secret: string; now: number } }> {
+    const key = await this.ctx.storage.get<string>("publicKey");
+    if (!key || !this.env.ADMIN_KEY) return {};
+    return { direct: { secret: await directSecret(this.env.ADMIN_KEY, id, key), now: Date.now() } };
   }
 
   // cloudex node rm: the node is refused from now on, and its socket closes.

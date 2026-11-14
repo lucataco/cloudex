@@ -96,6 +96,17 @@ import { type MachineReport, machineAction, nodeIsolation, nodeRetryAt, offlineA
 // A sandbox's node is offline since since; tries failed asks since, and the next is at retryAt (nodeRetryAt).
 type NodeDown = { since: number; lastSeenAt: number | null; tries?: number; retryAt?: number };
 import { tokenAlive } from "./tokens";
+import {
+  type DirectSessions,
+  directRefusal,
+  directSecret,
+  endedSessions,
+  mintDirectTicket,
+  mintSession,
+  reportSessions,
+  sameSessions,
+  sweepSessions,
+} from "./direct";
 import { CREDENTIAL_ENDED, LINK_HEADER, TOKEN_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
 // Exits 0 once the entrypoint is ready in this start of the machine, and 3
@@ -2133,6 +2144,80 @@ export class Sandbox extends DurableObject<Env> {
         this.streams.endClient(c.id, CREDENTIAL_ENDED, "signed out: the token or session that opened this has ended");
       }
     }
+    await this.endDirect();
+  }
+
+  // ---------------------------------------------------------------- the direct path (v0.2.3, direct.ts)
+
+  private async directSessions(): Promise<DirectSessions> {
+    return (await this.ctx.storage.get<DirectSessions>("directSessions")) ?? {};
+  }
+
+  // GET /v1/sandboxes/{ref}/direct for a sandbox on a node with a direct path
+  // (index.ts): refused as serve() refuses a tcp connection; activity; the
+  // CLI's ssh key added, unless this run has added it already (so that a
+  // repeat ssh while the node's link to Cloudflare blinks needs no exec); and
+  // a ticket for one connection to port, whose session is kept with the token
+  // that asked (null: the admin key). node and publicKey are D1's, never the
+  // Node object's, which isn't woken.
+  async direct(a: { node: string; publicKey: string; port: number; key: string | null; tokenId: string | null }): Promise<{ ticket: string; expiresAt: number }> {
+    const r = this.mustRecord();
+    const why = directRefusal({
+      state: r.state,
+      onNode: this.onNode?.placement.node ?? null,
+      asked: a.node,
+      revokedNode: (await this.ctx.storage.get<string>("revokedNode")) ?? null,
+    });
+    if (why === "moved") fail(409, `${r.name ?? r.id} isn't on node ${a.node}; try again`);
+    if (why === "removed") fail(410, removedMessage(this.onNode!.placement.name));
+    if (why === "not-running") fail(409, wrongState(r));
+    if (!Number.isInteger(a.port) || a.port < 1 || a.port > 65535) fail(400, "port must be 1-65535");
+    this.touch();
+    if (a.key) {
+      if (!SSH_KEY.test(a.key)) fail(400, "that isn't an SSH public key");
+      const keys = (await this.ctx.storage.get<string[]>("directKeys")) ?? [];
+      if (!keys.includes(a.key)) {
+        await this.authorize(a.key);
+        await this.ctx.storage.put("directKeys", [...keys, a.key].slice(-16));
+      }
+    }
+    const t = await mintDirectTicket(await directSecret(this.env.ADMIN_KEY, a.node, a.publicKey), { node: a.node, sandbox: r.id, port: a.port });
+    await this.ctx.storage.put("directSessions", mintSession(await this.directSessions(), t.session, { t: a.tokenId, e: t.exp }));
+    return { ticket: t.ticket, expiresAt: t.exp * 1000 };
+  }
+
+  // From the node's Node object: the sessions open on this sandbox's direct
+  // port now, and whether a client sent bytes since the last report, which
+  // counts as activity, as a splice's client messages do.
+  async nodeDirect(node: string, rep: { open: string[]; active: boolean }): Promise<void> {
+    const p = this.onNode?.placement;
+    if (!p || p.node !== node || !this.record || this.removing) return;
+    if (rep.active && this.record.state === "running") this.touch();
+    const before = await this.directSessions();
+    const after = reportSessions(before, rep.open, Date.now());
+    if (!sameSessions(before, after)) await this.ctx.storage.put("directSessions", after);
+  }
+
+  // From the alarm: sessions whose token ended are ended on the node (and
+  // their tickets refused there, if they're still unused), as watchCredential
+  // ends a WebSocket; old ones are forgotten. While the node is offline that
+  // waits for the next alarm (a residual the plan states: D10).
+  private async endDirect() {
+    const before = await this.directSessions();
+    if (!Object.keys(before).length) return;
+    const now = Date.now();
+    const all = sweepSessions(before, now);
+    const ended = await endedSessions(all, (t) => tokenAlive(this.env.DB, t), now);
+    if (ended.length && this.record) {
+      try {
+        await this.nodeOp("directEnd", { sandbox: this.record.id, sessions: ended }, 10_000);
+        for (const i of ended) delete all[i];
+        console.log(`[${this.record.id}] ended ${ended.length} direct sessions whose token ended`);
+      } catch (e) {
+        console.error(`[${this.record.id}] ending direct sessions: ${message(e)}; again at the next alarm`);
+      }
+    }
+    if (!sameSessions(before, all)) await this.ctx.storage.put("directSessions", all);
   }
 
   // ---------------------------------------------------------------- the lifecycle on a node (v0.2.2 M5)
@@ -2158,7 +2243,7 @@ export class Sandbox extends DurableObject<Env> {
   // An op on this sandbox's node, through its Node object. A node that's
   // offline answers 503 naming it (and is noted, for the alarm); one that was
   // removed, 410.
-  private async nodeOp(name: "create" | "start" | "stop" | "delete" | "streams", args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  private async nodeOp(name: "create" | "start" | "stop" | "delete" | "streams" | "directEnd", args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
     const p = this.onNode!.placement;
     if ((await this.ctx.storage.get<string>("revokedNode")) === p.node) fail(410, removedMessage(p.name));
     try {
@@ -2189,6 +2274,9 @@ export class Sandbox extends DurableObject<Env> {
   // doesn't (the agent lets it go).
   private async startOnNode(r: SandboxRecord, hold = false) {
     const p = this.onNode!.placement;
+    // A new run: no direct session of the last one is open, and the ssh keys
+    // it added are added again when asked for (v0.2.3).
+    await this.ctx.storage.delete(["directSessions", "directKeys"]);
     const made = await this.nodeOp(
       "create",
       {
