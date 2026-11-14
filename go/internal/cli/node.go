@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -187,6 +189,21 @@ func printNode(cmd *cobra.Command, n *api.Node) error {
 			img += fmt.Sprintf(" (%.0f%%)", *n.Image.Progress*100)
 		}
 		row("Image", img)
+	}
+	if d := n.Direct; d != nil {
+		var eps []string
+		for _, a := range d.Addrs {
+			eps = append(eps, clean(net.JoinHostPort(a, strconv.Itoa(d.Port))))
+		}
+		v := strings.Join(eps, ", ")
+		if v == "" {
+			v = fmt.Sprintf("port %d", d.Port)
+		}
+		v += " (" + clean(d.State) + ")"
+		if d.Error != "" {
+			v += ": " + clean(d.Error)
+		}
+		row("Direct", v)
 	}
 	where := orDash(n.Colo)
 	if n.LocationHint != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -33,6 +34,9 @@ type Node struct {
 	RevokedAt    *int64         `json:"revokedAt"`
 	RTTMs        *int64         `json:"rttMs,omitempty"`
 	Image        *NodeImage     `json:"image,omitempty"`
+	// Direct is the node's direct port (v0.2.3): absent for an older agent
+	// or with the port turned off.
+	Direct *NodeDirect `json:"direct,omitempty"`
 	// GetNode only (v0.2.2 M5): machines of no sandbox, sandboxes deleted
 	// while it was offline whose machines it removes when it's back, and its
 	// agent's clock less the deployment's at its last connect.
@@ -46,6 +50,44 @@ type NodeIsolation struct {
 	Unisolated bool     `json:"unisolated"`
 	CheckedAt  *int64   `json:"checkedAt,omitempty"`
 	Failed     []string `json:"failed,omitempty"`
+}
+
+// NodeDirect is a node's direct port, as its agent reports it.
+type NodeDirect struct {
+	Port  int      `json:"port"`
+	Addrs []string `json:"addrs"`
+	State string   `json:"state"` // listening, off or failed
+	Error string   `json:"error,omitempty"`
+}
+
+// Direct is GET /v1/sandboxes/{ref}/direct's answer (v0.2.3): where the
+// sandbox runs and, for a node with a usable direct port, the node's key to
+// pin, its candidates and a ticket for one connection.
+type Direct struct {
+	Sandbox  string `json:"sandbox"`
+	Provider string `json:"provider"` // cloudflare or node
+	Node     *struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"node,omitempty"`
+	PublicKey string `json:"publicKey,omitempty"`
+	Direct    *struct {
+		Port  int      `json:"port"`
+		Addrs []string `json:"addrs"`
+	} `json:"direct,omitempty"`
+	Ticket    *string `json:"ticket,omitempty"`
+	ExpiresAt *int64  `json:"expiresAt,omitempty"`
+}
+
+// Direct asks for a direct ticket to a sandbox's port; key, when given, is
+// the ssh public key to authorize in it.
+func (c *Client) Direct(ctx context.Context, ref string, port int, key string) (*Direct, error) {
+	q := url.Values{"port": {strconv.Itoa(port)}}
+	if key != "" {
+		q.Set("key", key)
+	}
+	var d Direct
+	return &d, c.doShort(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(ref)+"/direct?"+q.Encode(), nil, &d)
 }
 
 // NodeImage is the machine image on a node, and whether it has it.

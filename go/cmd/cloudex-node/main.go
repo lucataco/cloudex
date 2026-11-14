@@ -1,6 +1,7 @@
 // Command cloudex-node is the agent on a node: a user's own host that runs
 // sandboxes for a Cloudex deployment. It dials out to the deployment and keeps
-// a control socket open; the host needs no inbound port.
+// a control socket open. Its one inbound port is the optional direct port
+// (v0.2.3), which needs a ticket from the deployment.
 //
 //	cloudex-node join --api https://<deployment> --token - < token-file
 //	cloudex-node run [--join cxj_... --api https://<deployment>]
@@ -100,6 +101,8 @@ func newRoot() *cobra.Command {
 	var runUnisolated bool
 	var spares int
 	var rc node.RuntimeConfig
+	var directPort int
+	var directAddrs []string
 	run := &cobra.Command{
 		Use:   "run",
 		Short: "Keep this node connected to its deployment (joining first with --join)",
@@ -143,6 +146,14 @@ func newRoot() *cobra.Command {
 				}
 				a.Runtime = r
 				lg.Printf("machines: pool %s, agent container %q, images %v%s", rc.Pool, rc.Self, r.Allowed, map[bool]string{true: ", unisolated (testing only)"}[id.Unisolated])
+				if directPort != 0 {
+					dc, err := directConfig(directPort, directAddrs)
+					if err != nil {
+						return err
+					}
+					a.Direct = &node.Direct{Config: dc}
+					lg.Printf("direct port %d on %v", dc.Port, dc.Addrs)
+				}
 			} else {
 				lg.Printf("no --pool: this agent runs no machines")
 			}
@@ -165,6 +176,8 @@ func newRoot() *cobra.Command {
 	run.Flags().StringVar(&rc.DockerRoot, "docker-root", "", "where Docker's data root is mounted read-only, for its free space")
 	run.Flags().StringArrayVar(&rc.Probes, "probe", nil, "an address of the host or its LAN (ip:port, or udp53=ip) the self-test must find closed; repeatable")
 	run.Flags().Float64Var(&rc.KeepFreeGB, "keep-free-gb", node.KeepFreeGB, "below this much free space on Docker's disk, stop the machine that wrote the most; new machines need 5 GB more")
+	run.Flags().IntVar(&directPort, "direct-port", 0, "take direct connections (v0.2.3) on this host port, published by the sidecar "+node.RelayName+" on the --direct-addr addresses; 0: none")
+	run.Flags().StringArrayVar(&directAddrs, "direct-addr", nil, "a private (RFC 1918) or tailnet (100.64/10) IPv4 address of the host to publish the direct port on; repeatable")
 	run.Flags().IntVar(&rc.DiskGB, "disk-gb", 0, "cap each machine's writable layer at this size, where Docker's storage driver can (btrfs, zfs, overlay2 on xfs with pquota); 0: no cap")
 
 	var asJSON bool
@@ -222,7 +235,7 @@ func newRoot() *cobra.Command {
 	status.Flags().DurationVar(&wait, "wait", 0, "wait this long for the connection and the self-test's result")
 	status.Flags().Int64Var(&since, "since", 0, "with --wait, count only a self-test from this time on (unix ms)")
 
-	root.AddCommand(join, run, status, newProbe(state), newFirewall(), newPickPool(), newSelfTest(state, &dockerSocket), newCA(state))
+	root.AddCommand(join, run, status, newProbe(state), newFirewall(), newPickPool(), newSelfTest(state, &dockerSocket), newCA(state), newRelay(), newDirectAddrs())
 	return root
 }
 
@@ -529,6 +542,6 @@ func newProbe(state func() node.State) *cobra.Command {
 	fake.Flags().Int64Var(&overrunMax, "overrun-max", 96<<20, "the most an overrun flood sends")
 	fake.Flags().StringSliceVar(&directAddrs, "direct-addr", nil, "report a direct path listening on these addresses, and take open <ticket>, close <session> and active <sandbox> lines on stdin (v0.2.3 M1)")
 	fake.Flags().IntVar(&directPort, "direct-port", 7022, "the direct port it reports")
-	probe.AddCommand(connect, join, stream, flood, fake)
+	probe.AddCommand(connect, join, stream, flood, fake, newProbeDirect())
 	return probe
 }

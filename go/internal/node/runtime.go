@@ -45,6 +45,9 @@ type Runtime struct {
 	// each machine's writable layer where the storage driver can.
 	KeepFreeGB float64
 	DiskGB     int
+	// Direct is the direct port (v0.2.3), which the self-test probes; nil
+	// when it's off.
+	Direct *Direct
 	// FreeSpace, in tests, stands in for the free space under DockerRoot.
 	FreeSpace func() float64
 	// Subnet hands out machine networks round-robin over the pool, so a

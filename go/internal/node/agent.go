@@ -157,6 +157,10 @@ type Agent struct {
 	egress    *Egress
 	egressNow chan struct{}
 	nodeCA    atomic.Pointer[CA]
+
+	// Direct is the direct port (v0.2.3, direct.go): nil when the installer
+	// turned it off. It needs the runtime.
+	Direct *Direct
 }
 
 // CA is the node CA now; nil until the deployment has named its provider hosts.
@@ -256,6 +260,9 @@ func (a *Agent) facts() Facts {
 	if a.Runtime != nil {
 		f = a.Runtime.Facts(f)
 	}
+	if a.Direct != nil {
+		f.Direct = a.Direct.Fact()
+	}
 	return f
 }
 
@@ -352,6 +359,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.egress = &Egress{API: a.API, Node: a.ID, Key: a.Key, HTTP: hc, Log: a.Log, Debug: a.Debug, CA: a.CA, Version: a.Version}
 		a.egressNow = make(chan struct{}, 1)
 		go a.egressLoop(ctx)
+		if d := a.Direct; d != nil && d.Config.Port != 0 {
+			d.NodeID, d.Key, d.Docker, d.Self, d.Pool, d.Log, d.Debug = a.ID, a.Key, a.docker(), r.Self, r.Pool, a.Log, a.Debug
+			d.Target = r.Target
+			d.Send = a.send
+			d.Changed = func() { a.send(FactsMessage{Type: "facts", Facts: a.facts()}) }
+			d.OnListening = a.kickSelfTest
+			r.Direct = d
+			go d.Run(ctx)
+		}
+	} else {
+		a.Direct = nil
 	}
 	var down time.Time
 	attempt := 0
@@ -429,6 +447,11 @@ func (a *Agent) revoked(ctx context.Context, why string) {
 	if a.Runtime != nil {
 		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		n = a.Runtime.StopAll(sctx, "its node was removed from the deployment (cloudex node rm)")
+		cancel()
+	}
+	if a.Direct != nil {
+		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		a.Direct.Revoke(dctx)
 		cancel()
 	}
 	a.logf("REVOKED: %s. Stopped %d running machines; their disks stay on this host until you uninstall the agent (node-install.sh --uninstall)", why, n)
@@ -561,6 +584,9 @@ func (a *Agent) session(ctx context.Context, c *websocket.Conn) (string, int) {
 			}
 			if a.Runtime != nil && len(w.Providers) > 0 {
 				a.setProviders(w.Providers)
+			}
+			if a.Direct != nil {
+				a.Direct.Welcome(w.Direct)
 			}
 			continue
 		}

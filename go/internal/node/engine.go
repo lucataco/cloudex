@@ -268,8 +268,9 @@ func (d *Docker) ContainersSized(ctx context.Context, labels ...string) ([]Conta
 	return cs, err
 }
 
-// ContainerCreate makes a container from a body built by MachineSpec (spec.go).
-func (d *Docker) ContainerCreate(ctx context.Context, name string, body *CreateBody) (string, error) {
+// ContainerCreate makes a container from a body built by MachineSpec or
+// RelaySpec (spec.go, relay.go): the only container shapes the agent makes.
+func (d *Docker) ContainerCreate(ctx context.Context, name string, body containerBody) (string, error) {
 	var r struct {
 		ID string `json:"Id"`
 	}
@@ -307,10 +308,23 @@ func (d *Docker) ContainerRemove(ctx context.Context, id string) error {
 	return err
 }
 
+// containerBody is a body the agent creates containers from.
+type containerBody interface{ containerBody() }
+
+func (*CreateBody) containerBody() {}
+func (*RelayBody) containerBody()  {}
+
+// PortBinding is one host address and port Docker publishes a port on.
+type PortBinding struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}
+
 // ContainerDetail is what the agent reads of one container.
 type ContainerDetail struct {
 	ID    string `json:"Id"`
 	Name  string `json:"Name"`
+	Image string `json:"Image"` // the image's id
 	State struct {
 		Running   bool   `json:"Running"`
 		Status    string `json:"Status"`
@@ -321,13 +335,18 @@ type ContainerDetail struct {
 		Labels map[string]string `json:"Labels"`
 		Image  string            `json:"Image"`
 		Env    []string          `json:"Env"`
+		Cmd    []string          `json:"Cmd"`
 	} `json:"Config"`
 	HostConfig      json.RawMessage `json:"HostConfig"`
 	NetworkSettings struct {
 		Networks map[string]struct {
 			IPAddress string `json:"IPAddress"`
+			Gateway   string `json:"Gateway"`
 			NetworkID string `json:"NetworkID"`
 		} `json:"Networks"`
+		// Ports are the bindings Docker made at the last start: empty for a
+		// container whose start failed (M0 Q2).
+		Ports map[string][]PortBinding `json:"Ports"`
 	} `json:"NetworkSettings"`
 }
 

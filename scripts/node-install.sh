@@ -23,8 +23,13 @@
 #      the machines' cx* bridges), and a timer that loads it again within 30 s
 #      if anything else removes it (a `flush ruleset`);
 #   4. joins the deployment with the token, and starts the agent's container,
-#      cloudex-node, with the Docker socket (it has no port of its own), at
-#      most 1 GiB of memory and 1024 processes;
+#      cloudex-node, with the Docker socket, at most 1 GiB of memory and 1024
+#      processes. Unless --direct off, the agent runs a sidecar,
+#      cloudex-node-direct, that Docker publishes the direct port (7022) on,
+#      on this host's private LAN and tailnet IPv4 addresses only (--direct
+#      auto chooses them, --direct-addr names them): ssh from a laptop near
+#      the node goes straight to it, and each connection needs a ticket from
+#      the deployment;
 #   5. waits for it to be online and for its isolation self-test to pass;
 #   6. boots a throwaway machine, checks from inside it that the internet
 #      answers and the host and metadata don't, and removes it.
@@ -38,14 +43,21 @@
 # --unisolated is for testing only, on a host where you have no root: no
 # firewall, so machines reach the host, its LAN and its tailnet.
 #
+# CLOUDEX_NODE_ALLOW_ARCH=<arch>, set to exactly this host's `uname -m`, is
+# for testing only too: it installs on a host that isn't amd64 (an arm64 VM
+# that runs amd64 images through Rosetta or qemu-user). Without it, anything
+# but amd64 is refused.
+#
 # Everything is in main, called on the last line, so a download cut short
 # runs nothing.
 set -euo pipefail
 
 API="" TOKEN=${CLOUDEX_JOIN_TOKEN:-} VERSION="" DIGEST="" AGENT_IMAGE="" POOL="" MACHINE_IMAGE=""
 UNISOLATED=0 UNINSTALL=0 YES=0 KEEP_IMAGES=0 KEEP_FREE_GB="" DISK_GB=""
-ALLOW=() BLOCK=()
+DIRECT="" DIRECT_PORT=""
+ALLOW=() BLOCK=() DIRECT_ADDRS=()
 NAME=cloudex-node
+SIDECAR=cloudex-node-direct
 UNIT=cloudex-node-firewall.service
 CHECK=cloudex-node-firewall-check
 AGENT_REPO=ghcr.io/lucataco/cloudex-node
@@ -74,11 +86,28 @@ Options:
   --block CIDR          another IPv4 range machines may not reach (repeatable)
   --keep-free-gb N      keep this much free on Docker's disk: below it, the machine that wrote the most is stopped (default 5)
   --disk-gb N           cap each machine's disk at N GB where Docker's storage driver can (btrfs, zfs, overlay2 on xfs with pquota)
+  --direct auto|off     the direct port for ssh from your LAN or tailnet (default auto: this host's private and tailnet IPv4 addresses)
+  --direct-addr IP      publish the direct port on exactly this private (RFC 1918) or tailnet (100.64/10) address (repeatable)
+  --direct-port N       the direct port (default 7022)
   --unisolated          testing only, without root: no firewall
+                        (testing only as well: CLOUDEX_NODE_ALLOW_ARCH=$(uname -m) in the environment installs on a host that isn't amd64)
   --uninstall           remove the agent, its machines, the firewall and the images it pulled
   --keep-images         with --uninstall, keep the images
   --yes                 don't ask before removing machines
 EOF
+}
+
+# usable_ip says whether $1 is an RFC 1918 or 100.64/10 IPv4 address.
+usable_ip() {
+	local a b c d
+	[[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+	a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} c=${BASH_REMATCH[3]} d=${BASH_REMATCH[4]}
+	for o in "$a" "$b" "$c" "$d"; do [[ $o =~ ^(0|[1-9][0-9]*)$ && $o -le 255 ]] || return 1; done
+	[[ $a == 10 ]] && return 0
+	[[ $a == 172 && $b -ge 16 && $b -le 31 ]] && return 0
+	[[ $a == 192 && $b == 168 ]] && return 0
+	[[ $a == 100 && $b -ge 64 && $b -le 127 ]] && return 0
+	return 1
 }
 
 # repo_of is an image reference without its tag and digest.
@@ -102,6 +131,9 @@ main() {
 		--machine-image) MACHINE_IMAGE=$2; shift 2 ;;
 		--allow-image) ALLOW+=("$2"); shift 2 ;;
 		--block) BLOCK+=("$2"); shift 2 ;;
+		--direct) DIRECT=$2; shift 2 ;;
+		--direct-addr) DIRECT_ADDRS+=("$2"); shift 2 ;;
+		--direct-port) DIRECT_PORT=$2; shift 2 ;;
 		--unisolated) UNISOLATED=1; shift ;;
 		--uninstall) UNINSTALL=1; shift ;;
 		--keep-images) KEEP_IMAGES=1; shift ;;
@@ -138,8 +170,10 @@ main() {
 			images_before=$(sed -n 's/^IMAGES_BEFORE=//p' "$ETC/install.env")
 			agent_image=$(sed -n 's/^AGENT_IMAGE=//p' "$ETC/install.env")
 		fi
-		say "removing the agent"
+		say "removing the agent and its direct port's sidecar"
+		# The agent first, so that it can't make the sidecar again.
 		docker rm -f "$NAME" >/dev/null 2>&1 || true
+		for c in $(docker ps -aq --filter name="^/$SIDECAR\$" --filter label=build.cloudex.role=direct); do docker rm -f "$c" >/dev/null; done
 		say "removing its machines and their networks"
 		for c in $(docker ps -aq --filter label=build.cloudex.node); do docker rm -f -v "$c" >/dev/null; done
 		for n in $(docker network ls -q --filter label=build.cloudex.node); do docker network rm "$n" >/dev/null; done
@@ -175,7 +209,17 @@ main() {
 	# ---------------------------------------------------------------- 1. checks
 	say "checking this host"
 	[[ $(uname -s) == Linux ]] || die "nodes run on Linux"
-	case $(uname -m) in x86_64 | amd64) ;; *) die "nodes are amd64 only for now (this is $(uname -m))" ;; esac
+	arch=$(uname -m)
+	case $arch in
+	x86_64 | amd64) ;;
+	*)
+		if [[ -n ${CLOUDEX_NODE_ALLOW_ARCH:-} && ${CLOUDEX_NODE_ALLOW_ARCH} == "$arch" ]]; then
+			warn "CLOUDEX_NODE_ALLOW_ARCH=$arch: installing on $arch for testing only. The agent and the machines are amd64 images, so this host must run them (Rosetta, qemu-user)."
+		else
+			die "nodes are amd64 only for now (this is $arch)"
+		fi
+		;;
+	esac
 	dv=$(docker version -f '{{.Server.Version}}')
 	# Before 28, Docker ignores the priority the agent's machine networks are
 	# attached with, and its default route could move onto one of them.
@@ -242,6 +286,46 @@ main() {
 		[[ -n $POOL ]] || POOL=$(agent --network host "$AGENT_IMAGE" pick-pool)
 	fi
 	say "machine networks: $POOL"
+
+	# ---------------------------------------------------------------- the direct port
+	# A re-run keeps how it was chosen: the same addresses if they were
+	# named, chosen again if auto (a DHCP change), none if off.
+	prev_mode=$(sed -n 's/^DIRECT_MODE=//p' "$ETC/install.env")
+	if [[ -z $DIRECT && ${#DIRECT_ADDRS[@]} -eq 0 ]]; then
+		DIRECT=${prev_mode:-auto}
+		if [[ $DIRECT == addrs ]]; then
+			read -r -a DIRECT_ADDRS <<<"$(sed -n 's/^DIRECT_ADDRS=//p' "$ETC/install.env")"
+		fi
+		[[ -n $DIRECT_PORT ]] || DIRECT_PORT=$(sed -n 's/^DIRECT_PORT=//p' "$ETC/install.env")
+	fi
+	[[ ${#DIRECT_ADDRS[@]} -gt 0 && $DIRECT != off ]] && DIRECT=addrs
+	DIRECT_PORT=${DIRECT_PORT:-7022}
+	[[ $DIRECT_PORT =~ ^[0-9]+$ && $DIRECT_PORT -ge 1 && $DIRECT_PORT -le 65535 ]] || die "--direct-port takes a port, 1 to 65535"
+	case $DIRECT in
+	auto | addrs | off) ;;
+	*) die "--direct takes auto or off" ;;
+	esac
+	# On a re-run, the sidecar's own listeners don't count: it is made again
+	# with the new addresses when the agent is replaced.
+	ours=$(docker port "$SIDECAR" 2>/dev/null | awk '{print $3}' || true)
+	if [[ $DIRECT == auto ]]; then
+		mapfile -t DIRECT_ADDRS < <(docker run --rm --network host "$AGENT_IMAGE" direct-addrs)
+		[[ ${#DIRECT_ADDRS[@]} -gt 0 ]] || { warn "no private or tailnet IPv4 address here for the direct port: ssh goes through the deployment (--direct-addr names one)"; DIRECT=off; }
+	fi
+	if [[ $DIRECT != off ]]; then
+		for a in "${DIRECT_ADDRS[@]}"; do
+			usable_ip "$a" || die "--direct-addr $a: give a private (10/8, 172.16/12, 192.168/16) or tailnet (100.64/10) IPv4 address of this host"
+			if command -v ip >/dev/null && ! ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -qx "$a"; then
+				warn "$a isn't an address of this host now; the direct port waits for it (the agent tries every 30 s)"
+			fi
+			if command -v ss >/dev/null && ss -ltnH 2>/dev/null | awk '{print $4}' | grep -vxF -e "${ours:-none}" | grep -qxE "($a|0\.0\.0\.0|\*|\[::\]):$DIRECT_PORT"; then
+				die "something listens on $a:$DIRECT_PORT already; choose another --direct-port, or --direct off"
+			fi
+		done
+		say "direct port: $DIRECT_PORT on ${DIRECT_ADDRS[*]}"
+	else
+		say "direct port: off (ssh goes through the deployment)"
+	fi
 
 	# ---------------------------------------------------------------- 3. the firewall
 	if [[ $UNISOLATED != 1 ]]; then
@@ -334,12 +418,19 @@ main() {
 		for a in $(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1); do
 			case $a in 100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) probes+=(--probe "$a:22") ;; esac
 		done
+		if [[ $DIRECT != off ]]; then
+			for a in "${DIRECT_ADDRS[@]}"; do probes+=(--probe "$a:$DIRECT_PORT"); done
+		fi
 	fi
 	run_args=(--pool "$POOL" --docker-root /docker-root "${probes[@]}")
 	[[ -n $MACHINE_IMAGE ]] && run_args+=(--machine-image "$MACHINE_IMAGE")
 	[[ -n $KEEP_FREE_GB ]] && run_args+=(--keep-free-gb "$KEEP_FREE_GB")
 	[[ -n $DISK_GB ]] && run_args+=(--disk-gb "$DISK_GB")
 	for a in "${ALLOW[@]}"; do run_args+=(--allow-image "$a"); done
+	if [[ $DIRECT != off ]]; then
+		run_args+=(--direct-port "$DIRECT_PORT")
+		for a in "${DIRECT_ADDRS[@]}"; do run_args+=(--direct-addr "$a"); done
+	fi
 
 	docker network inspect "$NAME" >/dev/null 2>&1 || docker network create --label build.cloudex.agent=1 "$NAME" >/dev/null
 	docker volume inspect "$NAME" >/dev/null 2>&1 || docker volume create --label build.cloudex.agent=1 "$NAME" >/dev/null
@@ -361,6 +452,8 @@ main() {
 		say "replacing the running agent (its machines keep running)"
 		docker rm -f "$NAME" >/dev/null
 	fi
+	# The new agent makes its sidecar again, with the addresses chosen now.
+	docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
 	DROOT=$(docker info -f '{{.DockerRootDir}}')
 	say "starting the agent"
 	STARTED_MS=$(($(date +%s) * 1000))
@@ -377,6 +470,7 @@ main() {
 	{
 		grep '^IMAGES_BEFORE=' "$ETC/install.env"
 		printf 'AGENT_IMAGE=%s\nPOOL=%s\nRUNTIME=%s\nUNISOLATED=%s\nINSTALLED_AT=%s\n' "$AGENT_IMAGE" "$POOL" "$RUNTIME" "$UNISOLATED" "$(date -u +%FT%TZ)"
+		printf 'DIRECT_MODE=%s\nDIRECT_ADDRS=%s\nDIRECT_PORT=%s\n' "$DIRECT" "${DIRECT_ADDRS[*]}" "$DIRECT_PORT"
 	} >"$ETC/install.env.new" && mv "$ETC/install.env.new" "$ETC/install.env"
 
 	# ---------------------------------------------------------------- 5. online, isolated
@@ -403,6 +497,9 @@ main() {
 		warn "it has no isolation (--unisolated): machines reach this host, its LAN and its tailnet. For testing only."
 	elif [[ $RUNTIME == docker ]]; then
 		warn "machines on this node run under plain Docker. Root in a machine is root on this host if code escapes the container. Use this node only for code you trust, or install Sysbox (https://github.com/nestybox/sysbox) and run this installer again."
+	fi
+	if [[ $DIRECT != off ]]; then
+		say "direct connections: port $DIRECT_PORT on $(printf '%s ' "${DIRECT_ADDRS[@]}")(each connection needs a ticket from the deployment; --direct off turns it off)"
 	fi
 	echo "Uninstall with: curl -fsSL https://cloudex.build/node | sudo bash -s -- --uninstall"
 }

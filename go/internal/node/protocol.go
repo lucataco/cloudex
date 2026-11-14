@@ -1,8 +1,10 @@
 // Package node is cloudex-node, the agent that runs on a user's own host (a
 // node) and keeps a control WebSocket open to the deployment's Node Durable
-// Object (apps/api/src/node.ts). The host has no inbound port: the agent dials
-// out, signs every request with the node's own Ed25519 key, and reconnects by
-// itself after a drop or a deploy.
+// Object (apps/api/src/node.ts). The agent dials out, signs every request
+// with the node's own Ed25519 key, and reconnects by itself after a drop or a
+// deploy. Its one inbound port (v0.2.3) is the direct port (direct.go),
+// published only on the host's private and tailnet addresses, which takes a
+// connection only with a ticket from the deployment.
 //
 // The messages are defined in packages/schema/src/node.ts. The examples in
 // packages/schema/fixtures/node/protocol.json are what both sides are checked

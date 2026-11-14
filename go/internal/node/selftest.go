@@ -13,9 +13,11 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -90,7 +92,10 @@ func (r *SelfTestReport) Failed() []string {
 func (r *SelfTestReport) Breach() bool {
 	for _, c := range r.Checks {
 		switch c.Want {
-		case "open", "own", "resolved", "answered":
+		case "open", "own", "resolved", "answered", WantDirectPublish:
+			// A public publish of the direct port fails the self-test
+			// (new machines are refused) but isn't a breach of the
+			// machines' isolation: a ticket is still needed.
 			continue
 		}
 		if !c.OK {
@@ -423,6 +428,36 @@ func (r *Runtime) selfTest(ctx context.Context, rep *SelfTestReport) error {
 	t("metadata 169.254.169.254:80", "169.254.169.254", 80, "closed")
 	t("tailnet 100.100.100.100:53", "100.100.100.100", 53, "closed")
 	u("tailnet DNS 100.100.100.100 (udp)", "100.100.100.100", "timeout")
+	// The direct port (v0.2.3): its published addresses, the agent's
+	// listener and the relay give a machine nothing.
+	var dctl, drelay netip.Addr
+	if dr := r.Direct; dr != nil && dr.Config.Port != 0 {
+		addrs, public, ctl, relay, _ := dr.Published()
+		dport := strconv.Itoa(dr.Config.Port)
+		for _, a := range addrs {
+			hp := net.JoinHostPort(a, dport)
+			if !slices.Contains(r.HostProbes, hp) {
+				t("the direct port "+hp, a, dport, "closed")
+			}
+		}
+		if ctl.IsValid() {
+			dctl = ctl
+			t("the agent's direct listener "+netip.AddrPortFrom(ctl, RelayPort).String(), ctl.String(), RelayPort, "closed")
+		}
+		if relay.IsValid() {
+			drelay = relay
+			t("the direct port's relay "+netip.AddrPortFrom(relay, RelayPort).String(), relay.String(), RelayPort, "closed")
+		}
+		got := "only " + strings.Join(addrs, ", ")
+		if public {
+			got = "a public address or wildcard too: " + dr.Fact().Error
+		}
+		add("the direct port's publish", WantDirectPublish, got, !public)
+		if ctl.IsValid() {
+			got := directFromElsewhere(ctx, ctl)
+			add("the direct listener takes only the relay", "closed without a byte", got, got == "closed without a byte" || got == "refused")
+		}
+	}
 	for _, hp := range r.HostProbes {
 		if host, ok := strings.CutPrefix(hp, "udp53="); ok {
 			u("the host's network "+host+" (DNS, udp)", host, "timeout")
@@ -469,6 +504,15 @@ func (r *Runtime) selfTest(ctx context.Context, rep *SelfTestReport) error {
 	for i, s := range selfAddrs {
 		phases = append(phases, []step{nIn("route", "add", s+"/32", "via", a)}, []step{nt(fmt.Sprintf("routedControl%d", i), s, port, "")})
 	}
+	if dctl.IsValid() {
+		if !slices.Contains(selfAddrs, dctl.String()) {
+			phases = append(phases, []step{nIn("route", "add", dctl.String()+"/32", "via", a)})
+		}
+		phases = append(phases, []step{nt("routedDirect", dctl.String(), RelayPort, "")})
+	}
+	if drelay.IsValid() {
+		phases = append(phases, []step{nIn("route", "add", drelay.String()+"/32", "via", a)}, []step{nt("routedRelay", drelay.String(), RelayPort, "")})
+	}
 	phases = append(phases,
 		[]step{nIn("route", "replace", "default", "via", a)},
 		[]step{nt("throughAgent", "1.1.1.1", 443, "")})
@@ -487,6 +531,12 @@ func (r *Runtime) selfTest(ctx context.Context, rep *SelfTestReport) error {
 		k := fmt.Sprintf("routedControl%d", i)
 		add("NET_ADMIN: the agent's control address "+s+", routed to it", "closed or refused as a machine", outN[k], judge("refused", outN[k], netA))
 	}
+	if dctl.IsValid() {
+		add("NET_ADMIN: the agent's direct listener, routed to it", "no session", outN["routedDirect"], judge("nosession", outN["routedDirect"], netA))
+	}
+	if drelay.IsValid() {
+		add("NET_ADMIN: the direct port's relay, routed through the agent", "closed", outN["routedRelay"], judge("closed", outN["routedRelay"], netA))
+	}
 	add("NET_ADMIN: the internet with the agent as its gateway", "closed (the agent doesn't forward)", outN["throughAgent"], judge("closed", outN["throughAgent"], netA))
 
 	// What the agent's listener saw: nothing from probe N, or forged, may
@@ -502,6 +552,39 @@ func (r *Runtime) selfTest(ctx context.Context, rep *SelfTestReport) error {
 	}
 	add("the agent tells machines apart (network and source)", "only probe A, on its own network", strings.Join(seen, ", "), len(bad) == 0)
 	return nil
+}
+
+// WantDirectPublish is the direct port's publish check's expectation.
+const WantDirectPublish = "only private and tailnet addresses"
+
+// directFromElsewhere connects to the direct listener from the agent itself,
+// which isn't the relay: it must close without a byte.
+func directFromElsewhere(ctx context.Context, ctl netip.Addr) string {
+	d := net.Dialer{Timeout: 2 * time.Second}
+	c, err := d.DialContext(ctx, "tcp4", netip.AddrPortFrom(ctl, RelayPort).String())
+	if err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return "refused"
+		}
+		return "err: " + err.Error()
+	}
+	defer c.Close()
+	c.Write([]byte("CXR1 192.168.1.1 4000\n"))
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	b := make([]byte, 64)
+	n, err := c.Read(b)
+	if n == 0 && err != nil && !isTimeout(err) {
+		return "closed without a byte"
+	}
+	if n == 0 {
+		return "held open (no close within 2 s)"
+	}
+	return fmt.Sprintf("answered %q", b[:n])
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // judge reads a probe result against what it should be: open, own (its own
@@ -522,6 +605,9 @@ func judge(expect, got string, own MachineNet) bool {
 		return got == "timeout" || got == "unreachable"
 	case "refused":
 		return got == "timeout" || got == "unreachable" || got == "open:refused"
+	case "nosession":
+		// The direct listener closes what isn't the relay without a byte.
+		return got == "timeout" || got == "unreachable" || got == "refused" || got == "open" || got == "open:refused"
 	}
 	return false
 }
