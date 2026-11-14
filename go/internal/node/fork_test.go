@@ -298,12 +298,13 @@ func TestTheLastMachineOfAForkTakesItsImageAndTheSweepTheRest(t *testing.T) {
 	r, f := forkRuntime(t)
 	ctx := context.Background()
 	p1 := "cx-orig01-fork-1731600000004"
-	i1, err := r.Commit(ctx, "cx-orig01", p1)
+	i1, err := r.CommitForks(ctx, "cx-orig01", p1, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"cx-fork01", "cx-fork02"} {
 		f.ctrs["c-"+id] = &fakeCtr{id: "c-" + id, image: i1.ID, labels: map[string]string{LabelNode: forkNode, LabelSandbox: id, LabelRole: "machine"}}
+		r.forkMade(i1.Image, id) // as Create does
 	}
 	// A fork of a fork: its image's parent is i1.
 	p2 := "cx-fork02-fork-1731600000005"
@@ -315,6 +316,7 @@ func TestTheLastMachineOfAForkTakesItsImageAndTheSweepTheRest(t *testing.T) {
 		t.Fatalf("the record of a fork of a fork has parent %q, want %s", rec.Parent, i1.ID)
 	}
 	f.ctrs["c-cx-fork03"] = &fakeCtr{id: "c-cx-fork03", image: i2.ID, labels: map[string]string{LabelNode: forkNode, LabelSandbox: "cx-fork03", LabelRole: "machine"}}
+	r.forkMade(i2.Image, "cx-fork03")
 	if err := r.Delete(ctx, "cx-fork01"); err != nil {
 		t.Fatal(err)
 	}
@@ -340,12 +342,16 @@ func TestTheLastMachineOfAForkTakesItsImageAndTheSweepTheRest(t *testing.T) {
 	if f.imgs["sha256:base"] == nil {
 		t.Fatal("the base image went")
 	}
-	// An orphan (its forks never made): the sweep takes it once it's old enough.
+	// An orphan (its forks made and deleted): the sweep takes it once it's old enough.
 	p3 := "cx-orig01-fork-1731600000006"
 	i3, err := r.Commit(ctx, "cx-orig01", p3)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if n := r.SweepForks(ctx, 0); n != 0 || f.imgs[i3.ID] == nil {
+		t.Fatalf("a fork image whose fork wasn't made yet was swept (%d)", n)
+	}
+	r.forkMade(i3.Image, "cx-fork04")
 	if n := r.SweepForks(ctx, time.Hour); n != 0 || f.imgs[i3.ID] == nil {
 		t.Fatalf("a new fork image was swept (%d)", n)
 	}
@@ -413,5 +419,54 @@ func TestConcurrentCommitsCountEachOthersCopies(t *testing.T) {
 	}
 	if r.FreeGB() < r.minFree() {
 		t.Fatalf("the node is under its floor: %.0f GB free", r.FreeGB())
+	}
+}
+
+// Review F-L1: a point's image stays for its forks whose machines haven't
+// been made: not swept after an hour, and not dropped when a sibling is
+// deleted first, until each was made or deleted, or ForkWaitMax.
+func TestAForkImageWaitsForForksNotMadeYet(t *testing.T) {
+	r, f := forkRuntime(t)
+	ctx := context.Background()
+	p := "cx-orig01-fork-1731600000010"
+	info, err := r.CommitForks(ctx, "cx-orig01", p, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One of two made, then deleted before its sibling's create.
+	f.ctrs["c-cx-fork11"] = &fakeCtr{id: "c-cx-fork11", image: info.ID, labels: map[string]string{LabelNode: forkNode, LabelSandbox: "cx-fork11", LabelRole: "machine"}}
+	r.forkMade(info.Image, "cx-fork11")
+	if err := r.Delete(ctx, "cx-fork11", info.Image); err != nil {
+		t.Fatal(err)
+	}
+	if f.imgs[info.ID] == nil {
+		t.Fatal("the image went with one fork while its sibling hadn't been made")
+	}
+	if n := r.SweepForks(ctx, 0); n != 0 || f.imgs[info.ID] == nil {
+		t.Fatal("the sweep took an image a fork is waiting for")
+	}
+	if _, err := r.forkImage(ctx, info.Image); err != nil {
+		t.Fatalf("the sibling's create: %v", err)
+	}
+	// A delete asked twice of the made one counts once.
+	if err := r.Delete(ctx, "cx-fork11", info.Image); err != nil || f.imgs[info.ID] == nil {
+		t.Fatalf("a repeated delete: %v; image left: %v", err, f.imgs[info.ID] != nil)
+	}
+	// The sibling is deleted without ever having had a machine: the image goes.
+	if err := r.Delete(ctx, "cx-fork12", info.Image); err != nil {
+		t.Fatal(err)
+	}
+	if f.imgs[info.ID] != nil || len(r.Forks.All()) != 0 {
+		t.Fatalf("left the image (%v) or its record (%v)", f.imgs[info.ID] != nil, r.Forks.All())
+	}
+	// Waiting has a limit.
+	p2 := "cx-orig01-fork-1731600000011"
+	i2, err := r.CommitForks(ctx, "cx-orig01", p2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Forks.Update(p2, func(rec *ForkRecord) { rec.At = time.Now().Add(-ForkWaitMax - time.Minute).UnixMilli() })
+	if n := r.SweepForks(ctx, time.Hour); n != 1 || f.imgs[i2.ID] != nil {
+		t.Fatalf("swept %d past ForkWaitMax", n)
 	}
 }

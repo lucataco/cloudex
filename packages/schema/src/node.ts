@@ -291,11 +291,14 @@ export type NodeMessage = z.infer<typeof NodeMessage>;
 // sessions of the sandbox and every one opened with a ticket of those tokens,
 // and refuse their tickets if they haven't been used yet (the token that asked
 // for them has ended); answers {ended: the number closed}. And (M5) commit
-// {sandbox, point}: commit the machine's disk, running (paused for the copy)
+// {sandbox, point, forks?}: commit the machine's disk, running (paused for the copy)
 // or stopped, into the fork image cloudex-fork/<node>:<point>; answers
 // {image, id, bytes, tookMs, paused, layers}. It may take minutes; the same
 // point asked again gets the same image, or waits for the commit under way.
-// create's image may then name that fork image.
+// create's image may then name that fork image. The image is kept for the
+// forks (1-10, default 1) whose machines haven't been made yet; delete's
+// image? names a fork's image, so that one deleted before its machine was
+// made counts as made (2026-11-14 review, F-L1).
 export const NodeOpName = z.enum(["ping", "facts", "streams", "create", "start", "stop", "delete", "selftest", "directEnd", "commit"]);
 export type NodeOpName = z.infer<typeof NodeOpName>;
 export const NodeOp = z.object({

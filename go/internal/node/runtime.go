@@ -480,6 +480,9 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 		return nil, err
 	}
 	r.logf("%s: made its machine on %s (%s)", req.Sandbox, n.Subnet, n.Bridge)
+	if fork {
+		r.forkMade(req.Image, req.Sandbox)
+	}
 	return &MachineInfo{Address: n.Machine.String(), Container: n.Name, State: "stopped", Created: true}, nil
 }
 
@@ -747,7 +750,11 @@ func (r *Runtime) Stop(ctx context.Context, sandbox string) error {
 }
 
 // Delete removes a sandbox's machine, its anonymous volumes and its network.
-func (r *Runtime) Delete(ctx context.Context, sandbox string) error {
+//
+// forkRef is the fork image the Worker placed it on, if any: a fork deleted
+// before its machine was made counts as made, so that its point's image can
+// go (review F-L1).
+func (r *Runtime) Delete(ctx context.Context, sandbox string, forkRef ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	cs, err := r.Docker.Containers(ctx, r.labels(LabelSandbox+"="+sandbox)...)
@@ -776,6 +783,11 @@ func (r *Runtime) Delete(ctx context.Context, sandbox string) error {
 		}
 	}
 	r.logf("%s: removed its machine", sandbox)
+	if len(cs) == 0 && len(forkRef) > 0 && IsForkRef(forkRef[0]) {
+		if id := r.forkMade(forkRef[0], sandbox); id != "" {
+			images = append(images, id)
+		}
+	}
 	// A fork's image goes with the last machine that used it (fork.go).
 	dropped := false
 	for _, id := range images {

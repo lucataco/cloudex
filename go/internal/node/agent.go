@@ -762,6 +762,7 @@ func (a *Agent) answer(op Op) Result {
 		Sandbox string `json:"sandbox"`
 		Count   int    `json:"count"`
 		Hold    bool   `json:"hold"`
+		Image   string `json:"image"` // delete: the fork image it was placed on (review F-L1)
 	}
 	b, _ := json.Marshal(op.Args)
 	json.Unmarshal(b, &args)
@@ -793,13 +794,14 @@ func (a *Agent) answer(op Op) Result {
 		var c struct {
 			Sandbox string `json:"sandbox"`
 			Point   string `json:"point"`
+			Forks   int    `json:"forks"` // v0.2.3 review F-L1; absent: 1
 		}
 		if json.Unmarshal(b, &c) != nil {
 			return errResult(op.ID, "bad arguments")
 		}
 		ctx, cancel := context.WithTimeout(a.runCtx, CommitTimeout+time.Minute)
 		defer cancel()
-		info, err := r.Commit(ctx, c.Sandbox, c.Point)
+		info, err := r.CommitForks(ctx, c.Sandbox, c.Point, c.Forks)
 		if err != nil {
 			return errResult(op.ID, err.Error())
 		}
@@ -859,7 +861,7 @@ func (a *Agent) answer(op Op) Result {
 		if a.egress != nil {
 			a.egress.Drop(args.Sandbox)
 		}
-		err := r.Delete(ctx, args.Sandbox)
+		err := r.Delete(ctx, args.Sandbox, args.Image)
 		a.kickEgress()
 		if err != nil {
 			return errResult(op.ID, err.Error())

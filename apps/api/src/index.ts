@@ -629,7 +629,7 @@ app.post("/v1/sandboxes/:ref/fork", async (c) => {
     });
   }
   const names = await copyNames(c.env, input);
-  const from = await newMethod(ref, stub.forkPoint());
+  const from = await newMethod(ref, stub.forkPoint(names.length));
   const opts = { size: on ? original.size : (input.size ?? original.size), idleMinutes: input.idleMinutes ?? original.idleMinutes };
   return c.json(await startCopies(c.env, c.get("who"), names, opts, original.id, from, undefined, place), 201);
 });

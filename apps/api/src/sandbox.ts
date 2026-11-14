@@ -609,10 +609,12 @@ export class Sandbox extends DurableObject<Env> {
     return m ? { madeOn: m } : {};
   }
 
-  async forkPoint(): Promise<ForkSource> {
+  // forks: how many will start from it (a node keeps its image until each
+  // has been made or deleted, review F-L1).
+  async forkPoint(forks = 1): Promise<ForkSource> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
-      if (this.onNode) return this.forkPointOnNode(r);
+      if (this.onNode) return this.forkPointOnNode(r, forks);
       if (r.state === "running") {
         this.touch();
         const t0 = Date.now();
@@ -643,7 +645,7 @@ export class Sandbox extends DurableObject<Env> {
   // The point is named here, so that if the answer is lost (the node's object
   // restarted with a deploy, or the link reset) the same op asked again gets
   // the same image, or waits for the commit under way.
-  private async forkPointOnNode(r: SandboxRecord): Promise<ForkSource> {
+  private async forkPointOnNode(r: SandboxRecord, forks: number): Promise<ForkSource> {
     const p = this.onNode!.placement;
     const name = r.name ?? r.id;
     if (r.state !== "running" && r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
@@ -656,7 +658,7 @@ export class Sandbox extends DurableObject<Env> {
     let out: Record<string, unknown>;
     for (let attempt = 0; ; attempt++) {
       try {
-        out = await this.nodeOp("commit", { sandbox: r.id, point }, SAVE_TIMEOUT_MS);
+        out = await this.nodeOp("commit", { sandbox: r.id, point, forks }, SAVE_TIMEOUT_MS);
         break;
       } catch (e) {
         const { status, message: why } = errorStatus(e);
@@ -2364,8 +2366,14 @@ export class Sandbox extends DurableObject<Env> {
     try {
       made = await create(p.image ?? this.env.NODE_IMAGE);
     } catch (e) {
-      // A fork's first start needs its image: it never falls back.
-      if (!p.image || r.startedAt === null || !/the fork image .* is gone/.test(errorStatus(e).message)) throw e;
+      // A fork's first start needs its image: it never falls back, and says
+      // what to do instead of failing the same way forever (review F-L1).
+      const gone = /the fork image .* is gone/.test(errorStatus(e).message);
+      if (p.image && r.startedAt === null && gone) {
+        const name = r.name ?? r.id;
+        fail(409, `${name} is a fork that never started, and the disk it was forked with is gone from node ${p.name} (its image was removed: the other forks of it were deleted, or it went unused for days). Delete it (cloudex rm ${name}) and fork the original again`);
+      }
+      if (!p.image || r.startedAt === null || !gone) throw e;
       forkGone = true;
       const { image: _, ...rest } = p;
       await this.ctx.storage.put("node", rest);
@@ -2451,7 +2459,9 @@ export class Sandbox extends DurableObject<Env> {
     this.streams.closeAll(1000, "the sandbox was deleted");
     if ((await this.ctx.storage.get<string>("revokedNode")) === p.node) return;
     try {
-      await this.nodeOp("delete", { sandbox: r.id }, 90_000);
+      // A fork's image, so that a fork deleted before its machine was ever
+      // made counts as made (review F-L1); an older agent ignores it.
+      await this.nodeOp("delete", { sandbox: r.id, ...(p.image ? { image: p.image } : {}) }, 90_000);
     } catch (e) {
       const { status } = errorStatus(e);
       if (status === 410) return;

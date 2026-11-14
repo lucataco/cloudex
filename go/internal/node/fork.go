@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -57,6 +58,11 @@ var CommitTimeout = 15 * time.Minute
 
 // ForkSweepAge is how old an unused fork image must be before the sweep removes it.
 var ForkSweepAge = time.Hour
+
+// ForkWaitMax is how long the image of a point whose forks haven't all been
+// made is kept for them (a node offline, a create that failed, a user who
+// hasn't resumed one yet).
+var ForkWaitMax = 7 * 24 * time.Hour
 
 // ForkSweepEvery is how often the sweep runs.
 var ForkSweepEvery = time.Hour
@@ -114,6 +120,11 @@ type ForkRecord struct {
 	TookMs  int64  `json:"tookMs,omitempty"`
 	Paused  bool   `json:"paused,omitempty"`
 	Layers  int    `json:"layers,omitempty"`
+	// Waiting is how many forks of the point haven't had their machine made
+	// (nor been deleted) yet: the image stays for them, past an hour unused
+	// and past the delete of a sibling, up to ForkWaitMax (review F-L1).
+	Waiting int      `json:"waiting,omitempty"`
+	Made    []string `json:"made,omitempty"` // the forks counted off Waiting, so each counts once
 }
 
 type forkFile struct {
@@ -189,6 +200,20 @@ func (b *ForkBook) Put(point string, rec ForkRecord) error {
 	return b.write(f)
 }
 
+// Update changes a point's record, if there is one.
+func (b *ForkBook) Update(point string, change func(*ForkRecord)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := b.read()
+	rec, ok := f.Points[point]
+	if !ok {
+		return
+	}
+	change(&rec)
+	f.Points[point] = rec
+	b.write(f)
+}
+
 // Forget drops points.
 func (b *ForkBook) Forget(points ...string) {
 	b.mu.Lock()
@@ -258,8 +283,18 @@ func (r *Runtime) secPerGB(store string) float64 {
 	return defaultSecPerGB[store]
 }
 
-// Commit makes the image of a fork point of a sandbox's machine (op commit).
+// Commit makes the image of a fork point of a sandbox's machine (op commit),
+// for one fork.
 func (r *Runtime) Commit(ctx context.Context, sandbox, point string) (*ForkInfo, error) {
+	return r.CommitForks(ctx, sandbox, point, 1)
+}
+
+// CommitForks is Commit for forks forks, whose machines the point's image
+// is kept for (review F-L1).
+func (r *Runtime) CommitForks(ctx context.Context, sandbox, point string, forks int) (*ForkInfo, error) {
+	if forks < 1 || forks > 10 {
+		forks = 1
+	}
 	if err := r.ready(); err != nil {
 		return nil, err
 	}
@@ -294,7 +329,7 @@ func (r *Runtime) Commit(ctx context.Context, sandbox, point string) (*ForkInfo,
 	}
 	r.commits[point] = run
 	r.forkMu.Unlock()
-	run.info, run.err = r.commit(ctx, sandbox, point, ref)
+	run.info, run.err = r.commit(ctx, sandbox, point, ref, forks)
 	close(run.done)
 	r.forkMu.Lock()
 	delete(r.commits, point)
@@ -302,7 +337,7 @@ func (r *Runtime) Commit(ctx context.Context, sandbox, point string) (*ForkInfo,
 	return run.info, run.err
 }
 
-func (r *Runtime) commit(ctx context.Context, sandbox, point, ref string) (*ForkInfo, error) {
+func (r *Runtime) commit(ctx context.Context, sandbox, point, ref string, forks int) (*ForkInfo, error) {
 	c, err := r.container(ctx, sandbox)
 	if err != nil {
 		return nil, err
@@ -355,7 +390,7 @@ func (r *Runtime) commit(ctx context.Context, sandbox, point, ref string) (*Fork
 	}
 	running := c.State.Running
 	now := time.Now()
-	r.Forks.Put(point, ForkRecord{Ref: ref, Sandbox: sandbox, Parent: parent, State: "committing", At: now.UnixMilli()})
+	r.Forks.Put(point, ForkRecord{Ref: ref, Sandbox: sandbox, Parent: parent, State: "committing", At: now.UnixMilli(), Waiting: forks})
 	cctx, cancel := context.WithTimeout(ctx, CommitTimeout)
 	defer cancel()
 	id, err := r.Docker.Commit(cctx, c.ID, r.forkRepo(), point, true, CommitConfig{Env: env, Labels: labels})
@@ -372,7 +407,7 @@ func (r *Runtime) commit(ctx context.Context, sandbox, point, ref string) (*Fork
 			}
 		}
 	}
-	rec := ForkRecord{Image: id, Ref: ref, Sandbox: sandbox, Parent: parent, State: "done", At: time.Now().UnixMilli(), Bytes: bytes, TookMs: took.Milliseconds(), Paused: running, Layers: layers}
+	rec := ForkRecord{Image: id, Ref: ref, Sandbox: sandbox, Parent: parent, State: "done", At: time.Now().UnixMilli(), Bytes: bytes, TookMs: took.Milliseconds(), Paused: running, Layers: layers, Waiting: forks}
 	if err := r.Forks.Put(point, rec); err != nil {
 		r.logf("recording the fork point %s: %v", point, err)
 	}
@@ -451,6 +486,30 @@ func (r *Runtime) forkImage(ctx context.Context, ref string) (string, error) {
 	return img.ID, nil
 }
 
+// forkMade counts the fork sandbox of the point ref names as made (its
+// machine was made, or it was deleted before that), once, and answers the
+// point's image id.
+func (r *Runtime) forkMade(ref, sandbox string) string {
+	if r.Forks == nil {
+		return ""
+	}
+	_, point, _ := strings.Cut(ref, ":")
+	id := ""
+	r.Forks.Update(point, func(rec *ForkRecord) {
+		id = rec.Image
+		if rec.Waiting > 0 && !slices.Contains(rec.Made, sandbox) {
+			rec.Waiting--
+			rec.Made = append(rec.Made, sandbox)
+		}
+	})
+	return id
+}
+
+// waiting says whether a point's image is kept for forks not made yet.
+func waiting(rec ForkRecord, now time.Time) bool {
+	return rec.Waiting > 0 && now.Sub(time.UnixMilli(rec.At)) < ForkWaitMax
+}
+
 // dropForkImage removes a fork image once nothing uses it, then its parent
 // fork images the same way. Called with r.mu held, after a delete removed
 // the containers that used it.
@@ -464,7 +523,11 @@ func (r *Runtime) dropForkImage(ctx context.Context, id string) bool {
 		point := img.Config.Labels[LabelPoint]
 		parent := img.Parent
 		if r.Forks != nil {
-			if rec, ok := r.Forks.Get(point); ok && rec.Parent != "" {
+			rec, ok := r.Forks.Get(point)
+			if ok && waiting(rec, time.Now()) {
+				return dropped // its other forks haven't been made yet
+			}
+			if ok && rec.Parent != "" {
 				parent = rec.Parent
 			}
 		}
@@ -557,6 +620,9 @@ func (r *Runtime) sweepForks(ctx context.Context, minAge time.Duration) int {
 			at := time.Unix(i.Created, 0)
 			if rec, ok := book[p]; ok {
 				if rec.State == "committing" && now.Sub(time.UnixMilli(rec.At)) < 2*CommitTimeout {
+					continue
+				}
+				if waiting(rec, now) {
 					continue
 				}
 				if rec.At > 0 {
