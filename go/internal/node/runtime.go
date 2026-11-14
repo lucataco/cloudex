@@ -636,10 +636,22 @@ func (r *Runtime) Reattach(ctx context.Context, nets map[string]MachineNet) {
 		if _, ok := self.NetworkSettings.Networks[n.Name]; ok {
 			continue
 		}
+		// Under the lifecycle lock, and looked at again: a create or a delete
+		// may have attached or removed it meanwhile (a delete disconnects the
+		// agent before it removes the network, under this lock).
 		r.mu.Lock()
-		err := r.Docker.NetworkConnect(ctx, n.Name, r.Self, n.Agent.String(), -1000)
+		now, err := r.Docker.ContainerInspect(ctx, r.Self)
+		if err == nil {
+			if _, ok := now.NetworkSettings.Networks[n.Name]; ok {
+				r.mu.Unlock()
+				continue
+			}
+			err = r.Docker.NetworkConnect(ctx, n.Name, r.Self, n.Agent.String(), -1000)
+		}
 		r.mu.Unlock()
-		if err != nil {
+		if IsNotFound(err) {
+			continue // deleted meanwhile
+		} else if err != nil {
 			r.logf("%s: joining its network again: %v", id, err)
 		} else {
 			r.logf("%s: joined its network again at %s (the agent's container was replaced)", id, n.Agent)

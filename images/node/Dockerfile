@@ -8,7 +8,9 @@
 # The build stage runs on the builder's own platform and cross-compiles: Go
 # 1.27's amd64 toolchain crashes under Rosetta (v0.2.3 M2), and an arm64 test
 # host's agent (the installer's CLOUDEX_NODE_ALLOW_ARCH) is built with
-# --platform linux/arm64. Releases are linux/amd64 only.
+# --build-arg TARGETARCH=arm64 (the default below wins over the platform
+# BuildKit sets, so --platform alone still gives amd64: v0.2.3 M4). Releases
+# are linux/amd64 only.
 FROM --platform=$BUILDPLATFORM golang:1.27@sha256:01aa404fa56b604b6f48e90c1d6e2c79fe5cd78f9592f78d80303fbe171cdcc0 AS build
 ARG VERSION=dev
 ARG TARGETARCH=amd64

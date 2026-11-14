@@ -2481,7 +2481,7 @@ if want node; then
 		elif [[ -z ${VERIFY_NODE_AGENT_IMAGE:-} ]]; then
 			# Built there from this checkout, with images/node/Dockerfile.
 			if (cd "$repo" && COPYFILE_DISABLE=1 tar czf "$work/node-src.tgz" go images/node) &&
-				"${NODE_SSH[@]}" "mkdir -p $NODE_DIR/src && tar xzf - -C $NODE_DIR/src 2>/dev/null && cd $NODE_DIR/src && docker build -q -f images/node/Dockerfile --build-arg VERSION=verify-$P -t $AIMG . >/dev/null" <"$work/node-src.tgz" 2>"$work/e"; then
+				"${NODE_SSH[@]}" "mkdir -p $NODE_DIR/src && tar xzf - -C $NODE_DIR/src 2>/dev/null && cd $NODE_DIR/src && a=\$(uname -m) && docker build -q -f images/node/Dockerfile --build-arg VERSION=verify-$P --build-arg TARGETARCH=\$([ \$a = aarch64 ] && echo arm64 || echo amd64) -t $AIMG . >/dev/null" <"$work/node-src.tgz" 2>"$work/e"; then
 				NODE_BUILT=1
 			else
 				ok_up=0 why="couldn't build the agent's image there: $(tail -3 "$work/e")"
