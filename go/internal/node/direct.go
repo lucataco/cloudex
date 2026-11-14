@@ -49,9 +49,15 @@ const (
 	// client behind Tailscale's SNAT (and the host's own containers): one
 	// address for many people, so a budget of its own, which leaves the rest
 	// to the LAN.
-	DirectGatewayMax  = 64
-	DirectSessionsMax = 256  // open sessions on the node
-	DirectSeenMax     = 4096 // session ids remembered until their ticket expires
+	DirectGatewayMax = 64
+	// The rest of DirectHandshakesMax is the LAN's, which can't take the
+	// gateway's share (2026-11-14 re-review 6: eight LAN addresses filled
+	// every slot); and connections whose relay header hasn't been read yet
+	// get a few more, so that a burst of them doesn't shut out either.
+	DirectLANMax       = DirectHandshakesMax - DirectGatewayMax
+	DirectPreHeaderMax = 64
+	DirectSessionsMax  = 256  // open sessions on the node
+	DirectSeenMax      = 4096 // session ids remembered until their ticket expires
 	// One token's share, so that one token holder can't take the node's
 	// (the admin key, which reaches everything anyway, has none): tickets
 	// seen in a ticket's lifetime, and sessions open at once.
@@ -112,7 +118,8 @@ type Direct struct {
 	why       string
 	addrs     []string // the sidecar's actual bindings
 	public    bool     // a binding isn't private or tailnet
-	hs        int
+	hs        int      // connections in their handshake, from accept
+	hsLAN     int      // of those past the relay's header, from other than the gateway
 	perClient map[netip.Addr]int
 	sessions  map[string]*directSession
 	seen      map[string]seenTicket // session id -> until when, and its token
@@ -459,7 +466,7 @@ func (d *Direct) accept(c net.Conn) {
 		return
 	}
 	d.mu.Lock()
-	if d.hs >= DirectHandshakesMax {
+	if d.hs >= DirectHandshakesMax+DirectPreHeaderMax {
 		d.mu.Unlock()
 		c.Close()
 		return
@@ -535,6 +542,7 @@ func ClientAllowed(client netip.Addr, pool netip.Prefix) error {
 func (d *Direct) handle(c net.Conn) {
 	inHS := true
 	var client netip.Addr
+	lan := false
 	done := func() {
 		if !inHS {
 			return
@@ -542,6 +550,9 @@ func (d *Direct) handle(c net.Conn) {
 		inHS = false
 		d.mu.Lock()
 		d.hs--
+		if lan {
+			d.hsLAN--
+		}
 		if client.IsValid() {
 			if d.perClient[client]--; d.perClient[client] <= 0 {
 				delete(d.perClient, client)
@@ -583,6 +594,16 @@ func (d *Direct) handle(c net.Conn) {
 		d.debugf("refused %s: %d handshakes from it already", cl, limit)
 		c.Close()
 		return
+	}
+	if limit != DirectGatewayMax {
+		if d.hsLAN >= DirectLANMax {
+			d.mu.Unlock()
+			d.debugf("refused %s: %d handshakes from the LAN already", cl, DirectLANMax)
+			c.Close()
+			return
+		}
+		d.hsLAN++
+		lan = true
 	}
 	client = cl.Addr()
 	d.perClient[client]++

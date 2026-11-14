@@ -457,14 +457,22 @@ func TestListenerHandshakeLimits(t *testing.T) {
 	if c := hold("192.168.65.1"); !closedAtOnce(c) {
 		t.Fatal("the 17th handshake from one client wasn't closed")
 	}
-	// Other clients up to the node's cap, then the next is closed at accept.
-	for i := DirectPerClientMax; i < DirectHandshakesMax; i++ {
+	// Other LAN clients up to the LAN's share, then the next LAN one is closed
+	// (re-review 6: eight LAN addresses used to fill every slot) while the
+	// gateway (the tailnet behind Tailscale's SNAT) still has its own 64.
+	for i := DirectPerClientMax; i < DirectLANMax; i++ {
 		held = append(held, hold(fmt.Sprintf("192.168.66.%d", i)))
 	}
+	waitFor(t, func() bool { r.d.mu.Lock(); defer r.d.mu.Unlock(); return r.d.hsLAN == DirectLANMax })
+	if c := hold("192.168.67.1"); !closedAtOnce(c) {
+		t.Fatal("a LAN handshake over the LAN's share wasn't closed")
+	}
+	for i := 0; i < DirectGatewayMax; i++ {
+		held = append(held, hold("172.18.0.1"))
+	}
 	waitFor(t, func() bool { r.d.mu.Lock(); defer r.d.mu.Unlock(); return r.d.hs == DirectHandshakesMax })
-	c, _ := net.Dial("tcp4", r.addr)
-	if !closedAtOnce(c) {
-		t.Fatal("the handshake over the node's cap wasn't closed")
+	if c := hold("172.18.0.1"); !closedAtOnce(c) {
+		t.Fatal("a handshake over the gateway's share wasn't closed")
 	}
 	// The deadline frees them.
 	for _, c := range held {
