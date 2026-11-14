@@ -729,6 +729,12 @@ func (a *Agent) answer(op Op) Result {
 		}
 		p.more(max(1, min(args.Count, SparesMax)))
 		return okResult(op.ID, struct{}{})
+	case "directEnd":
+		var d DirectEnd
+		if json.Unmarshal(b, &d) != nil || !sandboxID.MatchString(d.Sandbox) || len(d.Sessions) > directEndMax {
+			return errResult(op.ID, "bad arguments")
+		}
+		return okResult(op.ID, map[string]int{"ended": a.endDirect(d)})
 	}
 	switch op.Name {
 	case "create", "start", "stop", "delete", "selftest":

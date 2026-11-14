@@ -84,6 +84,18 @@ export interface NodeImage {
 }
 
 /**
+ * A node's direct path (v0.2.3): the port its agent takes ssh on straight from
+ * the LAN or a tailnet, the host addresses it's published on, and its state.
+ */
+export interface NodeDirect {
+  port: number;
+  addrs: string[];
+  state: "listening" | "off" | "failed";
+  /** Why it failed. */
+  error?: string;
+}
+
+/**
  * A node: your own Linux host with Docker that runs sandboxes for the
  * deployment, through its agent (cloudex-node), which dials out and stays
  * connected. What it reports about itself (its name aside) comes from its
@@ -119,6 +131,8 @@ export interface NodeInfo {
   pendingDeletes?: string[];
   /** Nodes.get only: its agent's clock less the deployment's at its last connect, in seconds. */
   clockSkewSec?: number;
+  /** Its direct path, as its agent last reported it; absent for an agent older than v0.2.3. */
+  direct?: NodeDirect;
 }
 
 /** A node as added: the token its agent joins with (once, before expiresAt), and the command that installs the agent. */

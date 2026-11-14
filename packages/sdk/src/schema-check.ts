@@ -28,6 +28,7 @@ import type {
   NodeInfo,
   NodeIsolation,
   NodeImage,
+  NodeDirect,
   Placement,
   NewToken,
   Provider,
@@ -103,10 +104,11 @@ export const checks: [
   Same<Placement, schema.Placement>,
   Same<NodeIsolation, schema.NodeIsolation>,
   Same<NodeImage, schema.NodeImage>,
+  Same<NodeDirect, schema.NodeDirect>,
   Same<NodeInfo, schema.Node>,
   Same<NewNodeInfo, schema.NewNode>,
 ] = [
   true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
   true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-  true, true, true, true, true, true,
+  true, true, true, true, true, true, true,
 ];

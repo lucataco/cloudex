@@ -40,6 +40,20 @@ type ImageFact struct {
 	Progress *float64 `json:"progress,omitempty"` // 0 to 1, while pulling
 }
 
+// DirectFact is the direct path (v0.2.3): the port the agent takes
+// connections on straight from the LAN or a tailnet, the host addresses
+// Docker publishes it on, and its state: listening, off, or failed (Error
+// says why).
+type DirectFact struct {
+	Port  int      `json:"port"`
+	Addrs []string `json:"addrs"` // IPv4, at most DirectAddrsMax
+	State string   `json:"state"` // listening, off or failed
+	Error string   `json:"error,omitempty"`
+}
+
+// DirectAddrsMax is the most addresses a DirectFact may list.
+const DirectAddrsMax = 8
+
 // Facts describe the host. Sizes it can't tell are null.
 type Facts struct {
 	Arch       string     `json:"arch"`    // amd64 or arm64
@@ -49,6 +63,9 @@ type Facts struct {
 	MemoryMB   *int       `json:"memoryMb"`
 	DiskFreeGB *float64   `json:"diskFreeGb"`
 	Image      *ImageFact `json:"image,omitempty"`
+	// Direct is absent from agents older than v0.2.3, and an older Worker
+	// drops it.
+	Direct *DirectFact `json:"direct,omitempty"`
 }
 
 // Machine is a sandbox's container on this node, as the agent sees it.
@@ -162,10 +179,52 @@ type TicketRequest struct {
 // Welcome follows the agent's hello: the image the deployment's machines
 // run, and (v0.2.2 M6) the hosts of the AI providers whose HTTPS calls the
 // deployment intercepts, which the node CA is limited to (ca.go).
+//
+// Direct (v0.2.3) carries the node's secret for direct tickets
+// (go/internal/direct), which the agent keeps in memory only, and the
+// Worker's clock, by which it judges a ticket's expiry. A Worker older than
+// v0.2.3 sends none: then the direct path stays off, and the agent sends no
+// DirectReport.
 type Welcome struct {
-	Type      string   `json:"type"` // welcome
-	Image     string   `json:"image"`
-	Providers []string `json:"providers,omitempty"`
+	Type      string         `json:"type"` // welcome
+	Image     string         `json:"image"`
+	Providers []string       `json:"providers,omitempty"`
+	Direct    *WelcomeDirect `json:"direct,omitempty"`
+}
+
+// WelcomeDirect is welcome's direct part.
+type WelcomeDirect struct {
+	Secret string `json:"secret"` // 32 bytes in base64
+	Now    int64  `json:"now"`    // the Worker's clock, ms
+}
+
+// DirectReport (v0.2.3) lists a sandbox's sessions open on the direct port
+// now (all of them; one missing has closed), and whether any client sent
+// bytes since the last report, which counts as activity. Sent on each open
+// and close, and every direct.ReportEvery while any is open; only after a
+// welcome that carried Direct, since an older Worker closes the socket on a
+// message type it doesn't know.
+type DirectReport struct {
+	Type    string   `json:"type"` // direct
+	Sandbox string   `json:"sandbox"`
+	Open    []string `json:"open"` // session ids, at most direct.SessionsMax
+	Active  bool     `json:"active"`
+}
+
+// NewDirectReport is a report as the agent sends it.
+func NewDirectReport(sandbox string, open []string, active bool) DirectReport {
+	if open == nil {
+		open = []string{}
+	}
+	return DirectReport{Type: "direct", Sandbox: sandbox, Open: open, Active: active}
+}
+
+// DirectEnd is the directEnd op's arguments (v0.2.3): end these sessions of
+// the sandbox, and refuse their tickets if they haven't been used yet (the
+// token that asked for them has ended).
+type DirectEnd struct {
+	Sandbox  string   `json:"sandbox"`
+	Sessions []string `json:"sessions"`
 }
 
 // Tickets is the answer: each one opens one stream socket, once, within 60 s.

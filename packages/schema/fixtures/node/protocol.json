@@ -560,6 +560,118 @@
           "ca": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n"
         }
       }
+    },
+    {
+      "name": "facts with the direct path (v0.2.3)",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "pass",
+            "unisolated": false,
+            "checkedAt": 1762819200000
+          },
+          "cpus": 2,
+          "memoryMb": 7936,
+          "diskFreeGb": 81.2,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "present"
+          },
+          "direct": {
+            "port": 7022,
+            "addrs": [
+              "192.168.1.20",
+              "100.124.24.58"
+            ],
+            "state": "listening"
+          }
+        }
+      }
+    },
+    {
+      "name": "facts with a failed direct path (v0.2.3)",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "pass",
+            "unisolated": false,
+            "checkedAt": 1762819200000
+          },
+          "cpus": 2,
+          "memoryMb": 7936,
+          "diskFreeGb": 81.2,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "present"
+          },
+          "direct": {
+            "port": 7022,
+            "addrs": [],
+            "state": "failed",
+            "error": "published on a public address: 203.0.113.9"
+          }
+        }
+      }
+    },
+    {
+      "name": "a direct report (v0.2.3)",
+      "model": "NodeMessage",
+      "message": {
+        "type": "direct",
+        "sandbox": "cx-abc123",
+        "open": [
+          "0123456789abcdef"
+        ],
+        "active": true
+      }
+    },
+    {
+      "name": "a direct report, all closed (v0.2.3)",
+      "model": "NodeMessage",
+      "message": {
+        "type": "direct",
+        "sandbox": "cx-abc123",
+        "open": [],
+        "active": false
+      }
+    },
+    {
+      "name": "welcome with the direct secret (v0.2.3)",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "welcome",
+        "image": "ghcr.io/lucataco/cloudex-base:v0.2.2@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "providers": [
+          "api.anthropic.com"
+        ],
+        "direct": {
+          "secret": "LhPB8DyCoAbNy22bIG1SEfBAJfvjACDtFM+myfNaBgU=",
+          "now": 1762819200000
+        }
+      }
+    },
+    {
+      "name": "op-directEnd (v0.2.3)",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "op",
+        "id": "op-e1",
+        "name": "directEnd",
+        "args": {
+          "sandbox": "cx-abc123",
+          "sessions": [
+            "0123456789abcdef"
+          ]
+        }
+      }
     }
   ],
   "invalid": [
@@ -594,7 +706,7 @@
             "unisolated": false
           },
           "cpus": 1,
-          "memoryMb": 1000000000000.0,
+          "memoryMb": 1000000000000,
           "diskFreeGb": 1
         }
       }
@@ -959,6 +1071,240 @@
           "*.openai.com"
         ]
       }
+    },
+    {
+      "name": "direct addresses that aren't IPv4",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "pass",
+            "unisolated": false,
+            "checkedAt": 1762819200000
+          },
+          "cpus": 2,
+          "memoryMb": 7936,
+          "diskFreeGb": 81.2,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "present"
+          },
+          "direct": {
+            "port": 7022,
+            "addrs": [
+              "fd7a:115c:a1e0::1"
+            ],
+            "state": "listening"
+          }
+        }
+      }
+    },
+    {
+      "name": "more than 8 direct addresses",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "pass",
+            "unisolated": false,
+            "checkedAt": 1762819200000
+          },
+          "cpus": 2,
+          "memoryMb": 7936,
+          "diskFreeGb": 81.2,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "present"
+          },
+          "direct": {
+            "port": 7022,
+            "addrs": [
+              "10.0.0.1",
+              "10.0.0.2",
+              "10.0.0.3",
+              "10.0.0.4",
+              "10.0.0.5",
+              "10.0.0.6",
+              "10.0.0.7",
+              "10.0.0.8",
+              "10.0.0.9"
+            ],
+            "state": "listening"
+          }
+        }
+      }
+    },
+    {
+      "name": "a direct state outside the set",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "pass",
+            "unisolated": false,
+            "checkedAt": 1762819200000
+          },
+          "cpus": 2,
+          "memoryMb": 7936,
+          "diskFreeGb": 81.2,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "present"
+          },
+          "direct": {
+            "port": 7022,
+            "addrs": [],
+            "state": "maybe"
+          }
+        }
+      }
+    },
+    {
+      "name": "a direct port out of range",
+      "model": "NodeMessage",
+      "message": {
+        "type": "facts",
+        "facts": {
+          "arch": "amd64",
+          "runtime": "sysbox",
+          "isolation": {
+            "firewall": "pass",
+            "unisolated": false,
+            "checkedAt": 1762819200000
+          },
+          "cpus": 2,
+          "memoryMb": 7936,
+          "diskFreeGb": 81.2,
+          "image": {
+            "ref": "ghcr.io/lucataco/cloudex-base:v0.2.2",
+            "state": "present"
+          },
+          "direct": {
+            "port": 70220,
+            "addrs": [],
+            "state": "off"
+          }
+        }
+      }
+    },
+    {
+      "name": "a direct report with more than 64 sessions",
+      "model": "NodeMessage",
+      "message": {
+        "type": "direct",
+        "sandbox": "cx-abc123",
+        "open": [
+          "0000000000000000",
+          "0000000000000001",
+          "0000000000000002",
+          "0000000000000003",
+          "0000000000000004",
+          "0000000000000005",
+          "0000000000000006",
+          "0000000000000007",
+          "0000000000000008",
+          "0000000000000009",
+          "000000000000000a",
+          "000000000000000b",
+          "000000000000000c",
+          "000000000000000d",
+          "000000000000000e",
+          "000000000000000f",
+          "0000000000000010",
+          "0000000000000011",
+          "0000000000000012",
+          "0000000000000013",
+          "0000000000000014",
+          "0000000000000015",
+          "0000000000000016",
+          "0000000000000017",
+          "0000000000000018",
+          "0000000000000019",
+          "000000000000001a",
+          "000000000000001b",
+          "000000000000001c",
+          "000000000000001d",
+          "000000000000001e",
+          "000000000000001f",
+          "0000000000000020",
+          "0000000000000021",
+          "0000000000000022",
+          "0000000000000023",
+          "0000000000000024",
+          "0000000000000025",
+          "0000000000000026",
+          "0000000000000027",
+          "0000000000000028",
+          "0000000000000029",
+          "000000000000002a",
+          "000000000000002b",
+          "000000000000002c",
+          "000000000000002d",
+          "000000000000002e",
+          "000000000000002f",
+          "0000000000000030",
+          "0000000000000031",
+          "0000000000000032",
+          "0000000000000033",
+          "0000000000000034",
+          "0000000000000035",
+          "0000000000000036",
+          "0000000000000037",
+          "0000000000000038",
+          "0000000000000039",
+          "000000000000003a",
+          "000000000000003b",
+          "000000000000003c",
+          "000000000000003d",
+          "000000000000003e",
+          "000000000000003f",
+          "0000000000000040"
+        ],
+        "active": false
+      }
+    },
+    {
+      "name": "a direct report with a session that isn't 16 hex digits",
+      "model": "NodeMessage",
+      "message": {
+        "type": "direct",
+        "sandbox": "cx-abc123",
+        "open": [
+          "xyz"
+        ],
+        "active": false
+      }
+    },
+    {
+      "name": "a direct report for something that isn't a sandbox",
+      "model": "NodeMessage",
+      "message": {
+        "type": "direct",
+        "sandbox": "n1",
+        "open": [],
+        "active": false
+      }
+    },
+    {
+      "name": "a welcome whose direct secret isn't 32 bytes",
+      "model": "WorkerMessage",
+      "message": {
+        "type": "welcome",
+        "image": "x",
+        "direct": {
+          "secret": "c2hvcnQ=",
+          "now": 1762819200000
+        }
+      }
     }
   ],
   "window": 4194304,
@@ -998,5 +1344,122 @@
         ""
       ]
     }
+  },
+  "direct": {
+    "_": "Direct tickets (v0.2.3; apps/api/src/direct.ts mints them, go/internal/direct checks them). secret is directSecret(adminKey, node, publicKey) in base64. Each valid ticket is what the Worker mints at nowMs with the session given, and reads back as its claims under secret until it expires (claims.e, unix s). Every invalid one is refused under secret, whatever the clock.",
+    "label": "cloudex node direct tickets v1",
+    "adminKey": "cx_admin_test_0123456789abcdefghijklmnopqrstuv",
+    "node": "nd-abcd1234",
+    "publicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+    "secret": "LhPB8DyCoAbNy22bIG1SEfBAJfvjACDtFM+myfNaBgU=",
+    "nowMs": 1762819200000,
+    "ttlSec": 60,
+    "max": 512,
+    "valid": [
+      {
+        "name": "ssh",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0.0hhtwvnn8CzVsi0xxRcDvRU_UTFEgXv0bgmfOaV-YxM",
+        "claims": {
+          "n": "nd-abcd1234",
+          "s": "cx-abc123",
+          "p": 22,
+          "i": "0123456789abcdef",
+          "e": 1762819260
+        }
+      },
+      {
+        "name": "another sandbox and port",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtZGVmNDU2IiwicCI6MzAwMCwiaSI6ImZlZGNiYTk4NzY1NDMyMTAiLCJlIjoxNzYyODE5MjYwfQ.yXt3cBIPZFOGM8n14_qkoy9Gpc5IhTjgCU3XpISmWTU",
+        "claims": {
+          "n": "nd-abcd1234",
+          "s": "cx-def456",
+          "p": 3000,
+          "i": "fedcba9876543210",
+          "e": 1762819260
+        }
+      }
+    ],
+    "invalid": [
+      {
+        "name": "a changed payload",
+        "ticket": "eyJuIjoibmAtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0.0hhtwvnn8CzVsi0xxRcDvRU_UTFEgXv0bgmfOaV-YxM"
+      },
+      {
+        "name": "a changed MAC",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0.0hhtwAnn8CzVsi0xxRcDvRU_UTFEgXv0bgmfOaV-YxM"
+      },
+      {
+        "name": "another node's secret",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0.A5scAZrv1DYEW8G1sOVWfNslxzDEa5wLdaVr1cznn30"
+      },
+      {
+        "name": "another admin key",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0.TVU867OlRYg_2lUJb-4P14JZ2m2Ykh_HtXpvstYc1fc"
+      },
+      {
+        "name": "no MAC",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0."
+      },
+      {
+        "name": "no dot",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0"
+      },
+      {
+        "name": "three parts",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0.0hhtwvnn8CzVsi0xxRcDvRU_UTFEgXv0bgmfOaV-YxM.0hhtwvnn8CzVsi0xxRcDvRU_UTFEgXv0bgmfOaV-YxM"
+      },
+      {
+        "name": "empty",
+        "ticket": ""
+      },
+      {
+        "name": "padded base64",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0=.0hhtwvnn8CzVsi0xxRcDvRU_UTFEgXv0bgmfOaV-YxM"
+      },
+      {
+        "name": "longer than 512 bytes",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MCwieCI6Inl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5In0.yen5IoJJ6AYYmxyky0LxHvdzkyNEge6LmBXsqLPLSdg"
+      },
+      {
+        "name": "an extra claim, signed",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MCwieCI6MX0.kmCcwNNgCIc8Vsb-fwpDaJL3QEdbfOqusxZ17xGathw"
+      },
+      {
+        "name": "a missing claim, signed",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIn0.hD4cuLg2x-NT3ifSAE5cqG6cHwsyKk794MvVY3EDE38"
+      },
+      {
+        "name": "a claim in capitals, signed",
+        "ticket": "eyJOIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0.37h3GuV2f0Oe4CQeQ6pUBsQI1PLSlQz9KwMph3IZ7DE"
+      },
+      {
+        "name": "port 0, signed",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MCwiaSI6IjAxMjM0NTY3ODlhYmNkZWYiLCJlIjoxNzYyODE5MjYwfQ.nc_lBAi0XP01tyu8Fh3pBjAgOASeJ_MlsJRUL7gxdiM"
+      },
+      {
+        "name": "port 65536, signed",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6NjU1MzYsImkiOiIwMTIzNDU2Nzg5YWJjZGVmIiwiZSI6MTc2MjgxOTI2MH0.1bOEYwO6mygrD4azOKkwK4RWZjWDegOJTEnmkt4y6pg"
+      },
+      {
+        "name": "a port as text, signed",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6IjIyIiwiaSI6IjAxMjM0NTY3ODlhYmNkZWYiLCJlIjoxNzYyODE5MjYwfQ.wCp1xbJiHmjuLQ7mwuXMZDDkCmGTpeqPHhq-jj8Nrdg"
+      },
+      {
+        "name": "a session that isn't 16 hex digits, signed",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoiY3gtYWJjMTIzIiwicCI6MjIsImkiOiIwMTIzNDU2Nzg5QUJDREVGIiwiZSI6MTc2MjgxOTI2MH0.d8FTwuCyUfPfb8CxP4vz-wvMbUc70nkwXoLPV1ppJl0"
+      },
+      {
+        "name": "a node that isn't a node id, signed",
+        "ticket": "eyJuIjoiYm94IiwicyI6ImN4LWFiYzEyMyIsInAiOjIyLCJpIjoiMDEyMzQ1Njc4OWFiY2RlZiIsImUiOjE3NjI4MTkyNjB9.GVro436SMwo9ZD2g3bvG-jeaEyR1MqWWwONI0hwMHlo"
+      },
+      {
+        "name": "a sandbox that isn't a sandbox id, signed",
+        "ticket": "eyJuIjoibmQtYWJjZDEyMzQiLCJzIjoibjEiLCJwIjoyMiwiaSI6IjAxMjM0NTY3ODlhYmNkZWYiLCJlIjoxNzYyODE5MjYwfQ.vP_U1JU1Ahqt0AnBQvZelIfAFBo347pjOHHAL_MHjGU"
+      },
+      {
+        "name": "JSON that isn't an object, signed",
+        "ticket": "WzEsMiwzLDQsNV0.dSoT0IFrUBf6BK17xAEv7RIvuKqWallF9nwqYedK7KY"
+      }
+    ]
   }
 }

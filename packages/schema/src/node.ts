@@ -70,6 +70,24 @@ export const NodeImage = z.object({
 });
 export type NodeImage = z.infer<typeof NodeImage>;
 
+// The direct path (v0.2.3): the port a node's agent takes ssh and other TCP
+// connections on straight from a client on its LAN or tailnet, published by
+// Docker on the host addresses its installer chose (private IPv4 or
+// 100.64/10). state: listening, off (turned off, or the deployment's welcome
+// had no secret), or failed (error says why, from Docker or the listener).
+// The Worker answers clients only with the private and tailnet addresses
+// among addrs (direct.ts), whatever a node reports.
+export const DIRECT_PORT = 7022;
+export const DIRECT_ADDRS_MAX = 8;
+const IPv4 = z.string().regex(/^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/, "an IPv4 address");
+export const NodeDirect = z.object({
+  port: z.number().int().min(1).max(65535),
+  addrs: z.array(IPv4).max(DIRECT_ADDRS_MAX),
+  state: z.enum(["listening", "off", "failed"]),
+  error: NodeText(500).optional(),
+});
+export type NodeDirect = z.infer<typeof NodeDirect>;
+
 // What the agent reports about its host. Unknown sizes are null.
 export const NodeFacts = z.object({
   arch: z.enum(["amd64", "arm64"]),
@@ -79,6 +97,7 @@ export const NodeFacts = z.object({
   memoryMb: z.number().int().min(1).max(64 * 1024 * 1024).nullable(),
   diskFreeGb: z.number().min(0).max(1_000_000).nullable(),
   image: NodeImage.optional(),
+  direct: NodeDirect.optional(), // v0.2.3; an older agent has none
 });
 export type NodeFacts = z.infer<typeof NodeFacts>;
 
@@ -119,6 +138,9 @@ export const Node = z.object({
   // GET /v1/nodes/{node} only: the agent's clock less the deployment's at its
   // last connect, in seconds (more than 60 either way is refused).
   clockSkewSec: z.number().int().optional(),
+  // v0.2.3: the node's direct path as its agent last reported it; absent for
+  // an agent older than v0.2.3.
+  direct: NodeDirect.optional(),
 });
 export type Node = z.infer<typeof Node>;
 
@@ -203,7 +225,22 @@ export const NodeTicketRequest = z.object({
   sandbox: SandboxId,
   count: z.number().int().min(1).max(STREAM_TICKETS_MAX),
 });
-export const NodeMessage = z.discriminatedUnion("type", [NodeHello, NodeFactsMessage, NodeStateMessage, NodeResult, NodeTicketRequest]);
+// Direct sessions (v0.2.3): for one sandbox, the sessions open on the direct
+// port now (all of them: one missing has closed), and whether any client sent
+// bytes since the last report (which counts as activity, as a splice's client
+// messages do). Sent on open and close and every DIRECT_REPORT_SEC while any
+// is open, and only after a welcome that carried direct, so that an older
+// Worker never sees one.
+export const DIRECT_SESSIONS_MAX = 64;
+export const DIRECT_REPORT_SEC = 30;
+export const DirectSessionId = z.string().regex(/^[0-9a-f]{16}$/, "a direct session id, 16 hex digits");
+export const NodeDirectReport = z.object({
+  type: z.literal("direct"),
+  sandbox: SandboxId,
+  open: z.array(DirectSessionId).max(DIRECT_SESSIONS_MAX),
+  active: z.boolean(),
+});
+export const NodeMessage = z.discriminatedUnion("type", [NodeHello, NodeFactsMessage, NodeStateMessage, NodeResult, NodeTicketRequest, NodeDirectReport]);
 export type NodeMessage = z.infer<typeof NodeMessage>;
 
 // Worker to agent. The set of ops is fixed: none of them runs anything on the
@@ -220,7 +257,10 @@ export type NodeMessage = z.infer<typeof NodeMessage>;
 // - stop {sandbox}: stop it, keeping its disk;
 // - delete {sandbox}: remove the machine, its volumes and its network;
 // - selftest: run the isolation self-test now; answers {pass, failed, checks, tookMs}.
-export const NodeOpName = z.enum(["ping", "facts", "streams", "create", "start", "stop", "delete", "selftest"]);
+// v0.2.3 adds directEnd {sandbox, sessions}: close those direct sessions, and
+// refuse their tickets if they haven't been used yet (the token that asked for
+// them has ended); answers {ended: the number closed}.
+export const NodeOpName = z.enum(["ping", "facts", "streams", "create", "start", "stop", "delete", "selftest", "directEnd"]);
 export type NodeOpName = z.infer<typeof NodeOpName>;
 export const NodeOp = z.object({
   type: z.literal("op"),
@@ -241,10 +281,19 @@ export const NodeTickets = z.object({
 // hosts of the AI providers whose HTTPS calls the deployment intercepts,
 // which the agent's node CA is name-constrained to.
 export const ProviderHost = z.string().regex(/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/, "a host name").max(253);
+// direct (v0.2.3): the node's own secret for direct tickets (32 bytes in
+// base64; derived from ADMIN_KEY, the node's id and its key, never stored by
+// the agent), and the Worker's clock in ms, by which the agent judges a
+// ticket's expiry. An agent older than v0.2.3 ignores it.
+export const NodeWelcomeDirect = z.object({
+  secret: z.string().regex(/^[A-Za-z0-9+/]{43}=$/, "32 bytes in base64"),
+  now: z.number().int().min(0),
+});
 export const NodeWelcome = z.object({
   type: z.literal("welcome"),
   image: z.string().max(400),
   providers: z.array(ProviderHost).max(32).optional(),
+  direct: NodeWelcomeDirect.optional(),
 });
 
 // The route a node's agent passes its machines' requests to cloudex.internal
@@ -256,6 +305,40 @@ export const EGRESS_BODY_MAX = 100_000_000;
 export const EGRESS_ACTIVITY_SEC = 30;
 export const WorkerMessage = z.discriminatedUnion("type", [NodeOp, NodeTickets, NodeWelcome]);
 export type WorkerMessage = z.infer<typeof WorkerMessage>;
+
+// ---------------------------------------------------------------- the direct path (v0.2.3)
+//
+// GET /v1/sandboxes/{ref}/direct?port=P[&key=K], for the CLI's cloudex proxy:
+// where a sandbox runs and, on a node with a direct path, the node's key to
+// pin, the addresses to try, and a ticket for one connection to port P. On
+// the direct port, after TLS 1.3 (ALPN DIRECT_ALPN) with a certificate over
+// the node's key, the client sends "CXD1 <ticket>\n" and reads "ok\n" or
+// "err <reason>\n"; after ok the connection is the sandbox's port P.
+//
+// A ticket is b64url(JSON {n: node, s: sandbox, p: port, i: session (16 hex),
+// e: expiry, unix s}) "." b64url(HMAC-SHA256(secret, the first part as
+// text)), at most DIRECT_TICKET_MAX bytes, good once for DIRECT_TICKET_SEC.
+// fixtures/node/protocol.json ("direct") has vectors both sides check.
+export const DIRECT_ALPN = "cloudex-direct/1";
+export const DIRECT_TICKET_SEC = 60;
+export const DIRECT_TICKET_MAX = 512;
+export const DirectAnswer = z.union([
+  z.object({ sandbox: z.string(), provider: z.literal("cloudflare") }),
+  z.object({
+    sandbox: z.string(),
+    provider: z.literal("node"),
+    node: z.object({ id: z.string(), name: z.string() }),
+    // The node's Ed25519 public key in base64: what its TLS certificate must carry.
+    publicKey: z.string(),
+    // null: no direct path (an agent older than v0.2.3, turned off, failed,
+    // or no private or tailnet address); use the Worker path.
+    direct: z.object({ port: z.number().int(), addrs: z.array(z.string()) }).nullable(),
+    // With direct only.
+    ticket: z.string().nullable(),
+    expiresAt: z.number().int().nullable(),
+  }),
+]);
+export type DirectAnswer = z.infer<typeof DirectAnswer>;
 
 // ---------------------------------------------------------------- streams (M3)
 //

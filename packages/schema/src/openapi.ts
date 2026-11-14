@@ -51,7 +51,7 @@ import {
   UpdateSandbox,
   UpdateSettings,
 } from "./index.ts";
-import { CreateNode, NewNode, Node, NodeJoin, NodeJoined } from "./node.ts";
+import { CreateNode, DirectAnswer, NewNode, Node, NodeJoin, NodeJoined } from "./node.ts";
 
 // Request bodies are described as sent (defaults make fields optional);
 // responses as returned.
@@ -108,6 +108,7 @@ const responses = {
   Node,
   NewNode,
   NodeJoined,
+  DirectAnswer,
   Error: ApiError,
 };
 
@@ -646,6 +647,25 @@ export function openapi(version: string) {
           description: "Binary messages each way. cloudex ssh uses port 22." +
             " A socket opened with a token or session closes with code 4401 once that token is revoked or expires, or the session signs out (checked about once a minute).",
           responses: { 101: { description: "Switching to the WebSocket" } },
+        }),
+      },
+      "/v1/sandboxes/{ref}/direct": {
+        parameters: [
+          sandboxRef,
+          { name: "port", in: "query", description: "The port in the sandbox the ticket is for", schema: { type: "integer", minimum: 1, maximum: 65535, default: 22 } },
+          { name: "key", in: "query", description: "An SSH public key to add for the cloudex user first", schema: { type: "string" } },
+        ],
+        get: op("getDirect", "Where to connect to a port in the sandbox: straight to its node, or through the deployment", {
+          description:
+            "For the CLI's cloudex proxy (ssh, scp and what rides them); the SDKs don't use it. A sandbox on Cloudflare " +
+            "answers provider cloudflare: use connectTcp. A sandbox on a node answers the node, its Ed25519 public key, " +
+            "and, when the node has a direct path, the private and tailnet addresses and port to try and a ticket for one " +
+            "connection, good for 60 s. There, after a TLS 1.3 handshake (ALPN cloudex-direct/1) whose certificate carries " +
+            "that key, send the line CXD1 <ticket> and read ok or err <reason>; after ok the connection is the sandbox's port. " +
+            "direct is null when the node has no direct path (an agent older than v0.2.3, turned off or failed): use connectTcp. " +
+            "Refused like connectTcp: 409 when the sandbox isn't running, 410 when its node was removed. A session opened " +
+            "with a token ends within about 90 s of the token being revoked.",
+          responses: { 200: ok("Where to connect", ref("DirectAnswer")) },
         }),
       },
       "/v1/me": {

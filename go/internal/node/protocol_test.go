@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lucataco/cloudex/go/internal/direct"
 )
 
 // The examples the TypeScript models are checked against too
@@ -77,6 +79,8 @@ func decodeAs(t *testing.T, model string, raw json.RawMessage) any {
 		v = &StreamMsg{}
 	case head.Type == "tickets":
 		v = &TicketRequest{}
+	case head.Type == "direct":
+		v = &DirectReport{}
 	case head.Type == "hello":
 		v = &Hello{}
 	case head.Type == "facts":
@@ -241,5 +245,40 @@ func TestEgressMatchesTheFixture(t *testing.T) {
 				t.Fatalf("%s: %v", ex.Name, err)
 			}
 		}
+	}
+}
+
+// The direct path's messages (v0.2.3), as the agent writes and reads them.
+func TestTheDirectMessagesMatchTheFixture(t *testing.T) {
+	b, _ := json.Marshal(NewDirectReport("cx-abc123", []string{"0123456789abcdef"}, true))
+	sameJSON(t, "direct report", b, example(t, "a direct report (v0.2.3)"))
+	b, _ = json.Marshal(NewDirectReport("cx-abc123", nil, false))
+	sameJSON(t, "direct report, none open", b, example(t, "a direct report, all closed (v0.2.3)"))
+
+	var w Welcome
+	if err := json.Unmarshal(example(t, "welcome with the direct secret (v0.2.3)"), &w); err != nil || w.Direct == nil || w.Direct.Now <= 0 {
+		t.Fatalf("welcome: %+v %v", w, err)
+	}
+	if _, err := direct.DecodeSecret(w.Direct.Secret); err != nil {
+		t.Fatal(err)
+	}
+	// A welcome from an older Worker has none.
+	var old Welcome
+	json.Unmarshal(example(t, "welcome"), &old)
+	if old.Direct != nil {
+		t.Fatal("an old welcome has a direct part")
+	}
+
+	var op Op
+	json.Unmarshal(example(t, "op-directEnd (v0.2.3)"), &op)
+	b, _ = json.Marshal((&Agent{}).answer(op))
+	var r Result
+	json.Unmarshal(b, &r)
+	if !r.OK || string(r.Value) != `{"ended":0}` {
+		t.Fatalf("directEnd: %s", b)
+	}
+	bad := Op{Type: "op", ID: "op-e2", Name: "directEnd", Args: map[string]json.RawMessage{"sandbox": json.RawMessage(`"n1"`)}}
+	if r := (&Agent{}).answer(bad); r.OK {
+		t.Fatal("directEnd for something that isn't a sandbox")
 	}
 }
