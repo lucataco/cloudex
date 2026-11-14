@@ -19,7 +19,8 @@
 # reaches the node's direct addresses, VERIFY_NODE_DIRECT_CLASS (lan-onlink or tailnet) the class
 # the race should win with, VERIFY_NODE_DIRECT_ADDR (comma list) the installer's --direct-addr,
 # VERIFY_NODE_DIRECT_STALE an address with no host for N59, and VERIFY_NODE_ALLOW_ARCH the
-# installer's testing-only CLOUDEX_NODE_ALLOW_ARCH (a host that isn't amd64).
+# installer's testing-only CLOUDEX_NODE_ALLOW_ARCH (a host that isn't amd64), and
+# VERIFY_NODE_INSTALL_ARGS more installer options (--direct off for a v0.2.2 agent).
 # VERIFY_NODE=<node> (v0.2.2): the lifecycle, connect, inside, agents, tokens, dashboard, sdk
 # and browser areas make their sandboxes on that node, which must be online (cloudex node
 # add, then its installer), instead of on Cloudflare; what isn't on nodes yet (forks, sizes
@@ -2290,14 +2291,14 @@ node_direct() {
 	local l0 l1 l2 pr1 pr2 cases60
 	pr1=$(dprobe --addr "$first:$dport" --sandbox "$SDID" --save /w/t60.json >/dev/null 2>&1; dprobe --addr "$first:$dport" --sandbox "$SDID" --present /w/t60.json 2>&1)
 	sleep 3
-	l1=$(node_sh "docker exec $DMC wc -l < /var/log/sshd.log" 2>/dev/null | tr -d ' ')
+	l1=$(node_sh "docker exec $DMC sh -c 'wc -l < /var/log/sshd.log'" 2>/dev/null | tr -d ' ')
 	pr2=$(dprobe --addr "$first:$dport" --sandbox "$SDID" --present /w/t60.json 2>&1)
 	cases60=$(dprobe --addr "$first:$dport" --sandbox "$SDID" --cases altered,othersandbox,otherport,othernode,noticket,garbage,long,plaintext,noalpn,wrongpin,expired 2>&1)
 	local c60=$?
 	sleep 3
-	l2=$(node_sh "docker exec $DMC wc -l < /var/log/sshd.log" 2>/dev/null | tr -d ' ')
+	l2=$(node_sh "docker exec $DMC sh -c 'wc -l < /var/log/sshd.log'" 2>/dev/null | tr -d ' ')
 	node_sh "rm -f $NODE_DIR/t60.json"
-	OUT="a saved ticket: $pr1, then $pr2; the cases (exit $c60): $(tr '\n' ';' <<<"$cases60" | tr -s ' '); sshd's log: $l1 lines after the good session, $l2 after the bad ones" CODE=""
+	OUT="sshd's log: ${l1:-?} lines after the good session, ${l2:-?} after the bad ones; a saved ticket: $pr1, then $pr2; the cases (exit $c60, $(grep -c ' PASS ' <<<"$cases60") PASS): $(tr '\n' ';' <<<"$cases60" | tr -s ' ')" CODE=""
 	ok N60 "$(direct_desc N60)" [ -n "$(grep '^ok SSH-2.0-' <<<"$pr1")" -a "$pr2" = "err used already" -a "$c60" = 0 -a "$(grep -c ' PASS ' <<<"$cases60")" = 11 \
 		-a -n "$l1" -a "$l1" = "$l2" ]
 
@@ -2532,8 +2533,12 @@ if want node; then
 			inst=(--api "$API_URL" --agent-image "$AIMG")
 			[[ -n ${VERIFY_NODE_MACHINE_IMAGE:-} ]] && inst+=(--machine-image "$VERIFY_NODE_MACHINE_IMAGE")
 			[[ -z $NODE_SUDO ]] && inst+=(--unisolated)
-			# v0.2.3: the direct port's addresses (default: the installer's auto).
+			# v0.2.3: the direct port's addresses (default: the installer's auto),
+			# and VERIFY_NODE_INSTALL_ARGS, more of the installer's options (such
+			# as --direct off, for an agent older than v0.2.3).
 			for a in ${VERIFY_NODE_DIRECT_ADDR//,/ }; do inst+=(--direct-addr "$a"); done
+			read -ra extra_inst <<<"${VERIFY_NODE_INSTALL_ARGS:-}"
+			inst+=(${extra_inst[@]+"${extra_inst[@]}"})
 			t0=$(now_s)
 			install_node "$tok" "${inst[@]}" >"$work/install.log" 2>&1
 			irc=$?
