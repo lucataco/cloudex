@@ -2697,11 +2697,12 @@ node_forks() {
 	cx fork "$KKK" --name "$KO" --no-use
 	K_OID=$(field '.[0].id')
 	PO=$(ctr_point "$K_OID")
+	local ko70="its fork: code $CODE, $(field '.[0].state // empty') ${PO:-no machine} $(field '.[0].error // empty' | head -c 200) $(grep -m1 '^error' <<<"$ERR" | head -c 200)"
 	kill_agent
 	wait_state "$N" offline 75
 	refuse71 "on an offline node" "node $N is offline" fork "$K1" --name "$P-koff" --no-use
 	cx delete "$KO" --yes --force
-	local d70="code $CODE" tr70
+	local d70="code $CODE $(grep -m1 '^error' <<<"$ERR" | head -c 200)" tr70
 	tr70=$(now_ms)
 	start_agent
 	wait_state "$N" online 60
@@ -2739,7 +2740,7 @@ node_forks() {
 	"$CX" delete "$KK" --yes >/dev/null 2>&1
 	"$CX" delete "$KKK" --yes >/dev/null 2>&1
 	i70d=$(fork_count)
-	r70="$r70 after the first fork (which had a fork of its own) went: $i70c of the original's left; after the rest: $i70d fork images on the node ($(fork_left)); delete --force while offline: $d70, its image gone at the reconnect: ${gone70:-NO};"
+	r70="$r70 after the first fork (which had a fork of its own) went: $i70c of the original's left; after the rest: $i70d fork images on the node ($(fork_left)); delete --force while offline ($ko70): $d70, its image gone at the reconnect: ${gone70:-NO};"
 	# An orphan: an image labelled as this node's fork that no sandbox uses
 	# (as a fork whose start never came would leave), swept at once with --age 0s.
 	local sw70 left70
@@ -2750,7 +2751,7 @@ node_forks() {
 	left70=$(fork_count)
 	r70="$r70 an orphan: $before70 fork images, the sweep removed $sw70, $left70 left"
 	OUT="$r70" CODE=""
-	okv N70 "$(forks_desc N70)" [ "$w70" = keptkept -a "$i70a" = 1 -a "$i70b" = 0 -a "$i70d" = 0 -a "$gone70" = yes -a "$d70" = "code 0" -a "$before70" = 1 -a "$sw70" = 1 -a "$left70" = 0 ]
+	okv N70 "$(forks_desc N70)" [ "$w70" = keptkept -a "$i70a" = 1 -a "$i70b" = 0 -a "$i70d" = 0 -a -n "$PO" -a "$gone70" = yes -a "${d70:0:6}" = "code 0" -a "$before70" = 1 -a "$sw70" = 1 -a "$left70" = 0 ]
 
 	# N76: a deploy during a fork's commit. The fork starts as the deploy
 	# begins uploading the Worker, so that the Worker (and, a few minutes on,
