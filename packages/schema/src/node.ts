@@ -255,11 +255,19 @@ export const NodeTicketRequest = z.object({
 export const DIRECT_SESSIONS_MAX = 64;
 export const DIRECT_REPORT_SEC = 30;
 export const DirectSessionId = z.string().regex(/^[0-9a-f]{16}$/, "a direct session id, 16 hex digits");
+// tokens (v0.2.3 review D-M1): the ids of the tokens whose tickets opened
+// those sessions (each ticket names its token, claim t), without the admin
+// key's. The Sandbox object checks each of them, whether or not it still
+// remembers minting the ticket, and ends the sessions of one that ended. The
+// agent sends the report again for every sandbox with open sessions after
+// each welcome, so a report lost while the link was down is made good.
+export const DirectTokenId = z.string().regex(/^tk-[a-z0-9]{8}$/, "a token id");
 export const NodeDirectReport = z.object({
   type: z.literal("direct"),
   sandbox: SandboxId,
   open: z.array(DirectSessionId).max(DIRECT_SESSIONS_MAX),
   active: z.boolean(),
+  tokens: z.array(DirectTokenId).max(DIRECT_SESSIONS_MAX).optional(),
 });
 export const NodeMessage = z.discriminatedUnion("type", [NodeHello, NodeFactsMessage, NodeStateMessage, NodeResult, NodeTicketRequest, NodeDirectReport]);
 export type NodeMessage = z.infer<typeof NodeMessage>;
@@ -278,9 +286,10 @@ export type NodeMessage = z.infer<typeof NodeMessage>;
 // - stop {sandbox}: stop it, keeping its disk;
 // - delete {sandbox}: remove the machine, its volumes and its network;
 // - selftest: run the isolation self-test now; answers {pass, failed, checks, tookMs}.
-// v0.2.3 adds directEnd {sandbox, sessions}: close those direct sessions, and
-// refuse their tickets if they haven't been used yet (the token that asked for
-// them has ended); answers {ended: the number closed}. And (M5) commit
+// v0.2.3 adds directEnd {sandbox, sessions, tokens?}: close those direct
+// sessions of the sandbox and every one opened with a ticket of those tokens,
+// and refuse their tickets if they haven't been used yet (the token that asked
+// for them has ended); answers {ended: the number closed}. And (M5) commit
 // {sandbox, point}: commit the machine's disk, running (paused for the copy)
 // or stopped, into the fork image cloudex-fork/<node>:<point>; answers
 // {image, id, bytes, tookMs, paused, layers}. It may take minutes; the same
@@ -342,8 +351,12 @@ export type WorkerMessage = z.infer<typeof WorkerMessage>;
 // "err <reason>\n"; after ok the connection is the sandbox's port P.
 //
 // A ticket is b64url(JSON {n: node, s: sandbox, p: port, i: session (16 hex),
-// e: expiry, unix s}) "." b64url(HMAC-SHA256(secret, the first part as
-// text)), at most DIRECT_TICKET_MAX bytes, good once for DIRECT_TICKET_SEC.
+// t: the id of the token that asked for it, "" for the admin key, e: expiry,
+// unix s}) "." b64url(HMAC-SHA256(secret, the first part as text)), at most
+// DIRECT_TICKET_MAX bytes, good once for DIRECT_TICKET_SEC. The agent keeps t
+// with the session, so that it can end every session of a token that ended,
+// and refuses a ticket without it (one an object minted on the code from
+// before the review: the CLI then takes the Worker path).
 // fixtures/node/protocol.json ("direct") has vectors both sides check.
 export const DIRECT_ALPN = "cloudex-direct/1";
 export const DIRECT_TICKET_SEC = 60;

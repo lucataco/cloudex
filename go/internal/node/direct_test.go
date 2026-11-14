@@ -287,8 +287,13 @@ func newDirectRig(t *testing.T, relay string) *directRig {
 }
 
 func (r *directRig) ticket(sandbox string, port int) string {
+	return r.ticketOf("", sandbox, port)
+}
+
+// ticketOf is a ticket asked for by token ("" for the admin key).
+func (r *directRig) ticketOf(token, sandbox string, port int) string {
 	c := claims(time.Now().Add(time.Minute))
-	c.Sandbox, c.Port = sandbox, port
+	c.Sandbox, c.Port, c.Token = sandbox, port, token
 	return direct.Mint(testSecret, c)
 }
 
@@ -522,5 +527,66 @@ func TestRelay(t *testing.T) {
 	a.Close()
 	if b, _ := io.ReadAll(c); string(b) != "back" {
 		t.Fatalf("client read %q", b)
+	}
+}
+
+// Review D-M1: the agent ends a token's sessions on its own evidence (the
+// token in each ticket), whatever the Worker remembers of the session ids,
+// refuses the token's unused tickets, names the tokens in its reports, and
+// reports every open session again after a welcome, so a lost open report
+// is made good.
+func TestEndByToken(t *testing.T) {
+	r := newDirectRig(t, "127.0.0.1")
+	var port int
+	fmt.Sscan(r.machine, &port)
+	drain := func() []DirectReport {
+		var out []DirectReport
+		for {
+			select {
+			case rep := <-r.reports:
+				out = append(out, rep)
+			case <-time.After(200 * time.Millisecond):
+				return out
+			}
+		}
+	}
+	open := func(token string) net.Conn {
+		c, err := r.connect(t, "192.168.65.1", r.ticketOf(token, "cx-abc123", port))
+		if err != nil {
+			t.Fatalf("%q: %v", token, err)
+		}
+		direct.ReadLine(c, 100)
+		return c
+	}
+	revoked, kept, admin := open("tk-revoked1"), open("tk-keepme12"), open("")
+	defer kept.Close()
+	defer admin.Close()
+	reps := drain()
+	if last := reps[len(reps)-1]; len(last.Open) != 3 || strings.Join(last.Tokens, ",") != "tk-keepme12,tk-revoked1" {
+		t.Fatalf("the report names the tokens of the open sessions, not the admin key's: %+v", last)
+	}
+	// A welcome again (the control socket reconnected): every open session is reported.
+	r.d.Welcome(&WelcomeDirect{Secret: base64.StdEncoding.EncodeToString(testSecret), Now: time.Now().UnixMilli()})
+	if reps := drain(); len(reps) != 1 || len(reps[0].Open) != 3 || len(reps[0].Tokens) != 2 {
+		t.Fatalf("after a welcome: %+v", reps)
+	}
+	// The Worker names only the token, no session id.
+	if n := r.d.End(DirectEnd{Sandbox: "cx-abc123", Sessions: []string{}, Tokens: []string{"tk-revoked1"}}); n != 1 {
+		t.Fatalf("ended %d sessions; want the revoked token's one", n)
+	}
+	revoked.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadAll(revoked); isTimeout(err) {
+		t.Fatal("the revoked token's session is still open")
+	}
+	io.WriteString(kept, "still\n")
+	if l, _ := direct.ReadLine(kept, 100); l != "still" {
+		t.Fatalf("another token's session: %q", l)
+	}
+	if _, err := r.connect(t, "192.168.65.1", r.ticketOf("tk-revoked1", "cx-abc123", port)); err == nil || !strings.Contains(err.Error(), "its token ended") {
+		t.Fatalf("an unused ticket of the ended token: %v", err)
+	}
+	// Another sandbox's directEnd doesn't touch these.
+	if n := r.d.End(DirectEnd{Sandbox: "cx-other1", Sessions: []string{}, Tokens: []string{"tk-keepme12"}}); n != 0 {
+		t.Fatalf("another sandbox's directEnd closed %d", n)
 	}
 }

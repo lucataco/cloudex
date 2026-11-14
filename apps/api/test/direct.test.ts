@@ -7,20 +7,20 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const {
-  MINTED_GRACE_MS,
-  OPEN_FORGET_MS,
   SEEN_RENEW_MS,
-  SESSIONS_KEPT,
+  TOKEN_FORGET_MS,
+  TOKEN_TICKETS_MAX,
+  TOKENS_MINT_MAX,
   directCandidates,
   directRefusal,
   directSecret,
-  endedSessions,
+  endedTokens,
   mintDirectTicket,
-  mintSession,
+  mintToken,
   privateOrShared,
   readDirectTicket,
-  reportSessions,
-  sweepSessions,
+  reportTokens,
+  sweepTokens,
 } = await import("../src/direct.ts");
 const { DIRECT_TICKET_MAX, DIRECT_TICKET_SEC } = await import("@cloudex/schema/node");
 
@@ -33,7 +33,7 @@ type Vectors = {
   nowMs: number;
   ttlSec: number;
   max: number;
-  valid: { name: string; ticket: string; claims: { n: string; s: string; p: number; i: string; e: number } }[];
+  valid: { name: string; ticket: string; claims: { n: string; s: string; p: number; i: string; t: string; e: number } }[];
   invalid: { name: string; ticket: string }[];
 };
 const v = (JSON.parse(readFileSync(new URL("../../../packages/schema/fixtures/node/protocol.json", import.meta.url), "utf8")) as { direct: Vectors }).direct;
@@ -54,11 +54,11 @@ test("the secret is the fixture's, and depends on the admin key, the node and it
 
 test("the Worker mints exactly the fixture's tickets, and reads them back until they expire", async () => {
   for (const e of v.valid) {
-    const t = await mintDirectTicket(v.secret, { node: e.claims.n, sandbox: e.claims.s, port: e.claims.p, session: e.claims.i }, v.nowMs);
+    const t = await mintDirectTicket(v.secret, { node: e.claims.n, sandbox: e.claims.s, port: e.claims.p, token: e.claims.t || null, session: e.claims.i }, v.nowMs);
     assert.equal(t.ticket, e.ticket, e.name);
     assert.equal(t.exp, e.claims.e);
     const c = await readDirectTicket(v.secret, e.ticket, v.nowMs);
-    assert.deepEqual(c, { node: e.claims.n, sandbox: e.claims.s, port: e.claims.p, session: e.claims.i, exp: e.claims.e }, e.name);
+    assert.deepEqual(c, { node: e.claims.n, sandbox: e.claims.s, port: e.claims.p, session: e.claims.i, token: e.claims.t, exp: e.claims.e }, e.name);
     assert.ok(await readDirectTicket(v.secret, e.ticket, v.nowMs + DIRECT_TICKET_SEC * 1000 - 1));
     assert.equal(await readDirectTicket(v.secret, e.ticket, v.nowMs + DIRECT_TICKET_SEC * 1000), null, `${e.name}: expired`);
   }
@@ -69,15 +69,16 @@ test("every invalid ticket in the fixture is refused", async () => {
 });
 
 test("a ticket names its node, sandbox and port, and works only under that node's secret", async () => {
-  const t = await mintDirectTicket(v.secret, { node: v.node, sandbox: "cx-abc123", port: 22 });
+  const t = await mintDirectTicket(v.secret, { node: v.node, sandbox: "cx-abc123", port: 65535, token: "tk-zzzz7777" });
   assert.match(t.session, /^[0-9a-f]{16}$/);
   assert.ok(t.ticket.length <= DIRECT_TICKET_MAX);
   const c = (await readDirectTicket(v.secret, t.ticket))!;
-  assert.deepEqual([c.node, c.sandbox, c.port], [v.node, "cx-abc123", 22]);
+  assert.deepEqual([c.node, c.sandbox, c.port, c.token], [v.node, "cx-abc123", 65535, "tk-zzzz7777"]);
   const other = await directSecret(v.adminKey, "nd-zzzz9999", v.publicKey);
   assert.equal(await readDirectTicket(other, t.ticket), null);
   // Each mint is its own session.
-  const t2 = await mintDirectTicket(v.secret, { node: v.node, sandbox: "cx-abc123", port: 22 });
+  const t2 = await mintDirectTicket(v.secret, { node: v.node, sandbox: "cx-abc123", port: 22, token: null });
+  assert.equal((await readDirectTicket(v.secret, t2.ticket))!.token, "", "the admin key's");
   assert.notEqual(t2.session, t.session);
   assert.equal(await readDirectTicket(v.secret, "x".repeat(DIRECT_TICKET_MAX + 1)), null);
 });
@@ -109,54 +110,67 @@ test("the object refuses as serve() does: moved, removed, not running", () => {
   assert.equal(directRefusal({ ...base, asked: "nd-other000" }), "moved");
 });
 
-test("sessions: reported open, closed when a report leaves them out, minted ones forgotten after their ticket", () => {
+test("tokens: kept from the mint, renewed by reports now and then, forgotten an hour after the last evidence", () => {
   const now = 1_000_000_000_000;
   const e = Math.floor(now / 1000) + 60;
-  let s = mintSession({}, "a000000000000000", { t: "tk-1", e });
-  s = mintSession(s, "b000000000000000", { t: null, e });
-  s = reportSessions(s, ["a000000000000000", "ffffffffffffffff"], now);
-  assert.equal(s["a000000000000000"]!.o, now);
-  assert.equal(s["ffffffffffffffff"], undefined, "an id it didn't mint is ignored");
-  assert.equal(s["b000000000000000"]!.o, undefined, "minted, not open yet");
-  // Reports while it stays open renew o only now and then.
-  assert.equal(reportSessions(s, ["a000000000000000"], now + 30_000)["a000000000000000"]!.o, now);
-  assert.equal(reportSessions(s, ["a000000000000000"], now + SEEN_RENEW_MS)["a000000000000000"]!.o, now + SEEN_RENEW_MS);
-  // Closed: left out of a report.
-  const closed = reportSessions(s, [], now + 1000);
-  assert.deepEqual(Object.keys(closed), ["b000000000000000"]);
-  // Swept: the minted one after its ticket plus the grace, the open one when no report named it for long.
-  assert.ok(sweepSessions(s, e * 1000 + MINTED_GRACE_MS - 1)["b000000000000000"]);
-  assert.equal(sweepSessions(s, e * 1000 + MINTED_GRACE_MS)["b000000000000000"], undefined);
-  assert.ok(sweepSessions(s, now + OPEN_FORGET_MS - 1)["a000000000000000"]);
-  assert.equal(sweepSessions(s, now + OPEN_FORGET_MS)["a000000000000000"], undefined);
+  let s = mintToken({}, "tk-aaaa1111", e, now) as Record<string, { m: number[]; s: number }>;
+  assert.deepEqual(s, { "tk-aaaa1111": { m: [e], s: now } });
+  assert.equal(mintToken(s, null, e, now), s, "the admin key isn't kept");
+  // A report renews only now and then, and adds a token it names that wasn't minted here.
+  assert.equal(reportTokens(s, ["tk-aaaa1111"], now + 30_000), s);
+  assert.equal(reportTokens(s, ["tk-aaaa1111"], now + SEEN_RENEW_MS)["tk-aaaa1111"]!.s, now + SEEN_RENEW_MS);
+  s = reportTokens(s, ["tk-bbbb2222"], now);
+  assert.deepEqual(s["tk-bbbb2222"], { m: [], s: now });
+  // Expired ticket times go; a token with no evidence for an hour goes.
+  assert.deepEqual(sweepTokens(s, e * 1000)["tk-aaaa1111"], { m: [], s: now });
+  assert.ok(sweepTokens(s, now + TOKEN_FORGET_MS - 1)["tk-aaaa1111"]);
+  assert.equal(sweepTokens(s, now + TOKEN_FORGET_MS)["tk-aaaa1111"], undefined);
 });
 
-test("sessions kept are bounded: minting drops the oldest that aren't open", () => {
+test("a mint over a token's caps is refused, never made room for by forgetting another", () => {
   const now = 1_000_000_000_000;
-  let s = mintSession({}, "0".repeat(16), { t: "tk-1", e: 1 });
-  s = reportSessions(s, ["0".repeat(16)], now);
-  for (let i = 1; i <= SESSIONS_KEPT + 10; i++) s = mintSession(s, i.toString(16).padStart(16, "0"), { t: "tk-1", e: 100 + i });
-  assert.equal(Object.keys(s).length, SESSIONS_KEPT);
-  assert.ok(s["0".repeat(16)], "the open one stays");
-  assert.ok(s[(SESSIONS_KEPT + 10).toString(16).padStart(16, "0")], "the newest stays");
-  assert.equal(s[(1).toString(16).padStart(16, "0")], undefined, "the oldest went");
+  const e = Math.floor(now / 1000) + 60;
+  let s: Record<string, { m: number[]; s: number }> = {};
+  for (let i = 0; i < TOKEN_TICKETS_MAX; i++) s = mintToken(s, "tk-aaaa1111", e, now) as typeof s;
+  assert.match(mintToken(s, "tk-aaaa1111", e, now) as string, /direct tickets for the sandbox from the last minute/);
+  // Once those expire, it may mint again.
+  assert.equal(typeof mintToken(s, "tk-aaaa1111", e + 60, e * 1000), "object");
+  // Distinct tokens: refused past the cap while the others' entries last.
+  s = {};
+  for (let i = 0; i < TOKENS_MINT_MAX; i++) s = mintToken(s, `tk-${i.toString().padStart(8, "a")}`, e, now) as typeof s;
+  assert.match(mintToken(s, "tk-zzzz9999", e, now) as string, /tokens have used the direct path/);
+  assert.equal(typeof mintToken(sweepTokens(s, now + TOKEN_FORGET_MS), "tk-zzzz9999", e, now + TOKEN_FORGET_MS), "object");
 });
 
-test("sessions whose token ended are ended: open ones, and unused tickets still good; each token asked once", async () => {
+test("review D-M1: a token that minted 256 more tickets after the one it used, then was revoked, is ended", async () => {
+  // Before: the object kept 256 sessions and dropped the oldest unopened to
+  // mint more, so the first ticket's session was forgotten and never ended.
   const now = 1_000_000_000_000;
-  const live = Math.floor(now / 1000) + 30;
-  let s = mintSession({}, "a000000000000000", { t: "tk-gone", e: 1 });
-  s = reportSessions(s, ["a000000000000000"], now - 1000); // open, ticket long expired
-  s = mintSession(s, "b000000000000000", { t: "tk-gone", e: live }); // unused, still good
-  s = mintSession(s, "c000000000000000", { t: "tk-gone", e: 1 }); // unused, expired: nothing to end
-  s = mintSession(s, "d000000000000000", { t: "tk-live", e: live });
-  s = mintSession(s, "e000000000000000", { t: null, e: live }); // the admin key
-  const asked: string[] = [];
-  const ended = await endedSessions(s, async (t) => (asked.push(t), t === "tk-live"), now);
-  assert.deepEqual(ended.sort(), ["a000000000000000", "b000000000000000"]);
-  assert.deepEqual(asked.sort(), ["tk-gone", "tk-live"]);
-  // A D1 error leaves them for the next check.
-  assert.deepEqual(await endedSessions(s, async () => Promise.reject(new Error("D1")), now), []);
+  let s: Record<string, { m: number[]; s: number }> | string = {};
+  let refused = 0;
+  for (let i = 0; i < 257; i++) {
+    const next = mintToken(s as Record<string, { m: number[]; s: number }>, "tk-evil0001", Math.floor(now / 1000) + 60, now + i);
+    if (typeof next === "string") refused++;
+    else s = next;
+  }
+  assert.equal(refused, 257 - TOKEN_TICKETS_MAX, "mints past the cap are refused");
+  s = sweepTokens(s as Record<string, { m: number[]; s: number }>, now + 5 * 60_000);
+  assert.deepEqual(await endedTokens(s, async () => false), ["tk-evil0001"]);
+});
+
+test("review D-M1: a session whose open report was lost is still ended, by the token its next report or the mint names", async () => {
+  const now = 1_000_000_000_000;
+  // The mint alone keeps the token for an hour: past the 3 minutes after
+  // which an unopened session used to be forgotten, and past the agent's
+  // 5-minute quiet report.
+  let s = mintToken({}, "tk-quiet001", Math.floor(now / 1000) + 60, now) as Record<string, { m: number[]; s: number }>;
+  s = sweepTokens(s, now + 10 * 60_000);
+  assert.deepEqual(await endedTokens(s, async () => false), ["tk-quiet001"]);
+  // An object that has forgotten it (or never minted it) takes it from a report.
+  s = reportTokens({}, ["tk-quiet001"], now + 2 * TOKEN_FORGET_MS);
+  assert.deepEqual(await endedTokens(s, async () => false), ["tk-quiet001"]);
+  // A failed check leaves it for the next alarm.
+  assert.deepEqual(await endedTokens(s, async () => Promise.reject(new Error("D1"))), []);
 });
 
 test("GET /v1/sandboxes/{ref}/direct needs what tcp needs: a read token gets 403, a user token passes", async () => {

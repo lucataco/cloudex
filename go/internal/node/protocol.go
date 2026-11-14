@@ -208,27 +208,34 @@ type WelcomeDirect struct {
 // and close, and every direct.ReportEvery while any is open; only after a
 // welcome that carried Direct, since an older Worker closes the socket on a
 // message type it doesn't know.
+//
+// Tokens (review D-M1) are the ids of the tokens whose tickets opened those
+// sessions, without the admin key's: the Sandbox object checks each, whether
+// or not it remembers the ticket, and ends the sessions of one that ended.
 type DirectReport struct {
 	Type    string   `json:"type"` // direct
 	Sandbox string   `json:"sandbox"`
 	Open    []string `json:"open"` // session ids, at most direct.SessionsMax
 	Active  bool     `json:"active"`
+	Tokens  []string `json:"tokens,omitempty"`
 }
 
 // NewDirectReport is a report as the agent sends it.
-func NewDirectReport(sandbox string, open []string, active bool) DirectReport {
+func NewDirectReport(sandbox string, open []string, active bool, tokens ...string) DirectReport {
 	if open == nil {
 		open = []string{}
 	}
-	return DirectReport{Type: "direct", Sandbox: sandbox, Open: open, Active: active}
+	return DirectReport{Type: "direct", Sandbox: sandbox, Open: open, Active: active, Tokens: tokens}
 }
 
 // DirectEnd is the directEnd op's arguments (v0.2.3): end these sessions of
-// the sandbox, and refuse their tickets if they haven't been used yet (the
-// token that asked for them has ended).
+// the sandbox, and every session of it opened with a ticket of one of
+// Tokens (review D-M1), and refuse their tickets if they haven't been used
+// yet (the token that asked for them has ended).
 type DirectEnd struct {
 	Sandbox  string   `json:"sandbox"`
 	Sessions []string `json:"sessions"`
+	Tokens   []string `json:"tokens,omitempty"`
 }
 
 // Tickets is the answer: each one opens one stream socket, once, within 60 s.

@@ -46,6 +46,7 @@ import type {
   UpdateSandbox,
   UpdateSettings,
 } from "@cloudex/schema";
+import { DIRECT_TICKET_SEC } from "@cloudex/schema/node";
 import {
   BACKUP_SCRIPT,
   type BackupManifest,
@@ -96,17 +97,7 @@ import { type MachineReport, machineAction, nodeIsolation, nodeRetryAt, offlineA
 // A sandbox's node is offline since since; tries failed asks since, and the next is at retryAt (nodeRetryAt).
 type NodeDown = { since: number; lastSeenAt: number | null; tries?: number; retryAt?: number };
 import { tokenAlive } from "./tokens";
-import {
-  type DirectSessions,
-  directRefusal,
-  directSecret,
-  endedSessions,
-  mintDirectTicket,
-  mintSession,
-  reportSessions,
-  sameSessions,
-  sweepSessions,
-} from "./direct";
+import { type DirectTokens, directRefusal, directSecret, endedTokens, mintDirectTicket, mintToken, reportTokens, sameTokens, sweepTokens } from "./direct";
 import { CREDENTIAL_ENDED, LINK_HEADER, TOKEN_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
 // Exits 0 once the entrypoint is ready in this start of the machine, and 3
@@ -2214,17 +2205,19 @@ export class Sandbox extends DurableObject<Env> {
 
   // ---------------------------------------------------------------- the direct path (v0.2.3, direct.ts)
 
-  private async directSessions(): Promise<DirectSessions> {
-    return (await this.ctx.storage.get<DirectSessions>("directSessions")) ?? {};
+  private async directTokens(): Promise<DirectTokens> {
+    return (await this.ctx.storage.get<DirectTokens>("directTokens")) ?? {};
   }
 
   // GET /v1/sandboxes/{ref}/direct for a sandbox on a node with a direct path
   // (index.ts): refused as serve() refuses a tcp connection; activity; the
   // CLI's ssh key added, unless this run has added it already (so that a
   // repeat ssh while the node's link to Cloudflare blinks needs no exec); and
-  // a ticket for one connection to port, whose session is kept with the token
-  // that asked (null: the admin key). node and publicKey are D1's, never the
-  // Node object's, which isn't woken.
+  // a ticket for one connection to port, which names the token that asked
+  // (null: the admin key), kept so the alarm can end its sessions when it
+  // ends; over a token's caps (direct.ts mintToken), 429, and the CLI takes
+  // the Worker path. node and publicKey are D1's, never the Node object's,
+  // which isn't woken.
   async direct(a: { node: string; publicKey: string; port: number; key: string | null; tokenId: string | null }): Promise<{ ticket: string; expiresAt: number }> {
     const r = this.mustRecord();
     const why = directRefusal({
@@ -2246,43 +2239,51 @@ export class Sandbox extends DurableObject<Env> {
         await this.ctx.storage.put("directKeys", [...keys, a.key].slice(-16));
       }
     }
-    const t = await mintDirectTicket(await directSecret(this.env.ADMIN_KEY, a.node, a.publicKey), { node: a.node, sandbox: r.id, port: a.port });
-    await this.ctx.storage.put("directSessions", mintSession(await this.directSessions(), t.session, { t: a.tokenId, e: t.exp }));
+    const now = Date.now();
+    const exp = Math.floor(now / 1000) + DIRECT_TICKET_SEC;
+    const tokens = mintToken(sweepTokens(await this.directTokens(), now), a.tokenId, exp, now);
+    if (typeof tokens === "string") fail(429, `${tokens}; or connect through the Worker (CLOUDEX_DIRECT=off)`);
+    // Kept before the ticket exists: a ticket is never out without its token.
+    if (a.tokenId !== null) await this.ctx.storage.put("directTokens", tokens);
+    const t = await mintDirectTicket(await directSecret(this.env.ADMIN_KEY, a.node, a.publicKey), { node: a.node, sandbox: r.id, port: a.port, token: a.tokenId }, now);
     return { ticket: t.ticket, expiresAt: t.exp * 1000 };
   }
 
   // From the node's Node object: the sessions open on this sandbox's direct
-  // port now, and whether a client sent bytes since the last report, which
-  // counts as activity, as a splice's client messages do.
-  async nodeDirect(node: string, rep: { open: string[]; active: boolean }): Promise<void> {
+  // port now with their tokens, and whether a client sent bytes since the
+  // last report, which counts as activity, as a splice's client messages do.
+  // Every token named is kept for the alarm to check, whether or not this
+  // object remembers minting its ticket (review D-M1).
+  async nodeDirect(node: string, rep: { open: string[]; active: boolean; tokens?: string[] }): Promise<void> {
     const p = this.onNode?.placement;
     if (!p || p.node !== node || !this.record || this.removing) return;
     if (rep.active && this.record.state === "running") this.touch();
-    const before = await this.directSessions();
-    const after = reportSessions(before, rep.open, Date.now());
-    if (!sameSessions(before, after)) await this.ctx.storage.put("directSessions", after);
+    if (!rep.tokens?.length) return;
+    const before = await this.directTokens();
+    const after = reportTokens(before, rep.tokens, Date.now());
+    if (!sameTokens(before, after)) await this.ctx.storage.put("directTokens", after);
   }
 
-  // From the alarm: sessions whose token ended are ended on the node (and
-  // their tickets refused there, if they're still unused), as watchCredential
-  // ends a WebSocket; old ones are forgotten. While the node is offline that
-  // waits for the next alarm (a residual the plan states: D10).
+  // From the alarm: every direct session of a token that ended is ended on
+  // the node, and its unused tickets refused there, as watchCredential ends a
+  // WebSocket; tokens with no evidence for an hour are forgotten. While the
+  // node is offline that waits for the next alarm (a residual the plan
+  // states: D10); the agent reports its open sessions again when it's back.
   private async endDirect() {
-    const before = await this.directSessions();
+    const before = await this.directTokens();
     if (!Object.keys(before).length) return;
-    const now = Date.now();
-    const all = sweepSessions(before, now);
-    const ended = await endedSessions(all, (t) => tokenAlive(this.env.DB, t), now);
+    const all = sweepTokens(before, Date.now());
+    const ended = await endedTokens(all, (t) => tokenAlive(this.env.DB, t));
     if (ended.length && this.record) {
       try {
-        await this.nodeOp("directEnd", { sandbox: this.record.id, sessions: ended }, 10_000);
-        for (const i of ended) delete all[i];
-        console.log(`[${this.record.id}] ended ${ended.length} direct sessions whose token ended`);
+        const out = await this.nodeOp("directEnd", { sandbox: this.record.id, sessions: [], tokens: ended }, 10_000);
+        for (const t of ended) delete all[t];
+        console.log(`[${this.record.id}] ended the direct sessions of ${ended.length} tokens that ended (${typeof out.ended === "number" ? out.ended : "?"} open)`);
       } catch (e) {
         console.error(`[${this.record.id}] ending direct sessions: ${message(e)}; again at the next alarm`);
       }
     }
-    if (!sameSessions(before, all)) await this.ctx.storage.put("directSessions", all);
+    if (!sameTokens(before, all)) await this.ctx.storage.put("directTokens", all);
   }
 
   // ---------------------------------------------------------------- the lifecycle on a node (v0.2.2 M5)
@@ -2341,7 +2342,7 @@ export class Sandbox extends DurableObject<Env> {
     const p = this.onNode!.placement;
     // A new run: no direct session of the last one is open, and the ssh keys
     // it added are added again when asked for (v0.2.3).
-    await this.ctx.storage.delete(["directSessions", "directKeys"]);
+    await this.ctx.storage.delete(["directSessions", "directTokens", "directKeys"]);
     const create = (image: string | undefined) =>
       this.nodeOp(
         "create",

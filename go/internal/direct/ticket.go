@@ -45,12 +45,16 @@ const (
 )
 
 // Claims are what a ticket says: one connection to Port on Sandbox, on Node,
-// for the session Session, until Exp (unix seconds).
+// for the session Session, asked for by Token (a token's id, "" for the
+// admin key), until Exp (unix seconds). The agent keeps Token with the
+// session, so that it can end every session of a token that ended (review
+// D-M1); a ticket without it (one minted by code from before) is refused.
 type Claims struct {
 	Node    string `json:"n"`
 	Sandbox string `json:"s"`
 	Port    int    `json:"p"`
 	Session string `json:"i"`
+	Token   string `json:"t"`
 	Exp     int64  `json:"e"`
 }
 
@@ -58,6 +62,7 @@ var (
 	nodeID    = regexp.MustCompile(`^nd-[a-z0-9]{8}$`)
 	sandboxID = regexp.MustCompile(`^cx-[a-z0-9]{6}$`)
 	sessionID = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	tokenID   = regexp.MustCompile(`^(tk-[a-z0-9]{8})?$`)
 	b64url    = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 )
 
@@ -132,22 +137,26 @@ func Verify(secret []byte, ticket string) (Claims, error) {
 	if err != nil {
 		return c, ErrMalformed
 	}
-	// Exactly the five claims, each of its type.
+	// Exactly the six claims, each of its type.
 	var fields map[string]json.RawMessage
-	if json.Unmarshal(raw, &fields) != nil || len(fields) != 5 {
+	if json.Unmarshal(raw, &fields) != nil || len(fields) != 6 {
 		return c, ErrClaims
 	}
-	for _, k := range []string{"n", "s", "p", "i", "e"} {
+	for _, k := range []string{"n", "s", "p", "i", "t", "e"} {
 		if _, ok := fields[k]; !ok { // exactly these, in this case: Go's decoder alone would take "N"
 			return c, ErrClaims
 		}
+	}
+	// t may be "", so it must be a string (the decoder takes null as "").
+	if t := fields["t"]; len(t) == 0 || t[0] != '"' {
+		return c, ErrClaims
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if dec.Decode(&c) != nil {
 		return Claims{}, ErrClaims
 	}
-	if !nodeID.MatchString(c.Node) || !sandboxID.MatchString(c.Sandbox) || !sessionID.MatchString(c.Session) || c.Port < 1 || c.Port > 65535 || c.Exp <= 0 {
+	if !nodeID.MatchString(c.Node) || !sandboxID.MatchString(c.Sandbox) || !sessionID.MatchString(c.Session) || !tokenID.MatchString(c.Token) || c.Port < 1 || c.Port > 65535 || c.Exp <= 0 {
 		return Claims{}, ErrClaims
 	}
 	return c, nil

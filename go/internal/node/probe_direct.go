@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"time"
 
@@ -47,6 +48,21 @@ func (f *FakeAgent) sessions(sb string) []string {
 	return out
 }
 
+// tokens are the tokens of a sandbox's open sessions, for its report.
+func (f *FakeAgent) tokens(sb string) []string {
+	var out []string
+	for _, t := range f.opened[sb] {
+		if t != "" && !slices.Contains(out, t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (f *FakeAgent) reportOf(sb string, active bool) DirectReport {
+	return NewDirectReport(sb, f.sessions(sb), active, f.tokens(sb)...)
+}
+
 func (f *FakeAgent) directLines(ctx context.Context) {
 	for {
 		var line string
@@ -63,11 +79,11 @@ func (f *FakeAgent) directLines(ctx context.Context) {
 		rep := map[string]any{"line": verb}
 		f.dmu.Lock()
 		if f.opened == nil {
-			f.opened = map[string]map[string]bool{}
+			f.opened = map[string]map[string]string{}
 		}
 		var send *DirectReport
 		switch verb {
-		case "open":
+		case "open", "open-quiet":
 			c, err := direct.Verify(f.secret, arg)
 			switch {
 			case f.secret == nil:
@@ -78,33 +94,36 @@ func (f *FakeAgent) directLines(ctx context.Context) {
 				rep["error"] = "for another node"
 			case c.Expired(time.Now().Add(f.skew), 10*time.Second):
 				rep["error"] = "expired"
-			case f.opened[c.Sandbox][c.Session]:
+			case has(f.opened[c.Sandbox], c.Session):
 				rep["error"] = "used already"
 			default:
 				if f.opened[c.Sandbox] == nil {
-					f.opened[c.Sandbox] = map[string]bool{}
+					f.opened[c.Sandbox] = map[string]string{}
 				}
-				f.opened[c.Sandbox][c.Session] = true
-				r := NewDirectReport(c.Sandbox, f.sessions(c.Sandbox), true)
-				send = &r
+				f.opened[c.Sandbox][c.Session] = c.Token
+				// open-quiet: as if the open report were lost on the way.
+				if verb == "open" {
+					r := f.reportOf(c.Sandbox, true)
+					send = &r
+				}
 				rep["ok"] = true
 			}
-			rep["sandbox"], rep["port"], rep["session"] = c.Sandbox, c.Port, c.Session
+			rep["sandbox"], rep["port"], rep["session"], rep["token"] = c.Sandbox, c.Port, c.Session, c.Token
 		case "close":
 			for sb, set := range f.opened {
-				if set[arg] {
+				if has(set, arg) {
 					delete(set, arg)
-					r := NewDirectReport(sb, f.sessions(sb), false)
+					r := f.reportOf(sb, false)
 					send = &r
 					rep["ok"], rep["sandbox"] = true, sb
 				}
 			}
 		case "active":
-			r := NewDirectReport(arg, f.sessions(arg), true)
+			r := f.reportOf(arg, true)
 			send = &r
 			rep["ok"] = true
 		default:
-			rep["error"] = "lines are open <ticket>, close <session> or active <sandbox>"
+			rep["error"] = "lines are open <ticket>, open-quiet <ticket> (no report), close <session> or active <sandbox>"
 		}
 		f.dmu.Unlock()
 		if send != nil {
@@ -128,15 +147,15 @@ func (f *FakeAgent) directEnd(op Op) Result {
 	}
 	f.dmu.Lock()
 	n := 0
-	for _, s := range d.Sessions {
-		if f.opened[d.Sandbox][s] {
+	for s, t := range f.opened[d.Sandbox] {
+		if slices.Contains(d.Sessions, s) || (t != "" && slices.Contains(d.Tokens, t)) {
 			delete(f.opened[d.Sandbox], s)
 			n++
 		}
 	}
 	var r *DirectReport
 	if n > 0 {
-		x := NewDirectReport(d.Sandbox, f.sessions(d.Sandbox), false)
+		x := f.reportOf(d.Sandbox, false)
 		r = &x
 	}
 	f.dmu.Unlock()
@@ -144,7 +163,12 @@ func (f *FakeAgent) directEnd(op Op) Result {
 		f.send(*r)
 	}
 	if f.Report != nil {
-		f.Report(map[string]any{"directEnd": d.Sessions, "sandbox": d.Sandbox, "ended": n, "at": time.Now().UTC().Format(time.RFC3339)})
+		f.Report(map[string]any{"directEnd": d.Sessions, "tokens": d.Tokens, "sandbox": d.Sandbox, "ended": n, "at": time.Now().UTC().Format(time.RFC3339)})
 	}
 	return okResult(op.ID, map[string]int{"ended": n})
+}
+
+func has(m map[string]string, k string) bool {
+	_, ok := m[k]
+	return ok
 }

@@ -13,12 +13,13 @@
 //   The agent checks it with the secret it holds, so a node whose link to
 //   Cloudflare blinks stays reachable directly. go/internal/direct checks the
 //   same format, against the vectors in fixtures/node/protocol.json.
-// - Sessions. The object keeps each ticket's session with the token that
-//   asked for it (DirectSessions below). The agent reports the open ones for
-//   the sandbox (the direct message, through the Node object); the object's
-//   alarm checks their tokens as it checks a splice's, and asks the agent to
-//   end those whose token ended (the directEnd op). Sessions it minted and
-//   never saw open are forgotten 2 minutes after their ticket expired.
+// - Sessions. Each ticket names the token that asked for it, and the agent
+//   keeps that with the session. The object keeps the tokens that minted
+//   tickets (DirectTokens below), and the agent reports the open sessions for
+//   the sandbox with their tokens (the direct message, through the Node
+//   object); the object's alarm checks those tokens as it checks a splice's,
+//   and asks the agent to end every session of one that ended (the directEnd
+//   op, by token).
 // - The node's key and addresses come from D1 (nodes.public_key and
 //   nodes.direct), never from the Node object, which mustn't be woken per
 //   connection (research/v0.2.3-plan.md, item 9).
@@ -58,26 +59,31 @@ export async function directSecret(adminKey: string, node: string, publicKey: st
   return b64(new Uint8Array(mac));
 }
 
-export type DirectClaims = { node: string; sandbox: string; port: number; session: string; exp: number };
+export type DirectClaims = { node: string; sandbox: string; port: number; session: string; token: string; exp: number };
 
 const SESSION = /^[0-9a-f]{16}$/;
 const NODE_ID = /^nd-[a-z0-9]{8}$/;
 const SANDBOX_ID = /^cx-[a-z0-9]{6}$/;
+// The token claim: a token's id, or "" for the admin key (which has no row).
+const TOKEN_CLAIM = /^(tk-[a-z0-9]{8})?$/;
 
 export const newSession = () => [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 const secretKey = (secret: string, usages: ("sign" | "verify")[]) => hmacKey(Uint8Array.from(atob(secret), (c) => c.charCodeAt(0)), usages);
 
-// A ticket for one connection to port on sandbox, on node, good for
-// DIRECT_TICKET_SEC from nowMs. session is chosen here unless given (tests).
+// A ticket for one connection to port on sandbox, on node, asked for by token
+// (its id; null or "" for the admin key), good for DIRECT_TICKET_SEC from
+// nowMs. session is chosen here unless given (tests). The token is in the
+// claims so that the agent can end the sessions of a token that ended on its
+// own evidence (review D-M1), whatever the object remembers.
 export async function mintDirectTicket(
   secret: string,
-  c: { node: string; sandbox: string; port: number; session?: string },
+  c: { node: string; sandbox: string; port: number; token: string | null; session?: string },
   nowMs = Date.now(),
 ): Promise<{ ticket: string; session: string; exp: number }> {
   const session = c.session ?? newSession();
   const exp = Math.floor(nowMs / 1000) + DIRECT_TICKET_SEC;
-  const payload = b64url(enc.encode(JSON.stringify({ n: c.node, s: c.sandbox, p: c.port, i: session, e: exp })));
+  const payload = b64url(enc.encode(JSON.stringify({ n: c.node, s: c.sandbox, p: c.port, i: session, t: c.token ?? "", e: exp })));
   const mac = new Uint8Array(await crypto.subtle.sign("HMAC", await secretKey(secret, ["sign"]), enc.encode(payload)));
   return { ticket: `${payload}.${b64url(mac)}`, session, exp };
 }
@@ -94,13 +100,14 @@ export async function readDirectTicket(secret: string, ticket: string, nowMs = D
     const ok = await crypto.subtle.verify("HMAC", await secretKey(secret, ["verify"]), unb64url(mac), enc.encode(payload));
     if (!ok) return null;
     const p = JSON.parse(new TextDecoder().decode(unb64url(payload))) as Record<string, unknown>;
-    if (Object.keys(p).sort().join() !== "e,i,n,p,s") return null;
-    const { n, s, p: port, i, e } = p;
+    if (Object.keys(p).sort().join() !== "e,i,n,p,s,t") return null;
+    const { n, s, p: port, i, t, e } = p;
     if (typeof n !== "string" || !NODE_ID.test(n) || typeof s !== "string" || !SANDBOX_ID.test(s)) return null;
     if (typeof i !== "string" || !SESSION.test(i) || typeof e !== "number" || !Number.isInteger(e)) return null;
+    if (typeof t !== "string" || !TOKEN_CLAIM.test(t)) return null;
     if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) return null;
     if (e * 1000 <= nowMs) return null;
-    return { node: n, sandbox: s, port, session: i, exp: e };
+    return { node: n, sandbox: s, port, session: i, token: t, exp: e };
   } catch {
     return null;
   }
@@ -149,73 +156,80 @@ export function directRefusal(s: { state: string; onNode: string | null; asked: 
   return null;
 }
 
-// ---------------------------------------------------------------- sessions
+// ---------------------------------------------------------------- tokens (review D-M1)
 
-// Each session the sandbox's object minted: t, the token that asked (null:
-// the admin key, which has no row to check); e, its ticket's expiry (unix s);
-// o, when the agent last reported it open (ms), absent until then.
-export type DirectSession = { t: string | null; e: number; o?: number };
-export type DirectSessions = Record<string, DirectSession>;
+// The object keeps, per token (never the admin key), what it needs to end
+// that token's direct sessions when it ends: m, the expiries (unix s) of its
+// tickets for this sandbox that haven't expired, which also caps how many it
+// may have; s, the last evidence it may have a session open (ms): a mint, or
+// an agent's report naming it.
+//
+// Before the review the object kept each session instead, at most 256, and
+// dropped the oldest unopened one to mint more; ids it didn't remember were
+// ignored in reports. So a token could mint 256 more tickets after its first,
+// use the first, and keep that session after it was revoked; and a lost
+// "open" report (the node over its report budget, its link down) let a quiet
+// session be forgotten 3 minutes after its mint. Now nothing is dropped to
+// make room (a mint over the caps is refused instead), the tokens in a report
+// are taken whether or not the object remembers them, an entry lasts an hour
+// after its last evidence (the agent reports quiet sessions every 5 minutes,
+// and again after each welcome), and the agent ends sessions by token.
+export type DirectToken = { m: number[]; s: number };
+export type DirectTokens = Record<string, DirectToken>;
 
-// Minted sessions not seen open are forgotten this long after their ticket
-// expired; open ones that no report has named for OPEN_FORGET_MS (a node away
-// that long) are forgotten too, so that the record stays bounded.
-export const MINTED_GRACE_MS = 2 * 60_000;
-export const OPEN_FORGET_MS = 60 * 60_000;
-// The most sessions one sandbox's object keeps: minting more drops the oldest
-// that aren't open.
-export const SESSIONS_KEPT = 4 * DIRECT_SESSIONS_MAX;
-
-export function mintSession(all: DirectSessions, id: string, s: DirectSession): DirectSessions {
-  const next = { ...all, [id]: s };
-  const ids = Object.keys(next);
-  if (ids.length <= SESSIONS_KEPT) return next;
-  const unopened = ids.filter((i) => next[i]!.o === undefined && i !== id).sort((a, b) => next[a]!.e - next[b]!.e);
-  for (const i of unopened.slice(0, ids.length - SESSIONS_KEPT)) delete next[i];
-  return next;
-}
-
-// An agent's report of the sandbox's open sessions: those it names that were
-// minted here are open now; those open before that it no longer names have
-// closed and go. Ids this object didn't mint are ignored.
-// o is renewed only when it's older than SEEN_RENEW_MS, so that the 30 s
-// reports of a long session don't each write the object's storage.
+// Tickets a token may hold for one sandbox that haven't expired: as many as
+// the sandbox may have sessions open on the direct port.
+export const TOKEN_TICKETS_MAX = DIRECT_SESSIONS_MAX;
+// Tokens one sandbox mints for while their entries last; reports may add as
+// many again (an agent names at most DIRECT_SESSIONS_MAX open sessions), so
+// the record stays bounded at twice this.
+export const TOKENS_MINT_MAX = 64;
+// An entry is forgotten this long after its last evidence.
+export const TOKEN_FORGET_MS = 60 * 60_000;
+// A report renews s only when it's older than this, so that the reports of a
+// long session don't each write the object's storage.
 export const SEEN_RENEW_MS = 5 * 60_000;
-export function reportSessions(all: DirectSessions, open: string[], nowMs: number): DirectSessions {
-  const named = new Set(open);
-  const next: DirectSessions = {};
-  for (const [id, s] of Object.entries(all)) {
-    if (named.has(id)) next[id] = s.o !== undefined && nowMs - s.o < SEEN_RENEW_MS ? s : { ...s, o: nowMs };
-    else if (s.o === undefined) next[id] = s;
+
+// A mint for token (null: the admin key, which isn't kept) whose ticket
+// expires at exp: the new record, or why it's refused (429).
+export function mintToken(all: DirectTokens, token: string | null, exp: number, nowMs: number): DirectTokens | string {
+  if (token === null) return all;
+  const cur = all[token];
+  const live = (cur?.m ?? []).filter((e) => e * 1000 > nowMs);
+  if (live.length >= TOKEN_TICKETS_MAX) return `this token has ${TOKEN_TICKETS_MAX} direct tickets for the sandbox from the last minute; wait a moment`;
+  if (!cur && Object.keys(all).length >= TOKENS_MINT_MAX) return `${TOKENS_MINT_MAX} tokens have used the direct path to this sandbox in the last hour`;
+  return { ...all, [token]: { m: [...live, exp], s: nowMs } };
+}
+
+// An agent's report naming the tokens of the sandbox's open sessions: each is
+// kept, known or not, with its evidence renewed.
+export function reportTokens(all: DirectTokens, tokens: string[], nowMs: number): DirectTokens {
+  let next = all;
+  for (const t of new Set(tokens)) {
+    const cur = next[t];
+    if (cur && nowMs - cur.s < SEEN_RENEW_MS) continue;
+    next = { ...next, [t]: { m: cur?.m ?? [], s: nowMs } };
   }
   return next;
 }
 
-// Drops minted sessions whose ticket expired more than MINTED_GRACE_MS ago,
-// and open ones not reported for OPEN_FORGET_MS.
-export function sweepSessions(all: DirectSessions, nowMs: number): DirectSessions {
-  const next: DirectSessions = {};
-  for (const [id, s] of Object.entries(all)) {
-    const keep = s.o === undefined ? s.e * 1000 + MINTED_GRACE_MS > nowMs : nowMs - s.o < OPEN_FORGET_MS;
-    if (keep) next[id] = s;
+// Drops expired ticket times, and tokens with no evidence for TOKEN_FORGET_MS.
+export function sweepTokens(all: DirectTokens, nowMs: number): DirectTokens {
+  const next: DirectTokens = {};
+  for (const [t, e] of Object.entries(all)) {
+    if (nowMs - e.s >= TOKEN_FORGET_MS) continue;
+    const m = e.m.filter((x) => x * 1000 > nowMs);
+    next[t] = m.length === e.m.length ? e : { ...e, m };
   }
   return next;
 }
 
-// The sessions to end because their token ended: open ones, and minted ones
-// whose ticket could still be used (the agent refuses those when it's told).
-// alive answers whether a token still works; each token is asked once.
-export async function endedSessions(all: DirectSessions, alive: (token: string) => Promise<boolean>, nowMs: number): Promise<string[]> {
-  const asked = new Map<string, Promise<boolean>>();
+// The tokens that ended, among those kept. alive answers whether a token
+// still works; a failed check counts as alive until the next one.
+export async function endedTokens(all: DirectTokens, alive: (token: string) => Promise<boolean>): Promise<string[]> {
   const out: string[] = [];
-  for (const [id, s] of Object.entries(all)) {
-    if (s.t === null) continue;
-    if (s.o === undefined && s.e * 1000 <= nowMs) continue;
-    let a = asked.get(s.t);
-    if (!a) asked.set(s.t, (a = alive(s.t).catch(() => true)));
-    if (!(await a)) out.push(id);
-  }
+  for (const t of Object.keys(all)) if (!(await alive(t).catch(() => true))) out.push(t);
   return out;
 }
 
-export const sameSessions = (a: DirectSessions, b: DirectSessions) => JSON.stringify(a) === JSON.stringify(b);
+export const sameTokens = (a: DirectTokens, b: DirectTokens) => JSON.stringify(a) === JSON.stringify(b);

@@ -47,6 +47,7 @@ const (
 	DirectPerClientMax    = 16   // of those from one client address
 	DirectSessionsMax     = 256  // open sessions on the node
 	DirectSeenMax         = 4096 // session ids remembered until their ticket expires
+	DirectEndedTokensMax  = 1024 // tokens that ended, remembered until their tickets expire
 	DirectGrace           = 10 * time.Second
 	DirectQuietReport     = 5 * time.Minute // a report while sessions are open but quiet
 	DirectSidecarEvery    = 30 * time.Second
@@ -102,6 +103,7 @@ type Direct struct {
 	perClient map[netip.Addr]int
 	sessions  map[string]*directSession
 	seen      map[string]time.Time // session id -> forget after (local clock)
+	ended     map[string]time.Time // token id -> refuse its tickets until (local clock)
 	reported  map[string]time.Time // sandbox -> last report
 	kick      chan struct{}
 	listened  bool
@@ -110,6 +112,7 @@ type Direct struct {
 
 type directSession struct {
 	id, sandbox string
+	token       string // the token whose ticket opened it; "" for the admin key
 	conn        net.Conn
 	active      atomic.Bool // the client sent bytes since the last report
 }
@@ -132,6 +135,7 @@ func (d *Direct) init() {
 		d.perClient = map[netip.Addr]int{}
 		d.sessions = map[string]*directSession{}
 		d.seen = map[string]time.Time{}
+		d.ended = map[string]time.Time{}
 		d.reported = map[string]time.Time{}
 		d.kick = make(chan struct{}, 1)
 		if d.state == "" {
@@ -211,8 +215,15 @@ func (d *Direct) Welcome(w *WelcomeDirect) {
 		}
 	}
 	d.revoked = false
+	have := d.secret != nil
 	d.mu.Unlock()
 	d.wake()
+	// Every sandbox's open sessions again, with their tokens: a report lost
+	// while the link was down (or over the node's report budget) would
+	// otherwise wait for the next quiet report (review D-M1).
+	if have {
+		go d.reportAll()
+	}
 }
 
 func (d *Direct) wake() {
@@ -646,6 +657,11 @@ func (d *Direct) admit(ticket string) (direct.Claims, string) {
 	if _, ok := d.seen[c.Session]; ok {
 		return c, "used already"
 	}
+	if c.Token != "" {
+		if _, ok := d.ended[c.Token]; ok {
+			return c, "its token ended"
+		}
+	}
 	if len(d.seen) >= DirectSeenMax {
 		return c, "busy: too many tickets in the last minute"
 	}
@@ -657,6 +673,11 @@ func (d *Direct) pruneSeenLocked(now time.Time) {
 	for id, until := range d.seen {
 		if now.After(until) {
 			delete(d.seen, id)
+		}
+	}
+	for t, until := range d.ended {
+		if now.After(until) {
+			delete(d.ended, t)
 		}
 	}
 }
@@ -680,7 +701,7 @@ func (d *Direct) open(c direct.Claims, conn net.Conn) (*directSession, string) {
 	if n >= direct.SessionsMax {
 		return nil, fmt.Sprintf("%s has %d direct sessions open", c.Sandbox, direct.SessionsMax)
 	}
-	s := &directSession{id: c.Session, sandbox: c.Sandbox, conn: conn}
+	s := &directSession{id: c.Session, sandbox: c.Sandbox, token: c.Token, conn: conn}
 	d.sessions[s.id] = s
 	return s, ""
 }
@@ -720,18 +741,39 @@ func (d *Direct) report(sandbox string, active bool) {
 		return
 	}
 	open := d.openOfLocked(sandbox)
+	var tokens []string
 	for _, s := range d.sessions {
-		if s.sandbox == sandbox && s.active.Swap(false) {
+		if s.sandbox != sandbox {
+			continue
+		}
+		if s.active.Swap(false) {
 			active = true
 		}
+		if s.token != "" && !slices.Contains(tokens, s.token) && len(tokens) < direct.SessionsMax {
+			tokens = append(tokens, s.token)
+		}
 	}
+	sort.Strings(tokens)
 	d.reported[sandbox] = d.now()
 	if len(open) == 0 {
 		delete(d.reported, sandbox)
 	}
 	send := d.Send
 	d.mu.Unlock()
-	send(NewDirectReport(sandbox, open, active))
+	send(NewDirectReport(sandbox, open, active, tokens...))
+}
+
+// reportAll sends a report for every sandbox with sessions open.
+func (d *Direct) reportAll() {
+	d.mu.Lock()
+	sbs := map[string]bool{}
+	for _, s := range d.sessions {
+		sbs[s.sandbox] = true
+	}
+	d.mu.Unlock()
+	for sb := range sbs {
+		d.report(sb, false)
+	}
 }
 
 // reports sends, every direct.ReportEvery, a report for each sandbox whose
@@ -766,8 +808,11 @@ func (d *Direct) reportDue() {
 	}
 }
 
-// End is the directEnd op: it closes the named sessions of the sandbox and
-// refuses their tickets until they expire; it answers how many it closed.
+// End is the directEnd op: it closes the named sessions of the sandbox, and
+// every session of the sandbox opened with a ticket of one of the named
+// tokens, and refuses their tickets until they expire (a token's, anywhere
+// on the node: a token that ended doesn't come back); it answers how many it
+// closed.
 func (d *Direct) End(e DirectEnd) int {
 	if d == nil {
 		return 0
@@ -783,6 +828,19 @@ func (d *Direct) End(e DirectEnd) int {
 		}
 		if _, ok := d.seen[id]; !ok && len(d.seen) < 2*DirectSeenMax {
 			d.seen[id] = now.Add(direct.TicketTTL + DirectGrace)
+		}
+	}
+	for _, t := range e.Tokens {
+		if t == "" {
+			continue
+		}
+		for _, s := range d.sessions {
+			if s.token == t && s.sandbox == e.Sandbox && !slices.Contains(closing, s) {
+				closing = append(closing, s)
+			}
+		}
+		if len(d.ended) < DirectEndedTokensMax {
+			d.ended[t] = now.Add(direct.TicketTTL + DirectGrace)
 		}
 	}
 	d.mu.Unlock()

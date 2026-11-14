@@ -598,7 +598,7 @@ export class Node extends DurableObject<Env> {
         }
         this.ctx.waitUntil(
           this.env.SANDBOX.getByName(sb)
-            .nodeDirect(id, { open: m.open, active: m.active })
+            .nodeDirect(id, { open: m.open, active: m.active, ...(m.tokens ? { tokens: m.tokens } : {}) })
             .catch((e: unknown) => console.error(`[${id}] telling ${sb} of its direct sessions: ${errorStatus(e).message}`)),
         );
         return;

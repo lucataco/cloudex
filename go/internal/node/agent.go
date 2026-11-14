@@ -801,7 +801,7 @@ func (a *Agent) answer(op Op) Result {
 		return okResult(op.ID, info)
 	case "directEnd":
 		var d DirectEnd
-		if json.Unmarshal(b, &d) != nil || !sandboxID.MatchString(d.Sandbox) || len(d.Sessions) > directEndMax {
+		if json.Unmarshal(b, &d) != nil || !sandboxID.MatchString(d.Sandbox) || len(d.Sessions) > directEndMax || len(d.Tokens) > directEndMax {
 			return errResult(op.ID, "bad arguments")
 		}
 		return okResult(op.ID, map[string]int{"ended": a.endDirect(d)})
