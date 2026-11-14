@@ -141,6 +141,20 @@ func newProbeDirect() *cobra.Command {
 				b, _ := json.Marshal(d)
 				return os.WriteFile(save, b, 0o600)
 			}
+			if present != "" && pipe {
+				// A session on a ticket minted earlier (the review's checks:
+				// tickets minted after it, a revoke after it opened).
+				b, err := os.ReadFile(present)
+				if err != nil {
+					return err
+				}
+				var d api.Direct
+				if err := json.Unmarshal(b, &d); err != nil || d.Ticket == nil {
+					return fmt.Errorf("%s: not a saved answer with a ticket", present)
+				}
+				pub, _ := base64.StdEncoding.DecodeString(d.PublicKey)
+				return p.pipeTicket(ctx, *d.Ticket, ed25519.PublicKey(pub), cmd.InOrStdin(), cmd.OutOrStdout())
+			}
 			if present != "" {
 				b, err := os.ReadFile(present)
 				if err != nil {
@@ -171,7 +185,7 @@ func newProbeDirect() *cobra.Command {
 	cmd.Flags().StringVar(&cases, "cases", "good,replay,altered,othersandbox,otherport,othernode,noticket,garbage,long,plaintext,noalpn,wrongpin,expired", "the cases, comma-separated")
 	cmd.Flags().BoolVar(&pipe, "pipe", false, "open one session and carry stdin and stdout over it")
 	cmd.Flags().StringVar(&save, "save", "", "instead: save a fresh ticket (the API's answer) to this file")
-	cmd.Flags().StringVar(&present, "present", "", "instead: present the ticket saved in this file once, and print the answer")
+	cmd.Flags().StringVar(&present, "present", "", "instead: present the ticket saved in this file once, and print the answer (with --pipe: open the session on it)")
 	cmd.Flags().IntVar(&flood, "flood", 0, "instead: open this many TCP connections at once that send nothing (a slow-loris), and say how the node closed them; then a good session")
 	return cmd
 }
@@ -393,6 +407,10 @@ func (p *directProbe) pipe(ctx context.Context, in io.Reader, out io.Writer) err
 	if err != nil {
 		return err
 	}
+	return p.pipeTicket(ctx, t, pub, in, out)
+}
+
+func (p *directProbe) pipeTicket(ctx context.Context, t string, pub ed25519.PublicKey, in io.Reader, out io.Writer) error {
 	hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	raw, err := (&net.Dialer{}).DialContext(hctx, "tcp", p.addr)
