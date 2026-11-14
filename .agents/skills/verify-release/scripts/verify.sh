@@ -1551,6 +1551,8 @@ routed-other-agent-80 000
 routed-other-agent-443 000
 forged-source 000"
 	local got42
+	# (An arm64 host running the amd64 image says so first: not a probe's line.)
+	h42=$(grep -v "^WARNING: The requested image's platform" <<<"$h42")
 	got42=$(grep -v '^control-' <<<"$h42" | sed 's/ *$//')
 	# The control address: nothing on 80 and 443, and on the direct port (v0.2.3)
 	# no session: no connection, or one closed without a TLS handshake.
@@ -1564,7 +1566,13 @@ forged-source 000"
 
 	# N43: the agent's listening sockets, from its own network namespace.
 	local l43 bad43
-	l43=$(node_sh "docker run --rm --network container:cloudex-node --entrypoint ss $(node_sh "docker inspect $MC -f '{{.Config.Image}}'") -Hltn" 2>/dev/null | awk '{print $4}' | sort | tr '\n' ' ')
+	# As root, the host's own ss in the agent's namespace: an amd64 ss under
+	# Rosetta (an arm64 test host) doesn't show the interface a socket is bound to.
+	if [[ -n $NODE_SUDO ]]; then
+		l43=$(node_sh "sudo nsenter -t \$(docker inspect -f '{{.State.Pid}}' cloudex-node) -n ss -Hltn" 2>/dev/null | awk '{print $4}' | sort | tr '\n' ' ')
+	else
+		l43=$(node_sh "docker run --rm --network container:cloudex-node --entrypoint ss $(node_sh "docker inspect $MC -f '{{.Config.Image}}'") -Hltn" 2>/dev/null | awk '{print $4}' | sort | tr '\n' ' ')
+	fi
 	# A listener bound to its network's interface (review H4) shows as addr%eth1:port.
 	local bound43
 	bound43=$(tr ' ' '\n' <<<"$l43" | grep -c '%')
@@ -2105,7 +2113,7 @@ direct_client() { [[ ${VERIFY_NODE_DIRECT:-} == 1 ]]; }
 # reaches its own published addresses; the listener sees its own address), with
 # the deployment's key from stdin: never in a process's arguments there.
 dprobe() {
-	"${NODE_SSH[@]}" "read -r k; export CLOUDEX_API_KEY=\$k CLOUDEX_API_URL=$API_URL; docker run --rm --network host -e CLOUDEX_API_KEY -e CLOUDEX_API_URL -v $NODE_DIR:/w $AIMG probe direct $*" <<<"$(jq -r .apiKey "$src_cfg/config.json")"
+	"${NODE_SSH[@]}" "read -r k; export CLOUDEX_API_KEY=\$k CLOUDEX_API_URL=$API_URL; docker run --rm --network host --user \$(id -u):\$(id -g) -e CLOUDEX_API_KEY -e CLOUDEX_API_URL -v $NODE_DIR:/w $AIMG probe direct $*" <<<"$(jq -r .apiKey "$src_cfg/config.json")"
 }
 median() { sort -n | awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)] }'; }
 # The race's choice in a CLOUDEX_DEBUG log: "chose direct 1.2.3.4:7022 (lan-onlink)" or "chose the Worker path".
