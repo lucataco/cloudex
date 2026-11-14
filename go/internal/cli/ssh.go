@@ -263,10 +263,16 @@ type wsConn struct{ net.Conn }
 // splice connects stdin and stdout to conn until either ends.
 func splice(ctx context.Context, conn net.Conn) error {
 	// ssh closes our stdin when it's done; closing the connection then
-	// makes the read below fail, which isn't an error worth printing.
+	// makes the read below fail, which isn't an error worth printing. The
+	// direct path is TCP end to end, so there the end of stdin is passed
+	// on as a half-close and the answer still comes back (cloudex proxy
+	// box 8000 < request); ssh ends the proxy itself when it exits.
 	var closed atomic.Bool
 	go func() {
 		io.Copy(conn, os.Stdin)
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok && cw.CloseWrite() == nil {
+			return
+		}
 		closed.Store(true)
 		conn.Close()
 	}()
