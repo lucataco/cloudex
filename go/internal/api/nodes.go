@@ -41,6 +41,9 @@ type Node struct {
 	// direct port's certificate carries: absent before it joins, once it's
 	// removed, and from an older deployment.
 	PublicKey string `json:"publicKey,omitempty"`
+	// Forks are its fork images (v0.2.3 M5), GetNode only: absent from an
+	// older agent or deployment.
+	Forks *NodeForks `json:"forks,omitempty"`
 	// GetNode only (v0.2.2 M5): machines of no sandbox, sandboxes deleted
 	// while it was offline whose machines it removes when it's back, and its
 	// agent's clock less the deployment's at its last connect.
@@ -57,6 +60,16 @@ type NodeIsolation struct {
 }
 
 // NodeDirect is a node's direct port, as its agent reports it.
+// NodeForks are a node's fork images: how many, the space they hold, how
+// Docker keeps images there (overlay2, containerd or other), and the seconds
+// a commit takes, and a running original is paused for, per GiB it wrote.
+type NodeForks struct {
+	Images   int     `json:"images"`
+	GB       float64 `json:"gb"`
+	Store    string  `json:"store"`
+	SecPerGB float64 `json:"secPerGb"`
+}
+
 type NodeDirect struct {
 	Port  int      `json:"port"`
 	Addrs []string `json:"addrs"`

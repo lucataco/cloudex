@@ -339,7 +339,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.startPools()
 			a.selfTests(ctx)
 		}()
+		go a.forkSweeps(ctx)
 		go r.Watch(ctx)
+		if r.Forks == nil {
+			r.Forks = NewForkBook(a.State.Dir)
+		}
 		r.LastSubnet = a.State.LastSubnet
 		r.SaveSubnet = func(p netip.Prefix) {
 			if err := a.State.SaveLastSubnet(p); err != nil {
@@ -662,6 +666,24 @@ func (a *Agent) hello() Hello {
 	return NewHello(a.Version, a.facts(), ms)
 }
 
+// forkSweeps removes unused fork images (fork.go) at start and every
+// ForkSweepEvery.
+func (a *Agent) forkSweeps(ctx context.Context) {
+	t := time.NewTimer(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		sctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		a.Runtime.SweepForks(sctx, ForkSweepAge)
+		cancel()
+		t.Reset(ForkSweepEvery)
+	}
+}
+
 func (a *Agent) kickSelfTest() {
 	select {
 	case a.testNow <- struct{}{}:
@@ -755,6 +777,28 @@ func (a *Agent) answer(op Op) Result {
 		}
 		p.more(max(1, min(args.Count, SparesMax)))
 		return okResult(op.ID, struct{}{})
+	case "commit":
+		// A fork point (fork.go): its own deadline, not an op's 3 minutes,
+		// since a commit copies everything the sandbox wrote. A repeat of the
+		// same point (its answer lost to a deploy) waits for this one.
+		r := a.Runtime
+		if r == nil {
+			return errResult(op.ID, errNoRuntime.Error())
+		}
+		var c struct {
+			Sandbox string `json:"sandbox"`
+			Point   string `json:"point"`
+		}
+		if json.Unmarshal(b, &c) != nil {
+			return errResult(op.ID, "bad arguments")
+		}
+		ctx, cancel := context.WithTimeout(a.runCtx, CommitTimeout+time.Minute)
+		defer cancel()
+		info, err := r.Commit(ctx, c.Sandbox, c.Point)
+		if err != nil {
+			return errResult(op.ID, err.Error())
+		}
+		return okResult(op.ID, info)
 	case "directEnd":
 		var d DirectEnd
 		if json.Unmarshal(b, &d) != nil || !sandboxID.MatchString(d.Sandbox) || len(d.Sessions) > directEndMax {

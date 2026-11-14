@@ -96,6 +96,18 @@ export interface NodeDirect {
 }
 
 /**
+ * A node's fork images (v0.2.3): how many, the space they hold, how Docker
+ * keeps images there, and how many seconds a fork's copy takes per GiB a
+ * sandbox has written (a running one is paused that long).
+ */
+export interface NodeForks {
+  images: number;
+  gb: number;
+  store: "overlay2" | "containerd" | "other";
+  secPerGb: number;
+}
+
+/**
  * A node: your own Linux host with Docker that runs sandboxes for the
  * deployment, through its agent (cloudex-node), which dials out and stays
  * connected. What it reports about itself (its name aside) comes from its
@@ -135,6 +147,8 @@ export interface NodeInfo {
   direct?: NodeDirect;
   /** Its Ed25519 public key in base64, which its direct port's TLS certificate carries; absent before it joins and once removed. */
   publicKey?: string;
+  /** nodes.get only: its fork images, as its agent last reported them; absent for an agent older than v0.2.3. */
+  forks?: NodeForks;
 }
 
 /** A node as added: the token its agent joins with (once, before expiresAt), and the command that installs the agent. */
@@ -255,8 +269,8 @@ export interface CreateOptions {
    * Run it on this node (a name or id; see Cloudex.nodes) instead of
    * Cloudflare. The node must be online and pass its isolation self-test; an
    * own-only token can't use a node whose isolation is plain Docker. On a
-   * node, stop keeps the disk there; forks aren't available there yet (save
-   * it, then start sandboxes from the save).
+   * node, stop keeps the disk there, and its forks are made on the same
+   * node.
    */
   node?: string;
   /** With node: its machine's CPUs, from 0.25 up to the node's; default the size's (1 for standard-2). */
@@ -324,9 +338,10 @@ export interface ForkOptions {
   /** Default: the original's. */
   idleMinutes?: number;
   /**
-   * Cloudex.startFromSave only: start them on this node (a name or id), as
-   * create does, which moves a sandbox between Cloudflare and a node. Forks
-   * can't start on a node.
+   * Cloudex.startFromSave: start them on this node (a name or id), as
+   * create does, which moves a sandbox between Cloudflare and a node. A fork
+   * stays where its original is: for a sandbox on a node, this may name only
+   * that node, and cpus and memoryMb default to the original's.
    */
   node?: string;
   /** With node: each machine's CPUs. */
@@ -978,7 +993,9 @@ export class Sandbox {
   /**
    * Makes sandboxes that start from a copy of this one's whole disk. A running
    * sandbox is saved first, in seconds, and keeps running. Forks that failed
-   * to start come back in state "error"; resume() tries again.
+   * to start come back in state "error"; resume() tries again. A sandbox on a
+   * node is forked on that node: a running one pauses while its disk is
+   * copied there, and cpus and memoryMb default to its own.
    */
   async fork(options: ForkOptions = {}): Promise<Sandbox[]> {
     const forks = await this.#call<SandboxInfo[]>("POST", this.#path("/fork"), options);

@@ -169,7 +169,8 @@ export class CloudflareCompute implements Compute {
 // A sandbox's place on a node (v0.2.2 M5): which node (its id, and its name
 // for messages), the machine's address there (empty until its first start),
 // and the limits it was made with.
-export type NodePlacement = { node: string; name: string; address: string; cpus?: number; memoryMb?: number };
+// image (v0.2.3 M5): a fork's machine is made from its fork image on the node.
+export type NodePlacement = { node: string; name: string; address: string; cpus?: number; memoryMb?: number; image?: string };
 
 // A preview's request headers, as the node's agent sends them on.
 function headerList(req: Request): [string, string][] {

@@ -48,6 +48,8 @@ type Runtime struct {
 	// Direct is the direct port (v0.2.3), which the self-test probes; nil
 	// when it's off.
 	Direct *Direct
+	// Forks is forks.json (fork.go): the fork points this node committed.
+	Forks *ForkBook
 	// FreeSpace, in tests, stands in for the free space under DockerRoot.
 	FreeSpace func() float64
 	// Subnet hands out machine networks round-robin over the pool, so a
@@ -71,6 +73,8 @@ type Runtime struct {
 	infoAt  time.Time
 	notes   map[string]string // why the agent stopped a machine itself, until Docker says it stopped
 	noQuota bool              // the storage driver refused StorageOpt
+	forkMu  sync.Mutex
+	commits map[string]*commitRun // fork points being committed
 }
 
 // MinFreeGB is the least free space on Docker's disk a new machine needs
@@ -187,6 +191,9 @@ func (r *Runtime) Facts(f Facts) Facts {
 	if gb := r.FreeGB(); gb >= 0 {
 		gb = float64(int(gb*10)) / 10
 		f.DiskFreeGB = &gb
+	}
+	if i, err := r.dockerInfo(ctx); err == nil && i != nil {
+		f.Forks = r.forkFact(ctx, i)
 	}
 	r.factsMu.Lock()
 	defer r.factsMu.Unlock()
@@ -403,11 +410,16 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 		return nil, err
 	}
 	image := r.Image()
-	if req.Image != "" && r.ImageOverride == "" {
-		image = req.Image
-	}
-	if err := ImageAllowed(image, r.Allowed); err != nil {
-		return nil, err
+	// A fork's image (fork.go) is this node's own, checked against its
+	// record, not the allowed list; --machine-image doesn't replace it.
+	fork := IsForkRef(req.Image)
+	if !fork {
+		if req.Image != "" && r.ImageOverride == "" {
+			image = req.Image
+		}
+		if err := ImageAllowed(image, r.Allowed); err != nil {
+			return nil, err
+		}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -415,6 +427,13 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 		return nil, err
 	} else if c != nil {
 		return r.describe(c, req.Sandbox), nil
+	}
+	if fork {
+		id, err := r.forkImage(ctx, req.Image)
+		if err != nil {
+			return nil, err
+		}
+		image = id
 	}
 	if gb := r.FreeGB(); gb >= 0 && gb < r.minFree() {
 		return nil, fmt.Errorf("Docker's disk on this node has %.1f GB free; new machines need %.0f", gb, r.minFree())
@@ -732,9 +751,13 @@ func (r *Runtime) Delete(ctx context.Context, sandbox string) error {
 	if err != nil {
 		return err
 	}
+	var images []string
 	for _, c := range cs {
 		if err := r.Docker.ContainerRemove(ctx, c.ID); err != nil {
 			return err
+		}
+		if c.ImageID != "" {
+			images = append(images, c.ImageID)
 		}
 	}
 	ns, err := r.Docker.Networks(ctx, r.labels(LabelSandbox+"="+sandbox)...)
@@ -750,6 +773,14 @@ func (r *Runtime) Delete(ctx context.Context, sandbox string) error {
 		}
 	}
 	r.logf("%s: removed its machine", sandbox)
+	// A fork's image goes with the last machine that used it (fork.go).
+	dropped := false
+	for _, id := range images {
+		dropped = r.dropForkImage(ctx, id) || dropped
+	}
+	if dropped {
+		go r.changed()
+	}
 	return nil
 }
 

@@ -36,7 +36,8 @@
 # It says it worked only if all of that did.
 #
 # Again with --uninstall, it removes all of it: the agent, every machine and
-# network it made (their disks too), its volume, the firewall and its unit,
+# network it made (their disks too, and the images of forks made on the
+# node), its volume, the firewall and its unit,
 # and the images it pulled. Running it again without --uninstall updates the
 # agent (with --version) and keeps the node's identity and its machines.
 #
@@ -93,7 +94,7 @@ Options:
   --unisolated          testing only, without root: no firewall
                         (testing only as well: CLOUDEX_NODE_ALLOW_ARCH=$(uname -m) in the environment installs on a host that isn't amd64)
   --uninstall           remove the agent, its machines, the firewall and the images it pulled
-  --keep-images         with --uninstall, keep the images
+  --keep-images         with --uninstall, keep the images it pulled (fork images still go: they're disks)
   --yes                 don't ask before removing machines
 EOF
 }
@@ -180,6 +181,18 @@ main() {
 		for n in $(docker network ls -q --filter label=build.cloudex.node); do docker network rm "$n" >/dev/null; done
 		for n in $(docker network ls -q --filter label=build.cloudex.agent); do docker network rm "$n" >/dev/null; done
 		docker volume rm "$NAME" >/dev/null 2>&1 || true
+		# Fork images (v0.2.3) are machines' disks, not downloads: they go even
+		# with --keep-images. By id, newest first (a fork of a fork before the
+		# image it came from, which overlay2 refuses to remove while it has a
+		# child), again until none is left.
+		for _ in 1 2 3 4 5 6 7 8; do
+			forks=$(docker image ls -q --no-trunc --filter label=build.cloudex.role=fork --filter label=build.cloudex.node)
+			[[ -n $forks ]] || break
+			say "removing $(wc -w <<<"$forks" | tr -d ' ') fork images"
+			for i in $forks; do docker rmi "$i" >/dev/null 2>&1 || true; done
+		done
+		left=$(docker image ls -q --filter label=build.cloudex.role=fork --filter label=build.cloudex.node | wc -l | tr -d ' ')
+		[[ $left == 0 ]] || warn "$left fork images couldn't be removed; see docker image ls --filter label=build.cloudex.role=fork"
 		if [[ $ROOT == 1 ]]; then
 			say "removing the firewall"
 			systemctl disable --now "$CHECK.timer" >/dev/null 2>&1 || true

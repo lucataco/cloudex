@@ -546,7 +546,7 @@ func TestForkMakesTheForkCurrent(t *testing.T) {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}
 	var body map[string]any
-	json.Unmarshal([]byte(f.bodies[0]), &body)
+	json.Unmarshal([]byte(f.bodies[len(f.bodies)-1]), &body)
 	if body["name"] != "try-2" || body["count"] != float64(1) || body["idleMinutes"] != nil || body["size"] != nil {
 		t.Fatalf("request body %v", body)
 	}
@@ -567,7 +567,7 @@ func TestNewFromMakesSeveralForks(t *testing.T) {
 		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}
 	var body map[string]any
-	json.Unmarshal([]byte(f.bodies[1]), &body)
+	json.Unmarshal([]byte(f.bodies[len(f.bodies)-1]), &body)
 	if body["count"] != float64(2) || body["idleMinutes"] != float64(60) {
 		t.Fatalf("request body %v", body)
 	}

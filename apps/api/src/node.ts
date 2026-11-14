@@ -18,7 +18,12 @@
 //   wait at most for a machine's entrypoint, and selftest); a restart of this
 //   object loses its waiters, and their callers get an error. Nothing long
 //   runs as an op: an exec has a stream socket of its own (nodestream.ts),
-//   whose loss the agent sees and acts on.
+//   whose loss the agent sees and acts on. One exception (v0.2.3 M5):
+//   commit, a fork's copy of a machine's disk, which can take minutes. It is
+//   safe to lose: the caller names the fork point, the agent records it and
+//   carries on, and the same point asked again gets the same image or waits
+//   for the commit under way; an image no fork ever used is swept by the
+//   agent after an hour.
 // - Stream tickets (M3): the agent asks for them on the control socket, and
 //   this object, which knows the socket is the node's (signed and nonce-checked
 //   at connect, closed on revoke), issues them. Each opens one stream to one

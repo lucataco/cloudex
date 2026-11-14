@@ -242,6 +242,9 @@ type ContainerSummary struct {
 	State  string            `json:"State"` // running, exited, created, ...
 	Labels map[string]string `json:"Labels"`
 	SizeRw int64             `json:"SizeRw"` // with ContainersSized only
+	// ImageID is the image it was made from: a fork image (fork.go) is
+	// removed with the last container that used it.
+	ImageID string `json:"ImageID"`
 }
 
 // Containers lists containers, stopped ones too, carrying all the labels.
@@ -398,4 +401,101 @@ func (d *Docker) Events(ctx context.Context, fn func(Event), labels ...string) e
 		}
 		fn(e)
 	}
+}
+
+// ---------------------------------------------------------------- images (v0.2.3 M5)
+
+// CommitConfig is the part of an image's config a commit sets. Docker merges
+// it with the container's: what it doesn't name is kept, so a variable or a
+// label can be blanked or overwritten, never removed (M0 Q4).
+type CommitConfig struct {
+	Env    []string          `json:"Env"`
+	Labels map[string]string `json:"Labels"`
+}
+
+// Commit makes an image of a container's filesystem, tagged repo:tag. With
+// pause, a running container is frozen for the whole commit, so the copy is
+// consistent. It returns the image's id.
+func (d *Docker) Commit(ctx context.Context, container, repo, tag string, pause bool, cfg CommitConfig) (string, error) {
+	q := url.Values{"container": {container}, "repo": {repo}, "tag": {tag}, "pause": {strconv.FormatBool(pause)}}
+	var r struct {
+		ID string `json:"Id"`
+	}
+	if err := d.do(ctx, http.MethodPost, "/commit?"+q.Encode(), cfg, &r); err != nil {
+		return "", err
+	}
+	if r.ID == "" {
+		return "", errors.New("docker: the commit answered no image id")
+	}
+	return r.ID, nil
+}
+
+// ImageDetail is what the agent reads of one image.
+type ImageDetail struct {
+	ID       string   `json:"Id"`
+	RepoTags []string `json:"RepoTags"`
+	Parent   string   `json:"Parent"`
+	Size     int64    `json:"Size"`
+	Created  string   `json:"Created"`
+	Config   struct {
+		Labels map[string]string `json:"Labels"`
+		Env    []string          `json:"Env"`
+	} `json:"Config"`
+	RootFS struct {
+		Layers []string `json:"Layers"`
+	} `json:"RootFS"`
+}
+
+func (d *Docker) ImageInspect(ctx context.Context, ref string) (*ImageDetail, error) {
+	var i ImageDetail
+	if err := d.do(ctx, http.MethodGet, "/images/"+ref+"/json", nil, &i); err != nil {
+		return nil, err
+	}
+	return &i, nil
+}
+
+// ImageSummary is an image in a list.
+type ImageSummary struct {
+	ID         string            `json:"Id"`
+	RepoTags   []string          `json:"RepoTags"`
+	Labels     map[string]string `json:"Labels"`
+	Created    int64             `json:"Created"` // unix s
+	Size       int64             `json:"Size"`
+	SharedSize int64             `json:"SharedSize"` // -1 unless Docker computed it (system df)
+}
+
+// Images lists the images carrying all the labels.
+func (d *Docker) Images(ctx context.Context, labels ...string) ([]ImageSummary, error) {
+	var is []ImageSummary
+	err := d.do(ctx, http.MethodGet, "/images/json"+labelFilter(labels), nil, &is)
+	return is, err
+}
+
+// ImageUsage is GET /system/df's images, with each one's size shared with
+// other images: its own on disk is Size less SharedSize. On the containerd
+// image store Size counts both the compressed content and the unpacked
+// snapshot (M0 Q4).
+func (d *Docker) ImageUsage(ctx context.Context) ([]ImageSummary, error) {
+	var df struct {
+		Images []ImageSummary `json:"Images"`
+	}
+	err := d.do(ctx, http.MethodGet, "/system/df?type=image", nil, &df)
+	return df.Images, err
+}
+
+// ImageRemove removes an image by id, never forced: while a container or
+// (overlay2) a child image uses it, Docker answers 409 and it stays. Gone
+// already is fine.
+func (d *Docker) ImageRemove(ctx context.Context, id string) error {
+	err := d.do(ctx, http.MethodDelete, "/images/"+url.PathEscape(id), nil, nil)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// IsConflict says whether err is the daemon's 409.
+func IsConflict(err error) bool {
+	var de *DockerError
+	return errors.As(err, &de) && de.Status == http.StatusConflict
 }

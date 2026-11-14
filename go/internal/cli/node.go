@@ -205,6 +205,9 @@ func printNode(cmd *cobra.Command, n *api.Node) error {
 		}
 		row("Direct", v)
 	}
+	if f := n.Forks; f != nil {
+		row("Forks", fmt.Sprintf("%d images, %.1f GB; %s image store, about %s s per GiB to copy", f.Images, f.GB, clean(f.Store), strconv.FormatFloat(f.SecPerGB, 'f', -1, 64)))
+	}
 	where := orDash(n.Colo)
 	if n.LocationHint != nil {
 		where += ", sandboxes in " + *n.LocationHint

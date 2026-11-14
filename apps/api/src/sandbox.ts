@@ -175,7 +175,16 @@ type CreateInput = {
   repo?: string | Repo;
 };
 // madeOn: the node the source's disk came from, if any (saveProvenance).
-export type ForkSource = { sandbox: string; snapshot: { id: string }; settings?: StoredSettings; madeOn?: { id: string; name: string } };
+// On Cloudflare a fork point is a disk snapshot; on a node (v0.2.3 M5) it's
+// the fork image the node's agent committed there, which the forks are made
+// from, on that node.
+export type ForkSource = {
+  sandbox: string;
+  snapshot?: { id: string };
+  node?: { id: string; name: string; image: string };
+  settings?: StoredSettings;
+  madeOn?: { id: string; name: string };
+};
 // What a node's Node object tells a sandbox on it (v0.2.2 M5): whether the
 // node is online, and with a report, its machine's state.
 // note: why the agent stopped the machine itself (its disk watchdog, a missing firewall).
@@ -192,11 +201,10 @@ type SaveGrant = { id: string; mode: "read" | "write"; until?: number };
 
 export const NO_SUCH_SANDBOX = "no such sandbox";
 
-// What a sandbox on a node can't do yet in v0.2.2 (research/v0.2.2-plan.md):
-// forks are built on Cloudflare's disk snapshots. A named save does the same
-// job: save it, then start new sandboxes from the save, on the node or not.
-export const FORK_ON_NODE =
-  "forks aren't available for a sandbox on a node yet; save it (cloudex save <sandbox> <name>), then start new sandboxes from the save with cloudex new --from <name> [--on <node>]";
+// A fork stays where its original's disk is (v0.2.3 M5): a named save moves
+// a sandbox between Cloudflare and a node, or between nodes.
+export const forkStays = (name: string, where: string) =>
+  `a fork of ${name} stays ${where}, where its disk is; to start a copy elsewhere, save it (cloudex save ${name} <save>), then cloudex new --from <save> [--on <node>]`;
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^\[\d{3}\] /, "");
 
@@ -446,11 +454,14 @@ export class Sandbox extends DurableObject<Env> {
   // With from, the sandbox is a fork and starts from that save (see forkPoint);
   // with save, it starts from that named save.
   // With on, it runs on that node (v0.2.2 M5), which POST /v1/sandboxes (or
-  // a start from a named save, M6) chose and checked; never with from.
+  // a start from a named save, M6, or a fork of a node sandbox, v0.2.3 M5)
+  // chose and checked. A fork of a node sandbox goes only on its node, and
+  // one of a Cloudflare sandbox only on Cloudflare.
   async create(id: string, input: CreateInput, from?: ForkSource, save?: SaveManifest, on?: NodeChoice): Promise<SandboxRecord> {
     return this.exclusive(async () => {
       if (this.record) fail(409, `${id} already exists`);
-      if (on && from) fail(501, FORK_ON_NODE);
+      if (from?.node && on?.node !== from.node.id) fail(400, forkStays(from.sandbox, `on node ${from.node.name}`));
+      if (from && !from.node && on) fail(400, forkStays(from.sandbox, "on Cloudflare"));
       // A fork gets the original's settings, and a sandbox started from a save
       // the settings saved with it; checked before anything is kept.
       const settings =
@@ -483,13 +494,23 @@ export class Sandbox extends DurableObject<Env> {
       if (on) {
         // Before the index row, which names the node, so that the node's
         // reconcile never takes the machine for an orphan.
-        const placement: NodePlacement = { node: on.node, name: on.name, address: "", cpus: on.cpus, memoryMb: on.memoryMb };
+        // A fork's machine is made from its fork image, which the placement
+        // keeps, so that a resume that finds the machine gone makes it again
+        // from there while the image exists (startOnNode).
+        const placement: NodePlacement = {
+          node: on.node,
+          name: on.name,
+          address: "",
+          cpus: on.cpus,
+          memoryMb: on.memoryMb,
+          ...(from?.node ? { image: from.node.image } : {}),
+        };
         await this.ctx.storage.put("node", placement);
         this.place(placement);
       }
       await this.update({});
       if (settings) await this.ctx.storage.put("settings", settings);
-      if (from) {
+      if (from?.snapshot) {
         // The fork's save until it makes its own, so that a resume after a
         // failed start, or after the platform stops it first, starts here too.
         await this.ctx.storage.put("snapshot", from.snapshot);
@@ -600,7 +621,7 @@ export class Sandbox extends DurableObject<Env> {
   async forkPoint(): Promise<ForkSource> {
     return this.exclusive(async () => {
       const r = this.mustRecord();
-      if (this.onNode) fail(501, FORK_ON_NODE);
+      if (this.onNode) return this.forkPointOnNode(r);
       if (r.state === "running") {
         this.touch();
         const t0 = Date.now();
@@ -622,6 +643,50 @@ export class Sandbox extends DurableObject<Env> {
       }
       return { sandbox: r.id, snapshot: { id: snapshot.id }, settings: await this.ctx.storage.get<StoredSettings>("settings"), ...(await this.madeOn()) };
     });
+  }
+
+  // A fork point on a node (v0.2.3 M5): the node's agent commits the
+  // machine's disk into a fork image, running (paused while it's copied: about
+  // 2.3 s per GiB written on overlay2, 12.5 on the containerd image store) or
+  // stopped. Its disk is on the node, so a stopped one's has no 29-day limit.
+  // The point is named here, so that if the answer is lost (the node's object
+  // restarted with a deploy, or the link reset) the same op asked again gets
+  // the same image, or waits for the commit under way.
+  private async forkPointOnNode(r: SandboxRecord): Promise<ForkSource> {
+    const p = this.onNode!.placement;
+    const name = r.name ?? r.id;
+    if (r.state !== "running" && r.state !== "stopped" && r.state !== "error") fail(409, wrongState(r));
+    if ((await this.ctx.storage.get<string>("revokedNode")) === p.node) fail(410, removedMessage(p.name));
+    if (!this.hasDisk(r)) fail(409, `${name} has never started on node ${p.name}, so it has no disk to fork yet; resume it, then fork it`);
+    const running = r.state === "running";
+    if (running) this.touch();
+    const t0 = Date.now();
+    const point = `${r.id}-fork-${t0}`;
+    let out: Record<string, unknown>;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        out = await this.nodeOp("commit", { sandbox: r.id, point }, SAVE_TIMEOUT_MS);
+        break;
+      } catch (e) {
+        const { status, message: why } = errorStatus(e);
+        // Lost on the way (500: the node's object restarted; 503: its
+        // connection broke or reconnected), not refused: ask again.
+        const lost = status === 500 || (status === 503 && !/offline/.test(why));
+        if (!lost || attempt >= 4 || Date.now() - t0 > SAVE_TIMEOUT_MS) throw e;
+        console.log(`[${r.id}] the commit of ${point} on node ${p.node} wasn't answered (${why}); asking again`);
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+    }
+    const image = typeof out.image === "string" && out.image === `cloudex-fork/${p.node}:${point}` ? out.image : null;
+    if (!image) fail(502, `node ${p.name}'s agent didn't say which image it committed ${name} to`);
+    console.log(`[${r.id}] committed ${out.bytes} bytes on node ${p.node} for a fork in ${Date.now() - t0} ms (${running ? `paused ${out.tookMs} ms` : "stopped"})`);
+    if (running) this.touch();
+    return {
+      sandbox: r.id,
+      node: { id: p.node, name: p.name, image },
+      settings: await this.ctx.storage.get<StoredSettings>("settings"),
+      ...(await this.madeOn()),
+    };
   }
 
   async get(): Promise<SandboxRecord> {
@@ -2243,7 +2308,7 @@ export class Sandbox extends DurableObject<Env> {
   // An op on this sandbox's node, through its Node object. A node that's
   // offline answers 503 naming it (and is noted, for the alarm); one that was
   // removed, 410.
-  private async nodeOp(name: "create" | "start" | "stop" | "delete" | "streams" | "directEnd", args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  private async nodeOp(name: "create" | "start" | "stop" | "delete" | "streams" | "directEnd" | "commit", args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
     const p = this.onNode!.placement;
     if ((await this.ctx.storage.get<string>("revokedNode")) === p.node) fail(410, removedMessage(p.name));
     try {
@@ -2277,23 +2342,41 @@ export class Sandbox extends DurableObject<Env> {
     // A new run: no direct session of the last one is open, and the ssh keys
     // it added are added again when asked for (v0.2.3).
     await this.ctx.storage.delete(["directSessions", "directKeys"]);
-    const made = await this.nodeOp(
-      "create",
-      {
-        sandbox: r.id,
-        ...(this.env.NODE_IMAGE ? { image: this.env.NODE_IMAGE } : {}),
-        ...(p.cpus !== undefined ? { cpus: p.cpus } : {}),
-        ...(p.memoryMb !== undefined ? { memoryMb: p.memoryMb } : {}),
-        ...(hold ? { hold: true } : {}),
-      },
-      // The agent waits up to a minute for its first self-test after it starts.
-      120_000,
-    );
+    const create = (image: string | undefined) =>
+      this.nodeOp(
+        "create",
+        {
+          sandbox: r.id,
+          ...(image ? { image } : {}),
+          ...(p.cpus !== undefined ? { cpus: p.cpus } : {}),
+          ...(p.memoryMb !== undefined ? { memoryMb: p.memoryMb } : {}),
+          ...(hold ? { hold: true } : {}),
+        },
+        // The agent waits up to a minute for its first self-test after it starts.
+        120_000,
+      );
+    // A fork's machine comes from its fork image (v0.2.3 M5) while that's on
+    // the node; once it's gone (its other forks deleted, or swept), a machine
+    // that has to be made again starts from the deployment's image.
+    let made: Record<string, unknown>;
+    let forkGone = false;
+    try {
+      made = await create(p.image ?? this.env.NODE_IMAGE);
+    } catch (e) {
+      // A fork's first start needs its image: it never falls back.
+      if (!p.image || r.startedAt === null || !/the fork image .* is gone/.test(errorStatus(e).message)) throw e;
+      forkGone = true;
+      const { image: _, ...rest } = p;
+      await this.ctx.storage.put("node", rest);
+      this.place(rest);
+      made = await create(this.env.NODE_IMAGE);
+    }
     const answer = await this.nodeOp("start", { sandbox: r.id, ...(hold ? { hold: true } : {}) }, 150_000);
     const address = typeof answer.address === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(answer.address) ? answer.address : null;
     if (!address) fail(502, `node ${p.name}'s agent didn't say where the machine is`);
-    if (address !== p.address) {
-      const next = { ...p, address };
+    const cur = this.onNode!.placement; // without its image, if that's gone
+    if (address !== cur.address) {
+      const next = { ...cur, address };
       await this.ctx.storage.put("node", next);
       this.place(next);
     }
@@ -2303,7 +2386,12 @@ export class Sandbox extends DurableObject<Env> {
     this.onNode!.ca = ca;
     // Its machine was removed outside Cloudex since it last ran.
     if (made.created === true && r.startedAt !== null) {
-      await this.update({ notice: `Its machine was gone from node ${p.name}, so it started over from the image, without its files.` });
+      await this.update({
+        notice:
+          p.image && !forkGone
+            ? `Its machine was gone from node ${p.name}, so it started over from the disk it was forked with, without the changes since.`
+            : `Its machine was gone from node ${p.name}, so it started over from the image, without its files.`,
+      });
     }
   }
 

@@ -481,8 +481,8 @@ class Cloudex:
         of Cloudflare, with cpus (from 0.25) and memory_mb (from 512), at most
         the node's own; by default the size's. The node must be online and
         pass its isolation self-test, and an own-only token can't use a node
-        whose isolation is plain Docker. On a node, stop keeps the disk there;
-        forks aren't available there yet (save it, then start_from_save).
+        whose isolation is plain Docker. On a node, stop keeps the disk there,
+        and its forks are made on the same node.
         """
         body = _drop_none(
             name=name, size=size, idleMinutes=idle_minutes, env=env, files=files, repo=repo, node=node, cpus=cpus, memoryMb=memory_mb
@@ -994,6 +994,8 @@ class Sandbox:
         name: Optional[str] = None,
         size: Optional[str] = None,
         idle_minutes: Optional[int] = None,
+        cpus: Optional[float] = None,
+        memory_mb: Optional[int] = None,
     ) -> List["Sandbox"]:
         """Makes sandboxes (1 to 10) that start from a copy of this one's whole disk.
 
@@ -1001,8 +1003,12 @@ class Sandbox:
         count above 1, name is the start of <name>-1, <name>-2 and so on.
         Size and idle minutes default to this sandbox's. Forks that failed to
         start come back in state "error"; resume() tries again.
+
+        A sandbox on a node is forked on that node: a running one pauses while
+        its disk is copied there. cpus and memory_mb (for those only) default
+        to this sandbox's; size doesn't apply.
         """
-        body = _drop_none(name=name, count=count, size=size, idleMinutes=idle_minutes)
+        body = _drop_none(name=name, count=count, size=size, idleMinutes=idle_minutes, cpus=cpus, memoryMb=memory_mb)
         return [Sandbox(self._client, info) for info in self._client._call("POST", self._path("/fork"), body)]
 
     def save(self, name: str) -> Save:

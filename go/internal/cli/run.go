@@ -265,9 +265,6 @@ func (r *runner) start(ctx context.Context, spec runSpec, env map[string]string)
 	}
 	req := api.ForkRequest{Name: spec.name, Count: 1, Size: spec.size, IdleMinutes: idle, Node: spec.on}
 	var list []api.Sandbox
-	if !isSave && spec.on != "" {
-		return nil, fmt.Errorf("%s is a sandbox, and forks can't start on a node: save it (cloudex save %s <name>), then use --from <name> --on %s", ref, ref, spec.on)
-	}
 	if isSave {
 		r.say("starting a sandbox from the save %s", ref)
 		list, err = r.client.StartFromSave(ctx, ref, req)

@@ -298,33 +298,40 @@ function Links(props: { box: Sandbox }) {
 
 function ForkAndSave(props: { box: Sandbox; me: Me }) {
   const [forkName, setForkName] = useState("");
+  const [count, setCount] = useState(1);
   const [saveName, setSaveName] = useState(props.box.name ?? "");
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const node = onNode(props.box);
+  // On a node (v0.2.3) a stopped sandbox's disk is there to copy too.
+  const canFork = props.box.state === "running" || (node && (props.box.state === "stopped" || props.box.state === "error"));
   return (
     <section class="card">
-      <h2>{onNode(props.box) ? "Save" : "Fork and save"}</h2>
+      <h2>Fork and save</h2>
       <p class="muted small">
-        {onNode(props.box)
-          ? "A named save is a copy of this sandbox's disk, kept to start new sandboxes from, on Cloudflare or a node. Forks aren't available on nodes yet."
+        {node
+          ? "A fork is a new sandbox on this node with a copy of this one's disk; a running sandbox pauses while it's copied. A named save is a copy kept to start new sandboxes from, on Cloudflare or a node."
           : "A fork is a new sandbox with a copy of this one's disk. A named save is a copy kept to start new sandboxes from."}
       </p>
-      {onNode(props.box) ? null : (
-        <div class="row">
-          <input placeholder="name of the fork (optional)" value={forkName} onInput={(e) => setForkName(e.currentTarget.value.trim())} />
-          <Act
-            run={async () => {
-              const made = await post<Sandbox[]>(`${sb(props.box.id)}/fork`, forkName ? { name: forkName } : {});
-              navigate(`/s/${made[0]!.name ?? made[0]!.id}`);
-            }}
-            onError={setError}
-            busy="Forking…"
-            disabled={props.box.state !== "running"}
-          >
-            Fork
-          </Act>
-        </div>
-      )}
+      <div class="row">
+        <input placeholder="name of the fork (optional)" value={forkName} onInput={(e) => setForkName(e.currentTarget.value.trim())} />
+        <select value={String(count)} onChange={(e) => setCount(Number(e.currentTarget.value))} aria-label="how many forks">
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+            <option value={String(n)}>{n === 1 ? "1 fork" : `${n} forks`}</option>
+          ))}
+        </select>
+        <Act
+          run={async () => {
+            const made = await post<Sandbox[]>(`${sb(props.box.id)}/fork`, { ...(forkName ? { name: forkName } : {}), count });
+            navigate(made.length === 1 ? `/s/${made[0]!.name ?? made[0]!.id}` : "/");
+          }}
+          onError={setError}
+          busy="Forking…"
+          disabled={!canFork}
+        >
+          Fork
+        </Act>
+      </div>
       {props.me.ownOnly ? null : (
         <div class="row">
           <input placeholder="save name" value={saveName} onInput={(e) => setSaveName(e.currentTarget.value.trim())} />

@@ -88,6 +88,19 @@ export const NodeDirect = z.object({
 });
 export type NodeDirect = z.infer<typeof NodeDirect>;
 
+// Fork images on a node (v0.2.3 M5): how many, the space they hold (as Docker
+// counts each one's own), how Docker keeps images there (overlay2, or the
+// containerd store, which commits about 5 times slower and keeps an image
+// about twice), and how many seconds a commit takes per GiB a sandbox has
+// written, for which a running original is paused.
+export const NodeForks = z.object({
+  images: z.number().int().min(0).max(1_000_000),
+  gb: z.number().min(0).max(1_000_000),
+  store: z.enum(["overlay2", "containerd", "other"]),
+  secPerGb: z.number().min(0).max(100_000),
+});
+export type NodeForks = z.infer<typeof NodeForks>;
+
 // What the agent reports about its host. Unknown sizes are null.
 export const NodeFacts = z.object({
   arch: z.enum(["amd64", "arm64"]),
@@ -98,6 +111,7 @@ export const NodeFacts = z.object({
   diskFreeGb: z.number().min(0).max(1_000_000).nullable(),
   image: NodeImage.optional(),
   direct: NodeDirect.optional(), // v0.2.3; an older agent has none
+  forks: NodeForks.optional(), // v0.2.3; an older agent has none
 });
 export type NodeFacts = z.infer<typeof NodeFacts>;
 
@@ -145,6 +159,9 @@ export const Node = z.object({
   // TLS certificate carries (cloudex doctor pins it); absent before it joins
   // and once it's removed.
   publicKey: z.string().optional(),
+  // GET /v1/nodes/{node} only (v0.2.3): its fork images, as the agent last
+  // reported them; absent for an agent older than v0.2.3.
+  forks: NodeForks.optional(),
 });
 export type Node = z.infer<typeof Node>;
 
@@ -263,8 +280,13 @@ export type NodeMessage = z.infer<typeof NodeMessage>;
 // - selftest: run the isolation self-test now; answers {pass, failed, checks, tookMs}.
 // v0.2.3 adds directEnd {sandbox, sessions}: close those direct sessions, and
 // refuse their tickets if they haven't been used yet (the token that asked for
-// them has ended); answers {ended: the number closed}.
-export const NodeOpName = z.enum(["ping", "facts", "streams", "create", "start", "stop", "delete", "selftest", "directEnd"]);
+// them has ended); answers {ended: the number closed}. And (M5) commit
+// {sandbox, point}: commit the machine's disk, running (paused for the copy)
+// or stopped, into the fork image cloudex-fork/<node>:<point>; answers
+// {image, id, bytes, tookMs, paused, layers}. It may take minutes; the same
+// point asked again gets the same image, or waits for the commit under way.
+// create's image may then name that fork image.
+export const NodeOpName = z.enum(["ping", "facts", "streams", "create", "start", "stop", "delete", "selftest", "directEnd", "commit"]);
 export type NodeOpName = z.infer<typeof NodeOpName>;
 export const NodeOp = z.object({
   type: z.literal("op"),

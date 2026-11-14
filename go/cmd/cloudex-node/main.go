@@ -236,7 +236,7 @@ func newRoot() *cobra.Command {
 	status.Flags().DurationVar(&wait, "wait", 0, "wait this long for the connection and the self-test's result")
 	status.Flags().Int64Var(&since, "since", 0, "with --wait, count only a self-test from this time on (unix ms)")
 
-	root.AddCommand(join, run, status, newProbe(state), newFirewall(), newPickPool(), newSelfTest(state, &dockerSocket), newCA(state), newRelay(), newDirectAddrs())
+	root.AddCommand(join, run, status, newProbe(state), newFirewall(), newPickPool(), newSelfTest(state, &dockerSocket), newForks(state, &dockerSocket), newCA(state), newRelay(), newDirectAddrs())
 	return root
 }
 

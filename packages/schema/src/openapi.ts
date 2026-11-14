@@ -233,8 +233,8 @@ export function openapi(version: string) {
             "online (503 otherwise, naming it and when it was last seen) and pass its isolation self-test; an own-only " +
             "token can't use a node whose isolation is plain Docker (403). cpus and memoryMb go only with node. On a " +
             "node, in this version: stopping keeps the disk on the node (no save or backup), there's no 6-hour limit, " +
-            "named saves, agents, provider keys and the cloudex command inside work, and forks, sizes and backups " +
-            "aren't available (501 for a fork, 400 for a size or a backup).",
+            "named saves, agents, provider keys, the cloudex command inside and forks (on the same node) work, and " +
+            "sizes and backups aren't available (400).",
           requestBody: body("CreateSandbox", false),
           responses: { 201: sandbox },
         }),
@@ -279,9 +279,11 @@ export function openapi(version: string) {
         post: op("forkSandbox", "Make sandboxes that start from a copy of this one's disk", {
           description:
             "A running sandbox is saved first and keeps running. Forks that fail to start are " +
-            "returned in state error, with the reason; resuming one tries again. Not available for a sandbox on a " +
-            "node (501); and forks can't be made on a node (node, cpus and memoryMb are a 400): save the sandbox, " +
-            "then start sandboxes from the save there (startFromSave).",
+            "returned in state error, with the reason; resuming one tries again. A fork stays where its original's " +
+            "disk is: for a sandbox on a node, on that node, from an image its agent commits there (a running " +
+            "original pauses while its disk is copied); node may name only that node, cpus and memoryMb default to " +
+            "the original's, and size is a 400. For a sandbox on Cloudflare, node, cpus and memoryMb are a 400: " +
+            "save the sandbox, then start sandboxes from the save on a node (startFromSave).",
           requestBody: body("ForkRequest", false),
           responses: { 201: ok("The forks", { type: "array", items: ref("Sandbox") }) },
         }),

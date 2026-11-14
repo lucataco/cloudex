@@ -68,6 +68,8 @@ type Facts struct {
 	// Direct is absent from agents older than v0.2.3, and an older Worker
 	// drops it.
 	Direct *DirectFact `json:"direct,omitempty"`
+	// Forks: the node's fork images (v0.2.3 M5); absent from older agents.
+	Forks *ForkFact `json:"forks,omitempty"`
 }
 
 // Machine is a sandbox's container on this node, as the agent sees it.

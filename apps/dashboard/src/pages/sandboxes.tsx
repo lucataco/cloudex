@@ -208,7 +208,7 @@ function NewSandbox(props: { onMade: (s: Sandbox) => void }) {
           machine is root on that host if code escapes the container. Use it only for code you trust.
         </p>
       ) : null}
-      {node ? <p class="muted small">On a node, a stopped sandbox keeps its disk there. Forks aren't available on nodes yet: save a sandbox, then start new ones from the save.</p> : null}
+      {node ? <p class="muted small">On a node, a stopped sandbox keeps its disk there, and its forks are made there too.</p> : null}
       {saves.data?.find((v) => v.name === from)?.node ? (
         <p class="note small">
           The save {from} was made on node {saves.data.find((v) => v.name === from)!.node!.name}: it holds whatever that node put in it. Treat it like code from

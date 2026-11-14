@@ -54,7 +54,6 @@ func TestNewRefusesNodeFlagsThatDontGoTogether(t *testing.T) {
 	for _, args := range [][]string{
 		{"new", "--cpus", "2"},
 		{"new", "--memory", "4G"},
-		{"new", "--from", "base", "--cpus", "2"},
 		{"new", "--on", "box", "--memory", "4"},
 	} {
 		code, _, errOut := run(t, args...)
@@ -187,7 +186,7 @@ func TestDoctorWarnsAboutNodesWithoutFailing(t *testing.T) {
 func TestAnOfflineNodeOrSomethingNotOnNodesYetIsNoBugToReport(t *testing.T) {
 	withFakeAPI(t, map[string]string{
 		"POST /v1/sandboxes/n1/exec": `!503 {"error":"node box is offline (last seen 2026-11-11 14:02 UTC)"}`,
-		"POST /v1/sandboxes/n1/fork": `!501 {"error":"forks aren't available for a sandbox on a node yet; copy what you need with cloudex cp, or start a new sandbox on the node"}`,
+		"POST /v1/sandboxes/n1/fork": `!400 {"error":"a fork of n1 stays on node box, where its disk is; to start a copy elsewhere, save it (cloudex save n1 <save>), then cloudex new --from <save> [--on <node>]"}`,
 		"POST /v1/sandboxes/n1/stop": `!503 {"error":"the deployment's storage didn't answer"}`,
 	})
 	for _, args := range [][]string{{"exec", "n1", "--", "true"}, {"fork", "n1"}} {
@@ -200,7 +199,7 @@ func TestAnOfflineNodeOrSomethingNotOnNodesYetIsNoBugToReport(t *testing.T) {
 	}
 }
 
-// v0.2.2 M6: a save starts on a node, and says where it was made; a fork can't.
+// v0.2.2 M6: a save starts on a node, and says where it was made.
 func TestNewFromASaveOnANode(t *testing.T) {
 	saved := strings.Replace(saveJSON, `"ms":`, `"node":{"id":"nd-aaaaaaaa","name":"box"},"ms":`, 1)
 	f := withFakeAPI(t, map[string]string{
@@ -216,15 +215,37 @@ func TestNewFromASaveOnANode(t *testing.T) {
 	}
 }
 
-func TestNewFromASandboxOnANodeRefuses(t *testing.T) {
-	f := withFakeAPI(t, map[string]string{"GET /v1/sandboxes/web": sandboxJSON})
-	code, _, errOut := run(t, "new", "--from", "web", "--on", "box")
-	if code == 0 || !strings.Contains(errOut, "forks can't start on a node") {
-		t.Fatalf("code %d, stderr %q", code, errOut)
+// v0.2.3 M5: a fork of a sandbox on a node stays there, says so, and says
+// that a running original pauses while its disk is copied, and how long per GiB.
+func TestForkOfASandboxOnANode(t *testing.T) {
+	fork := strings.NewReplacer(`"cx-nnn111"`, `"cx-fff111"`, `"name":"n1"`, `"name":"n1-f"`).Replace(nodeSandboxJSON("running", "online", true, "sysbox"))
+	f := withFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/n1":       nodeSandboxJSON("running", "online", true, "sysbox"),
+		"GET /v1/nodes/nd-abcd1234":  `{"id":"nd-abcd1234","name":"box","state":"online","createdAt":1,"lastSeenAt":1,"machines":1,"revokedAt":null,"forks":{"images":0,"gb":0,"store":"containerd","secPerGb":12.5}}`,
+		"POST /v1/sandboxes/n1/fork": "!201 [" + fork + "]",
+	})
+	code, out, errOut := run(t, "fork", "n1", "--name", "n1-f", "--cpus", "2", "--memory", "2G", "--no-use")
+	if code != 0 || !strings.Contains(out, "n1-f is running on node box (2 CPUs, 2.0 GiB), a fork of n1") {
+		t.Fatalf("code %d, stdout %q, stderr %q", code, out, errOut)
 	}
-	for _, r := range f.requests {
-		if strings.HasPrefix(r, "POST") {
-			t.Fatalf("sent %v", f.requests)
+	for _, want := range []string{"on node box, where its disk is", "paused while its disk is copied (about 12.5 s per GiB it has written, on this node's containerd image store)", "stop it first"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("no %q in %q", want, errOut)
 		}
+	}
+	if got := f.bodies[len(f.bodies)-1]; got != `{"name":"n1-f","count":1,"cpus":2,"memoryMb":2048}` {
+		t.Fatalf("body %s", got)
+	}
+	// new --from <sandbox> --on <node> is the API's to check now.
+	f = withFakeAPI(t, map[string]string{
+		"GET /v1/sandboxes/n1":       nodeSandboxJSON("stopped", "online", true, "sysbox"),
+		"POST /v1/sandboxes/n1/fork": `!400 {"error":"a fork of n1 stays on node box, where its disk is"}`,
+	})
+	code, _, errOut = run(t, "new", "--from", "n1", "--on", "far")
+	if code == 0 || !strings.Contains(errOut, "stays on node box") || f.bodies[len(f.bodies)-1] != `{"count":1,"node":"far"}` {
+		t.Fatalf("code %d, stderr %q, bodies %v", code, errOut, f.bodies)
+	}
+	if strings.Contains(errOut, "paused") {
+		t.Fatalf("a stopped original doesn't pause: %q", errOut)
 	}
 }

@@ -76,7 +76,7 @@ import { readTicket } from "./nodestream";
 import { notFromDashboard, readSession, sessionCookie, sessionName } from "./session";
 import { hostLink, hostLinks, newMethod, onError, portParam, revokeLinks } from "./http";
 import { deleteKey, keyRefusal, listKeys, setKey } from "./keys";
-import { NO_SUCH_SANDBOX, type ForkSource, type NodeChoice } from "./sandbox";
+import { NO_SUCH_SANDBOX, forkStays, type ForkSource, type NodeChoice } from "./sandbox";
 import { type SaveManifest, deleteSave, getSave, listSaves, readManifest } from "./saves";
 import {
   LINK_HEADER,
@@ -598,20 +598,40 @@ function startCopies(
   );
 }
 
-// Forks (see ForkRequest), which all start from the same save, at the same time.
+// Forks (see ForkRequest), which all start from the same save, at the same
+// time. A fork of a sandbox on a node (v0.2.3 M5) starts on that node, from
+// the image its agent commits there, placed as a new sandbox on it is: for
+// the caller, who owns the forks.
 app.post("/v1/sandboxes/:ref/fork", async (c) => {
   const body = await c.req.text();
   const input = ForkRequest.parse(body ? JSON.parse(body) : {});
-  if (input.node || input.cpus !== undefined || input.memoryMb !== undefined) {
-    fail(400, "a fork starts where Cloudflare keeps its disk snapshots, so not on a node: save the sandbox (cloudex save), then start sandboxes from the save on the node (cloudex new --from <save> --on <node>)");
-  }
   const ref = c.req.param("ref");
-  const names = await copyNames(c.env, input);
   const { stub } = await sandbox(c.env, ref);
   const original = await stub.get();
+  const name = original.name ?? original.id;
+  const pl = original.placement;
+  const on = pl?.provider === "node" && pl.node ? { ...pl, node: pl.node } : null;
+  let place: Awaited<ReturnType<typeof placeOnNode>> = { hint: null };
+  if (!on) {
+    if (input.node || input.cpus !== undefined || input.memoryMb !== undefined) {
+      fail(400, `${forkStays(name, "on Cloudflare")}. Forks are made on a node only from a sandbox on that node (cpus and memoryMb go with those)`);
+    }
+  } else {
+    if (input.node && input.node !== on.node.id && input.node !== on.node.name) fail(400, forkStays(name, `on node ${on.node.name}`));
+    if (input.size) fail(400, `sizes are for Cloudflare: ${name} runs on node ${on.node.name}, so its forks do too; give cpus and memoryMb instead`);
+    // Checked before the commit: an offline node is a 503 that names it, an
+    // own-only token on a plain-Docker node a 403 (placement.ts).
+    place = await placeOnNode(c.env, c.get("who"), {
+      node: on.node.id,
+      cpus: input.cpus ?? on.cpus,
+      memoryMb: input.memoryMb ?? on.memoryMb,
+      size: original.size,
+    });
+  }
+  const names = await copyNames(c.env, input);
   const from = await newMethod(ref, stub.forkPoint());
-  const opts = { size: input.size ?? original.size, idleMinutes: input.idleMinutes ?? original.idleMinutes };
-  return c.json(await startCopies(c.env, c.get("who"), names, opts, original.id, from), 201);
+  const opts = { size: on ? original.size : (input.size ?? original.size), idleMinutes: input.idleMinutes ?? original.idleMinutes };
+  return c.json(await startCopies(c.env, c.get("who"), names, opts, original.id, from, undefined, place), 201);
 });
 
 // Named saves (saves.ts): made from a running sandbox, which keeps running;
@@ -835,7 +855,8 @@ async function live(env: Env, n: ApiNode, details: false | "some" | "all" = fals
     const out: ApiNode = { ...n, state: s.online ? "online" : "offline", lastSeenAt: s.lastSeenAt ?? n.lastSeenAt };
     if (!details) return out;
     const image = s.hello?.facts.image;
-    const more = { ...out, ...(image ? { image } : {}), ...(s.clockSkewSec !== null ? { clockSkewSec: s.clockSkewSec } : {}) };
+    const forks = s.hello?.facts.forks;
+    const more = { ...out, ...(image ? { image } : {}), ...(forks ? { forks } : {}), ...(s.clockSkewSec !== null ? { clockSkewSec: s.clockSkewSec } : {}) };
     // Machines of other users' sandboxes are for admins only (2026-11-12 review, W5).
     if (details !== "all") return more;
     const mine = new Set(await sandboxesOnNode(env.DB, n.id));

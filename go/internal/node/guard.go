@@ -142,6 +142,11 @@ func (r *Runtime) checkDisk(ctx context.Context, w *diskWatch) {
 			continue
 		}
 		note := fmt.Sprintf("Docker's disk on this node had %.1f GB free, under its floor of %.0f GB, and this machine had written the most (%.1f GB). Free space on the host, or delete files in the sandbox after resuming it.", free, floor, float64(c.SizeRw)/1e9)
+		// Fork images (v0.2.3) aren't machines, so stopping one never frees
+		// them: say what they hold.
+		if gb := r.forkGB(); gb > 1 {
+			note += fmt.Sprintf(" Fork images on this node hold %.1f GB more; each goes when the last sandbox forked from it is deleted.", gb)
+		}
 		if err := r.stopFor(ctx, id, c.ID, note); err != nil {
 			r.logf("the disk watchdog: %v", err)
 			return

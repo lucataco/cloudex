@@ -127,8 +127,8 @@ func newNewCmd(opts *options) *cobra.Command {
 			"With --on, it runs on one of your nodes (see cloudex node) instead of Cloudflare,\n" +
 			"with --cpus and --memory as its machine's limits there. A sandbox on a node keeps\n" +
 			"its disk there when it stops, and has no 6-hour limit. --on goes with --from a\n" +
-			"named save, which moves a sandbox between Cloudflare and a node; forks aren't\n" +
-			"available on nodes yet.",
+			"named save, which moves a sandbox between Cloudflare and a node. A fork of a\n" +
+			"sandbox on a node stays on that node, where --cpus and --memory set its limits.",
 		Example: "  cloudex new --name my-box\n" +
 			"  cloudex new --on box --cpus 2 --memory 4G --name n1\n" +
 			"  cloudex new --repo https://github.com/you/app --env GH_TOKEN=$(gh auth token) --env-file .env\n" +
@@ -138,11 +138,9 @@ func newNewCmd(opts *options) *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			settingsFlags := len(envPairs)+len(envFiles)+len(files) > 0 || repo != ""
-			if on == "" && (cmd.Flags().Changed("cpus") || cmd.Flags().Changed("memory")) {
+			// With --from a sandbox on a node, they set its forks' limits there.
+			if on == "" && from == "" && (cmd.Flags().Changed("cpus") || cmd.Flags().Changed("memory")) {
 				return errors.New("--cpus and --memory go with --on: on Cloudflare, pick a --size instead")
-			}
-			if on == "" && from != "" && (cmd.Flags().Changed("cpus") || cmd.Flags().Changed("memory")) {
-				return errors.New("--cpus and --memory go with --on")
 			}
 			if from != "" && settingsFlags {
 				return errors.New("--env, --env-file, --file and --repo don't go with --from: the new sandboxes get the settings of the sandbox or save; change them after with cloudex env set")
@@ -152,18 +150,9 @@ func newNewCmd(opts *options) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if on != "" {
-					req.Node = on
-					if cmd.Flags().Changed("cpus") {
-						req.CPUs = &cpus
-					}
-					if cmd.Flags().Changed("memory") {
-						mb, err := parseMemory(mem)
-						if err != nil {
-							return err
-						}
-						req.MemoryMB = &mb
-					}
+				req.Node = on
+				if err := nodeLimits(cmd, &req, cpus, mem); err != nil {
+					return err
 				}
 				return runNewFrom(cmd, opts, from, req, noUse)
 			}
@@ -248,8 +237,8 @@ func newNewCmd(opts *options) *cobra.Command {
 	cmd.Flags().Var(durationFlag{&idle}, "idle", "stop after this long without activity, such as 30m or 2h; 0 never stops it on a node, and waits for the 6-hour platform limit on Cloudflare")
 	cmd.Flags().BoolVar(&noUse, "no-use", false, "don't make it the current sandbox")
 	cmd.Flags().StringVar(&on, "on", "", "run it on this node (your own Docker host; see cloudex node) instead of Cloudflare")
-	cmd.Flags().Float64Var(&cpus, "cpus", 0, "with --on: its CPUs, such as 0.5 or 4 (default the size's: 1)")
-	cmd.Flags().StringVar(&mem, "memory", "", "with --on: its memory, such as 4G or 512M (default the size's: 6G, at most half the node's)")
+	cmd.Flags().Float64Var(&cpus, "cpus", 0, "with --on, or --from a sandbox on a node: its CPUs, such as 0.5 or 4 (default the size's: 1, or the original's)")
+	cmd.Flags().StringVar(&mem, "memory", "", "with --on, or --from a sandbox on a node: its memory, such as 4G or 512M (default the size's: 6G, at most half the node's, or the original's)")
 	cmd.Flags().StringVar(&from, "from", "", "start from a copy of this sandbox's disk (a fork), or from this named save")
 	cmd.Flags().IntVar(&count, "count", 1, fmt.Sprintf("with --from, how many sandboxes to start, up to %d", maxForks))
 	cmd.Flags().StringArrayVar(&envPairs, "env", nil, "NAME=VALUE: an environment variable (repeatable)")

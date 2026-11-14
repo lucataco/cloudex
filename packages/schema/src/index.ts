@@ -168,8 +168,11 @@ export type SandboxSettings = z.infer<typeof SandboxSettings>;
 // With count above 1 and a name, the forks are named <name>-1, <name>-2 and so
 // on. Size and idle minutes default to the original's.
 // node, cpus and memoryMb (v0.2.2 M6): start them on that node, as
-// CreateSandbox does; only from a named save (POST /v1/saves/{name}/sandboxes),
-// since forks are made from Cloudflare's disk snapshots.
+// CreateSandbox does, from a named save (POST /v1/saves/{name}/sandboxes).
+// A fork of a sandbox on a node (v0.2.3 M5) stays on that node: its disk is
+// committed there, paused while it's copied if it runs; node may only name
+// that node, size is refused, and cpus and memoryMb default to the
+// original's. A fork of a sandbox on Cloudflare stays on Cloudflare.
 export const ForkRequest = z.object({
   name: Name.optional(),
   count: z.number().int().min(1).max(10).default(1),
