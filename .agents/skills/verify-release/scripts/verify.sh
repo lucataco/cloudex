@@ -802,6 +802,10 @@ node_m3() {
 	in_m() { "$CX" exec "$NM" -- "$1" 2>/dev/null; }
 	ssh_cfg=$work/ssh_config_m
 	"$CX" ssh-config >"$ssh_cfg" 2>/dev/null
+	# These are the Worker path's checks: since v0.2.3 ssh to a node it can
+	# reach goes direct (the direct part, N57-N66, checks that).
+	local CLOUDEX_DIRECT=off
+	export CLOUDEX_DIRECT
 
 	# N09: exec's semantics, and the round trip.
 	cx exec "$NM" -- 'echo out-$((6*7)); echo err >&2; exit 3'
@@ -2131,7 +2135,7 @@ wait_gone() {
 	done
 	since "$t0"
 }
-D64="" DPORT=""
+D64="" D64_RAN="" DPORT=""
 
 node_direct() {
 	local SD=$P-d SDID DMC cfg dinfo dstate daddrs dport binds lsn wild
@@ -2140,8 +2144,16 @@ node_direct() {
 		direct_skip "the node reports no direct port (installed with --direct off, or an agent older than v0.2.3)" "N57 N58 N59 N60 N61 N62 N63 N64 N65"
 		return
 	fi
-	cx new --on "$N" --name "$SD" --no-use
-	SDID=$(field .id)
+	# The checks before may have left a self-test running (the review's
+	# firewall checks restart it): machines wait for it.
+	for _ in $(seq 1 18); do
+		cx new --on "$N" --name "$SD" --no-use
+		SDID=$(field .id)
+		[[ $CODE == 0 && -n $SDID ]] && break
+		has "$ERR" "finished its isolation self-test" || break
+		"$CX" delete "$SD" --yes >/dev/null 2>&1
+		sleep 10
+	done
 	if [[ $CODE != 0 || -z $SDID ]]; then
 		direct_skip "couldn't make a sandbox on the node: ${ERR:0:200}" "N57 N58 N59 N60 N61 N62 N63 N64 N65"
 		return
@@ -2390,6 +2402,7 @@ node_direct() {
 		stopcmd=$(since "$t64")
 		g64b=$(wait_gone "$pid64" 60)
 		kill "$pid64" 2>/dev/null
+		D64_RAN=1
 		D64="revoked token's session ($c64a) ended ${g64a:-NOT within 150} s after the revoke; stopped sandbox's session ($c64b) ended ${g64b:-NOT within 60} s after stop returned (stop took $stopcmd s)"
 		D64_OK=$([ -n "$(grep '^chose direct' <<<"$c64a")" -a -n "$(grep '^chose direct' <<<"$c64b")" -a -n "$g64a" -a -n "$g64b" ] &&
 			[ "$(awk -v a="${g64a:-999}" -v b="${g64b:-999}" 'BEGIN { print (a <= 90 && b <= 10) }')" = 1 ] && echo yes)
@@ -2626,14 +2639,14 @@ if want node; then
 			r35="without --force: code $CODE, ${ERR:0:120}"
 			# N64's last part: a direct session to that sandbox ends with node rm --force, and the port closes.
 			local_pid64="" c64c=""
-			if [[ $parts == *" direct "* && -n $DPORT ]] && direct_client; then
+			if [[ -n $D64_RAN ]]; then
 				CLOUDEX_DIRECT=only CLOUDEX_DEBUG=1 "$CX" ssh "$P-n5r" -- -N </dev/null >/dev/null 2>"$work/d64c.log" &
 				local_pid64=$!
 				sleep 8
 				c64c=$(chose "$work/d64c.log")
 			fi
 			cx node rm "$N" --yes --force
-			if [[ $parts == *" direct "* && -n $DPORT ]]; then
+			if [[ -n $D64_RAN || ( -n $DPORT && $parts == *" direct "* && ! ${VERIFY_NODE_DIRECT:-} == 1 ) ]]; then
 				g64c=""
 				[[ -n $local_pid64 ]] && g64c=$(wait_gone "$local_pid64" 30)
 				[[ -n $local_pid64 ]] && kill "$local_pid64" 2>/dev/null
@@ -2651,7 +2664,7 @@ if want node; then
 					skip N64 "$(direct_desc N64)" "the sessions need VERIFY_NODE_DIRECT=1; node rm --force left $p64 listening on :$DPORT and $sc64 sidecars"
 				fi
 			else
-				direct_skip "not in VERIFY_NODE_PARTS, or no direct port" N64
+				direct_skip "the direct part didn't run (not in VERIFY_NODE_PARTS, no direct port, or no sandbox for it)" N64
 			fi
 			sleep 2
 			st=$(node_state "$N")
