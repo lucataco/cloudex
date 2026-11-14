@@ -91,8 +91,11 @@ func newDirectAddrs() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			for _, a := range node.ChooseDirectAddrs(ifs) {
-				fmt.Fprintln(cmd.OutOrStdout(), a)
+			// The addresses on stdout, for the installer; what each is on
+			// stderr, which it shows (review D-L1).
+			for _, a := range node.ChooseDirectAddrsWhy(ifs) {
+				fmt.Fprintln(cmd.OutOrStdout(), a.Addr)
+				fmt.Fprintf(cmd.ErrOrStderr(), "  %s on %s (%s)\n", a.Addr, a.Iface, a.Kind)
 			}
 			return nil
 		},

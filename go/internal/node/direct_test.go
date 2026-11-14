@@ -214,8 +214,17 @@ func TestChooseDirectAddrs(t *testing.T) {
 		{Name: "veth99", Up: true, Addrs: pf("10.9.9.9/24")},
 		{Name: "tailscale0", Up: true, Addrs: pf("100.124.24.58/32", "fd7a:115c:a1e0::58/128")},
 		{Name: "enp3s0", Up: true, Addrs: pf("10.0.0.7/8")},
+		// Review D-L1: carrier-grade NAT on a WAN, a Docker network in
+		// 100.64/10, and VPN tunnels aren't the LAN or the tailnet.
+		{Name: "wan0", Up: true, Addrs: pf("100.72.1.9/10")},
+		{Name: "br-cgnat", Up: true, Addrs: pf("100.80.0.1/16")},
+		{Name: "wg0", Up: true, Addrs: pf("10.66.0.2/24")},
+		{Name: "tun0", Up: true, Addrs: pf("172.27.0.6/24")},
+		{Name: "zt5u4abc", Up: true, Addrs: pf("192.168.192.4/24")},
+		{Name: "wt0", Up: true, Addrs: pf("100.90.1.2/16")},
+		{Name: "tailscale1", Up: true, Addrs: pf("100.101.0.1/32")},
 	})
-	want := "100.124.24.58 10.0.0.7 192.168.1.20"
+	want := "100.101.0.1 100.124.24.58 10.0.0.7 192.168.1.20"
 	var s []string
 	for _, a := range got {
 		s = append(s, a.String())

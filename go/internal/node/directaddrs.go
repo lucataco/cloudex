@@ -18,45 +18,72 @@ type Iface struct {
 }
 
 // skipIfaces are interfaces that aren't the host's own LAN: Docker's
-// bridges and veths, the machine networks, other container and VM bridges.
-var skipIfaces = []string{"docker", "br-", "veth", "cx", "cloudex", "virbr", "lxcbr", "incusbr", "cni", "flannel", "kube"}
+// bridges and veths, the machine networks, other container and VM bridges,
+// and (review D-L1) VPN and overlay tunnels, whose peers aren't the user's
+// LAN: WireGuard, OpenVPN and other tun/tap, ZeroTier, PPP, NetBird, Nebula.
+// --direct-addr still names an address on any of them.
+var skipIfaces = []string{"docker", "br-", "veth", "cx", "cloudex", "virbr", "lxcbr", "incusbr", "cni", "flannel", "kube", "wg", "tun", "tap", "zt", "ppp", "wt", "nebula"}
+
+// tailnetIfaces are Tailscale's interfaces (tailscale0, or another name it
+// was given that starts so). 100.64/10 elsewhere is carrier-grade NAT on a
+// WAN, a Docker network, or another overlay: not the tailnet.
+var tailnetIfaces = []string{"tailscale"}
+
+func hasPrefix(name string, ps []string) bool {
+	for _, p := range ps {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// DirectAddr is an address ChooseDirectAddrs took, and why.
+type DirectAddr struct {
+	Addr  netip.Addr
+	Iface string
+	Kind  string // tailnet or lan
+}
 
 // ChooseDirectAddrs is the installer's --direct auto (`cloudex-node
-// direct-addrs`, run with --network host): the RFC 1918 IPv4 addresses of
-// up, non-loopback interfaces that aren't a bridge or veth of Docker, the
-// machines or another container runtime, and every 100.64/10 address (a
-// tailnet's), whatever its interface. Tailnet addresses come first, then the
-// LAN's, each sorted, at most DirectAddrsMax.
+// direct-addrs`, run with --network host): the 100.64/10 IPv4 addresses on
+// Tailscale's interface, then the RFC 1918 IPv4 addresses of up,
+// non-loopback interfaces that aren't a bridge or veth of Docker, the
+// machines or another container runtime, nor a VPN tunnel (review D-L1),
+// each sorted, at most DirectAddrsMax.
 func ChooseDirectAddrs(ifs []Iface) []netip.Addr {
-	var ts, lan []netip.Addr
+	var out []netip.Addr
+	for _, a := range ChooseDirectAddrsWhy(ifs) {
+		out = append(out, a.Addr)
+	}
+	return out
+}
+
+// ChooseDirectAddrsWhy is ChooseDirectAddrs with each address's interface.
+func ChooseDirectAddrsWhy(ifs []Iface) []DirectAddr {
+	var ts, lan []DirectAddr
 	seen := map[netip.Addr]bool{}
 	for _, i := range ifs {
-		if !i.Up || i.Loopback {
+		if !i.Up || i.Loopback || hasPrefix(i.Name, skipIfaces) {
 			continue
 		}
-		skip := false
-		for _, p := range skipIfaces {
-			if strings.HasPrefix(i.Name, p) {
-				skip = true
-			}
-		}
+		tailnet := hasPrefix(i.Name, tailnetIfaces)
 		for _, p := range i.Addrs {
 			a := p.Addr().Unmap()
 			if !a.Is4() || seen[a] {
 				continue
 			}
 			switch {
-			case direct.IsTailscale(a) && direct.Usable(a):
-				ts = append(ts, a)
+			case tailnet && direct.IsTailscale(a) && direct.Usable(a):
+				ts = append(ts, DirectAddr{a, i.Name, "tailnet"})
 				seen[a] = true
-			case skip:
-			case direct.Private(a):
-				lan = append(lan, a)
+			case !tailnet && direct.Private(a):
+				lan = append(lan, DirectAddr{a, i.Name, "lan"})
 				seen[a] = true
 			}
 		}
 	}
-	less := func(l []netip.Addr) { sort.Slice(l, func(i, j int) bool { return l[i].Less(l[j]) }) }
+	less := func(l []DirectAddr) { sort.Slice(l, func(i, j int) bool { return l[i].Addr.Less(l[j].Addr) }) }
 	less(ts)
 	less(lan)
 	out := append(ts, lan...)

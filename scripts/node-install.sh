@@ -88,7 +88,7 @@ Options:
   --block CIDR          another IPv4 range machines may not reach (repeatable)
   --keep-free-gb N      keep this much free on Docker's disk: below it, the machine that wrote the most is stopped (default 5)
   --disk-gb N           cap each machine's disk at N GB where Docker's storage driver can (btrfs, zfs, overlay2 on xfs with pquota)
-  --direct auto|off     the direct port for ssh from your LAN or tailnet (default auto: this host's private and tailnet IPv4 addresses)
+  --direct auto|off     the direct port for ssh from your LAN or tailnet (default auto: this host's tailnet IPv4 on tailscale*, and private IPv4 on interfaces that aren't bridges or VPN tunnels; printed before use)
   --direct-addr IP      publish the direct port on exactly this private (RFC 1918) or tailnet (100.64/10) address (repeatable)
   --direct-port N       the direct port (default 7022)
   --unisolated          testing only, without root: no firewall
@@ -326,8 +326,12 @@ main() {
 	# with the new addresses when the agent is replaced.
 	ours=$(docker port "$SIDECAR" 2>/dev/null | awk '{print $3}' || true)
 	if [[ $DIRECT == auto ]]; then
+		# The addresses on stdout; what each is on stderr, shown here, so that
+		# whoever installs sees which networks can reach the port (review D-L1).
+		say "choosing the direct port's addresses (tailnet on tailscale*, private on LAN interfaces; not bridges or VPN tunnels):"
 		mapfile -t DIRECT_ADDRS < <(docker run --rm --network host "$AGENT_IMAGE" direct-addrs)
 		[[ ${#DIRECT_ADDRS[@]} -gt 0 ]] || { warn "no private or tailnet IPv4 address here for the direct port: ssh goes through the deployment (--direct-addr names one)"; DIRECT=off; }
+		[[ $DIRECT == off ]] || say "  if one of these is a network you don't trust (a cloud VPC, a shared LAN), run again with --direct-addr IP for each you want, or --direct off"
 	fi
 	if [[ $DIRECT != off ]]; then
 		for a in "${DIRECT_ADDRS[@]}"; do
