@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -226,6 +227,23 @@ func (b *ForkBook) Update(point string, change func(*ForkRecord)) {
 	change(&rec)
 	f.Points[point] = rec
 	b.write(f)
+}
+
+// ForgetUnchanged drops points whose record is still the one in seen (read
+// earlier, without the lock held since): a record written meanwhile, by
+// this process or another, stays.
+func (b *ForkBook) ForgetUnchanged(seen map[string]ForkRecord, points ...string) {
+	defer b.lock()()
+	f := b.read()
+	n := len(f.Points)
+	for _, p := range points {
+		if cur, ok := f.Points[p]; ok && reflect.DeepEqual(cur, seen[p]) {
+			delete(f.Points, p)
+		}
+	}
+	if len(f.Points) != n {
+		b.write(f)
+	}
 }
 
 // Forget drops points.
@@ -575,6 +593,13 @@ func (r *Runtime) SweepForks(ctx context.Context, minAge time.Duration) int {
 }
 
 func (r *Runtime) sweepForks(ctx context.Context, minAge time.Duration) int {
+	// The book before the images (2026-11-14 re-review 4): a commit that
+	// finishes after the listing then has no record here to be forgotten as
+	// "image gone"; and only records still as they were are forgotten.
+	var book map[string]ForkRecord
+	if r.Forks != nil {
+		book = r.Forks.All()
+	}
 	imgs, err := r.Docker.Images(ctx, r.labels(LabelRole+"=fork")...)
 	if err != nil {
 		r.logf("the fork sweep: listing images: %v", err)
@@ -595,10 +620,6 @@ func (r *Runtime) sweepForks(ctx context.Context, minAge time.Duration) int {
 		busy[p] = true
 	}
 	r.forkMu.Unlock()
-	var book map[string]ForkRecord
-	if r.Forks != nil {
-		book = r.Forks.All()
-	}
 	present := map[string]bool{}
 	for _, i := range imgs {
 		present[i.Labels[LabelPoint]] = true
@@ -616,7 +637,7 @@ func (r *Runtime) sweepForks(ctx context.Context, minAge time.Duration) int {
 		stale = append(stale, p)
 	}
 	if len(stale) > 0 && r.Forks != nil {
-		r.Forks.Forget(stale...)
+		r.Forks.ForgetUnchanged(book, stale...)
 	}
 	sort.Slice(imgs, func(i, j int) bool { return imgs[i].Created > imgs[j].Created })
 	removed := 0
@@ -628,6 +649,9 @@ func (r *Runtime) sweepForks(ctx context.Context, minAge time.Duration) int {
 				continue
 			}
 			at := time.Unix(i.Created, 0)
+			if _, ok := book[p]; !ok && now.Sub(at) < 2*CommitTimeout {
+				continue // made after the book was read: a commit just finished
+			}
 			if rec, ok := book[p]; ok {
 				if rec.State == "committing" && now.Sub(time.UnixMilli(rec.At)) < 2*CommitTimeout {
 					continue

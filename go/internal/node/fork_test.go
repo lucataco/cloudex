@@ -492,3 +492,34 @@ func TestForkBookAcrossProcesses(t *testing.T) {
 		t.Fatalf("%d of 200 records kept", n)
 	}
 }
+
+// Re-review 4: the sweep read the images, then the book; a commit that
+// finished in between had its fresh record forgotten as "image gone". Now a
+// record written after the sweep's read stays, and an image with no record
+// in that read is left alone while it's young.
+func TestTheSweepKeepsARecordWrittenMeanwhile(t *testing.T) {
+	r, _ := forkRuntime(t)
+	p := "cx-orig01-fork-1731600000020"
+	seen := r.Forks.All()
+	r.Forks.Put(p, ForkRecord{State: "done", Image: "sha256:x", Waiting: 1, At: time.Now().UnixMilli()})
+	r.Forks.ForgetUnchanged(seen, p)
+	if _, ok := r.Forks.Get(p); !ok {
+		t.Fatal("a record written after the sweep's read was forgotten")
+	}
+	old := r.Forks.All()
+	r.Forks.ForgetUnchanged(old, p)
+	if _, ok := r.Forks.Get(p); ok {
+		t.Fatal("an unchanged record wasn't forgotten")
+	}
+	// A fresh fork image whose record the sweep didn't see isn't swept, even at age 0.
+	ctx := context.Background()
+	info, err := r.CommitForks(ctx, "cx-orig01", "cx-orig01-fork-1731600000021", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.forkMade(info.Image, "cx-fork21")
+	r.Forks.Forget("cx-orig01-fork-1731600000021") // as if the sweep's read came before the commit's record
+	if n := r.SweepForks(ctx, 0); n != 0 {
+		t.Fatalf("swept %d: a fork image just committed", n)
+	}
+}
