@@ -64,6 +64,9 @@ const (
 	directRelayRecheckGap  = 2 * time.Second
 )
 
+// DirectOffWhy is the direct fact's error on a node installed with --direct off.
+const DirectOffWhy = "turned off on this node (installed with --direct off)"
+
 // directEndMax bounds a directEnd's list: the most sessions a Sandbox object
 // keeps (direct.ts SESSIONS_KEPT).
 const directEndMax = 4 * direct.SessionsMax

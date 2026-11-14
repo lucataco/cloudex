@@ -229,9 +229,15 @@ export async function revokeNode(db: D1Database, id: string, now = Date.now()) {
 
 // A node as a caller may see it: other users' sandbox ids (orphans, pending
 // deletes) and the agent's round trip are for admins (2026-11-12 review, W5).
+// What a caller who isn't an admin sees of a node: not other users' sandbox
+// ids, the round trip (2026-11-12 review, W5), nor its direct port and LAN
+// and tailnet addresses (2026-11-14 review, D-L3): a read token, or one that
+// sees only its own sandboxes (CI running a PR's code), had every node's
+// network layout. A user gets the addresses of a sandbox's node, with a
+// ticket, from GET /v1/sandboxes/{ref}/direct, which needs write on it.
 export function nodeView(n: Node, admin: boolean): Node {
   if (admin) return n;
-  const { orphans: _o, pendingDeletes: _p, rttMs: _r, ...rest } = n;
+  const { orphans: _o, pendingDeletes: _p, rttMs: _r, direct: _d, ...rest } = n;
   return rest;
 }
 

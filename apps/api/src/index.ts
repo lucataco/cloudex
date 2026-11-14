@@ -882,7 +882,8 @@ app.post("/v1/nodes", async (c) => {
 // it, without asking the objects: the dashboard polls that way, since an
 // object kept busy drops its node's socket a few minutes after each deploy.
 app.get("/v1/nodes", async (c) => {
-  const rows = await listNodeRows(c.env.DB);
+  const admin = me(c.get("who")).role === "admin";
+  const rows = (await listNodeRows(c.env.DB)).map((n) => nodeView(n, admin));
   if (["0", "false"].includes(c.req.query("live") ?? "")) return c.json(rows);
   return c.json(await Promise.all(rows.map((n) => live(c.env, n))));
 });

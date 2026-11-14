@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/lucataco/cloudex/go/internal/direct"
 	"io"
 	"log"
 	"math/rand/v2"
@@ -262,6 +263,10 @@ func (a *Agent) facts() Facts {
 	}
 	if a.Direct != nil {
 		f.Direct = a.Direct.Fact()
+	} else if a.Runtime != nil {
+		// Installed with --direct off: say so, as node info shows "off"
+		// while the listener waits for its secret.
+		f.Direct = &DirectFact{Port: direct.Port, Addrs: []string{}, State: "off", Error: DirectOffWhy}
 	}
 	return f
 }

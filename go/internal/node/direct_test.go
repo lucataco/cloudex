@@ -110,8 +110,10 @@ func TestEndRefusesUnusedTickets(t *testing.T) {
 	c := claims(now.Add(time.Minute))
 	a, b := net.Pipe()
 	defer b.Close()
+	d.mu.Lock()
 	d.sessions["1111111111111111"] = &directSession{id: "1111111111111111", sandbox: c.Sandbox, conn: a}
 	d.sessions["2222222222222222"] = &directSession{id: "2222222222222222", sandbox: "cx-other1", conn: a}
+	d.mu.Unlock()
 	n := d.End(DirectEnd{Sandbox: c.Sandbox, Sessions: []string{"1111111111111111", "2222222222222222", c.Session}})
 	if n != 1 {
 		t.Fatalf("closed %d sessions; want only the one of that sandbox", n)
@@ -678,9 +680,11 @@ func TestDirectSharesOfTheLimits(t *testing.T) {
 	d2 := testDirect(now, 0)
 	a, b := net.Pipe()
 	defer b.Close()
+	d2.mu.Lock()
 	for i := 0; i < DirectTokenSessionsMax; i++ {
 		d2.sessions[fmt.Sprintf("%016x", i)] = &directSession{id: fmt.Sprintf("%016x", i), sandbox: fmt.Sprintf("cx-sb%04d", i), token: "tk-greedy01", conn: a}
 	}
+	d2.mu.Unlock()
 	c2 := claims(now.Add(time.Minute))
 	c2.Sandbox, c2.Token = "cx-new001", "tk-greedy01"
 	if _, why := d2.open(c2, a); !strings.Contains(why, "this token has") {

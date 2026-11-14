@@ -121,3 +121,20 @@ func TestNodeRmAsksFirstAndPassesForce(t *testing.T) {
 		t.Fatalf("--force: %d %q %q, queries %v", code, out, errOut, queries)
 	}
 }
+
+// The Direct line: addresses and state; "off" with its reason when the node
+// was installed with --direct off (review polish: it showed nothing then).
+func TestNodeInfoDirectLine(t *testing.T) {
+	for _, c := range []struct{ direct, want string }{
+		{`{"port":7022,"addrs":["192.168.65.2"],"state":"listening"}`, "Direct       192.168.65.2:7022 (listening)"},
+		{`{"port":7022,"addrs":["192.168.65.2"],"state":"off","error":"waiting for the deployment's secret"}`, "Direct       192.168.65.2:7022 (off): waiting for the deployment's secret"},
+		{`{"port":7022,"addrs":[],"state":"off","error":"turned off on this node (installed with --direct off)"}`, "Direct       off: turned off on this node (installed with --direct off)"},
+		{`{"port":7022,"addrs":[],"state":"failed","error":"published on a public address"}`, "Direct       port 7022 (failed): published on a public address"},
+	} {
+		withFakeAPI(t, map[string]string{"GET /v1/nodes/box": strings.Replace(node(0), `"revokedAt":null`, `"revokedAt":null,"direct":`+c.direct, 1)})
+		code, out, errOut := run(t, "node", "info", "box")
+		if code != 0 || !strings.Contains(out, c.want) {
+			t.Fatalf("code %d, stdout %q, stderr %q; want %q", code, out, errOut, c.want)
+		}
+	}
+}

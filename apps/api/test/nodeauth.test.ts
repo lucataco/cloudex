@@ -287,14 +287,26 @@ test("the install command names edge for anything but a release, and pins the di
   assert.doesNotMatch(c.split("sudo")[1]!, /cxj_t|--token/);
 });
 
-test("only admins see a node's orphans, pending deletes and round trip", () => {
-  const n = { id: "nd-aaaa1111", name: "box", orphans: ["cx-aaa111"], pendingDeletes: ["cx-bbb222"], rttMs: 40, state: "online" } as never;
+test("only admins see a node's orphans, pending deletes, round trip and direct addresses", () => {
+  const direct = { port: 7022, addrs: ["192.168.1.20", "100.124.24.58"], state: "listening" };
+  const n = { id: "nd-aaaa1111", name: "box", orphans: ["cx-aaa111"], pendingDeletes: ["cx-bbb222"], rttMs: 40, state: "online", direct, publicKey: "KEY" } as never;
   assert.deepEqual(nodes.nodeView(n, true), n);
   const seen = nodes.nodeView(n, false) as Record<string, unknown>;
   assert.equal(seen.orphans, undefined);
   assert.equal(seen.pendingDeletes, undefined);
   assert.equal(seen.rttMs, undefined);
+  // Review D-L3: the LAN and tailnet addresses and port are for admins.
+  assert.equal(seen.direct, undefined);
+  assert.equal(seen.publicKey, "KEY", "the key is public");
   assert.equal(seen.name, "box");
+});
+
+test("review D-L3: GET /v1/nodes and /v1/nodes/{node} go through nodeView", () => {
+  const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+  const list = src.slice(src.indexOf('app.get("/v1/nodes", '), src.indexOf('app.get("/v1/nodes/:node", '));
+  assert.match(list, /nodeView\(n, admin\)/);
+  const one = src.slice(src.indexOf('app.get("/v1/nodes/:node", '));
+  assert.match(one.slice(0, one.indexOf("});")), /nodeView\(n, admin\)/);
 });
 
 test("facts are checked again before they reach D1", async () => {

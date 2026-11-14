@@ -196,10 +196,14 @@ func printNode(cmd *cobra.Command, n *api.Node) error {
 			eps = append(eps, clean(net.JoinHostPort(a, strconv.Itoa(d.Port))))
 		}
 		v := strings.Join(eps, ", ")
-		if v == "" {
-			v = fmt.Sprintf("port %d", d.Port)
+		switch {
+		case v == "" && d.State == "off":
+			v = "off"
+		case v == "":
+			v = fmt.Sprintf("port %d (%s)", d.Port, clean(d.State))
+		default:
+			v += " (" + clean(d.State) + ")"
 		}
-		v += " (" + clean(d.State) + ")"
 		if d.Error != "" {
 			v += ": " + clean(d.Error)
 		}

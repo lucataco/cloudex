@@ -143,7 +143,7 @@ export interface NodeInfo {
   pendingDeletes?: string[];
   /** Nodes.get only: its agent's clock less the deployment's at its last connect, in seconds. */
   clockSkewSec?: number;
-  /** Its direct path, as its agent last reported it; absent for an agent older than v0.2.3. */
+  /** Its direct path, as its agent last reported it; absent for an agent older than v0.2.3, and unless the caller is an admin. */
   direct?: NodeDirect;
   /** Its Ed25519 public key in base64, which its direct port's TLS certificate carries; absent before it joins and once removed. */
   publicKey?: string;

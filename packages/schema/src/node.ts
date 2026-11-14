@@ -153,7 +153,8 @@ export const Node = z.object({
   // last connect, in seconds (more than 60 either way is refused).
   clockSkewSec: z.number().int().optional(),
   // v0.2.3: the node's direct path as its agent last reported it; absent for
-  // an agent older than v0.2.3.
+  // an agent older than v0.2.3, and for callers who aren't admins (its LAN
+  // and tailnet addresses; a user gets a sandbox's from GET .../direct).
   direct: NodeDirect.optional(),
   // v0.2.3: the node's Ed25519 public key in base64, what its direct port's
   // TLS certificate carries (cloudex doctor pins it); absent before it joins
