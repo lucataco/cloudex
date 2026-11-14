@@ -282,3 +282,25 @@ func TestTheDirectMessagesMatchTheFixture(t *testing.T) {
 		t.Fatal("directEnd for something that isn't a sandbox")
 	}
 }
+
+// Review D-note: the node key signs request strings, its certificate and TLS
+// 1.3 CertificateVerify content (64 spaces first); a method that isn't an
+// uppercase token is never signed, so no request string starts with a space.
+func TestSignOnlyMethodTokens(t *testing.T) {
+	_, key, _ := ed25519.GenerateKey(nil)
+	s := Signer{Key: key, Node: "nd-abcd1234"}
+	for _, m := range []string{"GET", "POST", "DELETE"} {
+		h := http.Header{}
+		s.Sign(h, m, "/v1/node/x", "")
+		if h.Get(HeaderSig) == "" {
+			t.Fatalf("%s wasn't signed", m)
+		}
+	}
+	for _, m := range []string{"", strings.Repeat(" ", 64) + "TLS 1.3, server CertificateVerify", "get", "GET /x", "G\nET", strings.Repeat("A", 17)} {
+		h := http.Header{}
+		s.Sign(h, m, "/v1/node/x", "")
+		if h.Get(HeaderSig) != "" {
+			t.Fatalf("%q was signed", m)
+		}
+	}
+}
