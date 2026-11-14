@@ -773,7 +773,15 @@ app.get("/v1/sandboxes/:ref/direct", async (c) => {
   const base = { sandbox: id, provider: "node" as const, node: { id: row.node, name: row.name ?? row.node }, publicKey: row.publicKey, direct };
   if (!direct) return c.json({ ...base, ticket: null, expiresAt: null } satisfies DirectAnswer);
   const who = c.get("who");
-  const t = await stub.direct({ node: row.node, publicKey: row.publicKey, port: q.data.port, key: q.data.key ?? null, tokenId: who.kind === "token" ? who.token.id : null });
+  let t: { ticket: string; expiresAt: number };
+  try {
+    t = await stub.direct({ node: row.node, publicKey: row.publicKey, port: q.data.port, key: q.data.key ?? null, tokenId: who.kind === "token" ? who.token.id : null });
+  } catch (e) {
+    // An object still running the code from before a deploy (busy ones keep
+    // it for minutes) has no direct(): the Worker path, then.
+    if (/does not implement|not a function/i.test(errorStatus(e).message)) return c.json({ ...base, direct: null, ticket: null, expiresAt: null } satisfies DirectAnswer);
+    throw e;
+  }
   return c.json({ ...base, ticket: t.ticket, expiresAt: t.expiresAt } satisfies DirectAnswer);
 });
 
