@@ -406,10 +406,22 @@ func TestConcurrentCommitsCountEachOthersCopies(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "another fork being copied now") {
 		t.Fatalf("the second commit while the first is under way: %v", err)
 	}
+	// Re-review 7: a new machine during the copy counts it too (13 GB would
+	// pass the floor of 10 alone; less the 8 GB being copied, it doesn't).
+	r.FreeSpace = func() float64 { return 13 }
+	if err := r.roomForMachine(); err == nil || !strings.Contains(err.Error(), "a fork being copied now") {
+		t.Fatalf("a create during the copy: %v", err)
+	}
+	r.FreeSpace = func() float64 { return 20 - float64(committed.Load())*8 }
 	close(hold)
 	if err := <-first; err != nil {
 		t.Fatalf("the first commit: %v", err)
 	}
+	r.FreeSpace = func() float64 { return 13 }
+	if err := r.roomForMachine(); err != nil {
+		t.Fatalf("a create after the copy, with 13 GB free: %v", err)
+	}
+	r.FreeSpace = func() float64 { return 20 - float64(committed.Load())*8 }
 	if len(r.reserved) != 0 {
 		t.Fatalf("reservations left: %v", r.reserved)
 	}

@@ -483,6 +483,17 @@ func (r *Runtime) reserveCommit(point, sandbox string, expected int64) (release 
 	}, nil
 }
 
+// reservedGB is what the commits under way expect to take, in GB.
+func (r *Runtime) reservedGB() float64 {
+	r.forkMu.Lock()
+	defer r.forkMu.Unlock()
+	var b int64
+	for _, x := range r.reserved {
+		b += x
+	}
+	return float64(b) / 1e9
+}
+
 // ErrForkImageGone starts the error create gives for a fork image that's
 // gone; the Worker then starts the sandbox from the base image.
 const ErrForkImageGone = "the fork image"

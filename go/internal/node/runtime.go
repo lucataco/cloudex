@@ -438,8 +438,8 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 		}
 		image = id
 	}
-	if gb := r.FreeGB(); gb >= 0 && gb < r.minFree() {
-		return nil, fmt.Errorf("Docker's disk on this node has %.1f GB free; new machines need %.0f", gb, r.minFree())
+	if err := r.roomForMachine(); err != nil {
+		return nil, err
 	}
 	if have, err := r.Docker.HasImage(ctx, image); err != nil {
 		return nil, err
@@ -484,6 +484,23 @@ func (r *Runtime) Create(ctx context.Context, req MachineRequest) (*MachineInfo,
 		r.forkMade(req.Image, req.Sandbox)
 	}
 	return &MachineInfo{Address: n.Machine.String(), Container: n.Name, State: "stopped", Created: true}, nil
+}
+
+// roomForMachine says whether Docker's disk leaves the floor for a new
+// machine, counting what the fork copies under way will take (2026-11-14
+// re-review 7: a create during a commit could take the node under it).
+func (r *Runtime) roomForMachine() error {
+	gb := r.FreeGB()
+	if gb < 0 {
+		return nil
+	}
+	if gb < r.minFree() {
+		return fmt.Errorf("Docker's disk on this node has %.1f GB free; new machines need %.0f", gb, r.minFree())
+	}
+	if res := r.reservedGB(); gb-res < r.minFree() {
+		return fmt.Errorf("Docker's disk on this node has %.1f GB free, but a fork being copied now will take about %.1f GB of it; new machines need %.0f. Try again when the copy finishes", gb, res, r.minFree())
+	}
+	return nil
 }
 
 func (r *Runtime) describe(c *ContainerDetail, sandbox string) *MachineInfo {
