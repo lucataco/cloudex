@@ -118,12 +118,19 @@ func (f *FakeAgent) directLines(ctx context.Context) {
 					rep["ok"], rep["sandbox"] = true, sb
 				}
 			}
+		case "report":
+			// report <sandbox> <tk-…,tk-…>: a report naming those tokens, as a
+			// misbehaving node could send (the re-review's check of 3).
+			sb, list, _ := strings.Cut(arg, " ")
+			r := NewDirectReport(sb, f.sessions(sb), false, strings.Split(list, ",")...)
+			send = &r
+			rep["ok"], rep["tokens"] = true, len(r.Tokens)
 		case "active":
 			r := f.reportOf(arg, true)
 			send = &r
 			rep["ok"] = true
 		default:
-			rep["error"] = "lines are open <ticket>, open-quiet <ticket> (no report), close <session> or active <sandbox>"
+			rep["error"] = "lines are open <ticket>, open-quiet <ticket> (no report), close <session>, active <sandbox> or report <sandbox> <tokens,…>"
 		}
 		f.dmu.Unlock()
 		if send != nil {
