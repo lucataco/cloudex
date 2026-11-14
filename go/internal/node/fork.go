@@ -134,11 +134,28 @@ type forkFile struct {
 	SecPerGB float64 `json:"secPerGb,omitempty"`
 }
 
-// ForkBook is forks.json. Without a path (tests) it lives in memory.
+// ForkBook is forks.json. Without a path (tests) it lives in memory. Each
+// read and change holds a lock file beside it as well as mu, since a
+// hand-run `cloudex-node forks --sweep` changes it from another process
+// (review F-L2: its read-modify-write could undo the agent's).
 type ForkBook struct {
 	Path string
 	mu   sync.Mutex
 	mem  *forkFile
+}
+
+// lock holds mu and, with a path, the lock file; the caller defers unlock.
+func (b *ForkBook) lock() (unlock func()) {
+	b.mu.Lock()
+	if b.Path == "" {
+		return b.mu.Unlock
+	}
+	un, err := lockFile(b.Path + ".lock")
+	if err != nil {
+		// No lock file (a read-only volume): mu still orders this process.
+		return b.mu.Unlock
+	}
+	return func() { un(); b.mu.Unlock() }
 }
 
 // NewForkBook is the book in a state directory.
@@ -185,16 +202,14 @@ func (b *ForkBook) write(f *forkFile) error {
 
 // Get is a point's record.
 func (b *ForkBook) Get(point string) (ForkRecord, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	defer b.lock()()
 	r, ok := b.read().Points[point]
 	return r, ok
 }
 
 // Put records a point.
 func (b *ForkBook) Put(point string, rec ForkRecord) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	defer b.lock()()
 	f := b.read()
 	f.Points[point] = rec
 	return b.write(f)
@@ -202,8 +217,7 @@ func (b *ForkBook) Put(point string, rec ForkRecord) error {
 
 // Update changes a point's record, if there is one.
 func (b *ForkBook) Update(point string, change func(*ForkRecord)) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	defer b.lock()()
 	f := b.read()
 	rec, ok := f.Points[point]
 	if !ok {
@@ -216,8 +230,7 @@ func (b *ForkBook) Update(point string, change func(*ForkRecord)) {
 
 // Forget drops points.
 func (b *ForkBook) Forget(points ...string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	defer b.lock()()
 	f := b.read()
 	n := len(f.Points)
 	for _, p := range points {
@@ -230,22 +243,19 @@ func (b *ForkBook) Forget(points ...string) {
 
 // All is every point.
 func (b *ForkBook) All() map[string]ForkRecord {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	defer b.lock()()
 	return b.read().Points
 }
 
 // Rate is the measured seconds per GiB, 0 when there's none.
 func (b *ForkBook) Rate() float64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	defer b.lock()()
 	return b.read().SecPerGB
 }
 
 // measured folds a commit's speed into the node's measure.
 func (b *ForkBook) measured(secPerGB float64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	defer b.lock()()
 	f := b.read()
 	if f.SecPerGB == 0 {
 		f.SecPerGB = secPerGB

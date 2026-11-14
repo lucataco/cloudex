@@ -470,3 +470,25 @@ func TestAForkImageWaitsForForksNotMadeYet(t *testing.T) {
 		t.Fatalf("swept %d past ForkWaitMax", n)
 	}
 }
+
+// Review F-L2: forks.json is changed by the agent and by a hand-run
+// `cloudex-node forks --sweep`, each with its own book; neither undoes the
+// other's change.
+func TestForkBookAcrossProcesses(t *testing.T) {
+	dir := t.TempDir()
+	a, b := NewForkBook(dir), NewForkBook(dir)
+	var wg sync.WaitGroup
+	for i, book := range []*ForkBook{a, b} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				book.Put(fmt.Sprintf("cx-orig0%d-fork-17316000%05d", i, j), ForkRecord{State: "done"})
+			}
+		}()
+	}
+	wg.Wait()
+	if n := len(a.All()); n != 200 {
+		t.Fatalf("%d of 200 records kept", n)
+	}
+}

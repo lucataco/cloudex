@@ -16,7 +16,9 @@ import (
 // newForks lists this node's fork images (v0.2.3 M5) and, with --sweep,
 // removes those no machine uses, as the agent does every hour: for the
 // release checks (N70, N76) and for a host that needs the space now. Run in
-// the agent's container, with its state volume.
+// the agent's container, with its state volume. forks.json is locked
+// against the agent's own changes (review F-L2), and a point whose forks
+// haven't all been made is kept whatever --age says (F-L1).
 func newForks(state func() node.State, socket *string) *cobra.Command {
 	var sweep bool
 	var age time.Duration
