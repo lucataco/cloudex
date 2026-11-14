@@ -336,9 +336,11 @@ func (r *Runtime) commit(ctx context.Context, sandbox, point, ref string) (*Fork
 	if store == "containerd" {
 		expected *= 2 // a compressed blob and an unpacked snapshot (M0 Q4)
 	}
-	if gb := r.FreeGB(); gb >= 0 && gb-float64(expected)/1e9 < r.minFree() {
-		return nil, fmt.Errorf("Docker's disk on this node has %.1f GB free; a fork of %s needs about %.1f GB for its copy and %.0f GB left over. Free space on the host, or delete sandboxes or forks on the node", gb, sandbox, float64(expected)/1e9, r.minFree())
+	release, err := r.reserveCommit(point, sandbox, expected)
+	if err != nil {
+		return nil, err
 	}
+	defer release()
 	var env []string
 	for _, kv := range c.Config.Env {
 		k, _, _ := strings.Cut(kv, "=")
@@ -384,6 +386,38 @@ func (r *Runtime) commit(ctx context.Context, sandbox, point, ref string) (*Fork
 	r.logf("%s: committed fork point %s in %v (%s; %.2f GB written, image %.2f GB, %d layers, %s store)", sandbox, point, took.Round(10*time.Millisecond), what, float64(written)/1e9, float64(bytes)/1e9, layers, store)
 	r.changed()
 	return &ForkInfo{Image: ref, ID: id, Bytes: bytes, TookMs: took.Milliseconds(), Paused: running, Layers: layers}, nil
+}
+
+// reserveCommit checks that the node's free space, less what the commits
+// under way expect to take, leaves the floor after this one's copy, and
+// holds expected bytes for it until release. Two forks at once used to pass
+// the check each alone, and the node ended under its floor (review F-M1).
+func (r *Runtime) reserveCommit(point, sandbox string, expected int64) (release func(), err error) {
+	r.forkMu.Lock()
+	defer r.forkMu.Unlock()
+	var others int64
+	for _, b := range r.reserved {
+		others += b
+	}
+	if gb := r.FreeGB(); gb >= 0 && gb-float64(others+expected)/1e9 < r.minFree() {
+		if others > 0 && gb-float64(expected)/1e9 >= r.minFree() {
+			what := "another fork being copied now takes"
+			if len(r.reserved) > 1 {
+				what = fmt.Sprintf("%d other forks being copied now take", len(r.reserved))
+			}
+			return nil, fmt.Errorf("Docker's disk on this node has %.1f GB free, but %s about %.1f GB of it; a fork of %s needs about %.1f GB for its copy and %.0f GB left over. Try again when the copy under way finishes", gb, what, float64(others)/1e9, sandbox, float64(expected)/1e9, r.minFree())
+		}
+		return nil, fmt.Errorf("Docker's disk on this node has %.1f GB free; a fork of %s needs about %.1f GB for its copy and %.0f GB left over. Free space on the host, or delete sandboxes or forks on the node", gb, sandbox, float64(expected)/1e9, r.minFree())
+	}
+	if r.reserved == nil {
+		r.reserved = map[string]int64{}
+	}
+	r.reserved[point] = expected
+	return func() {
+		r.forkMu.Lock()
+		delete(r.reserved, point)
+		r.forkMu.Unlock()
+	}, nil
 }
 
 // ErrForkImageGone starts the error create gives for a fork image that's

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -41,6 +42,8 @@ type forkDocker struct {
 	commits int
 	lastCfg CommitConfig
 	n       int
+	// commitHook runs (once, outside the lock) before a commit is answered.
+	commitHook func()
 }
 
 func startForkDocker(t *testing.T) (*forkDocker, string) {
@@ -91,6 +94,15 @@ func (f *forkDocker) img(ref string) *fakeImg {
 }
 
 func (f *forkDocker) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" && r.URL.Path == "/commit" {
+		f.mu.Lock()
+		hook := f.commitHook
+		f.commitHook = nil
+		f.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, _ := url.PathUnescape(r.URL.EscapedPath())
@@ -355,5 +367,51 @@ func TestImageStoreFromDockerInfo(t *testing.T) {
 		if got := i.ImageStore(); got != want {
 			t.Fatalf("%v: %s, want %s", i, got, want)
 		}
+	}
+}
+
+// Review F-M1: two forks of different sandboxes at once, each fitting alone
+// (20 GB free, 8 GB each, a 10 GB floor), both passed the free-space check,
+// and the node ended at 4 GB. The second is refused while the first is
+// being copied, saying why; once the first is done its space is counted by
+// the disk itself.
+func TestConcurrentCommitsCountEachOthersCopies(t *testing.T) {
+	r, f := forkRuntime(t)
+	var committed atomic.Int64
+	r.FreeSpace = func() float64 { return 20 - float64(committed.Load())*8 }
+	f.mu.Lock()
+	f.ctrs["c-orig"].sizeRw = 8e9
+	f.ctrs["c-two"] = &fakeCtr{id: "c-two", image: "sha256:base", running: true, sizeRw: 8e9,
+		labels: map[string]string{LabelNode: forkNode, LabelSandbox: "cx-two002", LabelRole: "machine"}}
+	f.mu.Unlock()
+	// The first commit holds in Docker until released.
+	hold := make(chan struct{})
+	f.mu.Lock()
+	f.commitHook = func() { <-hold }
+	f.mu.Unlock()
+	first := make(chan error, 1)
+	go func() {
+		_, err := r.Commit(context.Background(), "cx-orig01", "cx-orig01-fork-1731500000000")
+		committed.Add(1)
+		first <- err
+	}()
+	waitFor(t, func() bool { r.forkMu.Lock(); defer r.forkMu.Unlock(); return len(r.reserved) == 1 })
+	_, err := r.Commit(context.Background(), "cx-two002", "cx-two002-fork-1731500000001")
+	if err == nil || !strings.Contains(err.Error(), "another fork being copied now") {
+		t.Fatalf("the second commit while the first is under way: %v", err)
+	}
+	close(hold)
+	if err := <-first; err != nil {
+		t.Fatalf("the first commit: %v", err)
+	}
+	if len(r.reserved) != 0 {
+		t.Fatalf("reservations left: %v", r.reserved)
+	}
+	// Now the disk itself says 12 GB free: the second doesn't fit, with the plain reason.
+	if _, err := r.Commit(context.Background(), "cx-two002", "cx-two002-fork-1731500000002"); err == nil || strings.Contains(err.Error(), "being copied") {
+		t.Fatalf("after the first: %v", err)
+	}
+	if r.FreeGB() < r.minFree() {
+		t.Fatalf("the node is under its floor: %.0f GB free", r.FreeGB())
 	}
 }

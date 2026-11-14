@@ -75,6 +75,9 @@ type Runtime struct {
 	noQuota bool              // the storage driver refused StorageOpt
 	forkMu  sync.Mutex
 	commits map[string]*commitRun // fork points being committed
+	// reserved is the disk each commit under way expects to take (bytes),
+	// which the next commit's free-space check counts as taken (review F-M1).
+	reserved map[string]int64
 }
 
 // MinFreeGB is the least free space on Docker's disk a new machine needs
