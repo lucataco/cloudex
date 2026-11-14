@@ -618,6 +618,35 @@ func (r *Runtime) Start(ctx context.Context, sandbox string, hold bool) (*Machin
 	return r.describe(c, sandbox), nil
 }
 
+// Reattach puts the agent back on each machine network it isn't on, at its
+// .2. When the installer runs again (an upgrade, or new direct addresses), it
+// replaces the agent's container and leaves the machines running; the new
+// container starts on cloudex-node alone, so until now a running machine
+// lost exec, ssh and cloudex.internal until it was stopped and started
+// (v0.2.3 M4, on cataco). The egress loop calls it every 30 s.
+func (r *Runtime) Reattach(ctx context.Context, nets map[string]MachineNet) {
+	if r.Self == "" || len(nets) == 0 {
+		return
+	}
+	self, err := r.Docker.ContainerInspect(ctx, r.Self)
+	if err != nil {
+		return
+	}
+	for id, n := range nets {
+		if _, ok := self.NetworkSettings.Networks[n.Name]; ok {
+			continue
+		}
+		r.mu.Lock()
+		err := r.Docker.NetworkConnect(ctx, n.Name, r.Self, n.Agent.String(), -1000)
+		r.mu.Unlock()
+		if err != nil {
+			r.logf("%s: joining its network again: %v", id, err)
+		} else {
+			r.logf("%s: joined its network again at %s (the agent's container was replaced)", id, n.Agent)
+		}
+	}
+}
+
 // attachSelf makes sure the agent is on the sandbox's network at .2.
 func (r *Runtime) attachSelf(ctx context.Context, sandbox string) error {
 	self, err := r.Docker.ContainerInspect(ctx, r.Self)

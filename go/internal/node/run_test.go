@@ -2,8 +2,16 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -79,5 +87,56 @@ func TestAStartGivesUpAtOnceOnAPlantedSh(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.cfg.Cmd[0] != "/bin/sh" {
 		t.Fatalf("ran %v", f.cfg.Cmd)
+	}
+}
+
+func TestReattachJoinsTheNetworksTheAgentLost(t *testing.T) {
+	// The installer replaced the agent's container: it is on cloudex-node
+	// and one machine network, and must join the other one again.
+	dir, err := os.MkdirTemp("", "cxd") // a unix socket's path must be short
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "d.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var joined []string
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/containers/cloudex-node/json"):
+			io.WriteString(w, `{"Id":"self","NetworkSettings":{"Networks":{"cloudex-node":{},"cloudex-cx-aaa111":{}}}}`)
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/connect"):
+			var b struct {
+				Container      string
+				EndpointConfig struct{ IPAMConfig struct{ IPv4Address string } }
+			}
+			json.NewDecoder(r.Body).Decode(&b)
+			mu.Lock()
+			joined = append(joined, r.URL.Path+" "+b.Container+" "+b.EndpointConfig.IPAMConfig.IPv4Address)
+			mu.Unlock()
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+	nets := map[string]MachineNet{}
+	for id, sub := range map[string]string{"cx-aaa111": "10.250.0.0/28", "cx-bbb222": "10.250.0.16/28"} {
+		n, err := NetFor(id, netip.MustParsePrefix(sub))
+		if err != nil {
+			t.Fatal(err)
+		}
+		nets[id] = n
+	}
+	r := &Runtime{Docker: &Docker{Socket: sock}, Self: "cloudex-node"}
+	r.Reattach(context.Background(), nets)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(joined) != 1 || !strings.HasSuffix(joined[0], "/networks/cloudex-cx-bbb222/connect cloudex-node "+nets["cx-bbb222"].Agent.String()) {
+		t.Fatalf("joined %v", joined)
 	}
 }

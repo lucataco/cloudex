@@ -562,6 +562,9 @@ func (a *Agent) egressLoop(ctx context.Context) {
 	for {
 		lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		nets, err := a.Runtime.MachineNets(lctx)
+		if err == nil {
+			a.Runtime.Reattach(lctx, nets)
+		}
 		cancel()
 		if err == nil {
 			a.egress.Sync(nets)

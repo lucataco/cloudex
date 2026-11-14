@@ -122,13 +122,13 @@ func TestEndRefusesUnusedTickets(t *testing.T) {
 }
 
 func TestClientAllowed(t *testing.T) {
-	gw := netip.MustParseAddr("172.18.0.1")
 	pool := netip.MustParsePrefix("10.250.0.0/16")
 	for a, ok := range map[string]bool{
 		"192.168.65.1": true, "100.80.14.76": true, "10.1.2.3": true,
-		"172.18.0.1": false, "10.250.3.3": false, "8.8.8.8": false, "127.0.0.1": false, "0.0.0.0": false, "169.254.1.1": false,
+		// The agent network's gateway: a tailnet client behind Tailscale's SNAT.
+		"172.18.0.1": true, "10.250.3.3": false, "8.8.8.8": false, "127.0.0.1": false, "0.0.0.0": false, "169.254.1.1": false,
 	} {
-		if err := ClientAllowed(netip.MustParseAddr(a), gw, pool); (err == nil) != ok {
+		if err := ClientAllowed(netip.MustParseAddr(a), pool); (err == nil) != ok {
 			t.Errorf("%s: %v", a, err)
 		}
 	}
@@ -371,10 +371,17 @@ func TestListenerRefusals(t *testing.T) {
 		}
 	}
 	// Clients the relay names that aren't allowed get nothing past the header.
-	for _, client := range []string{"172.18.0.1", "10.250.0.3", "8.8.8.8"} {
+	for _, client := range []string{"10.250.0.3", "8.8.8.8"} {
 		if _, err := r.connect(t, client, r.ticket("cx-abc123", port)); err == nil {
 			t.Errorf("client %s connected", client)
 		}
+	}
+	// The agent network's gateway is how Tailscale's SNAT shows a tailnet
+	// client: it gets a session with a good ticket.
+	if c, err := r.connect(t, "172.18.0.1", r.ticket("cx-abc123", port)); err != nil {
+		t.Errorf("a client at the gateway: %v", err)
+	} else {
+		c.Close()
 	}
 	// A line over 1 KiB.
 	raw, _ := net.Dial("tcp4", r.addr)

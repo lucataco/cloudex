@@ -31,9 +31,11 @@ import (
 //	        ──TLS 1.3 (the node key), "CXD1 <ticket>"──▶ "ok" ──▶ the machine's port
 //
 // The listener takes a TCP connection only from the sidecar's address, and a
-// client only from a private or tailnet address that isn't the agent
-// network's gateway (how a machine shows when it reaches the publish without
-// the firewall, M0 Q3) or in the machine pool. A ticket is the Worker's
+// client only from a private or tailnet address outside the machine pool. The
+// agent network's gateway is allowed: Tailscale's default SNAT (NoSNAT false)
+// masquerades every tailnet client of a Docker publish as it (v0.2.3 M4, on
+// cataco), and so does a machine's own network for a machine without the
+// firewall (M0 Q3), which the firewall keeps from the publish. A ticket is the Worker's
 // (go/internal/direct): its MAC under the secret that came in welcome, this
 // node, not expired by the Worker's clock, not seen before, a machine here
 // that runs. Sessions are reported to the Worker so that they count as
@@ -483,16 +485,15 @@ func (d *Direct) fromRelay(peer netip.Addr) bool {
 }
 
 // ClientAllowed is the rule for the client the relay names: private or
-// tailnet IPv4, not the agent network's gateway (a machine without the
-// firewall, M0 Q3, or another container of the host's), not in the machine
-// pool.
-func ClientAllowed(client, gateway netip.Addr, pool netip.Prefix) error {
+// tailnet IPv4, not in the machine pool. The agent network's gateway is
+// allowed (see the top): a tailnet client behind Tailscale's SNAT shows as
+// it, and can't be told from a machine that reaches the publish without the
+// firewall (--unisolated), which still needs a ticket.
+func ClientAllowed(client netip.Addr, pool netip.Prefix) error {
 	client = client.Unmap()
 	switch {
 	case !direct.Usable(client):
 		return errors.New("not a private or tailnet address")
-	case gateway.IsValid() && client == gateway:
-		return errors.New("the agent network's gateway: a machine or another container on this host")
 	case pool.IsValid() && pool.Contains(client):
 		return errors.New("inside the machine pool")
 	}
@@ -533,10 +534,13 @@ func (d *Direct) handle(c net.Conn) {
 	d.mu.Lock()
 	gw, pool := d.gateway, d.Pool
 	d.mu.Unlock()
-	if err := ClientAllowed(cl.Addr(), gw, pool); err != nil {
+	if err := ClientAllowed(cl.Addr(), pool); err != nil {
 		d.logf("refused %s: %v", cl, err)
 		c.Close()
 		return
+	}
+	if gw.IsValid() && cl.Addr() == gw {
+		d.debugf("client %s is the agent network's gateway: behind the host's NAT (Tailscale's SNAT), or a machine without the firewall", cl)
 	}
 	d.mu.Lock()
 	if d.perClient[cl.Addr()] >= DirectPerClientMax {
