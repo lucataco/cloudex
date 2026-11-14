@@ -176,6 +176,15 @@ main() {
 		# The agent first, so that it can't make the sidecar again.
 		docker rm -f "$NAME" >/dev/null 2>&1 || true
 		for c in $(docker ps -aq --filter name="^/$SIDECAR\$" --filter label=build.cloudex.role=direct); do docker rm -f "$c" >/dev/null; done
+		# A running original is paused while its fork is committed; dockerd
+		# finishes that commit even with the agent gone, and the image would
+		# appear after the fork images were removed (review F-L3). Wait for it.
+		for _ in $(seq 1 180); do
+			[[ -n $(docker ps -q --filter label=build.cloudex.node --filter status=paused) ]] || break
+			[[ ${waited:-} ]] || say "waiting for a fork's copy under way to finish (its sandbox is paused)"
+			waited=1
+			sleep 5
+		done
 		say "removing its machines and their networks"
 		for c in $(docker ps -aq --filter label=build.cloudex.node); do docker rm -f -v "$c" >/dev/null; done
 		for n in $(docker network ls -q --filter label=build.cloudex.node); do docker network rm "$n" >/dev/null; done
@@ -185,14 +194,15 @@ main() {
 		# with --keep-images. By id, newest first (a fork of a fork before the
 		# image it came from, which overlay2 refuses to remove while it has a
 		# child), again until none is left.
-		for _ in 1 2 3 4 5 6 7 8; do
-			forks=$(docker image ls -q --no-trunc --filter label=build.cloudex.role=fork --filter label=build.cloudex.node)
-			[[ -n $forks ]] || break
-			say "removing $(wc -w <<<"$forks" | tr -d ' ') fork images"
-			for i in $forks; do docker rmi "$i" >/dev/null 2>&1 || true; done
-		done
-		left=$(docker image ls -q --filter label=build.cloudex.role=fork --filter label=build.cloudex.node | wc -l | tr -d ' ')
-		[[ $left == 0 ]] || warn "$left fork images couldn't be removed; see docker image ls --filter label=build.cloudex.role=fork"
+		remove_forks() {
+			for _ in 1 2 3 4 5 6 7 8; do
+				forks=$(docker image ls -q --no-trunc --filter label=build.cloudex.role=fork --filter label=build.cloudex.node)
+				[[ -n $forks ]] || break
+				say "removing $(wc -w <<<"$forks" | tr -d ' ') fork images"
+				for i in $forks; do docker rmi "$i" >/dev/null 2>&1 || true; done
+			done
+		}
+		remove_forks
 		if [[ $ROOT == 1 ]]; then
 			say "removing the firewall"
 			systemctl disable --now "$CHECK.timer" >/dev/null 2>&1 || true
@@ -218,6 +228,13 @@ main() {
 				docker rmi "$ref" >/dev/null 2>&1 || true
 			done <<<"$refs"
 		fi
+		# Once more at the very end: a commit that was under way for a
+		# stopped original (not paused, so not waited for) may have finished
+		# since (review F-L3).
+		sleep 3
+		remove_forks
+		left=$(docker image ls -q --filter label=build.cloudex.role=fork --filter label=build.cloudex.node | wc -l | tr -d ' ')
+		[[ $left == 0 ]] || warn "$left fork images couldn't be removed; see docker image ls --filter label=build.cloudex.role=fork"
 		rm -rf "$ETC"
 		say "uninstalled: no agent, machines, networks, volume or firewall of cloudex-node are left"
 		exit 0
