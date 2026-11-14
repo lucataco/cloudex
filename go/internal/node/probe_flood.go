@@ -157,6 +157,16 @@ type FakeAgent struct {
 	OverrunMax           int64
 	Report               func(map[string]any)
 	Log                  func(string, ...any)
+	// Direct (v0.2.3 M1, probe_direct.go): reported in its facts. With it the
+	// fake keeps welcome's direct secret, takes "open <ticket>", "close
+	// <session>" and "active <sandbox>" from Lines, reports the sessions open,
+	// and reports each directEnd it's sent.
+	Direct *DirectFact
+	Lines  <-chan string
+	dmu    sync.Mutex
+	secret []byte
+	skew   time.Duration // the Worker's clock less this one's, from welcome
+	opened map[string]map[string]bool
 
 	send     func(any) error
 	mu       sync.Mutex
@@ -193,8 +203,15 @@ func (f *FakeAgent) Run(ctx context.Context) error {
 		f.sandbox = map[string]bool{}
 	}
 	f.mu.Unlock()
-	if err := f.send(HelloError(f.Version, probeFacts(4), fmt.Errorf("a probe, which lists no machines"))); err != nil {
+	facts := probeFacts(4)
+	facts.Direct = f.Direct
+	if err := f.send(HelloError(f.Version, facts, fmt.Errorf("a probe, which lists no machines"))); err != nil {
 		return err
+	}
+	if f.Direct != nil && f.Lines != nil {
+		lctx, stop := context.WithCancel(ctx)
+		defer stop()
+		go f.directLines(lctx)
 	}
 	go func() {
 		t := time.NewTicker(PingEvery)
@@ -221,6 +238,8 @@ func (f *FakeAgent) Run(ctx context.Context) error {
 		var head struct{ Type string }
 		json.Unmarshal(b, &head)
 		switch head.Type {
+		case "welcome":
+			f.welcome(b)
 		case "tickets":
 			var t Tickets
 			json.Unmarshal(b, &t)
@@ -259,7 +278,11 @@ func (f *FakeAgent) answer(ctx context.Context, op Op) {
 	case "stop", "delete", "ping", "selftest":
 		r = okResult(op.ID, struct{}{})
 	case "facts":
-		r = okResult(op.ID, probeFacts(4))
+		facts := probeFacts(4)
+		facts.Direct = f.Direct
+		r = okResult(op.ID, facts)
+	case "directEnd":
+		r = f.directEnd(op)
 	default:
 		r = errResult(op.ID, "unknown op "+op.Name)
 	}

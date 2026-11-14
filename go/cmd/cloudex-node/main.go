@@ -467,6 +467,8 @@ func newProbe(state func() node.State) *cobra.Command {
 	var splice bool
 	var runFor time.Duration
 	var spliceMax, overrunMax int64
+	var directAddrs []string
+	var directPort int
 	fake := &cobra.Command{
 		Use:   "fake-agent",
 		Short: "Run as the node's agent without machines, answering create and start, with execs of cx-flood-overrun and cx-flood-channel (and with --splice, ssh) flooding their streams; print one JSON line per flood",
@@ -494,6 +496,17 @@ func newProbe(state func() node.State) *cobra.Command {
 				},
 				Log: func(format string, args ...any) { fmt.Fprintf(cmd.ErrOrStderr(), format+"\n", args...) },
 			}
+			if len(directAddrs) > 0 {
+				f.Direct = &node.DirectFact{Port: directPort, Addrs: directAddrs, State: "listening"}
+				lines := make(chan string)
+				go func() {
+					sc := bufio.NewScanner(cmd.InOrStdin())
+					for sc.Scan() {
+						lines <- sc.Text()
+					}
+				}()
+				f.Lines = lines
+			}
 			// Again after a drop (an edge reset ends a control socket now and
 			// then), as the real agent does, until --for is up.
 			for ctx.Err() == nil {
@@ -514,6 +527,8 @@ func newProbe(state func() node.State) *cobra.Command {
 	fake.Flags().DurationVar(&runFor, "for", 10*time.Minute, "how long to run")
 	fake.Flags().Int64Var(&spliceMax, "splice-max", 256<<20, "the most a splice flood sends")
 	fake.Flags().Int64Var(&overrunMax, "overrun-max", 96<<20, "the most an overrun flood sends")
+	fake.Flags().StringSliceVar(&directAddrs, "direct-addr", nil, "report a direct path listening on these addresses, and take open <ticket>, close <session> and active <sandbox> lines on stdin (v0.2.3 M1)")
+	fake.Flags().IntVar(&directPort, "direct-port", 7022, "the direct port it reports")
 	probe.AddCommand(connect, join, stream, flood, fake)
 	return probe
 }
