@@ -773,3 +773,30 @@ func TestRaceFailedCachedCandidatesDontWaitForTheAnswer(t *testing.T) {
 		t.Fatalf("via %s in %v", out.via, took)
 	}
 }
+
+// D-L3's side effect: a caller who isn't an admin sees no node addresses, so
+// doctor says it skipped the check and why, instead of nothing.
+func TestDoctorSaysWhyItSkipsDirectChecks(t *testing.T) {
+	ns := []api.Node{{Name: "box", State: "online"}, {Name: "far", State: "offline"}}
+	lines := directChecksFor(context.Background(), "user", ns, testNets, nil)
+	if len(lines) != 1 || !lines[0].ok || !strings.Contains(lines[0].msg, "skipped the direct port check of the online node: only admins") {
+		t.Fatalf("%+v", lines)
+	}
+	if lines := directChecksFor(context.Background(), "admin", ns, testNets, nil); len(lines) != 0 {
+		t.Fatalf("admin, no direct facts: %+v", lines)
+	}
+}
+
+// A token over its direct-session limit (the API's 429): the Worker path,
+// and the debug line says why, not that direct attempts failed.
+func TestRaceOverTheTokensLimitSaysSo(t *testing.T) {
+	s := newRace(t, "192.168.1.10:7022")
+	s.ends.apiErr = &api.Error{Status: 429, Message: "this token has 64 direct tickets for the sandbox from the last minute"}
+	if out, _ := s.run(t, "worker"); out.via != "worker" {
+		t.Fatal(out.via)
+	}
+	all := strings.Join(s.logs, "\n")
+	if !strings.Contains(all, "over its direct-session limit") || strings.Contains(all, "every direct attempt failed") {
+		t.Fatalf("logs:\n%s", all)
+	}
+}

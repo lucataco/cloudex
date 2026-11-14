@@ -724,6 +724,8 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 			switch {
 			case ans != nil && ans.Provider != "node":
 				reason = "on Cloudflare"
+			case overLimit(apiErr):
+				reason = "this token is over its direct-session limit"
 			case ticketErr != nil:
 				reason = "the node refused the ticket"
 			case made > 0:
@@ -754,6 +756,8 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 					r.log("the deployment has no direct path: it's older than this CLI")
 					until := r.now().Add(directOlderFor).UnixMilli()
 					r.change(func(c *directCache) { c.Older = until })
+				} else if overLimit(a.err) {
+					r.log("the API gave no ticket: this token is over its direct-session limit (%v)", a.err)
 				} else {
 					r.log("API: %v", a.err)
 				}
@@ -942,6 +946,29 @@ type doctorLine struct {
 	msg string
 }
 
+// directChecksFor is directChecks for a caller of role: only admins see the
+// nodes' direct addresses (2026-11-14 review, D-L3), so for anyone else it
+// says it skipped them and why, rather than nothing.
+func directChecksFor(ctx context.Context, role string, ns []api.Node, nets localNets, dial func(context.Context, string) (net.Conn, error)) []doctorLine {
+	if role != "" && role != "admin" {
+		online := 0
+		for _, n := range ns {
+			if n.State == "online" {
+				online++
+			}
+		}
+		if online == 0 {
+			return nil
+		}
+		what := fmt.Sprintf("%d online nodes", online)
+		if online == 1 {
+			what = "the online node"
+		}
+		return []doctorLine{{true, fmt.Sprintf("skipped the direct port check of %s: only admins see nodes' addresses (ssh to a sandbox on a node still goes direct when this computer reaches it)", what)}}
+	}
+	return directChecks(ctx, ns, nets, dial)
+}
+
 // directChecks tries a TLS handshake, with the node's key pinned and no
 // ticket, to each direct candidate of each online node, and says which
 // answer from this computer.
@@ -1032,4 +1059,11 @@ func directChecks(ctx context.Context, ns []api.Node, nets localNets, dial func(
 		all = append(all, l...)
 	}
 	return all
+}
+
+// overLimit says whether the API refused a ticket because the token has used
+// its share of the direct path (429): the Worker path, then.
+func overLimit(err error) bool {
+	var e *api.Error
+	return errors.As(err, &e) && e.Status == 429
 }

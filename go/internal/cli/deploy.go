@@ -161,7 +161,11 @@ func newDoctorCmd(opts *options) *cobra.Command {
 					if err == nil {
 						nodeWarnings(cmd.Context(), client, h.Version, func(msg string) { fmt.Fprintln(w, "warn ", msg) })
 						if ns, err := client.ListNodes(cmd.Context()); err == nil {
-							for _, l := range directChecks(cmd.Context(), ns, readLocalNets(), plainDial) {
+							role := ""
+							if m, err := client.Me(cmd.Context()); err == nil {
+								role = m.Role
+							}
+							for _, l := range directChecksFor(cmd.Context(), role, ns, readLocalNets(), plainDial) {
 								fmt.Fprintln(w, map[bool]string{true: "ok   ", false: "warn "}[l.ok], l.msg)
 							}
 						}
