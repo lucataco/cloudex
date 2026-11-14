@@ -199,6 +199,9 @@ main() {
 				[[ -n $ref && -n $id ]] || continue
 				case " $images_before " in *" $id "*) continue ;; esac
 				say "removing the image $ref"
+				# An image pulled by digest (the machine image is) has no tag:
+				# "repo:<none>" isn't a name docker rmi takes, its id is.
+				[[ $ref == *:"<none>" ]] && ref=$id
 				docker rmi "$ref" >/dev/null 2>&1 || true
 			done <<<"$refs"
 		fi
