@@ -332,6 +332,8 @@ func why(err error) string {
 		return "refused"
 	case errors.Is(err, syscall.EHOSTUNREACH):
 		return "no route to host"
+	case errors.Is(err, syscall.EHOSTDOWN):
+		return "host is down"
 	case errors.Is(err, syscall.ENETUNREACH):
 		return "network unreachable"
 	case errors.Is(err, io.EOF), errors.Is(err, syscall.ECONNRESET):
@@ -694,8 +696,9 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 
 	switch {
 	case placement == "cloudflare":
-		// By name: the API still says which sandbox the name is now.
-		startWorker("on Cloudflare (cached)")
+		// By name: the API says which sandbox the name is now, and the
+		// Worker path follows by id, on the connection the answer came on
+		// (dialing by name at once was slower: 2026-11-14, M3 Results).
 	case placement != "":
 		if n, ok := r.cache.Nodes[placement]; ok && r.t0.UnixMilli()-n.At <= directNodeFresh.Milliseconds() {
 			if key, ok := decodeKey(n.PublicKey); ok {
@@ -714,9 +717,13 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 			return finishWorker()
 		}
 		directLive := pending > 0 || waiting != nil || presenting || apiPending
-		if !directLive && !workerStarted && r.mode != "only" {
+		// Cached candidates that all failed: the Worker path now, not after
+		// the answer, which would most likely name the same ones.
+		if !workerStarted && r.mode != "only" && pending == 0 && waiting == nil && !presenting && (!apiPending || made > 0) {
 			reason := "nothing to try directly"
 			switch {
+			case ans != nil && ans.Provider != "node":
+				reason = "on Cloudflare"
 			case ticketErr != nil:
 				reason = "the node refused the ticket"
 			case made > 0:
@@ -833,7 +840,7 @@ func (r *directRace) run(ctx context.Context) (raceOutcome, error) {
 					}
 				}
 				if pending == 0 && runtime.GOOS == "darwin" && localNetworkBlocked(attemptErrs) {
-					r.log("every attempt failed at once with no route to host: macOS may be blocking this app's Local Network access (System Settings, Privacy & Security, Local Network)")
+					r.log("every attempt failed with no route to host: if the node is up on this network, macOS may be blocking this app's Local Network access (System Settings, Privacy & Security, Local Network)")
 				}
 				continue
 			}

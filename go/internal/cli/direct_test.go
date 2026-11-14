@@ -759,3 +759,17 @@ func TestRaceASlowAnswerStillGivesDirectAHeadStart(t *testing.T) {
 		t.Fatal("the Worker path started")
 	}
 }
+
+// Cached candidates that all fail start the Worker path at once, without
+// waiting for the answer.
+func TestRaceFailedCachedCandidatesDontWaitForTheAnswer(t *testing.T) {
+	s := newRace(t, "192.168.1.10:7022")
+	s.ends.apiDelay = 200 * time.Millisecond
+	s.net.at["192.168.1.10:7022"] = closedPort(t)
+	s.race.cache.Sandboxes["cx-node01"] = "nd-aaaa1111"
+	s.race.cache.Nodes["nd-aaaa1111"] = cachedNode{PublicKey: s.pubB64, Port: 7022, Addrs: []string{"192.168.1.10"}, At: time.Now().UnixMilli()}
+	out, took := s.run(t, "worker")
+	if out.via != "worker" || took > 150*time.Millisecond {
+		t.Fatalf("via %s in %v", out.via, took)
+	}
+}
