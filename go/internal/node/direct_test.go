@@ -695,3 +695,30 @@ func TestDirectSharesOfTheLimits(t *testing.T) {
 		t.Fatalf("another token: %q", why)
 	}
 }
+
+// Re-review 1: a directEnd for the token between admit and open (the
+// machine's lookup and dial) must still keep the session from opening.
+func TestEndBetweenAdmitAndOpen(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	d := testDirect(now, 0)
+	c := claims(now.Add(60 * time.Second))
+	c.Token = "tk-aaaaaaaa"
+	cl, why := d.admit(direct.Mint(testSecret, c))
+	if why != "" {
+		t.Fatal(why)
+	}
+	d.End(DirectEnd{Sandbox: c.Sandbox, Tokens: []string{"tk-aaaaaaaa"}})
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	if s, why := d.open(cl, a); s != nil || why != "its token ended" {
+		t.Fatalf("opened %v, %q", s != nil, why)
+	}
+	// Another token's ticket admitted at the same time still opens.
+	c2 := claims(now.Add(60 * time.Second))
+	c2.Token = "tk-bbbbbbbb"
+	cl2, _ := d.admit(direct.Mint(testSecret, c2))
+	if s, why := d.open(cl2, a); s == nil {
+		t.Fatalf("another token: %q", why)
+	}
+}

@@ -728,6 +728,14 @@ func (d *Direct) open(c direct.Claims, conn net.Conn) (*directSession, string) {
 	if d.secret == nil {
 		return nil, "the direct path closed"
 	}
+	// A directEnd for its token may have come between admit and now (the
+	// machine's lookup and dial take time): it would have closed nothing
+	// (2026-11-14 re-review).
+	if c.Token != "" {
+		if until, ok := d.ended[c.Token]; ok && d.now().Before(until) {
+			return nil, "its token ended"
+		}
+	}
 	if len(d.sessions) >= DirectSessionsMax {
 		return nil, fmt.Sprintf("this node has %d direct sessions open", DirectSessionsMax)
 	}
