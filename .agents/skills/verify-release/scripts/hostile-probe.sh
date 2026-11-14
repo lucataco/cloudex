@@ -42,7 +42,8 @@ say body-over-limit "$(head -c 100000001 /dev/zero | curl -s -m 60 -o /dev/null 
 # What NET_ADMIN tries: reach another machine's agent address through its own
 # agent (it arrives from this network's /28, so it's refused), forge a source
 # in the other network (no handshake), and the agent's control address
-# (nothing listens there).
+# (nothing listens there but, since v0.2.3, the direct port DIRECT_PORT, which
+# takes only the sidecar relay: a machine must get no TLS session from it).
 ip route add "$osub" via "$own" 2>/dev/null
 say routed-other-agent-80 "$(c -X POST "http://$other/save-on-term")"
 say routed-other-agent-443 "$(c -k --resolve "api.anthropic.com:443:$other" https://api.anthropic.com/v1/models)"
@@ -52,9 +53,32 @@ ip addr add "$forged/32" dev "$dev" 2>/dev/null
 say forged-source "$(c --interface "$forged" -X POST "http://$other/save-on-term")"
 ip addr del "$forged/32" dev "$dev" 2>/dev/null
 ip route del "$osub" via "$own" 2>/dev/null
+direct() {
+	python3 - "$1" "$2" <<'PY' 2>/dev/null || echo error
+import socket, ssl, sys
+try:
+    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=4)
+except socket.timeout:
+    print("timeout"); sys.exit()
+except ConnectionRefusedError:
+    print("refused"); sys.exit()
+except OSError:
+    print("unreachable"); sys.exit()
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+ctx.set_alpn_protocols(["cloudex-direct/1"])
+try:
+    ctx.wrap_socket(s).close(); print("tls")
+except socket.timeout:
+    print("stalled")
+except OSError:
+    print("closed")
+PY
+}
 for a in "${ctl[@]}"; do
 	ip route add "$a/32" via "$own" 2>/dev/null
 	say "control-$a-80" "$(c "http://$a/")"
 	say "control-$a-443" "$(c -k "https://$a/")"
+	[[ -n ${DIRECT_PORT:-} ]] && say "control-$a-direct" "$(direct "$a" "$DIRECT_PORT")"
 	ip route del "$a/32" via "$own" 2>/dev/null
 done

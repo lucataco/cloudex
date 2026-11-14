@@ -14,7 +14,12 @@
 # which runs cloudex deploy with $CLOUDFLARE_API_TOKEN), VERIFY_NODE_LONG=1 (N12's 30 idle
 # minutes, and with VERIFY_NODE_DEPLOY=1 N13's deploy during an scp), VERIFY_NODE_REBOOT=1
 # (N23 reboots the host), and with VERIFY_NODE_DEPLOY=1, N44's deploy during a node save;
-# VERIFY_NODE_PARTS (default "m3 m4 m5 m6") runs only those milestones' checks after the install.
+# VERIFY_NODE_PARTS (default "m3 m4 m5 m6 review direct") runs only those milestones' checks
+# after the install. The direct path (v0.2.3, N57-N66): VERIFY_NODE_DIRECT=1 says this machine
+# reaches the node's direct addresses, VERIFY_NODE_DIRECT_CLASS (lan-onlink or tailnet) the class
+# the race should win with, VERIFY_NODE_DIRECT_ADDR (comma list) the installer's --direct-addr,
+# VERIFY_NODE_DIRECT_STALE an address with no host for N59, and VERIFY_NODE_ALLOW_ARCH the
+# installer's testing-only CLOUDEX_NODE_ALLOW_ARCH (a host that isn't amd64).
 # VERIFY_NODE=<node> (v0.2.2): the lifecycle, connect, inside, agents, tokens, dashboard, sdk
 # and browser areas make their sandboxes on that node, which must be online (cloudex node
 # add, then its installer), instead of on Cloudflare; what isn't on nodes yet (forks, sizes
@@ -756,7 +761,8 @@ kill_agent() { node_sh "docker kill cloudex-node" >/dev/null 2>&1; }
 install_node() {
 	local tok=$1
 	shift
-	"${NODE_SSH[@]}" "read -r t; export CLOUDEX_JOIN_TOKEN=\$t; ${NODE_SUDO:+sudo --preserve-env=CLOUDEX_JOIN_TOKEN} bash $NODE_DIR/node-install.sh $*" <<<"$tok"
+	# VERIFY_NODE_ALLOW_ARCH: the installer's testing-only CLOUDEX_NODE_ALLOW_ARCH (v0.2.3).
+	"${NODE_SSH[@]}" "read -r t; export CLOUDEX_JOIN_TOKEN=\$t ${VERIFY_NODE_ALLOW_ARCH:+CLOUDEX_NODE_ALLOW_ARCH=$VERIFY_NODE_ALLOW_ARCH}; ${NODE_SUDO:+sudo --preserve-env=CLOUDEX_JOIN_TOKEN,CLOUDEX_NODE_ALLOW_ARCH} bash $NODE_DIR/node-install.sh $*" <<<"$tok"
 }
 # A fresh CLOUDFLARE_API_TOKEN from VERIFY_CF_TOKEN_CMD when it's set (wrangler's
 # own login gives tokens that last an hour, less than a node run).
@@ -1358,8 +1364,8 @@ M6_CHECKS=("N36 with fake keys, claude -p, codex exec and opencode run on a node
 	"N39 the cloudex command inside a node machine: info, set and host work, and stop from inside stops it, keeping its disk"
 	"N40 guest activity reaches the deployment: a background command's pings keep a sandbox with --idle 2m running, and /save-on-term is answered on the node"
 	"N41 a named save made on a node starts on Cloudflare with its files, and one made there starts back on the node, and saves names the node for both (the second's content came from it)"
-	"N42 a machine with NET_ADMIN can't reach another machine's agent address or forge its source, finds nothing on the agent's control address, can't use the agent as a proxy or for another sandbox's API, gets no backups or saves without a grant, and a body over 100 MB is refused"
-	"N43 the agent listens only on its machine networks' addresses, on 80 and 443: never on 0.0.0.0 or its control address"
+	"N42 a machine with NET_ADMIN can't reach another machine's agent address or forge its source, finds nothing on the agent's control address (no session on its direct port), can't use the agent as a proxy or for another sandbox's API, gets no backups or saves without a grant, and a body over 100 MB is refused"
+	"N43 the agent listens only on its machine networks' addresses, on 80 and 443, and on its control address only on the direct port, bound to its interface: never on 0.0.0.0"
 	"N44 a deploy during a save of a node sandbox ends cleanly: the sandbox keeps running, and the save either finished or left no objects in R2")
 m6_skip() { for c in "${M6_CHECKS[@]}"; do skip "${c%% *}" "${c#* }" "$1"; done; }
 m6_desc() { for c in "${M6_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
@@ -1509,14 +1515,18 @@ node_m6() {
 	osub=$(node_sh "docker network inspect $MCB -f '{{(index .IPAM.Config 0).Subnet}}'")
 	ctl=$(node_sh "docker inspect cloudex-node -f '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}'" | tr ' ' '\n' | grep -v '^cloudex-cx-' | cut -d= -f2 | tr '\n' ' ')
 	"${NODE_SSH[@]}" "cat > $NODE_DIR/hostile-probe.sh" <"$here/hostile-probe.sh"
+	# v0.2.3: with the direct port on, the agent listens there on its control
+	# address (inside, always on 7022; the installer's --direct-port is the host's).
+	local dp42=""
+	[[ -n $("$CX" node info "$N" --json 2>/dev/null | jq -r '.direct.port // empty') ]] && dp42=7022
 	if [[ $runtime == sysbox ]]; then
 		"$CX" cp "$here/hostile-probe.sh" "$S6:hostile-probe.sh" >/dev/null 2>&1
-		h42=$("$CX" exec "$S6" --root --timeout 5m -- "API_HOST=$api_host bash /home/cloudex/hostile-probe.sh $own $other $osub $S6BID $ctl" 2>&1)
+		h42=$("$CX" exec "$S6" --root --timeout 5m -- "DIRECT_PORT=$dp42 API_HOST=$api_host bash /home/cloudex/hostile-probe.sh $own $other $osub $S6BID $ctl" 2>&1)
 	else
 		local img sub5
 		img=$(node_sh "docker inspect $MC -f '{{.Config.Image}}'")
 		sub5=$(awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 + 3}' <<<"$own")
-		h42=$(node_sh "docker run --rm --label build.cloudex.node=verify --label build.cloudex.role=check --network $MC --ip $sub5 --cap-add NET_ADMIN -e API_HOST=$api_host -v $NODE_DIR/hostile-probe.sh:/p.sh:ro --entrypoint bash $img /p.sh $own $other $osub $S6BID $ctl" 2>&1)
+		h42=$(node_sh "docker run --rm --label build.cloudex.node=verify --label build.cloudex.role=check --network $MC --ip $sub5 --cap-add NET_ADMIN -e API_HOST=$api_host -e DIRECT_PORT=$dp42 -v $NODE_DIR/hostile-probe.sh:/p.sh:ro --entrypoint bash $img /p.sh $own $other $osub $S6BID $ctl" 2>&1)
 	fi
 	cp <(echo "$h42") "$out/hostile-probe.txt"
 	local want42="own-save-on-term {\"saved\":false}
@@ -1538,10 +1548,15 @@ routed-other-agent-443 000
 forged-source 000"
 	local got42
 	got42=$(grep -v '^control-' <<<"$h42" | sed 's/ *$//')
-	local ctl42
-	ctl42=$(grep '^control-' <<<"$h42" | awk '{print $2}' | sort -u | tr '\n' ' ')
+	# The control address: nothing on 80 and 443, and on the direct port (v0.2.3)
+	# no session: no connection, or one closed without a TLS handshake.
+	local ctl42 dir42 ndir42
+	ctl42=$(grep -E '^control-.*-(80|443) ' <<<"$h42" | awk '{print $2}' | sort -u | tr '\n' ' ')
+	dir42=$(grep -E '^control-.*-direct ' <<<"$h42" | awk '{print $2}' | sort -u | tr '\n' ' ')
+	ndir42=$(grep -cE '^control-.*-direct ' <<<"$h42")
 	OUT="on $runtime: $(tr '\n' ';' <<<"$h42" | head -c 900)" CODE=""
-	ok N42 "$(m6_desc N42)" [ "$got42" = "$want42" -a "$ctl42" = "000 " ]
+	ok N42 "$(m6_desc N42)" [ "$got42" = "$want42" -a "$ctl42" = "000 " -a \( -z "$dp42" -o "$ndir42" -ge 1 \) \
+		-a -z "$(tr ' ' '\n' <<<"$dir42" | grep . | grep -vxE 'timeout|refused|unreachable|closed|stalled')" ]
 
 	# N43: the agent's listening sockets, from its own network namespace.
 	local l43 bad43
@@ -1549,12 +1564,20 @@ forged-source 000"
 	# A listener bound to its network's interface (review H4) shows as addr%eth1:port.
 	local bound43
 	bound43=$(tr ' ' '\n' <<<"$l43" | grep -c '%')
+	# v0.2.3: the direct listener is the one socket allowed on the control
+	# address, on 7022 and bound to its interface (addr%ethN:7022).
+	local ctl43="" c43
+	for a in $ctl; do
+		c43=$(tr ' ' '\n' <<<"$l43" | grep -E "^${a//./\\.}[%:]")
+		ctl43="$ctl43$c43 "
+		[[ -n $dp42 && $(grep -c . <<<"$c43") == 1 && $c43 =~ ^${a//./\\.}%[a-z0-9]+:7022$ ]] && l43=$(tr ' ' '\n' <<<"$l43" | grep -vxF "$c43" | tr '\n' ' ')
+	done
 	l43=$(sed -E 's/%[^: ]+:/:/g' <<<"$l43")
 	# 127.0.0.11 is Docker's embedded DNS resolver, which dockerd runs in every
 	# container's namespace on a user network; it isn't the agent's.
 	l43=$(tr ' ' '\n' <<<"$l43" | grep . | grep -v '^127\.0\.0\.11:' | tr '\n' ' ')
 	bad43=$(tr ' ' '\n' <<<"$l43" | grep . | grep -vE '^10\.|^172\.' ; tr ' ' '\n' <<<"$l43" | grep . | grep -vE ':(80|443)$'; for a in $ctl; do tr ' ' '\n' <<<"$l43" | grep -F "$a:"; done)
-	OUT="listening: $l43($bound43 bound to their network's interface)" CODE=""
+	OUT="listening: $l43($bound43 bound to their network's interface); on the control address: ${ctl43// /}${dp42:+ (the direct port is on)}" CODE=""
 	ok N43 "$(m6_desc N43)" [ -n "$(grep -F "$own:80" <<<"$l43")" -a -n "$(grep -F "$own:443" <<<"$l43")" -a -z "$bad43" ]
 
 	# N44: a deploy during a node save.
@@ -2053,6 +2076,389 @@ node_review_worker() {
 }
 # ---- end node_review_worker
 
+# ---------------------------------------------------------------- node: direct
+# The direct path (v0.2.3 M4, N57-N66): the node's direct port, published by
+# its sidecar relay on the installer's private and tailnet addresses, and the
+# CLI's race between it and the Worker path. VERIFY_NODE_DIRECT=1 says this
+# machine reaches the node's direct addresses (an on-link VM, a tailnet);
+# VERIFY_NODE_DIRECT_CLASS (lan-onlink, the default, or tailnet) is the class
+# the race should win with. Without VERIFY_NODE_DIRECT, the checks that need a
+# client here SKIP, and the rest probe the port from the host itself.
+DIRECT_CHECKS=("N57 the installer publishes the direct port only on the chosen private and tailnet addresses, node info lists them as listening, and nothing listens on 0.0.0.0"
+	"N58 cloudex ssh to the node goes direct with the expected class; keystrokes p50 under 15 ms (LAN) or within 10 ms of host ssh (tailnet); scp of 256 MiB each way matches with cmp, and is faster than CLOUDEX_DIRECT=off in the same run"
+	"N59 with a stale, blackholed, closed or impostor candidate first (CLOUDEX_DIRECT_CANDIDATES), ssh still connects, by the Worker within 400 ms of CLOUDEX_DIRECT=off, or direct when a good candidate follows"
+	"N60 the direct port refuses replayed, expired, altered, foreign and missing tickets, and those sessions never reach sshd"
+	"N61 2000 connections and a slow-loris against the direct port leave the agent under 64 MiB, the node online, and a real direct session and a Worker-path exec working"
+	"N62 from inside a machine (as its user, and as root with route-changing rights), the published addresses, the sidecar and the agent's control address on the direct port give no session"
+	"N63 an open direct ssh session (keepalives only) keeps a --idle 2m sandbox running for 5 minutes; after it closes, the sandbox stops within 3 minutes"
+	"N64 revoking the token that opened a direct session ends it within 90 s; cloudex stop ends it at once; node rm --force ends it and closes the port"
+	"N65 a direct session survives a cloudex deploy and a 2-minute cut of the node's route to Cloudflare, and a new direct ssh opens during the cut"
+	"N66 the uninstaller removes the sidecar and the listener on the direct port")
+direct_skip() { for c in "${DIRECT_CHECKS[@]}"; do [[ -z ${2:-} || " $2 " == *" ${c%% *} "* ]] && skip "${c%% *}" "${c#* }" "$1"; done; }
+direct_desc() { for c in "${DIRECT_CHECKS[@]}"; do [[ ${c%% *} == "$1" ]] && echo "${c#* }"; done; }
+direct_client() { [[ ${VERIFY_NODE_DIRECT:-} == 1 ]]; }
+# cloudex-node probe direct ARGS, run on the host with --network host (the host
+# reaches its own published addresses; the listener sees its own address), with
+# the deployment's key from stdin: never in a process's arguments there.
+dprobe() {
+	"${NODE_SSH[@]}" "read -r k; export CLOUDEX_API_KEY=\$k CLOUDEX_API_URL=$API_URL; docker run --rm --network host -e CLOUDEX_API_KEY -e CLOUDEX_API_URL -v $NODE_DIR:/w $AIMG probe direct $*" <<<"$(jq -r .apiKey "$src_cfg/config.json")"
+}
+median() { sort -n | awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)] }'; }
+# The race's choice in a CLOUDEX_DEBUG log: "chose direct 1.2.3.4:7022 (lan-onlink)" or "chose the Worker path".
+chose() { grep -o 'chose .*' "$1" 2>/dev/null | tail -1 | tr -d '\r' | sed 's/;.*//'; }
+# Forget the networks the race marked failed (direct.json), so each try races afresh.
+clear_failed() {
+	local f=$CLOUDEX_CONFIG_DIR/direct.json
+	[[ -f $f ]] && jq 'del(.failed)' "$f" >"$f.t" 2>/dev/null && mv "$f.t" "$f"
+	return 0
+}
+# ms for one `cloudex ssh $1 -- true`, its debug log in $work/t.log.
+time_ssh() {
+	local t0
+	clear_failed
+	t0=$(now_ms)
+	CLOUDEX_DEBUG=1 "$CX" ssh "$1" -- true </dev/null >/dev/null 2>"$work/t.log"
+	[[ $? == 0 ]] || { echo fail; return; }
+	echo $(($(now_ms) - t0))
+}
+# Waits (up to $2 s) for the background process $1 to end; prints the seconds, or nothing.
+wait_gone() {
+	local t0
+	t0=$(now_s)
+	while kill -0 "$1" 2>/dev/null; do
+		[[ $(awk -v w="$(since "$t0")" -v m="$2" 'BEGIN { print (w > m) }') == 1 ]] && return 1
+		sleep 0.5
+	done
+	since "$t0"
+}
+D64="" DPORT=""
+
+node_direct() {
+	local SD=$P-d SDID DMC cfg dinfo dstate daddrs dport binds lsn wild
+	DPORT=$("$CX" node info "$N" --json 2>/dev/null | jq -r '.direct.port // empty')
+	if [[ -z $DPORT ]]; then
+		direct_skip "the node reports no direct port (installed with --direct off, or an agent older than v0.2.3)" "N57 N58 N59 N60 N61 N62 N63 N64 N65"
+		return
+	fi
+	cx new --on "$N" --name "$SD" --no-use
+	SDID=$(field .id)
+	if [[ $CODE != 0 || -z $SDID ]]; then
+		direct_skip "couldn't make a sandbox on the node: ${ERR:0:200}" "N57 N58 N59 N60 N61 N62 N63 N64 N65"
+		return
+	fi
+	DMC=cloudex-$SDID
+	cfg=$work/ssh_config_d
+
+	# N57: where the port is published. The listener opens after the welcome,
+	# and the agent remakes the sidecar every 30 s: wait for listening.
+	for _ in $(seq 1 40); do
+		dinfo=$("$CX" node info "$N" --json 2>/dev/null | jq -c '.direct // {}')
+		[[ $(jq -r .state <<<"$dinfo") == listening ]] && break
+		sleep 3
+	done
+	dstate=$(jq -r .state <<<"$dinfo") dport=$(jq -r .port <<<"$dinfo")
+	daddrs=$(jq -r '.addrs // [] | sort | join(" ")' <<<"$dinfo")
+	binds=$(node_sh "docker inspect cloudex-node-direct -f '{{json .HostConfig.PortBindings}}'" 2>/dev/null | jq -r '[to_entries[] | .key as $k | .value[] | "\(.HostIp):\(.HostPort)>\($k)"] | sort | join(" ")' 2>/dev/null)
+	lsn=$(node_sh "ss -ltnH" | awk -v p=":$dport" '$4 ~ p"$" { print $4 }' | sort | tr '\n' ' ')
+	wild=$(tr ' ' '\n' <<<"$lsn" | grep -E '^(0\.0\.0\.0|\*|\[::\]):')
+	local want57="" want_ss="" a bad57=""
+	for a in $daddrs; do
+		want57="$want57 $a:$dport>7022/tcp" want_ss="$want_ss$a:$dport "
+		[[ $a =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]] || bad57="$bad57 $a"
+	done
+	want57=$(tr ' ' '\n' <<<"$want57" | grep . | sort | tr '\n' ' ' | sed 's/ $//')
+	want_ss=$(tr ' ' '\n' <<<"$want_ss" | grep . | sort | tr '\n' ' ')
+	local chosen57=yes
+	if [[ -n ${VERIFY_NODE_DIRECT_ADDR:-} ]]; then
+		[[ $(tr ', ' '\n\n' <<<"$VERIFY_NODE_DIRECT_ADDR" | grep . | sort | tr '\n' ' ' | sed 's/ $//') == "$daddrs" ]] || chosen57=""
+	fi
+	OUT="node info: $dinfo; sidecar bindings: $binds; listening on :$dport: $lsn${VERIFY_NODE_DIRECT_ADDR:+; asked for $VERIFY_NODE_DIRECT_ADDR}" CODE=""
+	ok N57 "$(direct_desc N57)" [ "$dstate" = listening -a -n "$daddrs" -a -z "$bad57" -a "$binds" = "$want57" -a "$lsn" = "$want_ss" -a -z "$wild" -a -n "$chosen57" ]
+
+	"$CX" ssh-config >"$cfg" 2>/dev/null
+	local first=${daddrs%% *}
+
+	# N58: the race wins direct, keystrokes, and scp against the Worker path.
+	if direct_client; then
+		local class=${VERIFY_NODE_DIRECT_CLASS:-lan-onlink} c58 k58 hk58="" p58 hp58 big up dn oup odn same=yes keyok
+		CLOUDEX_DEBUG=1 "$CX" ssh "$SD" -- true </dev/null >/dev/null 2>"$work/d58.log"
+		CLOUDEX_DEBUG=1 "$CX" ssh "$SD" -- true </dev/null >/dev/null 2>"$work/d58.log"
+		c58=$(chose "$work/d58.log")
+		k58=$(CLOUDEX_DIRECT=only python3 "$here/keys.py" "$SD.cloudex" 200 "$cfg" 2>/dev/null)
+		p58=$(jq -r .p50 <<<"$k58" 2>/dev/null)
+		if [[ $class == lan-onlink ]]; then
+			keyok=$(awk -v p="${p58:-999}" 'BEGIN { print (p < 15) }')
+		else
+			# Host ssh's own keystrokes on the same line, to compare with.
+			hk58=$(KEYS_CMD="$VERIFY_NODE_SSH cat" python3 "$here/keys.py" host 200 none 2>/dev/null)
+			hp58=$(jq -r .p50 <<<"$hk58" 2>/dev/null)
+			keyok=$(awk -v p="${p58:-999}" -v h="${hp58:-0}" 'BEGIN { print (p <= h + 10) }')
+		fi
+		big=$work/big256d
+		head -c 268435456 /dev/urandom >"$big"
+		scp_t() { # MODE: up and down ms, cmp'd
+			local a b c
+			rm -f "$big.back"
+			a=$(now_ms)
+			CLOUDEX_DIRECT=$1 scp -F "$cfg" -o BatchMode=yes -q "$big" "$SD.cloudex:/tmp/vr-big" 2>>"$work/e58"
+			b=$(now_ms)
+			CLOUDEX_DIRECT=$1 scp -F "$cfg" -o BatchMode=yes -q "$SD.cloudex:/tmp/vr-big" "$big.back" 2>>"$work/e58"
+			c=$(now_ms)
+			cmp -s "$big" "$big.back" || same=""
+			echo "$((b - a)) $((c - b))"
+		}
+		read -r up dn <<<"$(scp_t only)"
+		read -r oup odn <<<"$(scp_t off)"
+		rm -f "$big" "$big.back"
+		mbs() { awk -v ms="$1" 'BEGIN { printf "%.1f", 268.435456 / (ms / 1000) }'; }
+		OUT="$c58; keystrokes direct $k58${hk58:+, host ssh $hk58}; scp 256 MiB direct up $(mbs "$up") MB/s down $(mbs "$dn"), CLOUDEX_DIRECT=off up $(mbs "$oup") down $(mbs "$odn"); cmp ${same:-DIFFERS} $(head -c 200 "$work/e58" 2>/dev/null)" CODE=""
+		ok N58 "$(direct_desc N58)" [ -n "$(grep -E "^chose direct [0-9.]+:$dport \\($class\\)$" <<<"$c58")" -a "$keyok" = 1 -a "$same" = yes \
+			-a "${up:-0}" -gt 0 -a "${oup:-0}" -gt "${up:-0}" -a "${odn:-0}" -gt "${dn:-0}" ]
+	else
+		skip N58 "$(direct_desc N58)" "set VERIFY_NODE_DIRECT=1 where this machine reaches the node's direct addresses ($daddrs)"
+	fi
+
+	# N59: bad first candidates fall back to the Worker path in time.
+	if direct_client; then
+		local offs="" t r59="" bad59="" stale blackhole=192.0.2.1 closed imp="" impc i59 med off_med
+		for _ in 1 2 3 4 5 6; do offs="$offs $(CLOUDEX_DIRECT=off time_ssh "$SD")"; done
+		if [[ ${VERIFY_NODE_DIRECT_CLASS:-lan-onlink} == tailnet ]]; then
+			stale=${VERIFY_NODE_DIRECT_STALE:-100.127.255.253}
+		else
+			stale=${VERIFY_NODE_DIRECT_STALE:-${first%.*}.253}
+		fi
+		closed="$first:$((dport + 1))"
+		# An impostor: a TLS 1.3 server with the right ALPN over another Ed25519
+		# key, published on the node's address (root hosts only: unlabelled ports
+		# aren't for other people's hosts).
+		if [[ -n $NODE_SUDO ]]; then
+			impc=vr-imp-$P
+			node_sh "docker run -d --name $impc --label build.cloudex.node=verify --label build.cloudex.role=check -p $first:$((dport + 77)):7099 --entrypoint sh $(node_sh "docker inspect $DMC -f '{{.Config.Image}}'") -c 'cd /tmp && openssl genpkey -algorithm ed25519 -out k.pem 2>/dev/null && openssl req -x509 -new -key k.pem -subj /CN=impostor -days 1 -out c.pem 2>/dev/null && exec openssl s_server -quiet -accept 7099 -cert c.pem -key k.pem -tls1_3 -alpn cloudex-direct/1'" >/dev/null 2>&1
+			sleep 3
+			imp="$first:$((dport + 77))"
+		fi
+		for i59 in "stale $stale" "blackhole $blackhole" "closed $closed" ${imp:+"impostor $imp"} "stale-then-good $stale,$first:$dport"; do
+			set -- $i59
+			local times=""
+			for _ in 1 2 3 4 5; do times="$times $(CLOUDEX_DIRECT_CANDIDATES=$2 time_ssh "$SD")"; done
+			med=$(tr ' ' '\n' <<<"$times" | grep -E '^[0-9]+$' | median)
+			r59="$r59 $1 ($2): [$times ] median ${med:-none}, $(chose "$work/t.log");"
+			[[ $times == *fail* ]] && bad59="$bad59 $1:failed"
+			if [[ $1 == stale-then-good ]]; then
+				[[ $(chose "$work/t.log") == "chose direct $first:$dport"* ]] || bad59="$bad59 $1:not-direct"
+			else
+				[[ $(chose "$work/t.log") == "chose the Worker path" ]] || bad59="$bad59 $1:not-worker"
+				eval "med_$1=\${med:-99999}"
+			fi
+		done
+		[[ -n $imp ]] && node_sh "docker rm -f $impc" >/dev/null 2>&1
+		for _ in 1 2 3 4; do offs="$offs $(CLOUDEX_DIRECT=off time_ssh "$SD")"; done
+		off_med=$(tr ' ' '\n' <<<"$offs" | grep -E '^[0-9]+$' | median)
+		for i59 in stale blackhole closed ${imp:+impostor}; do
+			eval "med=\$med_$i59"
+			((med - ${off_med:-0} > 400)) && bad59="$bad59 $i59:+$((med - off_med))ms"
+		done
+		OUT="${bad59:+FAILED:$bad59; }CLOUDEX_DIRECT=off: [$offs ] median $off_med;$r59${imp:+}${imp:-; no impostor (needs a root host)}" CODE=""
+		ok N59 "$(direct_desc N59)" [ -z "$bad59" -a -n "$off_med" ]
+		clear_failed
+	else
+		skip N59 "$(direct_desc N59)" "set VERIFY_NODE_DIRECT=1 where this machine reaches the node's direct addresses"
+	fi
+
+	# N60: bad tickets, and sshd never sees them. A saved ticket presented
+	# twice (once good, once replayed), then the probe's other cases.
+	local l0 l1 l2 pr1 pr2 cases60
+	pr1=$(dprobe --addr "$first:$dport" --sandbox "$SDID" --save /w/t60.json >/dev/null 2>&1; dprobe --addr "$first:$dport" --sandbox "$SDID" --present /w/t60.json 2>&1)
+	sleep 3
+	l1=$(node_sh "docker exec $DMC wc -l < /var/log/sshd.log" 2>/dev/null | tr -d ' ')
+	pr2=$(dprobe --addr "$first:$dport" --sandbox "$SDID" --present /w/t60.json 2>&1)
+	cases60=$(dprobe --addr "$first:$dport" --sandbox "$SDID" --cases altered,othersandbox,otherport,othernode,noticket,garbage,long,plaintext,noalpn,wrongpin,expired 2>&1)
+	local c60=$?
+	sleep 3
+	l2=$(node_sh "docker exec $DMC wc -l < /var/log/sshd.log" 2>/dev/null | tr -d ' ')
+	node_sh "rm -f $NODE_DIR/t60.json"
+	OUT="a saved ticket: $pr1, then $pr2; the cases (exit $c60): $(tr '\n' ';' <<<"$cases60" | tr -s ' '); sshd's log: $l1 lines after the good session, $l2 after the bad ones" CODE=""
+	ok N60 "$(direct_desc N60)" [ -n "$(grep '^ok SSH-2.0-' <<<"$pr1")" -a "$pr2" = "err used already" -a "$c60" = 0 -a "$(grep -c ' PASS ' <<<"$cases60")" = 11 \
+		-a -n "$l1" -a "$l1" = "$l2" ]
+
+	# N61: a flood, then a good session and an exec.
+	local fl61 st61 m61 s61 e61
+	agent_mem_watch 60 d61
+	fl61=$(dprobe --addr "$first:$dport" --sandbox "$SDID" --flood 2000 2>&1)
+	local c61=$?
+	sleep 2
+	m61=$(agent_mem_max d61)
+	st61=$(node_state "$N")
+	if direct_client; then
+		s61=$(CLOUDEX_DIRECT=only CLOUDEX_DEBUG=1 "$CX" ssh "$SD" -- echo direct-ok 2>"$work/d61.log" </dev/null)
+		s61="$s61 ($(chose "$work/d61.log"))"
+	else
+		s61=$(grep '^after the flood' <<<"$fl61" | grep -q ': ok SSH' && echo "direct-ok (the probe's own session, from the host)")
+	fi
+	e61=$(CLOUDEX_DIRECT=off "$CX" exec "$SD" -- echo worker-ok 2>&1)
+	OUT="$(tr '\n' ';' <<<"$fl61") probe exit $c61; agent at most ${m61:-?} MiB; node $st61; direct ssh: $s61; exec: $e61" CODE=""
+	ok N61 "$(direct_desc N61)" [ "$c61" = 0 -a -n "$m61" -a "${m61:-999}" -lt 64 -a "$st61" = online -a -n "$(grep '^direct-ok' <<<"$s61")" -a "$e61" = worker-ok ]
+
+	# N62: from inside machines. The targets: each published address on its
+	# host port, the sidecar's and the agent's addresses on the cloudex-node
+	# network on 7022.
+	local runtime62 relay62 agent62 own62 tg62="" r62a r62b r62c img62 sub62
+	runtime62=$("$CX" node info "$N" --json 2>/dev/null | jq -r .runtime)
+	relay62=$(node_sh "docker inspect cloudex-node-direct -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'" | awk '{print $1}')
+	agent62=$(node_sh "docker inspect cloudex-node -f '{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}'" | tr ' ' '\n' | grep '^cloudex-node=' | cut -d= -f2)
+	own62=$(node_sh "docker inspect $DMC -f '{{(index .NetworkSettings.Networks \"$DMC\").IPAddress}}'" | awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 - 1}')
+	for a in $daddrs; do tg62="$tg62 $a:$dport"; done
+	tg62="$tg62 $relay62:7022 $agent62:7022"
+	"$CX" cp "$here/direct-reach.py" "$SD:direct-reach.py" >/dev/null 2>&1
+	# As the machine's user, then as root routing each target through the agent.
+	r62a=$("$CX" exec "$SD" --timeout 3m -- "python3 ~/direct-reach.py $tg62" 2>&1)
+	if [[ $runtime62 == sysbox ]]; then
+		r62b=$("$CX" exec "$SD" --root --timeout 3m -- "python3 /home/cloudex/direct-reach.py $tg62; python3 /home/cloudex/direct-reach.py --via $own62 $tg62" 2>&1)
+	else
+		img62=$(node_sh "docker inspect $DMC -f '{{.Config.Image}}'")
+		sub62=$(awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 + 4}' <<<"$own62")
+		"${NODE_SSH[@]}" "cat > $NODE_DIR/direct-reach.py" <"$here/direct-reach.py"
+		r62b=$(node_sh "docker run --rm --label build.cloudex.node=verify --label build.cloudex.role=check --network $DMC --ip $sub62 --cap-add NET_ADMIN -v $NODE_DIR/direct-reach.py:/r.py:ro --entrypoint sh $img62 -c 'python3 /r.py $tg62; python3 /r.py --via $own62 $tg62'" 2>&1)
+	fi
+	r62c=$(printf '%s\n%s\n' "$r62a" "$r62b" | grep -E '^[0-9.]+:[0-9]+ ' | awk '{print $2}' | sort | uniq -c | tr -s ' ' | tr '\n' ',')
+	local n62
+	n62=$(printf '%s\n%s\n' "$r62a" "$r62b" | grep -cE '^[0-9.]+:[0-9]+ (timeout|refused|unreachable|closed|stalled)$')
+	OUT="on $runtime62, targets$tg62; as the user: $(tr '\n' ';' <<<"$r62a"); as root, plain then routed through the agent ($own62): $(tr '\n' ';' <<<"$r62b"); totals $r62c" CODE=""
+	ok N62 "$(direct_desc N62)" [ "$n62" = "$(($(wc -w <<<"$tg62") * 3))" ]
+
+	# N63: activity from a direct session keeps an idle sandbox running.
+	local SI=$P-di SIID spid63 alive63="" st63 took63 c63
+	if direct_client; then
+		cx new --on "$N" --name "$SI" --no-use
+		SIID=$(field .id)
+		"$CX" set "$SI" --idle 2m >/dev/null 2>&1
+		"$CX" ssh-config >"$cfg" 2>/dev/null
+		CLOUDEX_DIRECT=only CLOUDEX_DEBUG=1 ssh -F "$cfg" -o BatchMode=yes -o ServerAliveInterval=15 -N "$SI.cloudex" </dev/null >/dev/null 2>"$work/d63.log" &
+		spid63=$!
+		alive63=yes
+		for _ in $(seq 1 10); do
+			sleep 30
+			st63=$("$CX" info "$SI" --json 2>/dev/null | jq -r .state)
+			[[ $st63 == running ]] || alive63="$alive63 $st63"
+			kill -0 "$spid63" 2>/dev/null || alive63="$alive63 ssh-ended"
+		done
+		c63=$(chose "$work/d63.log")
+		kill "$spid63" 2>/dev/null
+		wait "$spid63" 2>/dev/null
+		local t63
+		t63=$(now_s)
+		took63=""
+		for _ in $(seq 1 60); do
+			[[ $("$CX" info "$SI" --json 2>/dev/null | jq -r .state) == stopped ]] && { took63=$(since "$t63"); break; }
+			sleep 5
+		done
+		OUT="$c63; through 5 minutes: ${alive63}; after ssh closed, stopped in ${took63:-more than 300} s" CODE=""
+		ok N63 "$(direct_desc N63)" [ "$alive63" = yes -a -n "$(grep '^chose direct' <<<"$c63")" -a -n "$took63" -a "$(awk -v t="${took63:-999}" 'BEGIN { print (t <= 180) }')" = 1 ]
+	else
+		skip N63 "$(direct_desc N63)" "set VERIFY_NODE_DIRECT=1 where this machine reaches the node's direct addresses"
+	fi
+
+	# N64 (first two parts; node rm --force comes before N35): a revoked
+	# token's session ends, and stop ends one at once.
+	if direct_client; then
+		local tcfg tid tsec pid64 g64a g64b
+		cx tokens create "$P-dt" --expires 1h --json
+		tid=$(field .id) tsec=$(field .secret)
+		OUT=""
+		tcfg=$work/tokcfg
+		mkdir -p "$tcfg" && chmod 700 "$tcfg"
+		jq --arg k "$tsec" '.apiKey = $k' "$CLOUDEX_CONFIG_DIR/config.json" >"$tcfg/config.json"
+		CLOUDEX_CONFIG_DIR=$tcfg CLOUDEX_DIRECT=only CLOUDEX_DEBUG=1 "$CX" ssh "$SD" -- -N -o ServerAliveInterval=15 </dev/null >/dev/null 2>"$work/d64.log" &
+		pid64=$!
+		sleep 8
+		local c64a
+		c64a=$(chose "$work/d64.log")
+		"$CX" tokens revoke "$tid" >/dev/null 2>&1
+		g64a=$(wait_gone "$pid64" 150)
+		kill "$pid64" 2>/dev/null
+		# stop: the idle sandbox of N63, resumed.
+		"$CX" resume "$SI" >/dev/null 2>&1
+		"$CX" ssh-config >"$cfg" 2>/dev/null
+		CLOUDEX_DIRECT=only CLOUDEX_DEBUG=1 ssh -F "$cfg" -o BatchMode=yes -o ServerAliveInterval=15 -N "$SI.cloudex" </dev/null >/dev/null 2>"$work/d64b.log" &
+		pid64=$!
+		sleep 8
+		local c64b t64
+		c64b=$(chose "$work/d64b.log")
+		t64=$(now_s)
+		"$CX" stop "$SI" >/dev/null 2>&1
+		local stopcmd
+		stopcmd=$(since "$t64")
+		g64b=$(wait_gone "$pid64" 60)
+		kill "$pid64" 2>/dev/null
+		D64="revoked token's session ($c64a) ended ${g64a:-NOT within 150} s after the revoke; stopped sandbox's session ($c64b) ended ${g64b:-NOT within 60} s after stop returned (stop took $stopcmd s)"
+		D64_OK=$([ -n "$(grep '^chose direct' <<<"$c64a")" -a -n "$(grep '^chose direct' <<<"$c64b")" -a -n "$g64a" -a -n "$g64b" ] &&
+			[ "$(awk -v a="${g64a:-999}" -v b="${g64b:-999}" 'BEGIN { print (a <= 90 && b <= 10) }')" = 1 ] && echo yes)
+		"$CX" delete "$SI" --yes >/dev/null 2>&1
+	else
+		D64="" D64_OK=""
+	fi
+
+	# N65: a direct session through a cut of the node's route to Cloudflare,
+	# and through a deploy.
+	local r65="" ok65=yes kp
+	if direct_client && [[ -n $NODE_SUDO || ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
+		if [[ -n $NODE_SUDO ]]; then
+			local actl off65="" new65 back65="" tcut
+			actl=$agent62
+			rm -f "$work/cut.done"
+			CLOUDEX_DIRECT=only python3 "$here/keys.py" "$SD.cloudex" 0 "$cfg" --until "$work/cut.done" >"$work/k65a" 2>/dev/null &
+			kp=$!
+			sleep 5
+			# Everything from the agent to port 443 is dropped (its socket to the
+			# Worker), and a timer takes the table away after 120 s whatever happens.
+			node_sh "sudo nft add table inet cxverify$P && sudo nft add chain inet cxverify$P cut '{ type filter hook forward priority -10; }' && sudo nft add rule inet cxverify$P cut ip saddr $actl tcp dport 443 drop && sudo systemd-run --quiet --unit cx-verify-cut-$P --on-active=120 nft delete table inet cxverify$P" >/dev/null 2>&1
+			tcut=$(now_s)
+			wait_state "$N" offline 100 && off65="offline after $WAITED s"
+			new65=$(CLOUDEX_DIRECT=only CLOUDEX_DEBUG=1 "$CX" ssh "$SD" -- echo cut-ok 2>"$work/d65.log" </dev/null)
+			new65="$new65 ($(chose "$work/d65.log"))"
+			while [[ $(awk -v w="$(since "$tcut")" 'BEGIN { print (w < 125) }') == 1 ]]; do sleep 2; done
+			node_sh "sudo nft delete table inet cxverify$P 2>/dev/null; sudo systemctl stop cx-verify-cut-$P.timer 2>/dev/null; sudo systemctl reset-failed cx-verify-cut-$P.service 2>/dev/null; true"
+			wait_state "$N" online 120 && back65="online again $WAITED s after the cut ended"
+			touch "$work/cut.done"
+			wait "$kp"
+			r65="the cut: ${off65:-NOT offline}; a new direct ssh during it: $new65; ${back65:-NOT back online}; the session $(cat "$work/k65a")"
+			[[ -n $off65 && -n $back65 && $new65 == "cut-ok (chose direct"* && $(jq -r .alive "$work/k65a" 2>/dev/null) == true ]] || ok65=""
+		else
+			r65="no cut (needs VERIFY_NODE_SUDO=1)"
+			ok65=""
+		fi
+		if [[ ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
+			local drc65
+			rm -f "$work/dep.done"
+			CLOUDEX_DIRECT=only python3 "$here/keys.py" "$SD.cloudex" 0 "$cfg" --until "$work/dep.done" >"$work/k65b" 2>/dev/null &
+			kp=$!
+			sleep 5
+			cf_fresh
+			"$CX" deploy --yes --skip-check >"$work/deploy65.log" 2>&1
+			drc65=$?
+			grep -q "API deployed at" "$work/deploy65.log" || drc65="$drc65 (the Worker wasn't replaced)"
+			sleep 20
+			touch "$work/dep.done"
+			wait "$kp"
+			r65="$r65; deploy exit $drc65, the session $(cat "$work/k65b")"
+			[[ $(jq -r .alive "$work/k65b" 2>/dev/null) == true && $drc65 != *replaced* ]] || ok65=""
+		else
+			r65="$r65; no deploy (set VERIFY_NODE_DEPLOY=1)"
+			ok65=""
+		fi
+		OUT="$r65" CODE=""
+		if [[ -n $NODE_SUDO && ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
+			ok N65 "$(direct_desc N65)" [ "$ok65" = yes ]
+		else
+			# One of the two ran: it must hold; the other is the reason for the SKIP.
+			[[ $r65 == *'"alive": true'* && $r65 != *NOT* ]] && skip N65 "$(direct_desc N65)" "only part of it ran: $r65" || fail N65 "$(direct_desc N65)" "$r65"
+		fi
+	else
+		skip N65 "$(direct_desc N65)" "needs VERIFY_NODE_DIRECT=1, and VERIFY_NODE_SUDO=1 (the cut) and VERIFY_NODE_DEPLOY=1 (the deploy)"
+	fi
+	"$CX" delete "$SD" --yes >/dev/null 2>&1
+}
+
 if want node; then
 	if [[ -z ${VERIFY_NODE_SSH:-} ]]; then
 		skip N00 "the node area" "set VERIFY_NODE_SSH to a command that runs a command on a host for the agent, such as 'ssh box'"
@@ -2062,6 +2468,7 @@ if want node; then
 		m6_skip "no node host: set VERIFY_NODE_SSH"
 		review_host_skip "no node host: set VERIFY_NODE_SSH"
 		review_worker_skip "no node host: set VERIFY_NODE_SSH"
+		direct_skip "no node host: set VERIFY_NODE_SSH"
 	else
 		read -ra NODE_SSH <<<"$VERIFY_NODE_SSH"
 		NODE_DIR="\$HOME/.cloudex-verify-$P"
@@ -2104,6 +2511,8 @@ if want node; then
 			inst=(--api "$API_URL" --agent-image "$AIMG")
 			[[ -n ${VERIFY_NODE_MACHINE_IMAGE:-} ]] && inst+=(--machine-image "$VERIFY_NODE_MACHINE_IMAGE")
 			[[ -z $NODE_SUDO ]] && inst+=(--unisolated)
+			# v0.2.3: the direct port's addresses (default: the installer's auto).
+			for a in ${VERIFY_NODE_DIRECT_ADDR//,/ }; do inst+=(--direct-addr "$a"); done
 			t0=$(now_s)
 			install_node "$tok" "${inst[@]}" >"$work/install.log" 2>&1
 			irc=$?
@@ -2194,7 +2603,7 @@ if want node; then
 			M3_SANDBOX="" M3_ID="" REBOOTED=""
 			# VERIFY_NODE_PARTS picks the milestones' checks to run after the
 			# install (default all): m3 m4 m5 m6.
-			parts=" ${VERIFY_NODE_PARTS:-m3 m4 m5 m6 review} "
+			parts=" ${VERIFY_NODE_PARTS:-m3 m4 m5 m6 review direct} "
 			if [[ $parts == *" m3 "* ]]; then node_m3; else m3_skip "not in VERIFY_NODE_PARTS"; fi
 			if [[ $parts == *" m4 "* ]]; then node_m4; else m4_skip "not in VERIFY_NODE_PARTS" "N18 N19 N20 N21 N22 N23 N24"; fi
 			if [[ $parts == *" m5 "* ]]; then node_m5; else m5_skip "not in VERIFY_NODE_PARTS"; fi
@@ -2206,6 +2615,7 @@ if want node; then
 				review_host_skip "not in VERIFY_NODE_PARTS" "N45 N46 N47 N48 N49 N50 N51 N53"
 				review_worker_skip "not in VERIFY_NODE_PARTS"
 			fi
+			if [[ $parts == *" direct "* ]]; then node_direct; else direct_skip "not in VERIFY_NODE_PARTS" "N57 N58 N59 N60 N61 N62 N63 N65"; fi
 			[[ -n $M3_SANDBOX ]] && "$CX" delete "$M3_SANDBOX" --yes >/dev/null 2>&1
 			left=$(node_sh "docker ps -aq --filter label=build.cloudex.role=machine | wc -l; docker network ls -q --filter label=build.cloudex.role=machine | wc -l" | tr '\n' ' ')
 			# N35: a node with a sandbox is removed only with --force, which
@@ -2214,7 +2624,35 @@ if want node; then
 			rid=$(field .id)
 			cx node rm "$N" --yes
 			r35="without --force: code $CODE, ${ERR:0:120}"
+			# N64's last part: a direct session to that sandbox ends with node rm --force, and the port closes.
+			local_pid64="" c64c=""
+			if [[ $parts == *" direct "* && -n $DPORT ]] && direct_client; then
+				CLOUDEX_DIRECT=only CLOUDEX_DEBUG=1 "$CX" ssh "$P-n5r" -- -N </dev/null >/dev/null 2>"$work/d64c.log" &
+				local_pid64=$!
+				sleep 8
+				c64c=$(chose "$work/d64c.log")
+			fi
 			cx node rm "$N" --yes --force
+			if [[ $parts == *" direct "* && -n $DPORT ]]; then
+				g64c=""
+				[[ -n $local_pid64 ]] && g64c=$(wait_gone "$local_pid64" 30)
+				[[ -n $local_pid64 ]] && kill "$local_pid64" 2>/dev/null
+				p64=""
+				for _ in $(seq 1 20); do
+					p64=$(node_sh "ss -ltnH" | awk -v p=":$DPORT" '$4 ~ p"$"' | wc -l | tr -d ' ')
+					[[ $p64 == 0 ]] && break
+					sleep 1
+				done
+				sc64=$(node_sh "docker ps -aq --filter name=^cloudex-node-direct\$ | wc -l" | tr -d ' ')
+				if direct_client; then
+					OUT="$D64; node rm --force: the session ($c64c) ended ${g64c:-NOT within 30} s after, $p64 listening on :$DPORT, sidecars left $sc64" CODE=""
+					ok N64 "$(direct_desc N64)" [ "${D64_OK:-}" = yes -a -n "$(grep '^chose direct' <<<"$c64c")" -a -n "$g64c" -a "$p64" = 0 -a "$sc64" = 0 ]
+				else
+					skip N64 "$(direct_desc N64)" "the sessions need VERIFY_NODE_DIRECT=1; node rm --force left $p64 listening on :$DPORT and $sc64 sidecars"
+				fi
+			else
+				direct_skip "not in VERIFY_NODE_PARTS, or no direct port" N64
+			fi
 			sleep 2
 			st=$(node_state "$N")
 			log=$(node_sh "docker logs --tail 5 cloudex-node 2>&1")
@@ -2248,6 +2686,16 @@ if want node; then
 			[[ -n ${REBOOTED:-} ]] && na="${na:-no change in the Docker objects, and no inet cloudex (the nftables tables were compared only without a reboot)}"
 			OUT="machines and networks after deleting the sandboxes: $left; outside the labels during the run: ${nb:-no change}; uninstall exit $urc; left by it (containers, networks, volume, unit files): $leftover; before and after: ${na:-no change}" CODE=""
 			ok N25 "$(m3_desc N25)" [ "$left" = "0 0 " -a -z "$nb" -a "$urc" = 0 -a "$leftover" = "0 0 0 0 " -a \( -z "$na" -o -n "$(grep '^no change in the Docker' <<<"$na")" \) ]
+			# N66: the sidecar (labelled build.cloudex.role=direct, no node label)
+			# and the direct port's listener are gone too.
+			if [[ -n $DPORT ]]; then
+				sc66=$(node_sh "docker ps -aq --filter label=build.cloudex.role=direct | wc -l; docker ps -aq --filter name=^cloudex-node-direct\$ | wc -l" | tr '\n' ' ')
+				l66=$(node_sh "ss -ltnH" | awk -v p=":$DPORT" '$4 ~ p"$" { print $4 }' | tr '\n' ' ')
+				OUT="sidecars left (by label, by name): $sc66; listening on :$DPORT: ${l66:-nothing}" CODE=""
+				ok N66 "$(direct_desc N66)" [ "$sc66" = "0 0 " -a -z "$l66" ]
+			else
+				direct_skip "the node had no direct port (or the direct part didn't run)" N66
+			fi
 			if [[ $parts == *" review "* ]]; then node_review_r3; else review_host_skip "not in VERIFY_NODE_PARTS" N52; fi
 			node_stop_all
 		fi
