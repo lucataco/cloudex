@@ -97,7 +97,7 @@ import { type MachineReport, machineAction, nodeIsolation, nodeRetryAt, offlineA
 // A sandbox's node is offline since since; tries failed asks since, and the next is at retryAt (nodeRetryAt).
 type NodeDown = { since: number; lastSeenAt: number | null; tries?: number; retryAt?: number };
 import { tokenAlive } from "./tokens";
-import { type DirectTokens, directRefusal, directSecret, endedTokens, mintDirectTicket, mintToken, reportTokens, sameTokens, sweepTokens } from "./direct";
+import { type DirectTokens, directRefusal, directSecret, endedTokens, mergeTokens, mintDirectTicket, mintToken, reportTokens, sameTokens, sweepTokens } from "./direct";
 import { CREDENTIAL_ENDED, LINK_HEADER, TOKEN_HEADER, errorStatus, fail, previewToken, sameSecret, sleep, withTimeout } from "./util";
 
 // Exits 0 once the entrypoint is ready in this start of the machine, and 3
@@ -2262,8 +2262,22 @@ export class Sandbox extends DurableObject<Env> {
     if (rep.active && this.record.state === "running") this.touch();
     if (!rep.tokens?.length) return;
     const before = await this.directTokens();
-    const after = reportTokens(before, rep.tokens, Date.now());
-    if (!sameTokens(before, after)) await this.ctx.storage.put("directTokens", after);
+    const { next, end } = await reportTokens(before, rep.tokens, Date.now(), (t) => tokenAlive(this.env.DB, t));
+    if (!sameTokens(before, next)) {
+      // Re-read: the D1 checks let mints and the alarm in (re-review 2).
+      const added: DirectTokens = {};
+      for (const [t, e] of Object.entries(next)) if (before[t] !== e) added[t] = e;
+      await this.ctx.storage.put("directTokens", mergeTokens(await this.directTokens(), added, []));
+    }
+    if (end.length && this.record) {
+      // Ended, or never a token of this deployment: end those sessions now.
+      try {
+        await this.nodeOp("directEnd", { sandbox: this.record.id, sessions: [], tokens: end }, 10_000);
+        console.log(`[${this.record.id}] ended the direct sessions of ${end.length} reported tokens that don't work`);
+      } catch (e) {
+        console.error(`[${this.record.id}] ending reported tokens' sessions: ${message(e)}; the next report asks again`);
+      }
+    }
   }
 
   // From the alarm: every direct session of a token that ended is ended on
@@ -2274,18 +2288,22 @@ export class Sandbox extends DurableObject<Env> {
   private async endDirect() {
     const before = await this.directTokens();
     if (!Object.keys(before).length) return;
-    const all = sweepTokens(before, Date.now());
-    const ended = await endedTokens(all, (t) => tokenAlive(this.env.DB, t));
+    const ended = await endedTokens(sweepTokens(before, Date.now()), (t) => tokenAlive(this.env.DB, t));
+    let acked: string[] = [];
     if (ended.length && this.record) {
       try {
         const out = await this.nodeOp("directEnd", { sandbox: this.record.id, sessions: [], tokens: ended }, 10_000);
-        for (const t of ended) delete all[t];
+        acked = ended;
         console.log(`[${this.record.id}] ended the direct sessions of ${ended.length} tokens that ended (${typeof out.ended === "number" ? out.ended : "?"} open)`);
       } catch (e) {
         console.error(`[${this.record.id}] ending direct sessions: ${message(e)}; again at the next alarm`);
       }
     }
-    if (!sameTokens(before, all)) await this.ctx.storage.put("directTokens", all);
+    // Re-read: the D1 checks and the op let mints and reports in, which a
+    // write of the copy read before would undo (re-review 2).
+    const cur = await this.directTokens();
+    const after = mergeTokens(sweepTokens(cur, Date.now()), {}, acked);
+    if (!sameTokens(cur, after)) await this.ctx.storage.put("directTokens", after);
   }
 
   // ---------------------------------------------------------------- the lifecycle on a node (v0.2.2 M5)

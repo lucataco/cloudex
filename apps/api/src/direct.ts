@@ -174,16 +174,25 @@ export function directRefusal(s: { state: string; onNode: string | null; asked: 
 // are taken whether or not the object remembers them, an entry lasts an hour
 // after its last evidence (the agent reports quiet sessions every 5 minutes,
 // and again after each welcome), and the agent ends sessions by token.
-export type DirectToken = { m: number[]; s: number };
+// r: taken from an agent's report, not minted here (2026-11-14 re-review 3:
+// such entries are capped apart, so that a node naming made-up tokens can't
+// lock real ones out of minting).
+export type DirectToken = { m: number[]; s: number; r?: 1 };
 export type DirectTokens = Record<string, DirectToken>;
 
 // Tickets a token may hold for one sandbox that haven't expired: as many as
 // the sandbox may have sessions open on the direct port.
 export const TOKEN_TICKETS_MAX = DIRECT_SESSIONS_MAX;
-// Tokens one sandbox mints for while their entries last; reports may add as
-// many again (an agent names at most DIRECT_SESSIONS_MAX open sessions), so
-// the record stays bounded at twice this.
+// Tokens one sandbox mints for while their entries last.
 export const TOKENS_MINT_MAX = 64;
+// Tokens taken from reports and not minted here: an honest agent has at most
+// DIRECT_SESSIONS_MAX sessions open on a sandbox, so as many tokens. With
+// TOKENS_MINT_MAX, the record stays within 128 entries.
+export const TOKENS_REPORTED_MAX = DIRECT_SESSIONS_MAX;
+// Tokens a report names that the object doesn't know which it checks in D1
+// (the rest wait for a later report: the agent sends one at least every 5
+// minutes while sessions are open, and after each welcome).
+export const TOKENS_CHECKED_PER_REPORT = 16;
 // An entry is forgotten this long after its last evidence.
 export const TOKEN_FORGET_MS = 60 * 60_000;
 // A report renews s only when it's older than this, so that the reports of a
@@ -197,19 +206,53 @@ export function mintToken(all: DirectTokens, token: string | null, exp: number, 
   const cur = all[token];
   const live = (cur?.m ?? []).filter((e) => e * 1000 > nowMs);
   if (live.length >= TOKEN_TICKETS_MAX) return `this token has ${TOKEN_TICKETS_MAX} direct tickets for the sandbox from the last minute; wait a moment`;
-  if (!cur && Object.keys(all).length >= TOKENS_MINT_MAX) return `${TOKENS_MINT_MAX} tokens have used the direct path to this sandbox in the last hour`;
+  const minted = Object.values(all).filter((e) => !e.r).length;
+  if ((!cur || cur.r) && minted >= TOKENS_MINT_MAX) return `${TOKENS_MINT_MAX} tokens have used the direct path to this sandbox in the last hour`;
   return { ...all, [token]: { m: [...live, exp], s: nowMs } };
 }
 
-// An agent's report naming the tokens of the sandbox's open sessions: each is
-// kept, known or not, with its evidence renewed.
-export function reportTokens(all: DirectTokens, tokens: string[], nowMs: number): DirectTokens {
+// An agent's report naming the tokens of the sandbox's open sessions. Known
+// ones have their evidence renewed. An unknown one (minted before the record
+// forgot it, or made up by the node) is checked with alive, at most
+// TOKENS_CHECKED_PER_REPORT a report: one that still works is kept, up to
+// TOKENS_REPORTED_MAX; one that doesn't (ended, or never existed) is in end,
+// for directEnd at once, which costs a node that made it up only its own
+// fake sessions (2026-11-14 re-review 3).
+export async function reportTokens(
+  all: DirectTokens,
+  tokens: string[],
+  nowMs: number,
+  alive: (token: string) => Promise<boolean>,
+): Promise<{ next: DirectTokens; end: string[] }> {
   let next = all;
+  const end: string[] = [];
+  let checked = 0;
   for (const t of new Set(tokens)) {
     const cur = next[t];
-    if (cur && nowMs - cur.s < SEEN_RENEW_MS) continue;
-    next = { ...next, [t]: { m: cur?.m ?? [], s: nowMs } };
+    if (cur) {
+      if (nowMs - cur.s >= SEEN_RENEW_MS) next = { ...next, [t]: { ...cur, s: nowMs } };
+      continue;
+    }
+    if (checked >= TOKENS_CHECKED_PER_REPORT) continue;
+    checked++;
+    const ok = await alive(t).catch(() => null);
+    if (ok === null) continue; // D1 failed: the next report asks again
+    if (!ok) end.push(t);
+    else if (Object.values(next).filter((e) => e.r).length < TOKENS_REPORTED_MAX) next = { ...next, [t]: { m: [], s: nowMs, r: 1 } };
+    else end.push(t); // more than an honest agent can have open
   }
+  return { next, end };
+}
+
+// The record now (re-read after awaits that let other requests in), with
+// what a report added and what an alarm ended merged in (re-review 2).
+export function mergeTokens(cur: DirectTokens, added: DirectTokens, ended: string[]): DirectTokens {
+  const next: DirectTokens = { ...cur };
+  for (const [t, e] of Object.entries(added)) {
+    const c = next[t];
+    next[t] = c ? { m: c.m, s: Math.max(c.s, e.s), ...(c.r && e.r ? { r: 1 as const } : {}) } : e;
+  }
+  for (const t of ended) delete next[t];
   return next;
 }
 

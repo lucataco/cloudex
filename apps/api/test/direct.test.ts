@@ -11,6 +11,9 @@ const {
   TOKEN_FORGET_MS,
   TOKEN_TICKETS_MAX,
   TOKENS_MINT_MAX,
+  TOKENS_REPORTED_MAX,
+  TOKENS_CHECKED_PER_REPORT,
+  mergeTokens,
   directCandidates,
   directRefusal,
   directSecret,
@@ -110,17 +113,18 @@ test("the object refuses as serve() does: moved, removed, not running", () => {
   assert.equal(directRefusal({ ...base, asked: "nd-other000" }), "moved");
 });
 
-test("tokens: kept from the mint, renewed by reports now and then, forgotten an hour after the last evidence", () => {
+test("tokens: kept from the mint, renewed by reports now and then, forgotten an hour after the last evidence", async () => {
   const now = 1_000_000_000_000;
   const e = Math.floor(now / 1000) + 60;
   let s = mintToken({}, "tk-aaaa1111", e, now) as Record<string, { m: number[]; s: number }>;
   assert.deepEqual(s, { "tk-aaaa1111": { m: [e], s: now } });
   assert.equal(mintToken(s, null, e, now), s, "the admin key isn't kept");
   // A report renews only now and then, and adds a token it names that wasn't minted here.
-  assert.equal(reportTokens(s, ["tk-aaaa1111"], now + 30_000), s);
-  assert.equal(reportTokens(s, ["tk-aaaa1111"], now + SEEN_RENEW_MS)["tk-aaaa1111"]!.s, now + SEEN_RENEW_MS);
-  s = reportTokens(s, ["tk-bbbb2222"], now);
-  assert.deepEqual(s["tk-bbbb2222"], { m: [], s: now });
+  const yes = async () => true;
+  assert.equal((await reportTokens(s, ["tk-aaaa1111"], now + 30_000, yes)).next, s);
+  assert.equal((await reportTokens(s, ["tk-aaaa1111"], now + SEEN_RENEW_MS, yes)).next["tk-aaaa1111"]!.s, now + SEEN_RENEW_MS);
+  s = (await reportTokens(s, ["tk-bbbb2222"], now, yes)).next;
+  assert.deepEqual(s["tk-bbbb2222"], { m: [], s: now, r: 1 });
   // Expired ticket times go; a token with no evidence for an hour goes.
   assert.deepEqual(sweepTokens(s, e * 1000)["tk-aaaa1111"], { m: [], s: now });
   assert.ok(sweepTokens(s, now + TOKEN_FORGET_MS - 1)["tk-aaaa1111"]);
@@ -167,8 +171,10 @@ test("review D-M1: a session whose open report was lost is still ended, by the t
   s = sweepTokens(s, now + 10 * 60_000);
   assert.deepEqual(await endedTokens(s, async () => false), ["tk-quiet001"]);
   // An object that has forgotten it (or never minted it) takes it from a report.
-  s = reportTokens({}, ["tk-quiet001"], now + 2 * TOKEN_FORGET_MS);
+  // A forgotten token that still works is kept for the alarm; one that ended is ended at once.
+  s = (await reportTokens({}, ["tk-quiet001"], now + 2 * TOKEN_FORGET_MS, async () => true)).next;
   assert.deepEqual(await endedTokens(s, async () => false), ["tk-quiet001"]);
+  assert.deepEqual(await reportTokens({}, ["tk-quiet001"], now + 2 * TOKEN_FORGET_MS, async () => false), { next: {}, end: ["tk-quiet001"] });
   // A failed check leaves it for the next alarm.
   assert.deepEqual(await endedTokens(s, async () => Promise.reject(new Error("D1"))), []);
 });
@@ -211,4 +217,48 @@ test("the node's direct fact reaches D1 with its facts, and the route's one read
   await revokeNode(db as never, "nd-abcd1234");
   assert.deepEqual(await directRow(db as never, "cx-abc123"), { node: "nd-abcd1234", name: "box", publicKey: null, direct: null });
   assert.equal("publicKey" in (await findNode(db as never, "box"))!, false);
+});
+
+test("re-review 3: a node naming made-up tokens can't grow the record or lock real tokens out", async () => {
+  // Before: 120 reports of 64 made-up ids gave 7,680 entries (315 KB), and a
+  // real token's mint was refused for an hour.
+  const now = 1_000_000_000_000;
+  let all: Record<string, { m: number[]; s: number; r?: 1 }> = {};
+  const real = new Set(["tk-real0001"]);
+  let ended = 0;
+  let asked = 0;
+  for (let r = 0; r < 120; r++) {
+    const ts = Array.from({ length: 64 }, (_, i) => `tk-${(r * 64 + i).toString(36).padStart(8, "0")}`);
+    const out = await reportTokens(all, ts, now + r * 500, async (t) => (asked++, real.has(t)));
+    all = out.next;
+    ended += out.end.length;
+  }
+  assert.equal(Object.keys(all).length, 0, "made-up tokens aren't kept");
+  assert.equal(asked, 120 * TOKENS_CHECKED_PER_REPORT, "D1 is asked a bounded number of times a report");
+  assert.equal(ended, asked, "their sessions are ended at once");
+  assert.equal(typeof mintToken(all, "tk-real0001", Math.floor(now / 1000) + 120, now + 61_000), "object");
+  // Tokens that do work, reported and not minted here, are capped apart from minted ones.
+  all = {};
+  for (let r = 0; r < 10; r++) {
+    const ts = Array.from({ length: 16 }, (_, i) => `tk-${(r * 16 + i).toString(36).padStart(8, "0")}`);
+    all = (await reportTokens(all, ts, now, async () => true)).next;
+  }
+  assert.equal(Object.keys(all).length, TOKENS_REPORTED_MAX);
+  assert.ok(JSON.stringify(all).length < 128 * 64);
+  for (let i = 0; i < TOKENS_MINT_MAX; i++) all = mintToken(all, `tk-mint${i.toString(36).padStart(4, "0")}`, Math.floor(now / 1000) + 60, now) as typeof all;
+  assert.equal(Object.keys(all).length, TOKENS_REPORTED_MAX + TOKENS_MINT_MAX);
+});
+
+test("re-review 2: what a mint or report wrote while the alarm awaited D1 is merged, not undone", () => {
+  const read = { "tk-aaaa1111": { m: [], s: 1 }, "tk-gone0001": { m: [], s: 1 } };
+  // Meanwhile a mint added a token and renewed another.
+  const now = { ...read, "tk-aaaa1111": { m: [99], s: 5 }, "tk-new00001": { m: [99], s: 5 } };
+  assert.deepEqual(mergeTokens(now, {}, ["tk-gone0001"]), { "tk-aaaa1111": { m: [99], s: 5 }, "tk-new00001": { m: [99], s: 5 } });
+  // A report's addition merged into a record a mint changed meanwhile keeps the mint's times.
+  assert.deepEqual(mergeTokens(now, { "tk-aaaa1111": { m: [], s: 9, r: 1 }, "tk-rep00001": { m: [], s: 9, r: 1 } }, []), {
+    "tk-aaaa1111": { m: [99], s: 9 },
+    "tk-gone0001": { m: [], s: 1 },
+    "tk-new00001": { m: [99], s: 5 },
+    "tk-rep00001": { m: [], s: 9, r: 1 },
+  });
 });
