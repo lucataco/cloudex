@@ -23,7 +23,9 @@ jobs:
       - run: pnpm test
 
   python:
-    runs-on: ubuntu-latest
+    # ubuntu-latest is 26.04 now, which has no Python 3.9; the SDK still
+    # supports 3.9, so this job stays on 24.04.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: python
