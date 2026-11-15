@@ -125,3 +125,34 @@ func TestNewSessionsAreHexAndDiffer(t *testing.T) {
 		t.Fatalf("%s %s", a, b)
 	}
 }
+
+// A ticket changed only in the unused bits of its MAC's last character
+// decodes to the same bytes under a lenient decoder; it must be refused.
+func TestATicketChangedInItsUnusedBitsIsRefused(t *testing.T) {
+	v := load(t)
+	secret, _ := DecodeSecret(v.Secret)
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	for _, e := range v.Valid {
+		last := strings.IndexByte(alphabet, e.Ticket[len(e.Ticket)-1])
+		for i := 1; i < 4; i++ {
+			changed := e.Ticket[:len(e.Ticket)-1] + string(alphabet[last^i])
+			if c, err := Verify(secret, changed); err == nil {
+				t.Errorf("%s with its last character %q: accepted as %+v", e.Name, alphabet[last^i], c)
+			}
+		}
+	}
+	// And one minted with a MAC ending in 'A' (the probe's altered case, N60).
+	for i := 0; i < 400; i++ {
+		c := v.Valid[0].Claims
+		c.Session = NewSession()
+		tk := Mint(secret, c)
+		if tk[len(tk)-1] != 'A' {
+			continue
+		}
+		if _, err := Verify(secret, tk[:len(tk)-1]+"B"); err == nil {
+			t.Fatalf("a MAC ending in A, changed to B: accepted")
+		}
+		return
+	}
+	t.Fatal("no ticket in 400 had a MAC ending in A")
+}

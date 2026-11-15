@@ -126,14 +126,18 @@ func Verify(secret []byte, ticket string) (Claims, error) {
 	if !ok || payload == "" || sig == "" || strings.Contains(sig, ".") || !b64url.MatchString(payload) || !b64url.MatchString(sig) {
 		return c, ErrMalformed
 	}
-	got, err := base64.RawURLEncoding.DecodeString(sig)
+	// Strict: a MAC's last character carries two unused bits, which the
+	// lenient decoder ignores, so four spellings of one ticket would verify
+	// (harmless, since replay is by session, but a changed ticket must fail:
+	// N60 found it on the brev VM, 2026-11-15).
+	got, err := base64.RawURLEncoding.Strict().DecodeString(sig)
 	if err != nil {
 		return c, ErrMalformed
 	}
 	if !hmac.Equal(got, mac(secret, payload)) {
 		return c, ErrBadMAC
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(payload)
 	if err != nil {
 		return c, ErrMalformed
 	}
