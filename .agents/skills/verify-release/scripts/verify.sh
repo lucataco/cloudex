@@ -2759,7 +2759,7 @@ node_forks() {
 	# the fork, the sweep leaves no image without a sandbox, and a fork asked
 	# again makes one image.
 	if [[ ${VERIFY_NODE_DEPLOY:-} == 1 ]]; then
-		local D=$P-kd DID DMC76 dpid fpid t76 up76="" dep76="" c76 st76 c76b st76b pt76b n76b sw76 left76 cnt76 rc76
+		local D=$P-kd DID DMC76 dpid fpid t76 up76="" dep76="" c76 st76 c76b st76b e76b pt76b n76b sw76 left76 cnt76 rc76
 		for _ in $(seq 1 18); do
 			cx new --on "$N" --name "$D" --no-use
 			DID=$(field .id)
@@ -2795,7 +2795,8 @@ node_forks() {
 		pz=$(node_sh "docker events --since $t0h --until \$(date +%s) --filter container=$DMC76 --filter event=pause --filter event=unpause --format '{{.Action}} {{.Time}}'" | tr '\n' ' ')
 		# Asked again.
 		cx fork "$D" --name "$D-b" --no-use
-		c76b=$CODE st76b=$(field '.[0].state')
+		c76b=$CODE st76b=$(field '.[0].state') e76b=""
+		[[ $CODE != 0 ]] && e76b=" ($(grep -m1 '^error' <<<"$ERR" | cut -c8-200), $(since "$t76") s after the deploy began)"
 		pt76b=$(ctr_point "$(field '.[0].id')")
 		n76b=$(fork_count "build.cloudex.point=$pt76b")
 		sw76=$(in_agent "forks --sweep --age 0s" 2>/dev/null | jq -r .removed)
@@ -2806,7 +2807,7 @@ node_forks() {
 			[[ " $used76 " == *" $i "* ]] || stray76=$((stray76 + 1))
 		done
 		cnt76=$(node_sh "docker logs cloudex-node 2>&1 | grep -c 'committed fork point $DID-fork-'")
-		OUT="$made76; deploy exit $rc76: uploading at ${up76:-?} s, Worker replaced at ${dep76:-?} s; the commit's pause and unpause (host time, deploy began $t0h): ${pz:-none}; the fork during it: exit $c76, ${st76:-no fork} ($(grep -m1 '^error' "$work/f76.err" | cut -c8-160)); asked again: exit $c76b, $st76b, $n76b image for its point; the sweep removed $sw76; images of $D with no fork after: $stray76; commits logged for $D: $cnt76" CODE=""
+		OUT="$made76; deploy exit $rc76: uploading at ${up76:-?} s, Worker replaced at ${dep76:-?} s; the commit's pause and unpause (host time, deploy began $t0h): ${pz:-none}; the fork during it: exit $c76, ${st76:-no fork} ($(grep -m1 '^error' "$work/f76.err" | cut -c8-160)); asked again: exit $c76b$e76b, $st76b, $n76b image for its point; the sweep removed $sw76; images of $D with no fork after: $stray76; commits logged for $D: $cnt76" CODE=""
 		okv N76 "$(forks_desc N76)" [ "$c76b" = 0 -a "$st76b" = running -a "$n76b" = 1 -a "$stray76" = 0 -a \( "$rc76" = 0 -o -n "$dep76" \) ]
 		"$CX" delete "$D-a" --yes >/dev/null 2>&1
 		"$CX" delete "$D-b" --yes >/dev/null 2>&1
